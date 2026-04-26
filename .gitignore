@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual envs
+.venv
+
+# Project data — never commit personal health data or generated briefings
+data/
+briefings/
+logs/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
