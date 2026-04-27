@@ -7,13 +7,25 @@ new fields later without re-pulling from Garmin.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import date as date_cls, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-DEFAULT_DB_PATH = Path.home() / "localrepo" / "local-fitness" / "data" / "fitness.db"
+
+def _default_db_path() -> Path:
+    """Resolve the SQLite path. Honor LOCAL_FITNESS_DATA_DIR for container
+    deployments where /data is a bind-mounted volume; default to the
+    host-CLI path when unset."""
+    override = os.environ.get("LOCAL_FITNESS_DATA_DIR")
+    if override:
+        return Path(override) / "fitness.db"
+    return Path.home() / "localrepo" / "local-fitness" / "data" / "fitness.db"
+
+
+DEFAULT_DB_PATH = _default_db_path()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_metrics (

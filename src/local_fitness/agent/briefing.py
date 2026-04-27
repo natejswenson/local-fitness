@@ -28,7 +28,18 @@ from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
 
-DEFAULT_BRIEFINGS_DIR = Path.home() / "localrepo" / "local-fitness" / "briefings"
+def _default_briefings_dir() -> Path:
+    """Resolve the briefings directory. Honor LOCAL_FITNESS_BRIEFINGS_DIR
+    for container deployments where /briefings is a bind-mounted volume;
+    default to the host-CLI path when unset."""
+    import os
+    override = os.environ.get("LOCAL_FITNESS_BRIEFINGS_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / "localrepo" / "local-fitness" / "briefings"
+
+
+DEFAULT_BRIEFINGS_DIR = _default_briefings_dir()
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
 

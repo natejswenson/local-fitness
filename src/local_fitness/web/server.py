@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -54,7 +55,14 @@ from ..ingest import daily as daily_ingest
 LOG = logging.getLogger(__name__)
 
 WEB_DIST = Path(__file__).resolve().parents[3] / "web" / "dist"
-BRIEFINGS_DIR = Path.home() / "localrepo" / "local-fitness" / "briefings"
+# Honor the same env override as briefing.py — /briefings inside the
+# container, host path otherwise.
+BRIEFINGS_DIR = Path(
+    os.environ.get(
+        "LOCAL_FITNESS_BRIEFINGS_DIR",
+        str(Path.home() / "localrepo" / "local-fitness" / "briefings"),
+    )
+)
 
 # Auto-sync settings — bite-sized: never pull more than this many days at once,
 # and don't pull more than once per this many minutes from the UI trigger.
@@ -140,6 +148,14 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------- API: data --
+
+@app.get("/health")
+async def api_health() -> dict:
+    """Lightweight liveness probe — used by Traefik's healthcheck.
+    Does not touch DB or external services so it stays fast even when
+    the agent is busy or Garmin is unreachable."""
+    return {"status": "ok"}
+
 
 @app.get("/api/config")
 async def api_config() -> dict:
@@ -595,13 +611,19 @@ else:
         }
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765, reload: bool = False) -> None:
-    """Start uvicorn. CLI entry point uses this."""
+def serve(host: str | None = None, port: int = 8765, reload: bool = False) -> None:
+    """Start uvicorn. CLI entry point uses this.
+
+    Host defaults to LOCAL_FITNESS_HOST env var if set, else 127.0.0.1.
+    The Dockerfile sets it to 0.0.0.0 so the container exposes the port
+    to the Docker network; host CLI keeps the loopback-only default.
+    """
     import uvicorn
-    LOG.info("Serving on http://%s:%d", host, port)
+    resolved_host = host or os.environ.get("LOCAL_FITNESS_HOST", "127.0.0.1")
+    LOG.info("Serving on http://%s:%d", resolved_host, port)
     uvicorn.run(
         "local_fitness.web.server:app" if reload else app,
-        host=host,
+        host=resolved_host,
         port=port,
         reload=reload,
         log_level="info",
