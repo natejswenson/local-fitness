@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
-import { AlertTriangle, ChevronDown, ChevronRight, Info, Sparkles, TrendingDown } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronRight, Info, MessageSquarePlus, Sparkles, TrendingDown } from 'lucide-react'
 import { api } from '@/lib/api'
 import type { Takeaway, TakeawayTone } from '@/lib/types'
 import { Card } from './Card'
@@ -59,7 +59,12 @@ const METRIC_LABELS: Record<string, { label: string; unit?: string; transform?: 
   tsb: { label: 'Freshness (TSB)' },
 }
 
-export function TakeawayCard({ takeaway }: { takeaway: Takeaway }) {
+export function TakeawayCard({
+  takeaway, onAsk,
+}: {
+  takeaway: Takeaway
+  onAsk?: () => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const tone = TONE_STYLE[takeaway.tone]
   const Icon = tone.Icon
@@ -88,13 +93,25 @@ export function TakeawayCard({ takeaway }: { takeaway: Takeaway }) {
         </div>
       )}
 
-      <button
-        onClick={() => setExpanded((v) => !v)}
-        className="w-full px-5 py-2.5 mt-1 flex items-center gap-1.5 text-xs text-muted hover:text-text transition-colors border-t border-border"
-      >
-        {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-        {expanded ? 'Less' : 'More'}
-      </button>
+      <div className="flex items-stretch border-t border-border mt-1">
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="flex-1 px-5 py-2.5 flex items-center gap-1.5 text-xs text-muted hover:text-text transition-colors"
+        >
+          {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+          {expanded ? 'Less' : 'More'}
+        </button>
+        {onAsk && (
+          <button
+            onClick={onAsk}
+            className="px-4 py-2.5 flex items-center gap-1.5 text-xs text-muted hover:text-accent transition-colors border-l border-border"
+            title="Ask the agent about this takeaway"
+          >
+            <MessageSquarePlus className="size-3.5" />
+            Ask about this
+          </button>
+        )}
+      </div>
 
       {expanded && (
         <div className="px-5 pb-5 prose-fitness text-[14.5px]">

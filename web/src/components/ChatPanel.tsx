@@ -20,7 +20,9 @@ const SUGGESTIONS = [
 
 const newId = () => Math.random().toString(36).slice(2, 10)
 
-export function ChatPanel() {
+type SeedRequest = { text: string; nonce: number }
+
+export function ChatPanel({ seedRequest }: { seedRequest?: SeedRequest | null }) {
   const [sessionId] = useState(() => crypto.randomUUID())
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
@@ -36,6 +38,21 @@ export function ChatPanel() {
       api.chatEnd(sessionId).catch(() => {})
     }
   }, [sessionId])
+
+  // External seeding — when a TakeawayCard "Ask about this" is clicked,
+  // the parent bumps a nonce so we re-fire even if the seed text is
+  // identical. We don't auto-send; user gets a chance to edit first.
+  useEffect(() => {
+    if (!seedRequest) return
+    setInput(seedRequest.text)
+    requestAnimationFrame(() => {
+      const ta = taRef.current
+      if (!ta) return
+      ta.focus()
+      ta.setSelectionRange(ta.value.length, ta.value.length)
+      ta.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+  }, [seedRequest])
 
   // Scroll the page so the latest message is visible without yanking the
   // brief out of view — only scroll if the latest message is below the fold.
