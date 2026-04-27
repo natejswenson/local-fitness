@@ -96,6 +96,21 @@ export function SyncIndicator({ onCompleted }: Props) {
   }
 
   if (state.last_status === 'auth_failure') {
+    // mfa_required is a deterministic state — Retry button won't help,
+    // only re-running `fitness pull` in a terminal can clear it. Surface
+    // the user-actionable hint inline.
+    const isMfa = state.last_error?.toLowerCase().includes('mfa_required') ?? false
+    if (isMfa) {
+      return (
+        <Pill
+          tone="warn"
+          title="Garmin requires MFA. Run `uv run fitness pull` in your terminal once to reauthenticate; subsequent syncs will reuse the cached session."
+        >
+          <Settings2 className="size-3" />
+          MFA needed — run `fitness pull` in terminal
+        </Pill>
+      )
+    }
     return (
       <PillWithRetry
         tone="bad"

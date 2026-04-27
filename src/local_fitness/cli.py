@@ -83,6 +83,7 @@ def pull(force_from: str | None, through: str | None):
     result = daily_ingest.pull(
         through=Date.fromisoformat(through) if through else None,
         force_from=Date.fromisoformat(force_from) if force_from else None,
+        mfa_callback=lambda: click.prompt("Garmin MFA code", hide_input=False).strip(),
     )
     click.echo(
         f"Status: {result['status']} · days: {result['days_pulled']} · "

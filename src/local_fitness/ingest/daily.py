@@ -23,12 +23,26 @@ LOG = logging.getLogger(__name__)
 EARLIEST_BACKFILL_DATE = date(2020, 9, 1)
 
 
-def _client() -> Garmin:
+def _no_mfa_callback() -> str:
+    """Default MFA callback for non-interactive contexts (web, launchd).
+
+    Raises so we never block on `input()` when there's no human to type
+    the code. The error message carries the `mfa_required:` prefix so
+    daily.pull() can classify it for the UI.
+    """
+    raise RuntimeError(
+        "mfa_required: Garmin requested MFA but no interactive callback "
+        "is available. Run `uv run fitness pull` in your terminal once "
+        "to authenticate; subsequent pulls reuse the cached session."
+    )
+
+
+def _client(mfa_callback: Callable[[], str] | None = None) -> Garmin:
     creds = auth.get_credentials()
     if not creds:
         raise RuntimeError("Garmin credentials not stored. Run `fitness setup` first.")
     email, password = creds
-    client = Garmin(email, password, prompt_mfa=lambda: input("Garmin MFA code: "))
+    client = Garmin(email, password, prompt_mfa=mfa_callback or _no_mfa_callback)
     client.login()
     return client
 
@@ -227,6 +241,7 @@ def pull(
     through: date | None = None,
     force_from: date | None = None,
     max_days: int | None = None,
+    mfa_callback: Callable[[], str] | None = None,
 ) -> dict:
     """Gap-aware pull: fill missing dates in `daily_metrics`, freshest first.
 
@@ -237,6 +252,11 @@ def pull(
         max_days: cap the number of dates pulled in this run. Older gaps are
             deferred to subsequent runs. Keeps auto-sync bite-sized so a
             long absence doesn't make a single sync take ages.
+        mfa_callback: zero-arg callable returning the MFA code string. Pass
+            from a CLI (e.g. `lambda: click.prompt("MFA code")`); leave None
+            in non-interactive contexts (web/launchd), in which case a
+            verification challenge surfaces as `auth_failure` with an
+            `mfa_required:` error message rather than blocking on `input()`.
 
     Returns a summary dict suitable for CLI output.
     """
@@ -296,7 +316,7 @@ def pull(
     status: str | None = None
 
     try:
-        client = _client()
+        client = _client(mfa_callback)
         for d in target_dates:
             try:
                 with db.connect() as conn:
@@ -332,19 +352,33 @@ def pull(
                 parts.append(f"{len(days_failed)} day(s) failed: {','.join(days_failed[:3])}{'…' if len(days_failed) > 3 else ''}")
             error = "; ".join(parts) or None
     except GarminConnectAuthenticationError as e:
-        status = "auth_failure"
-        error = f"auth: {e}"
-        LOG.error("Garmin auth failed: %s", e)
+        # garth wraps an MFA-callback RuntimeError into this exception, so
+        # check the message text for the mfa_required marker.
+        msg = str(e)
+        if "mfa_required" in msg.lower() or "mfa" in msg.lower() or "verification" in msg.lower():
+            status = "auth_failure"
+            error = "mfa_required: " + msg
+            LOG.warning("Garmin requires MFA — re-run `fitness pull` in terminal: %s", e)
+        else:
+            status = "auth_failure"
+            error = "credentials_invalid: " + msg
+            LOG.error("Garmin auth failed: %s", e)
     except RuntimeError as e:
-        # _client() raises this when credentials aren't stored — distinguish
-        # so the UI can show a calm "set up Garmin" hint, not a scary error.
-        if "credentials" in str(e).lower():
+        msg = str(e)
+        # _client() raises RuntimeError for two known cases — distinguish
+        # so the UI can show the right hint.
+        if "credentials" in msg.lower():
             status = "not_configured"
-            error = str(e)
+            error = msg
             LOG.info("Pull skipped: %s", e)
+        elif "mfa_required" in msg.lower():
+            # Default callback fired in a non-interactive context.
+            status = "auth_failure"
+            error = msg  # already prefixed with `mfa_required:`
+            LOG.warning("MFA required but no interactive callback; surfacing to UI")
         else:
             status = "partial" if last_ok else "failure"
-            error = str(e)
+            error = msg
             LOG.exception("Pull failed at %s", last_ok or pull_max)
     except Exception as e:
         status = "partial" if last_ok else "failure"
