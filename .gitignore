@@ -14,6 +14,12 @@ data/
 briefings/
 logs/
 
+# Frontend (web/)
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo
+
 # OS / editor cruft
 .DS_Store
 .idea/

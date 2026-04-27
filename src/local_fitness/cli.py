@@ -143,6 +143,25 @@ def ask(question: tuple[str, ...], opus: bool):
 
 
 @main.command()
+@click.option("--port", default=8765, help="Port to bind (default 8765)")
+@click.option("--host", default="127.0.0.1", help="Host to bind (default 127.0.0.1, localhost-only)")
+@click.option("--reload", is_flag=True, help="Reload on code changes (dev mode)")
+@click.option("--open", "open_browser", is_flag=True, help="Open browser on start")
+def serve(port: int, host: str, reload: bool, open_browser: bool):
+    """Start the web UI + API server."""
+    from .web.server import serve as serve_app
+    if open_browser:
+        import threading
+        import time
+        import webbrowser
+        def _open():
+            time.sleep(1)
+            webbrowser.open(f"http://{host}:{port}")
+        threading.Thread(target=_open, daemon=True).start()
+    serve_app(host=host, port=port, reload=reload)
+
+
+@main.command()
 def status():
     """Show DB stats and last ingest run."""
     db.init_schema()

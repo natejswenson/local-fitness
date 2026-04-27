@@ -10,10 +10,12 @@ requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.68",
     "click>=8.3.3",
+    "fastapi>=0.136.1",
     "fitparse>=1.2.0",
     "garminconnect>=0.3.3",
     "keyring>=25.7.0",
     "rich>=15.0.0",
+    "uvicorn[standard]>=0.46.0",
 ]
 
 [project.scripts]
