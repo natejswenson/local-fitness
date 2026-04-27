@@ -32,8 +32,9 @@ export const api = {
     if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`)
     return r.json() as Promise<BriefResponse>
   },
-  syncStart: async () => {
-    const r = await fetch('/api/sync', { method: 'POST' })
+  syncStart: async (opts: { force?: boolean } = {}) => {
+    const url = opts.force ? '/api/sync?force=true' : '/api/sync'
+    const r = await fetch(url, { method: 'POST' })
     if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`)
     return r.json() as Promise<SyncTriggerResponse>
   },

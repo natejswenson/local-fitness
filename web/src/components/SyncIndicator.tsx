@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Check, Loader2, Settings2 } from 'lucide-react'
+import { AlertTriangle, Check, Loader2, RotateCw, Settings2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import type { SyncState } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -13,8 +13,10 @@ type Props = {
 
 export function SyncIndicator({ onCompleted }: Props) {
   const [state, setState] = useState<SyncState | null>(null)
+  const [retrying, setRetrying] = useState(false)
   const wasRunningRef = useRef(false)
   const lastCompletedRef = useRef<string | null>(null)
+  const initialKickoffRef = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -25,6 +27,18 @@ export function SyncIndicator({ onCompleted }: Props) {
         const s = await api.syncStatus()
         if (cancelled) return
         setState(s)
+
+        // Smart mount: only fire syncStart on first poll if data is
+        // actually stale AND we're not throttled. Reloading the page five
+        // times in a row shouldn't fire five sync attempts.
+        if (!initialKickoffRef.current) {
+          initialKickoffRef.current = true
+          const stale = s.days_behind > 0 || s.last_status === 'orphaned' || s.last_status === 'interrupted'
+          const eligible = !s.is_running && s.seconds_until_eligible === 0
+          if (stale && eligible) {
+            api.syncStart().catch(() => {})
+          }
+        }
 
         // Detect a transition from running → done, or a fresh completion.
         const justFinished = wasRunningRef.current && !s.is_running
@@ -42,8 +56,6 @@ export function SyncIndicator({ onCompleted }: Props) {
       }
     }
 
-    // Kick off a sync attempt + start polling.
-    api.syncStart().catch(() => {})
     poll()
 
     return () => {
@@ -51,6 +63,17 @@ export function SyncIndicator({ onCompleted }: Props) {
       if (timer) clearTimeout(timer)
     }
   }, [onCompleted])
+
+  async function handleRetry() {
+    setRetrying(true)
+    try {
+      await api.syncStart({ force: true })
+    } catch {
+      // ignore — pill will re-render based on next poll
+    } finally {
+      setRetrying(false)
+    }
+  }
 
   if (!state) return null
 
@@ -74,27 +97,52 @@ export function SyncIndicator({ onCompleted }: Props) {
 
   if (state.last_status === 'auth_failure') {
     return (
-      <Pill tone="bad" title={state.last_error ?? undefined}>
+      <PillWithRetry
+        tone="bad"
+        title={state.last_error ?? undefined}
+        retrying={retrying}
+        onRetry={handleRetry}
+      >
         <AlertTriangle className="size-3" />
         Garmin auth failed
-      </Pill>
+      </PillWithRetry>
+    )
+  }
+
+  if (state.last_status === 'orphaned' || state.last_status === 'interrupted') {
+    return (
+      <PillWithRetry
+        tone="bad"
+        title={state.last_error ?? 'Previous sync did not finish cleanly'}
+        retrying={retrying}
+        onRetry={handleRetry}
+      >
+        <AlertTriangle className="size-3" />
+        Sync interrupted
+      </PillWithRetry>
     )
   }
 
   if (state.last_status === 'failure' || state.last_status === 'partial') {
     return (
-      <Pill tone="bad" title={state.last_error ?? undefined}>
+      <PillWithRetry
+        tone={state.last_status === 'partial' ? 'warn' : 'bad'}
+        title={state.last_error ?? undefined}
+        retrying={retrying}
+        onRetry={handleRetry}
+      >
         <AlertTriangle className="size-3" />
-        Sync failed
-      </Pill>
+        {state.last_status === 'partial' ? 'Sync partial' : 'Sync failed'}
+      </PillWithRetry>
     )
   }
 
-  if (state.last_completed_at) {
+  if (state.last_completed_at || state.data_through_date) {
+    const tone = state.days_behind >= 2 ? 'warn' : 'muted'
     return (
-      <Pill tone="muted" title={syncTooltip(state)}>
+      <Pill tone={tone} title={syncTooltip(state)}>
         <Check className="size-3" />
-        Synced {relativeTime(state.last_completed_at)}
+        {freshnessText(state)}
       </Pill>
     )
   }
@@ -102,23 +150,21 @@ export function SyncIndicator({ onCompleted }: Props) {
   return null
 }
 
-function syncTooltip(state: SyncState): string {
-  const parts: string[] = []
-  if (state.last_completed_at) parts.push(`Last: ${new Date(state.last_completed_at).toLocaleString()}`)
-  if (state.last_date_fetched) parts.push(`Through: ${state.last_date_fetched}`)
-  return parts.join(' · ')
+function freshnessText(state: SyncState): string {
+  if (!state.data_through_date) return 'Synced'
+  const days = state.days_behind
+  if (days === 0) return 'Synced through today'
+  if (days === 1) return 'Synced through yesterday'
+  const d = new Date(state.data_through_date + 'T00:00:00')
+  const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+  return `Through ${label} · ${days}d behind`
 }
 
-function relativeTime(iso: string): string {
-  const ms = Date.now() - new Date(iso).getTime()
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return 'just now'
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m} min ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  const d = Math.floor(h / 24)
-  return `${d}d ago`
+function syncTooltip(state: SyncState): string {
+  const parts: string[] = []
+  if (state.data_through_date) parts.push(`Data through: ${state.data_through_date}`)
+  if (state.last_completed_at) parts.push(`Last sync: ${new Date(state.last_completed_at).toLocaleString()}`)
+  return parts.join(' · ')
 }
 
 function Pill({
@@ -140,6 +186,31 @@ function Pill({
       )}
     >
       {children}
+    </span>
+  )
+}
+
+function PillWithRetry({
+  children, tone, title, retrying, onRetry,
+}: {
+  children: React.ReactNode
+  tone: 'warn' | 'bad'
+  title?: string
+  retrying: boolean
+  onRetry: () => void
+}) {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <Pill tone={tone} title={title}>{children}</Pill>
+      <button
+        onClick={onRetry}
+        disabled={retrying}
+        className="text-[11px] inline-flex items-center gap-1 px-2 py-1 rounded-full border border-border bg-surface hover:bg-surface-2 transition-colors text-muted hover:text-text disabled:opacity-50"
+        title="Retry sync"
+      >
+        {retrying ? <Loader2 className="size-3 animate-spin" /> : <RotateCw className="size-3" />}
+        Retry
+      </button>
     </span>
   )
 }
