@@ -76,16 +76,18 @@ export function Today() {
 
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="max-w-6xl mx-auto px-6 py-8 space-y-5">
-        {/* Header — personalised greeting + sync status + regenerate */}
-        <div className="flex items-end justify-between gap-4">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-5 sm:py-8 space-y-4 sm:space-y-5">
+        {/* Header — personalised greeting + sync status + regenerate.
+            Stacks vertically on mobile (greeting line; then pill + button
+            on their own row) so nothing wraps awkwardly on a phone. */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
           <div>
             <div className="text-sm text-muted">{greeting}</div>
-            <h1 className="text-2xl font-semibold tracking-tight mt-0.5">
+            <h1 className="text-xl sm:text-2xl font-semibold tracking-tight mt-0.5">
               {userName ? `${timeOfDayGreeting()}, ${userName}` : 'Today'}
             </h1>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <SyncIndicator onCompleted={onSyncCompleted} />
             <button
               onClick={regenerateBrief}
@@ -99,17 +101,17 @@ export function Today() {
           </div>
         </div>
 
-        {/* Stale brief banner */}
+        {/* Stale brief banner — gracefully wraps on narrow viewports */}
         {brief && briefIsStale && !briefLoading && (
           <button
             onClick={regenerateBrief}
-            className="w-full flex items-center justify-between gap-3 px-4 py-2.5 rounded-xl border border-warn/40 bg-warn/10 text-warn hover:bg-warn/15 transition-colors text-sm"
+            className="w-full flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 sm:gap-3 px-4 py-3 rounded-xl border border-warn/40 bg-warn/10 text-warn hover:bg-warn/15 transition-colors text-left text-[13px] sm:text-sm"
           >
-            <span className="inline-flex items-center gap-2">
-              <Sparkles className="size-4" />
-              Newer data available — your brief was generated before today's data landed
+            <span className="inline-flex items-start gap-2">
+              <Sparkles className="size-4 mt-0.5 shrink-0" />
+              <span>Newer data available — your brief was generated before today's data landed</span>
             </span>
-            <span className="text-xs underline-offset-2 hover:underline">Regenerate</span>
+            <span className="text-xs font-medium underline-offset-2 hover:underline shrink-0">Regenerate</span>
           </button>
         )}
 
@@ -166,7 +168,59 @@ export function Today() {
           </button>
           {showWorkouts && workouts && workouts.length > 0 && (
             <Card className="mt-2">
-              <CardBody>
+              {/* Mobile: stacked cards; readable at narrow widths without
+                  horizontal scroll. */}
+              <div className="sm:hidden divide-y divide-border">
+                {workouts.map((w) => {
+                  const Icon = activityIcon(w.activity_type)
+                  const loadStyle = trainingLoadStyle(w.training_load)
+                  return (
+                    <div key={w.activity_id} className="px-4 py-3 flex items-start gap-3">
+                      <span className="size-9 rounded-lg bg-surface-2 flex items-center justify-center shrink-0">
+                        <Icon className="size-4 text-muted" />
+                      </span>
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[13px] font-medium text-text">
+                            {fmtDate(w.date)}
+                          </span>
+                          {w.training_load != null && (
+                            <span
+                              className={cn(
+                                'inline-flex items-center justify-center min-w-[2.25rem] px-1.5 py-0.5 rounded-md text-[11px] font-medium tabular-nums',
+                                loadStyle,
+                              )}
+                              title={loadTooltip(w.training_load)}
+                            >
+                              Load {w.training_load.toFixed(0)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[13px] text-muted capitalize">
+                          {w.activity_type.replace(/_/g, ' ')}
+                          {w.distance_meters != null && (
+                            <> · <span className="text-text tabular-nums">{fmtKm(w.distance_meters)}</span></>
+                          )}
+                          {w.duration_seconds != null && (
+                            <> · <span className="text-text tabular-nums">{fmtSeconds(w.duration_seconds)}</span></>
+                          )}
+                        </div>
+                        <div className="text-[12px] text-muted tabular-nums flex flex-wrap gap-x-3 gap-y-0.5">
+                          {w.avg_pace_sec_per_km != null && (
+                            <span>Pace {fmtPace(w.avg_pace_sec_per_km)}</span>
+                          )}
+                          {w.avg_hr != null && (
+                            <span>HR {w.avg_hr}</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Desktop: full table. */}
+              <CardBody className="hidden sm:block">
                 <div className="overflow-x-auto -mx-5 px-5">
                   <table className="w-full text-sm">
                     <thead className="text-xs text-muted">
