@@ -61,6 +61,11 @@ BRIEFINGS_DIR = Path.home() / "localrepo" / "local-fitness" / "briefings"
 SYNC_MAX_DAYS = 30
 SYNC_THROTTLE_SECONDS = 15 * 60
 
+# Responsive-retry backoffs after a transient failure (Garmin 429, network
+# blip). Recovers in seconds–minutes rather than waiting the full throttle
+# window. Auth failures and not_configured do NOT auto-retry.
+SYNC_RETRY_BACKOFFS = [60, 5 * 60, 15 * 60]
+
 
 # Per-session ClaudeSDKClient so multi-turn chat keeps context.
 _chat_sessions: dict[str, ClaudeSDKClient] = {}
@@ -72,6 +77,9 @@ _session_lock = asyncio.Lock()
 _sync_running = False
 _sync_started_at: datetime | None = None
 _sync_lock = asyncio.Lock()
+_sync_task: asyncio.Task | None = None
+_retry_task: asyncio.Task | None = None
+_retry_count = 0
 
 
 def _options(model: str) -> ClaudeAgentOptions:
@@ -96,6 +104,20 @@ async def lifespan(app: FastAPI):
     if orphaned:
         LOG.info("Marked %d orphaned ingest_runs row(s) at startup", orphaned)
     yield
+
+    # Cancel any pending retry timer so we don't leave a dangling task.
+    global _retry_task, _sync_task
+    if _retry_task and not _retry_task.done():
+        _retry_task.cancel()
+    # Give an in-flight sync up to 2s to wrap (so daily.pull's finally
+    # block can land its closing UPDATE). If it's stuck deep in garth,
+    # let it ride — orphan recovery on next boot will reconcile.
+    if _sync_task and not _sync_task.done():
+        try:
+            await asyncio.wait_for(_sync_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
     # Tear down any live chat sessions on shutdown
     async with _session_lock:
         for sid, client in list(_chat_sessions.items()):
@@ -356,15 +378,47 @@ def _sync_state_dict() -> dict:
     }
 
 
+def _is_transient(status: str | None, error: str | None) -> bool:
+    """True for 429s, network blips, and similar — worth retrying soon."""
+    if status not in ("partial", "failure"):
+        return False
+    if not error:
+        return False
+    err = error.lower()
+    return any(
+        marker in err
+        for marker in (
+            "429", "rate limit", "rate-limit",
+            "timeout", "timed out",
+            "connection", "connect error", "network",
+            "temporarily", "service unavailable", "503", "502",
+        )
+    )
+
+
 async def _run_sync():
-    """Worker: call daily.pull in a thread, then recompute baselines if there's new data."""
-    global _sync_running, _sync_started_at
+    """Worker: call daily.pull in a thread, then recompute baselines on new data.
+
+    On transient failure (429 / network), arm a backoff retry. On success or
+    user-actionable failure (auth_failure, not_configured), reset retry count.
+    """
+    global _sync_running, _sync_started_at, _retry_count
     try:
         result = await asyncio.to_thread(daily_ingest.pull, max_days=SYNC_MAX_DAYS)
         LOG.info("Auto-sync result: %s", result)
-        if result.get("status") == "success" and result.get("days_pulled", 0) > 0:
-            await asyncio.to_thread(baselines_mod.recompute, lookback_days=90)
-            LOG.info("Auto-sync recomputed baselines after %d new days", result["days_pulled"])
+        status = result.get("status")
+        if status == "success":
+            _retry_count = 0
+            if result.get("days_pulled", 0) > 0:
+                await asyncio.to_thread(baselines_mod.recompute, lookback_days=90)
+                LOG.info("Auto-sync recomputed baselines after %d new days", result["days_pulled"])
+        elif _is_transient(status, result.get("error")):
+            _schedule_retry()
+        else:
+            # auth_failure / not_configured / non-transient failure — don't
+            # auto-retry; user has to act. Reset count so future success
+            # has a clean slate.
+            _retry_count = 0
     except Exception:
         LOG.exception("Auto-sync worker crashed")
     finally:
@@ -372,29 +426,61 @@ async def _run_sync():
         _sync_started_at = None
 
 
-@app.post("/api/sync")
-async def api_sync():
-    """Kick off a background pull from Garmin if not already running and not throttled.
+def _schedule_retry() -> None:
+    """Arm a one-shot retry on transient failure with exponential backoff."""
+    global _retry_count, _retry_task
+    delay = SYNC_RETRY_BACKOFFS[min(_retry_count, len(SYNC_RETRY_BACKOFFS) - 1)]
+    _retry_count += 1
+    LOG.info("Scheduling sync retry in %ds (attempt %d)", delay, _retry_count)
 
-    Returns immediately. Poll /api/sync/status to see when it completes.
+    async def _retry_after_delay() -> None:
+        try:
+            await asyncio.sleep(delay)
+            await _trigger_sync(force=True)
+        except asyncio.CancelledError:
+            LOG.debug("Retry task cancelled")
+            raise
+
+    if _retry_task and not _retry_task.done():
+        _retry_task.cancel()
+    _retry_task = asyncio.create_task(_retry_after_delay())
+
+
+async def _trigger_sync(force: bool = False) -> dict:
+    """Internal: kick off a sync if eligible (or forced).
+
+    Used by both the public `/api/sync` endpoint and the auto-retry loop.
+    `force=True` bypasses throttle but still respects the already-running
+    guard.
     """
-    global _sync_running, _sync_started_at
+    global _sync_running, _sync_started_at, _sync_task
     async with _sync_lock:
         if _sync_running:
             return {"started": False, "reason": "already_running", "state": _sync_state_dict()}
-        # Throttle: only one pull per SYNC_THROTTLE_SECONDS window.
-        last = _last_sync_run()
-        if last and last.get("completed_at"):
-            try:
-                done = datetime.fromisoformat(last["completed_at"])
-                if datetime.now() - done < timedelta(seconds=SYNC_THROTTLE_SECONDS):
-                    return {"started": False, "reason": "throttled", "state": _sync_state_dict()}
-            except ValueError:
-                pass
+        if not force:
+            last = _last_sync_run()
+            if last and last.get("completed_at"):
+                try:
+                    done = datetime.fromisoformat(last["completed_at"])
+                    if datetime.now() - done < timedelta(seconds=SYNC_THROTTLE_SECONDS):
+                        return {"started": False, "reason": "throttled", "state": _sync_state_dict()}
+                except ValueError:
+                    pass
         _sync_running = True
         _sync_started_at = datetime.now()
-        asyncio.create_task(_run_sync())
+        _sync_task = asyncio.create_task(_run_sync())
     return {"started": True, "state": _sync_state_dict()}
+
+
+@app.post("/api/sync")
+async def api_sync(force: bool = Query(False)):
+    """Kick off a background pull from Garmin if not running and not throttled.
+
+    `?force=true` bypasses the throttle (used by the Retry button after a
+    failure or for manual user-triggered refresh). Returns immediately;
+    poll /api/sync/status to see when it completes.
+    """
+    return await _trigger_sync(force=force)
 
 
 @app.get("/api/sync/status")
