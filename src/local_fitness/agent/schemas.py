@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Whitelisted metric names — must be queryable via /api/metric/{name} or
 # /api/training-load. Keep this list aligned with the FastAPI _ALLOWED_METRICS.
@@ -33,9 +33,28 @@ MetricName = Literal[
 Tone = Literal["positive", "caution", "critical", "neutral"]
 
 
+def _collapse_whitespace(v: object) -> object:
+    """Strip ALL whitespace (incl. internal) from a string. Used for enum
+    fields where the model has been observed to emit raw newlines mid-value
+    (e.g. ``"r\\nhr"`` instead of ``"rhr"``). Internal whitespace is never
+    legitimate in our enums."""
+    return "".join(v.split()) if isinstance(v, str) else v
+
+
+def _strip_edges(v: object) -> object:
+    """Strip leading/trailing whitespace only. Used for free-form prose
+    fields where internal newlines may be intentional (markdown details)."""
+    return v.strip() if isinstance(v, str) else v
+
+
 class TakeawayMetric(BaseModel):
     metric: MetricName
     days: int = Field(14, ge=7, le=730, description="Window for the inline chart")
+
+    @field_validator("metric", mode="before")
+    @classmethod
+    def _clean_metric(cls, v: object) -> object:
+        return _collapse_whitespace(v)
 
 
 class Takeaway(BaseModel):
@@ -44,6 +63,20 @@ class Takeaway(BaseModel):
     tone: Tone = Field("neutral", description="Sentiment for color treatment")
     metric: TakeawayMetric | None = Field(None, description="What metric to chart inline")
     details: str = Field(..., description="Full markdown deep-dive shown when expanded")
+
+    @field_validator("tone", mode="before")
+    @classmethod
+    def _clean_tone(cls, v: object) -> object:
+        # Enum field — collapse internal whitespace too. Models occasionally
+        # emit ``"\ncritical"`` or ``"crit\nical"`` from streamed JSON.
+        return _collapse_whitespace(v)
+
+    @field_validator("headline", "summary", "details", mode="before")
+    @classmethod
+    def _trim_prose(cls, v: object) -> object:
+        # Free-form fields: trim leading/trailing whitespace but preserve
+        # internal newlines (markdown details may legitimately contain them).
+        return _strip_edges(v)
 
 
 class Brief(BaseModel):

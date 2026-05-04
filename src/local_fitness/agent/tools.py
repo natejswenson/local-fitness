@@ -13,7 +13,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from .. import db
+from .. import db, notes
 
 
 SERVER_NAME = "fitness"
@@ -489,6 +489,89 @@ async def run_sql(args: dict) -> dict:
     return _text({"rows": rows, "count": len(rows)})
 
 
+@tool(
+    "save_user_note",
+    "Persist a NEW durable user preference. Call this ONLY when the user "
+    "expresses a lasting preference that does NOT overlap an existing note. "
+    "If a similar note already exists, ask the user first whether to "
+    "replace it (then call update_user_note) or keep both (then call this). "
+    "Skip transient questions, one-off corrections, and clarifications. "
+    "One sentence per note.",
+    {"note": str},
+)
+async def save_user_note(args: dict) -> dict:
+    text = (args.get("note") or "").strip()
+    if not text:
+        return _err("note text is required")
+    try:
+        n = notes.append_note(text)
+    except ValueError as e:
+        return _err(str(e))
+    return _text({"saved": True, "line": n.line, "timestamp": n.timestamp, "text": n.text})
+
+
+@tool(
+    "list_user_notes",
+    "Read the current list of saved user-preference notes from disk. "
+    "Use this when the user asks 'what notes do you have', 'show me my "
+    "settings', or before deciding whether a new preference overlaps an "
+    "existing note. Returns notes with their line indices so subsequent "
+    "update_user_note / delete_user_note calls can target a specific one.",
+    {},
+)
+async def list_user_notes(_args: dict) -> dict:
+    items = notes.read_notes()
+    return _text({
+        "notes": [
+            {"line": n.line, "timestamp": n.timestamp, "text": n.text}
+            for n in items
+        ],
+        "count": len(items),
+    })
+
+
+@tool(
+    "update_user_note",
+    "Replace the note at the given line index with new text (e.g. when the "
+    "user wants to refine an existing preference instead of adding a new "
+    "one). The line index comes from list_user_notes or the system "
+    "prompt's notes section. Always confirm with the user before "
+    "overwriting — don't silently replace.",
+    {"line": int, "note": str},
+)
+async def update_user_note(args: dict) -> dict:
+    line = args.get("line")
+    text = (args.get("note") or "").strip()
+    if line is None or not isinstance(line, int):
+        return _err("line index is required")
+    if not text:
+        return _err("new note text is required")
+    try:
+        n = notes.update_note(line, text)
+    except ValueError as e:
+        return _err(str(e))
+    if n is None:
+        return _err(f"no note at line {line}")
+    return _text({"updated": True, "line": n.line, "timestamp": n.timestamp, "text": n.text})
+
+
+@tool(
+    "delete_user_note",
+    "Remove the note at the given line index. Use when the user asks to "
+    "forget or drop a saved preference. Confirm with the user first if the "
+    "intent is ambiguous.",
+    {"line": int},
+)
+async def delete_user_note(args: dict) -> dict:
+    line = args.get("line")
+    if line is None or not isinstance(line, int):
+        return _err("line index is required")
+    ok = notes.delete_note(line)
+    if not ok:
+        return _err(f"no note at line {line}")
+    return _text({"deleted": True, "line": line})
+
+
 ALL_TOOLS = [
     get_today_status,
     get_metric,
@@ -501,6 +584,10 @@ ALL_TOOLS = [
     correlate,
     recovery_pattern,
     run_sql,
+    save_user_note,
+    list_user_notes,
+    update_user_note,
+    delete_user_note,
 ]
 
 

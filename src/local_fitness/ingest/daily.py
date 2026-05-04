@@ -237,6 +237,16 @@ def _ingest_activity_range(client: Garmin, conn, start: date, end: date) -> int:
     return n
 
 
+FRESHNESS_WINDOW_DAYS = 3
+"""Number of most-recent days to re-fetch on every pull, even if a row
+already exists. Garmin's daily totals (steps, sleep, etc.) update
+throughout the day and finalize at day-end. Without this window, a sync
+that ran at 5pm and saved partial step counts would leave that stale
+value in the DB forever — every subsequent gap-aware pull skips dates
+that already have a row. ``_ingest_day`` uses INSERT OR REPLACE so the
+overwrite is clean."""
+
+
 def pull(
     through: date | None = None,
     force_from: date | None = None,
@@ -244,6 +254,10 @@ def pull(
     mfa_callback: Callable[[], str] | None = None,
 ) -> dict:
     """Gap-aware pull: fill missing dates in `daily_metrics`, freshest first.
+
+    Always re-fetches the last ``FRESHNESS_WINDOW_DAYS`` days regardless of
+    whether rows already exist, so day-end totals overwrite any partial
+    values captured by an earlier same-day sync.
 
     Args:
         through: end date (default today).
@@ -263,14 +277,18 @@ def pull(
     db.init_schema()
     today = through or date.today()
 
-    # Build the target list. force_from = full range; otherwise gap-aware.
+    # Build the target list. force_from = full range; otherwise the union of
+    # (gap-aware missing dates) ∪ (freshness window).
     if force_from:
         target_dates = [
             force_from + timedelta(days=i)
             for i in range((today - force_from).days + 1)
         ]
     else:
-        target_dates = db.missing_daily_dates(EARLIEST_BACKFILL_DATE, today)
+        missing = db.missing_daily_dates(EARLIEST_BACKFILL_DATE, today)
+        # Always-refresh the last N days. Use a set then re-sort to dedupe.
+        fresh = [today - timedelta(days=i) for i in range(FRESHNESS_WINDOW_DAYS)]
+        target_dates = sorted(set(missing) | set(fresh))
 
     if not target_dates:
         LOG.info("No missing dates through %s — already up to date", today)

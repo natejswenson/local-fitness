@@ -27,6 +27,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "anthropic>=0.97.0",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

@@ -25,3 +25,9 @@ web/*.tsbuildinfo
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local runtime state
+.claude/
+
+# uxpolish-generated variant files (one-shot, not committed)
+web/src/components/*.v[0-9].tsx

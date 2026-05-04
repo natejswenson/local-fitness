@@ -18,6 +18,9 @@ export function Today() {
   const [dataThrough, setDataThrough] = useState<string | null>(null)
   const [workouts, setWorkouts] = useState<Workout[] | null>(null)
   const [briefLoading, setBriefLoading] = useState(false)
+  // Live takeaways stream into this array as the model emits them. When the
+  // brief lands a final `done`, we promote them into `brief` and clear this.
+  const [streamedTakeaways, setStreamedTakeaways] = useState<Takeaway[]>([])
   const [showWorkouts, setShowWorkouts] = useState(false)
   const [userName, setUserName] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -31,9 +34,6 @@ export function Today() {
         setDataThrough(b.data_through_date)
         setWorkouts(w.workouts)
         setUserName(c.user_name)
-        // Auto-regen on first visit if no brief exists yet today AND we have data.
-        // One-shot per page load — guard with a ref so React strict-mode double
-        // mount doesn't fire twice.
         if (!b.brief && b.data_through_date && !autoRegenAttemptedRef.current) {
           autoRegenAttemptedRef.current = true
           regenerateBrief()
@@ -43,8 +43,6 @@ export function Today() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Triggered by SyncIndicator when a background pull just completed
-  // successfully — quietly refetch workouts so any newly-arrived data shows.
   function onSyncCompleted() {
     api.workouts({ days: 30, limit: 8 }).then((w) => setWorkouts(w.workouts)).catch(() => {})
     api.brief().then((b) => setDataThrough(b.data_through_date)).catch(() => {})
@@ -52,10 +50,25 @@ export function Today() {
 
   async function regenerateBrief() {
     setBriefLoading(true)
+    setStreamedTakeaways([])
+    setError(null)
     try {
-      const r = await api.briefGenerate('claude-sonnet-4-6')
-      setBrief(r.brief)
-      setDataThrough(r.data_through_date)
+      for await (const evt of api.briefGenerateStream('claude-sonnet-4-6')) {
+        if (evt.type === 'takeaway') {
+          setStreamedTakeaways((prev) => {
+            // De-dup by index in case the server retries; preserve order.
+            const next = [...prev]
+            next[evt.index] = evt.takeaway
+            return next
+          })
+        } else if (evt.type === 'done') {
+          setBrief(evt.brief)
+          setDataThrough(evt.data_through_date)
+          setStreamedTakeaways([])
+        } else if (evt.type === 'error') {
+          setError(evt.message)
+        }
+      }
     } catch (e) {
       setError(String(e))
     } finally {
@@ -119,13 +132,19 @@ export function Today() {
             keep the brief above-the-fold. Each card is compact by default
             (sparkline thumbnail, headline, summary, action row) and expands
             inline to show the full chart + details. */}
-        {brief ? (
+        {brief || streamedTakeaways.length > 0 ? (
           <div className="space-y-3">
-            <div className="text-xs font-medium uppercase tracking-wider text-muted">
-              Key Takeaways
+            <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-muted">
+              <span>Key Takeaways</span>
+              {briefLoading && (
+                <span className="inline-flex items-center gap-1.5 normal-case tracking-normal text-faint">
+                  <Loader2 className="size-3 animate-spin" />
+                  <span>writing more…</span>
+                </span>
+              )}
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-              {brief.takeaways.map((t, i) => (
+              {(brief?.takeaways ?? streamedTakeaways).map((t, i) => (
                 <TakeawayCard key={i} takeaway={t} onAsk={() => askAbout(t)} />
               ))}
             </div>
@@ -137,7 +156,7 @@ export function Today() {
                 <div className="flex flex-col items-center gap-3 text-muted">
                   <Loader2 className="size-5 animate-spin text-accent" />
                   <div className="text-sm">Reading your data…</div>
-                  <div className="text-xs text-faint">First takeaways usually take 30–60 seconds</div>
+                  <div className="text-xs text-faint">First takeaway lands in a few seconds</div>
                 </div>
               ) : (
                 <div className="text-sm text-muted">

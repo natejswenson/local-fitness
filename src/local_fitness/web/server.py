@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -45,7 +46,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import db
+from .. import db, notes as user_notes_mod
 from ..agent import briefing as briefing_mod
 from ..agent import prompts
 from ..agent import tools as agent_tools
@@ -344,14 +345,77 @@ class BriefGenerateRequest(BaseModel):
 @app.post("/api/brief/generate")
 async def api_brief_generate(req: BriefGenerateRequest) -> dict:
     """Force-regenerate today's brief and return the structured object."""
-    await asyncio.to_thread(briefing_mod.generate_and_save, model=req.model)
-    brief = briefing_mod.load_today()
-    return {
-        "date": date.today().isoformat(),
-        "brief": brief.model_dump() if brief else None,
-        "cached": False,
-        "data_through_date": db.last_known_daily_date(),
-    }
+    t_endpoint_start = time.perf_counter()
+    try:
+        await asyncio.to_thread(briefing_mod.generate_and_save, model=req.model)
+        brief = briefing_mod.load_today()
+        return {
+            "date": date.today().isoformat(),
+            "brief": brief.model_dump() if brief else None,
+            "cached": False,
+            "data_through_date": db.last_known_daily_date(),
+        }
+    finally:
+        total_ms = (time.perf_counter() - t_endpoint_start) * 1000
+        LOG.info(
+            "endpoint_timing path=/api/brief/generate total_ms=%.1f model=%s",
+            total_ms,
+            req.model,
+        )
+
+
+@app.post("/api/brief/generate/stream")
+async def api_brief_generate_stream(req: BriefGenerateRequest) -> StreamingResponse:
+    """Stream takeaways as they're parsed from the model's accumulating output.
+
+    Wire format: NDJSON (one ``{...}\\n`` event per line). Matches the chat
+    endpoint's pattern so the frontend reuses the same fetch+reader idiom
+    (avoids EventSource / iOS-Safari SSE quirks). The final ``done`` event
+    carries the full Brief and the data_through_date so the UI can update
+    its cached state without a follow-up GET.
+    """
+    t_endpoint_start = time.perf_counter()
+    model = req.model
+
+    async def event_stream() -> AsyncIterator[bytes]:
+        cancelled = False
+        try:
+            async for evt in briefing_mod.generate_streaming(model=model):
+                if evt.get("type") == "done":
+                    # Annotate the final event with the data-through date so
+                    # the client can refresh its staleness banner.
+                    evt = {**evt, "data_through_date": db.last_known_daily_date()}
+                yield (json.dumps(evt) + "\n").encode("utf-8")
+        except asyncio.CancelledError:
+            # Client disconnected mid-stream. CancelledError is a BaseException
+            # so the previous `except Exception` missed it — leaving 200s+
+            # regens that completed without saving a brief and without any
+            # error log. Log explicitly, then re-raise so FastAPI cleans up.
+            cancelled = True
+            LOG.warning("Brief stream cancelled by client disconnect")
+            raise
+        except Exception as e:
+            LOG.exception("Brief stream failed")
+            yield (json.dumps({"type": "error", "message": str(e)}) + "\n").encode("utf-8")
+        finally:
+            total_ms = (time.perf_counter() - t_endpoint_start) * 1000
+            LOG.info(
+                "endpoint_timing path=/api/brief/generate/stream total_ms=%.1f model=%s cancelled=%s",
+                total_ms,
+                model,
+                cancelled,
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            # Defeat any reverse-proxy buffering (Traefik passes through fine
+            # but explicit beats implicit; also a hint to nginx-style proxies).
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
+    )
 
 
 # ---------------------------------------------------------------- API: sync --
@@ -579,6 +643,48 @@ async def api_chat_end(session_id: str) -> dict:
             pass
         return {"closed": True}
     return {"closed": False}
+
+
+# ---------------------------------------------------------------- API: notes --
+# Durable user preferences saved by the chat agent (or manually via the API
+# below). Read by both prompts.system_prompt() and the future Settings UI.
+
+
+class NoteCreate(BaseModel):
+    text: str
+
+
+@app.get("/api/notes")
+async def api_notes_list() -> dict:
+    """All notes, in on-disk order. ``line`` is the 0-indexed bullet
+    position — pass it back to DELETE to remove a specific note."""
+    notes = user_notes_mod.read_notes()
+    return {
+        "notes": [
+            {"line": n.line, "timestamp": n.timestamp, "text": n.text} for n in notes
+        ]
+    }
+
+
+@app.post("/api/notes")
+async def api_notes_create(body: NoteCreate) -> dict:
+    """Manually add a note (e.g. from a Settings UI). The agent's
+    ``save_user_note`` MCP tool is the in-chat path; this is the
+    out-of-band path for direct adds."""
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+    n = user_notes_mod.append_note(body.text)
+    return {"saved": True, "timestamp": n.timestamp, "text": n.text}
+
+
+@app.delete("/api/notes/{line_index}")
+async def api_notes_delete(line_index: int) -> dict:
+    """Delete the note at ``line_index`` (matches the ``line`` field
+    returned by GET /api/notes)."""
+    ok = user_notes_mod.delete_note(line_index)
+    if not ok:
+        raise HTTPException(status_code=404, detail="no note at that line")
+    return {"deleted": True}
 
 
 # ---------------------------------------------------------------- Static SPA --

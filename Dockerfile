@@ -35,21 +35,25 @@ RUN apt-get update \
 # claude_agent_sdk/_cli_version.py). Bump in lockstep with the SDK.
 RUN npm install -g @anthropic-ai/claude-code@2.1.119
 
-# Install uv (used to manage the Python env, same as the host workflow).
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+# Install uv into a system path so the non-root user picks it up too.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# Non-root user. The claude CLI refuses --dangerously-skip-permissions
+# (which the Agent SDK passes for permission_mode="bypassPermissions")
+# when uid==0, so the container must run as a regular user.
+RUN useradd --create-home --shell /bin/bash --uid 1001 app
 
 WORKDIR /app
 
 # Project metadata + lock first so the deps layer caches independent of
 # source-only changes. README.md is referenced by pyproject.toml's
 # `readme` field so it has to be present at sync time.
-COPY pyproject.toml uv.lock README.md ./
-COPY src/ ./src/
-RUN uv sync --frozen --no-dev
+COPY --chown=app:app pyproject.toml uv.lock README.md ./
+COPY --chown=app:app src/ ./src/
+RUN chown app:app /app && su app -c "uv sync --frozen --no-dev"
 
 # Copy the built SPA from stage 1 so FastAPI's static-file mount finds it.
-COPY --from=web-builder /web/dist ./web/dist
+COPY --from=web-builder --chown=app:app /web/dist ./web/dist
 
 # Container-only env. Host CLI keeps its existing defaults (Path.home()
 # for data/briefings, 127.0.0.1 for serve, Keychain for auth) — these
@@ -60,8 +64,11 @@ ENV LOCAL_FITNESS_HOST=0.0.0.0 \
     PYTHONUNBUFFERED=1
 
 # Pre-create the volume mount points so the bind-mounts can attach
-# cleanly on first run.
-RUN mkdir -p /data /briefings /root/.garminconnect /root/.claude
+# cleanly on first run, and own them as `app` so writes succeed.
+RUN mkdir -p /data /briefings /home/app/.garminconnect /home/app/.claude \
+    && chown -R app:app /data /briefings /home/app/.garminconnect /home/app/.claude
+
+USER app
 
 EXPOSE 8765
 

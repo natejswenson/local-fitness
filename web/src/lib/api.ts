@@ -1,6 +1,6 @@
 import type {
-  BriefResponse, ChatEvent, MetricSeries, SyncState, SyncTriggerResponse,
-  TodayResponse, TrainingLoadSeries, Workout,
+  BriefResponse, BriefStreamEvent, ChatEvent, MetricSeries, SyncState,
+  SyncTriggerResponse, TodayResponse, TrainingLoadSeries, Workout,
 } from './types'
 
 async function getJson<T>(url: string): Promise<T> {
@@ -31,6 +31,37 @@ export const api = {
     })
     if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`)
     return r.json() as Promise<BriefResponse>
+  },
+  briefGenerateStream: async function* (
+    model: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<BriefStreamEvent> {
+    const r = await fetch('/api/brief/generate/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+      signal,
+    })
+    if (!r.ok || !r.body) throw new Error(`${r.status}: ${await r.text()}`)
+    const reader = r.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx: number
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx).trim()
+        buf = buf.slice(idx + 1)
+        if (!line) continue
+        try {
+          yield JSON.parse(line) as BriefStreamEvent
+        } catch (e) {
+          console.warn('bad brief stream line', line, e)
+        }
+      }
+    }
   },
   syncStart: async (opts: { force?: boolean } = {}) => {
     const url = opts.force ? '/api/sync?force=true' : '/api/sync'

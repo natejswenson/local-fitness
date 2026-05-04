@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowUp, Loader2, MessageSquare, Wrench, X } from 'lucide-react'
+import { ArrowUp, BookmarkCheck, Loader2, MessageSquare, Wrench, X } from 'lucide-react'
 import { api } from '@/lib/api'
 import type { ChatEvent } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -205,16 +205,26 @@ function MessageBubble({ message, streaming }: { message: Message; streaming: bo
     <div>
       {message.tools.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-1.5">
-          {message.tools.map((t, i) => (
-            <span
-              key={i}
-              className="inline-flex items-center gap-1.5 text-[11px] text-muted bg-surface px-2 py-1 rounded-full border border-border"
-              title={JSON.stringify(t.input)}
-            >
-              <Wrench className="size-3" />
-              {t.name.replace(/^mcp__fitness__/, '')}
-            </span>
-          ))}
+          {message.tools.map((t, i) => {
+            const isSave = t.name === 'mcp__fitness__save_user_note'
+            // Saved-preference badge stands out from regular tool calls so
+            // Nate sees clearly when the agent commits something to memory.
+            return (
+              <span
+                key={i}
+                className={cn(
+                  'inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-full border',
+                  isSave
+                    ? 'text-accent bg-accent/10 border-accent/30 font-medium'
+                    : 'text-muted bg-surface border-border',
+                )}
+                title={isSave ? String(t.input?.note ?? '') : JSON.stringify(t.input)}
+              >
+                {isSave ? <BookmarkCheck className="size-3" /> : <Wrench className="size-3" />}
+                {isSave ? `Saved: ${String(t.input?.note ?? '').slice(0, 60)}${String(t.input?.note ?? '').length > 60 ? '…' : ''}` : t.name.replace(/^mcp__fitness__/, '')}
+              </span>
+            )
+          })}
         </div>
       )}
       <div className="prose-fitness text-[15px]">
