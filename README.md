@@ -151,6 +151,10 @@ the browser remembers it via `localStorage`. Cost-sensitive endpoints
 (`/api/chat`, `/api/brief/generate*`) are also rate-limited per-IP at 20
 requests / minute as defense-in-depth against subscription drain.
 
+For container deployment behind a reverse proxy (e.g. Traefik), see
+[`docs/deployment.md`](docs/deployment.md) — covers the compose
+service block, required env vars, and the token-rotation flow.
+
 ## Database
 
 SQLite at `./data/fitness.db` (project-relative; override with `LOCAL_FITNESS_DATA_DIR`).
