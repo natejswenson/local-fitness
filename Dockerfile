@@ -17,7 +17,7 @@ RUN pnpm build
 
 
 # ----- Stage 2: runtime -------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 # System deps:
 #  - curl: needed for the healthcheck and the uv installer.
