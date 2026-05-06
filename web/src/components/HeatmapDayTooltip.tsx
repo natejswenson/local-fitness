@@ -1,24 +1,17 @@
-import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Activity, Bike, Dumbbell, Footprints, HandMetal, Mountain, Waves } from 'lucide-react'
-import { api } from '@/lib/api'
-import type {
-  ActivityHeatmapDay, ActivityHeatmapDayResponse, HeatmapActivity,
-} from '@/lib/types'
+import type { ActivityHeatmapDay, HeatmapActivity } from '@/lib/types'
 import { fmtKm, fmtPace, fmtSeconds } from '@/lib/utils'
 
 /**
  * Floating popover that appears next to the hovered heatmap cell. Shows
  * everything that informed the cell's color: per-activity detail, raw
- * recovery markers with delta-from-baseline coloring, and the day's
- * Banister CTL/ATL/TSB state.
+ * recovery markers with delta-from-baseline AND percentile-rank-within-
+ * window coloring, and the day's Banister CTL/ATL/TSB state.
  *
- * Two render modes:
- *   - "active day": full day data is in the heatmap response; render
- *     immediately, no extra fetch.
- *   - "rest day": tooltip lazy-loads `/api/activity-heatmap-day/{date}`
- *     so wellness + load state still appear without bloating the
- *     initial heatmap payload.
+ * Renders synchronously — the heatmap response now spans every day with
+ * daily_metrics in the window (active + rest), so no follow-up fetch is
+ * needed regardless of which cell the user hovers.
  *
  * Uses a portal anchored to document.body so the SVG's overflow doesn't
  * clip the popover. Position is clamped to the viewport so cells near
@@ -30,7 +23,7 @@ const TOOLTIP_OFFSET = 14
 
 export type HoverTarget =
   | { kind: 'active'; day: ActivityHeatmapDay; rect: DOMRect }
-  | { kind: 'rest'; date: string; rect: DOMRect }
+  | { kind: 'rest'; day: ActivityHeatmapDay | null; date: string; rect: DOMRect }
 
 export type LoadRanking = {
   /** All active days in the window, sorted DESC by total_load. Used to
@@ -47,36 +40,6 @@ export function HeatmapDayTooltip({
   target: HoverTarget | null
   ranking?: LoadRanking
 }) {
-  // Cache rest-day fetches so re-hovering the same cell doesn't refetch.
-  const cacheRef = useRef<Map<string, ActivityHeatmapDayResponse>>(new Map())
-  const [restDayData, setRestDayData] = useState<ActivityHeatmapDayResponse | null>(null)
-  const [restDayLoading, setRestDayLoading] = useState(false)
-
-  useEffect(() => {
-    if (!target || target.kind !== 'rest') {
-      setRestDayData(null)
-      setRestDayLoading(false)
-      return
-    }
-    const cached = cacheRef.current.get(target.date)
-    if (cached) {
-      setRestDayData(cached)
-      return
-    }
-    setRestDayData(null)
-    setRestDayLoading(true)
-    let cancelled = false
-    api.activityHeatmapDay(target.date)
-      .then((d) => {
-        if (cancelled) return
-        cacheRef.current.set(target.date, d)
-        setRestDayData(d)
-      })
-      .catch(() => { /* missing data shows the empty state anyway */ })
-      .finally(() => { if (!cancelled) setRestDayLoading(false) })
-    return () => { cancelled = true }
-  }, [target])
-
   if (!target) return null
 
   // Compute viewport-clamped position. Default: right of the cell.
@@ -111,7 +74,7 @@ export function HeatmapDayTooltip({
       {target.kind === 'active' ? (
         <ActiveDaySection day={target.day} ranking={ranking} />
       ) : (
-        <RestDaySection date={target.date} data={restDayData} loading={restDayLoading} />
+        <RestDaySection day={target.day} date={target.date} />
       )}
     </div>,
     document.body,
@@ -138,24 +101,15 @@ function ActiveDaySection({
       <RecoverySection
         wellness={day.wellness}
         baseline={day.baseline}
+        recovery_pct={day.recovery_pct}
       />
       <LoadStateSection load_state={day.load_state} />
     </>
   )
 }
 
-function RestDaySection({
-  date, data, loading,
-}: {
-  date: string
-  data: ActivityHeatmapDayResponse | null
-  loading: boolean
-}) {
-  if (loading || !data) {
-    return <div className="text-muted text-[12px]">Loading recovery…</div>
-  }
-  const hasAnyWellness = data.wellness && Object.values(data.wellness).some((v) => v != null)
-  if (!hasAnyWellness && !data.load_state?.ctl) {
+function RestDaySection({ day, date }: { day: ActivityHeatmapDay | null; date: string }) {
+  if (!day) {
     return (
       <div className="text-muted text-[12px]">
         No watch data recorded for {date}.
@@ -165,10 +119,12 @@ function RestDaySection({
   return (
     <>
       <div className="text-[12px] text-muted">No activities — recovery day.</div>
-      {data.wellness && data.baseline && (
-        <RecoverySection wellness={data.wellness} baseline={data.baseline} />
-      )}
-      {data.load_state && <LoadStateSection load_state={data.load_state} />}
+      <RecoverySection
+        wellness={day.wellness}
+        baseline={day.baseline}
+        recovery_pct={day.recovery_pct}
+      />
+      <LoadStateSection load_state={day.load_state} />
     </>
   )
 }
@@ -280,10 +236,11 @@ function ActivitiesList({ activities }: { activities: HeatmapActivity[] }) {
 }
 
 function RecoverySection({
-  wellness, baseline,
+  wellness, baseline, recovery_pct,
 }: {
   wellness: { rhr: number | null; sleep_seconds: number | null; sleep_score: number | null; body_battery_max: number | null; avg_stress: number | null; steps: number | null }
   baseline: { rhr_60d: number | null; sleep_seconds_60d: number | null; body_battery_max_60d: number | null; stress_60d: number | null }
+  recovery_pct: { rhr: number | null; sleep_seconds: number | null; body_battery_max: number | null; avg_stress: number | null }
 }) {
   return (
     <div className="space-y-1.5">
@@ -294,6 +251,7 @@ function RecoverySection({
         delta={wellness.rhr != null && baseline.rhr_60d != null
           ? deltaTone(wellness.rhr - baseline.rhr_60d, { lowerIsBetter: true })
           : null}
+        pct={percentileTag(recovery_pct.rhr)}
       />
       <Row
         label="Sleep"
@@ -302,6 +260,7 @@ function RecoverySection({
         delta={wellness.sleep_seconds != null && baseline.sleep_seconds_60d != null
           ? deltaTone(wellness.sleep_seconds - baseline.sleep_seconds_60d, { lowerIsBetter: false, decimals: 0, unit: 'm', scale: 1 / 60 })
           : null}
+        pct={percentileTag(recovery_pct.sleep_seconds)}
       />
       <Row
         label="Body Battery"
@@ -309,6 +268,7 @@ function RecoverySection({
         delta={wellness.body_battery_max != null && baseline.body_battery_max_60d != null
           ? deltaTone(wellness.body_battery_max - baseline.body_battery_max_60d, { lowerIsBetter: false })
           : null}
+        pct={percentileTag(recovery_pct.body_battery_max)}
       />
       <Row
         label="Avg stress"
@@ -316,12 +276,31 @@ function RecoverySection({
         delta={wellness.avg_stress != null && baseline.stress_60d != null
           ? deltaTone(wellness.avg_stress - baseline.stress_60d, { lowerIsBetter: true })
           : null}
+        pct={percentileTag(recovery_pct.avg_stress)}
       />
       {wellness.steps != null && (
         <Row label="Steps" value={wellness.steps.toLocaleString()} />
       )}
     </div>
   )
+}
+
+/**
+ * Convert a 0..100 percent-rank (0 = best) into a small tag with tone.
+ * Returns null when the percentile is missing OR when it's mid-pack
+ * enough not to be worth chiming about — the goal is to chirp on
+ * remarkable days, not paint every row green.
+ */
+function percentileTag(
+  pct: number | null,
+): { text: string; tone: 'good' | 'bad' | 'neutral' } | null {
+  if (pct == null) return null
+  const rounded = Math.max(1, Math.round(pct))
+  if (pct <= 5) return { text: `top ${rounded}%`, tone: 'good' }
+  if (pct <= 25) return { text: `top ${rounded}%`, tone: 'good' }
+  if (pct >= 95) return { text: `bottom ${Math.max(1, Math.round(100 - pct))}%`, tone: 'bad' }
+  if (pct >= 75) return { text: `bottom ${Math.round(100 - pct)}%`, tone: 'bad' }
+  return null  // mid-pack; suppress to keep the tooltip readable
 }
 
 function LoadStateSection({
@@ -364,17 +343,25 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 function Row({
-  label, value, sub, delta, valueTone,
+  label, value, sub, delta, valueTone, pct,
 }: {
   label: string
   value: string
   sub?: string
   delta?: { text: string; tone: 'good' | 'bad' | 'neutral' } | null
   valueTone?: string
+  pct?: { text: string; tone: 'good' | 'bad' | 'neutral' } | null
 }) {
   return (
     <div className="flex items-baseline justify-between gap-2">
-      <span className="text-[11px] text-muted">{label}</span>
+      <span className="text-[11px] text-muted flex items-baseline gap-1.5">
+        {label}
+        {pct && (
+          <span className={`text-[10px] px-1.5 py-0 rounded-full border ${pctClass(pct.tone)}`}>
+            {pct.text}
+          </span>
+        )}
+      </span>
       <span className="flex items-baseline gap-1.5 tabular-nums">
         {sub && <span className="text-[10px] text-faint">{sub}</span>}
         <span className={`text-[12px] ${valueTone ?? 'text-text'}`}>{value}</span>
@@ -386,6 +373,12 @@ function Row({
       </span>
     </div>
   )
+}
+
+function pctClass(tone: 'good' | 'bad' | 'neutral'): string {
+  if (tone === 'good') return 'text-good border-good/30 bg-good/10'
+  if (tone === 'bad') return 'text-bad border-bad/30 bg-bad/10'
+  return 'text-faint border-border'
 }
 
 // =====================================================================

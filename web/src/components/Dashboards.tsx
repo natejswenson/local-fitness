@@ -112,10 +112,8 @@ function ActivityHeatmapPanel({ sessionId, model }: { sessionId: string; model: 
     api.activityHeatmap(days).then((r) => setData(r.values))
   }, [days])
 
-  // Build the load-rank lookup once per data refresh. Sort DESC by
-  // training load, then map date → 1-based ordinal. Ties resolve by
-  // the original date order (later = lower rank), which is fine —
-  // displaying "12th of 192" on a tied-50-load day is still accurate.
+  // Active days only — rest days have 0 load and would skew the rank
+  // toward "everyone is the hardest day."
   const ranking: LoadRanking | undefined = useMemo(() => {
     if (!data) return undefined
     const active = data.filter((d) => d.activity_count > 0)
@@ -249,8 +247,12 @@ function HeatmapGrid({
         ))}
         {/* Cells */}
         {weeks.map((cell) => {
-          const intensity = cell.entry
-            ? Math.min(1, cell.entry.total_load / maxLoad)
+          // Rest days now arrive with entries too (active+rest spine) —
+          // treat activity_count===0 as a rest cell so the visual stays
+          // identical to the active-only days.
+          const isActive = cell.entry && cell.entry.activity_count > 0
+          const intensity = isActive
+            ? Math.min(1, cell.entry!.total_load / maxLoad)
             : null
           const fill = intensity == null
             ? 'var(--color-surface-2)'
@@ -269,11 +271,14 @@ function HeatmapGrid({
               className="cursor-default hover:stroke-accent-dim"
               onMouseEnter={(e) => {
                 const rect = (e.target as SVGRectElement).getBoundingClientRect()
-                onHover(
-                  cell.entry
-                    ? { kind: 'active', day: cell.entry, rect }
-                    : { kind: 'rest', date: cell.date, rect },
-                )
+                if (cell.entry && cell.entry.activity_count > 0) {
+                  onHover({ kind: 'active', day: cell.entry, rect })
+                } else {
+                  // Rest day. The entry may be present (watch worn, no
+                  // workout) carrying inline wellness/baseline/percentile,
+                  // or absent (no daily_metrics row at all) → "no data".
+                  onHover({ kind: 'rest', day: cell.entry ?? null, date: cell.date, rect })
+                }
               }}
             />
           )
@@ -284,10 +289,13 @@ function HeatmapGrid({
 }
 
 function HeatmapTotals({ data }: { data: ActivityHeatmapDay[] }) {
+  // Spine is now daily_metrics (active + rest), so "active days" must
+  // filter on activity_count rather than counting every row.
   const totals = useMemo(() => {
-    const days = data.length
-    const totalLoad = data.reduce((s, d) => s + d.total_load, 0)
-    const totalActivities = data.reduce((s, d) => s + d.activity_count, 0)
+    const active = data.filter((d) => d.activity_count > 0)
+    const days = active.length
+    const totalLoad = active.reduce((s, d) => s + d.total_load, 0)
+    const totalActivities = active.reduce((s, d) => s + d.activity_count, 0)
     return { days, totalLoad, totalActivities }
   }, [data])
 

@@ -154,7 +154,6 @@ async def test_dashboards_require_auth(app_with_token):
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         for path in (
             "/api/activity-heatmap",
-            "/api/activity-heatmap-day/2026-04-29",
             "/api/strength-volume",
             "/api/pace-efficiency",
         ):
@@ -164,14 +163,8 @@ async def test_dashboards_require_auth(app_with_token):
                 path, headers={"Authorization": "Bearer test-token-fixed"}
             )
             assert r.status_code == 200, f"{path} with token returned {r.status_code}: {r.text}"
-            # The heatmap-day endpoint returns scalars at the top level, not
-            # a `values` array — every other dashboard endpoint returns an
-            # array, hence the conditional check.
             body = r.json()
-            if path == "/api/activity-heatmap-day/2026-04-29":
-                assert "wellness" in body
-            else:
-                assert "values" in body, f"{path} response missing `values`: {body}"
+            assert "values" in body, f"{path} response missing `values`: {body}"
 
 
 @pytest.mark.anyio

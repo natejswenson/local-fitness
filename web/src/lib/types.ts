@@ -178,8 +178,22 @@ export type HeatmapActivity = {
   avg_pace_sec_per_km: number | null
 }
 
+/**
+ * Per-marker percentile rank within the visible window. 0 = best for
+ * that metric (lowest RHR, longest sleep, highest body battery, lowest
+ * stress); 100 = worst. Computed across ALL daily_metrics rows in the
+ * window, including rest days.
+ */
+export type HeatmapRecoveryPct = {
+  rhr: number | null
+  sleep_seconds: number | null
+  body_battery_max: number | null
+  avg_stress: number | null
+}
+
 export type ActivityHeatmapDay = {
   date: string
+  /** 0 for rest days, > 0 for active. */
   activity_count: number
   total_load: number
   total_duration_seconds: number
@@ -188,6 +202,7 @@ export type ActivityHeatmapDay = {
   wellness: HeatmapWellness
   baseline: HeatmapBaseline
   load_state: HeatmapLoadState
+  recovery_pct: HeatmapRecoveryPct
 }
 
 export type ActivityHeatmapResponse = {
@@ -195,13 +210,6 @@ export type ActivityHeatmapResponse = {
   start_date: string
   end_date: string
   values: ActivityHeatmapDay[]
-}
-
-export type ActivityHeatmapDayResponse = {
-  date: string
-  wellness: HeatmapWellness | null
-  baseline: HeatmapBaseline | null
-  load_state: HeatmapLoadState | null
 }
 
 export type StrengthVolumeWeek = {

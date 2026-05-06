@@ -1,8 +1,7 @@
 import type {
-  ActivityHeatmapDayResponse, ActivityHeatmapResponse, BriefResponse,
-  BriefStreamEvent, ChatEvent, MetricSeries, PaceEfficiencyResponse,
-  StrengthVolumeResponse, SyncState, SyncTriggerResponse, TodayResponse,
-  TrainingLoadSeries, Workout,
+  ActivityHeatmapResponse, BriefResponse, BriefStreamEvent, ChatEvent,
+  MetricSeries, PaceEfficiencyResponse, StrengthVolumeResponse, SyncState,
+  SyncTriggerResponse, TodayResponse, TrainingLoadSeries, Workout,
 } from './types'
 
 // --- Auth token ---------------------------------------------------------
@@ -103,8 +102,6 @@ export const api = {
   },
   activityHeatmap: (days = 365) =>
     getJson<ActivityHeatmapResponse>(`/api/activity-heatmap?days=${days}`),
-  activityHeatmapDay: (date: string) =>
-    getJson<ActivityHeatmapDayResponse>(`/api/activity-heatmap-day/${date}`),
   strengthVolume: (weeks = 104) =>
     getJson<StrengthVolumeResponse>(`/api/strength-volume?weeks=${weeks}`),
   paceEfficiency: (days = 180, minDistanceKm = 2) =>
