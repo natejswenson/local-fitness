@@ -55,6 +55,25 @@ def test_briefing_prompt_no_continuity_when_empty():
     assert "recent briefs" not in p.lower()
 
 
+def test_briefing_prompt_prefetch_branch():
+    """Both prompt branches must hold the schema lock + mandates (design QG-1).
+    The pre-fetch branch injects the data and tells the model not to re-fetch."""
+    bundle = '{"get_today_status": {"latest": {"rhr": 50}}}'
+    p = prompts.briefing_prompt("Dana", prefetched=bundle)
+    low = p.lower()
+    # data injected + don't-refetch instruction
+    assert bundle in p
+    assert "already gathered" in low and "do not call those tools again" in low
+    # schema lock + mandates still present in the pre-fetch branch
+    assert "non-negotiable" in low and "takeaways" in low
+    assert "steps mandate" in low and "workout mandate" in low
+
+    # empty branch keeps the gather-via-tools list
+    e = prompts.briefing_prompt("Dana", prefetched="")
+    assert "call (in any sensible order)" in e.lower()
+    assert "get_today_status" in e
+
+
 def test_briefing_prompt_folds_in_training_plan():
     """The active plan rides inside the workout takeaway, recovery wins, and
     there is no parallel 'training plan' card (design §4c)."""

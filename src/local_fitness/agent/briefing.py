@@ -27,6 +27,7 @@ from claude_agent_sdk import (
 from pydantic import ValidationError
 
 from .. import db
+from . import briefing_data
 from . import prompts
 from . import tools as agent_tools
 from .schemas import Brief
@@ -410,9 +411,29 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             days_present,
             len(recent_briefs),
         )
+    # Pre-fetch the standard data in-process (collapses ~8 model round-trips
+    # into ~1 pass). On any failure, fall back to the tool-driven brief — the
+    # brief must never break because of the optimization.
+    prefetched = ""
+    t_prefetch = time.perf_counter()
+    try:
+        bundle = await briefing_data.gather_brief_context()
+        prefetched = briefing_data.render_for_prompt(bundle)
+        LOG.info(
+            "brief_prefetch ok keys=%d chars=%d ms=%.1f",
+            len(bundle),
+            len(prefetched),
+            (time.perf_counter() - t_prefetch) * 1000,
+        )
+    except Exception:
+        LOG.exception("brief_prefetch failed — falling back to tool-driven brief")
+        prefetched = ""
+
     try:
         async for message in query(
-            prompt=prompts.briefing_prompt(user_name, daily_step_goal, recent_briefs),
+            prompt=prompts.briefing_prompt(
+                user_name, daily_step_goal, recent_briefs, prefetched=prefetched
+            ),
             options=options,
         ):
             now = time.perf_counter()
