@@ -23,6 +23,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - REST: `GET /api/plan`, `POST /api/plan/{id}/commit`, `DELETE /api/plan/{id}`.
 - `plans.score_plan` — a deterministic plan-quality gate (safe ≤15%/week ramp +
   taper into the race).
+- `scripts/ab_brief.py` — an A/B simulation harness for prompt changes:
+  generates the brief across models and flags structural divergences (takeaway
+  count, mandated steps takeaway, plan-folded-in, tones). Dry-run by default
+  with a hard generation cap and a cost-free `--mock` mode.
 - A `Content-Security-Policy` header (`script-src 'self'`) as defense-in-depth
   against XSS from AI-authored plan strings.
 - The plan schedule shows **Target** and **Actual** columns (distance + pace);
