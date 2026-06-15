@@ -8,12 +8,12 @@ column names — no user input ever interpolates into SQL except via params.
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from .. import db, notes
+from .. import db, notes, plans
 
 
 SERVER_NAME = "fitness"
@@ -572,6 +572,143 @@ async def delete_user_note(args: dict) -> dict:
     return _text({"deleted": True, "line": line})
 
 
+# --- Training plans (the first agent->SQLite write path; DRAFT-ONLY) -------
+#
+# The model can only ever create/edit DRAFT plans. `status` is never an input:
+# propose hardcodes 'draft', revise builds its update from named goal params
+# only (never status), and revise refuses a non-draft target. Activating or
+# deleting a plan is a human action via the REST layer — there is no tool for
+# it. See plans.py for the enforced write boundary.
+
+_PROPOSE_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal_type": {"type": "string", "description": "5k | 10k | half | full | custom"},
+        "race_date": {"type": "string", "description": "ISO YYYY-MM-DD"},
+        "target_time_seconds": {"type": "integer", "description": "Goal finish time in seconds"},
+        "goal_distance_m": {"type": "number", "description": "Race distance (m); defaults from goal_type"},
+        "title": {"type": "string"},
+        "ability_snapshot": {"type": "object", "description": "Current-ability estimate you derived from the athlete's data"},
+        "workouts": {
+            "type": "array",
+            "description": "Full schedule: each {date, week_index, type, target_distance_m?, target_pace_sec_per_km?, target_duration_sec?, description, seq?}",
+            "items": {"type": "object"},
+        },
+    },
+    "required": ["goal_type", "race_date", "workouts"],
+}
+
+_REVISE_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "plan_id": {"type": "integer"},
+        "goal_type": {"type": "string"},
+        "race_date": {"type": "string"},
+        "target_time_seconds": {"type": "integer"},
+        "goal_distance_m": {"type": "number"},
+        "title": {"type": "string"},
+        "workouts": {"type": "array", "items": {"type": "object"}},
+    },
+    "required": ["plan_id"],
+}
+
+_EDITABLE_TOOL_FIELDS = ("goal_type", "race_date", "target_time_seconds", "goal_distance_m", "title")
+
+
+@tool(
+    "propose_training_plan",
+    "Create a DRAFT training plan from a goal + a full workout schedule you "
+    "generated. Ground it first: call training_load_status, get_today_status, "
+    "and query_workouts to read the athlete's real fitness before proposing. "
+    "Archives any prior draft. Does NOT activate the plan — the user commits it.",
+    _PROPOSE_PLAN_SCHEMA,
+)
+async def propose_training_plan(args: dict) -> dict:
+    goal_type = args.get("goal_type")
+    race_date = args.get("race_date")
+    workouts = args.get("workouts")
+    if not goal_type or not race_date:
+        return _err("goal_type and race_date are required")
+    goal_distance_m = args.get("goal_distance_m") or plans.GOAL_DISTANCE_M.get(goal_type)
+    target_time = args.get("target_time_seconds")
+    created_floor = db.last_known_daily_date() or date.today().isoformat()
+    err = plans.validate_plan_input(
+        goal_type, race_date, workouts or [], created_floor, goal_distance_m, target_time
+    )
+    if err:
+        return _err(err)
+    plan_id = plans.insert_draft(
+        {
+            "goal_type": goal_type,
+            "race_date": race_date,
+            "target_time_seconds": target_time,
+            "goal_distance_m": goal_distance_m,
+            "title": args.get("title"),
+            "ability_snapshot": args.get("ability_snapshot"),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        workouts,
+    )
+    return _text({"plan_id": plan_id, "status": "draft"})
+
+
+@tool(
+    "revise_training_plan",
+    "Revise the DRAFT plan during a riff: update goal fields and/or replace the "
+    "workout set wholesale. Only works on a draft (refuses active/archived "
+    "plans). Cannot change a plan's status — the user commits via the UI.",
+    _REVISE_PLAN_SCHEMA,
+)
+async def revise_training_plan(args: dict) -> dict:
+    plan_id = args.get("plan_id")
+    if not isinstance(plan_id, int):
+        return _err("plan_id (int) is required")
+    # status is deliberately NOT among the readable fields — it can never be set here.
+    fields = {k: args[k] for k in _EDITABLE_TOOL_FIELDS if k in args}
+    workouts = args.get("workouts")
+
+    if workouts is not None:
+        current = plans.get_plan(plan_id)
+        if current is None:
+            return _err(f"no plan {plan_id}")
+        gt = fields.get("goal_type", current["goal_type"])
+        rd = fields.get("race_date", current["race_date"])
+        created_floor = db.last_known_daily_date() or date.today().isoformat()
+        err = plans.validate_plan_input(
+            gt, rd, workouts, created_floor,
+            fields.get("goal_distance_m", current.get("goal_distance_m")),
+            fields.get("target_time_seconds", current.get("target_time_seconds")),
+        )
+        if err:
+            return _err(err)
+    try:
+        plans.revise_draft(plan_id, fields, workouts)
+    except (plans.PlanNotFoundError, plans.NotDraftError, ValueError) as e:
+        return _err(str(e))
+    return _text({"plan_id": plan_id, "status": "draft"})
+
+
+@tool(
+    "get_training_plan_status",
+    "Status of the ACTIVE training plan: goal, days to race, the most recent "
+    "graded day's prescription + verdict, today's prescribed session, and "
+    "overall adherence. Returns {active: false} when there is no active plan. "
+    "Call this first in a brief to decide whether to fold the plan in.",
+    {},
+)
+async def get_training_plan_status(_args: dict) -> dict:
+    active = plans.get_active_plan()
+    if active is None:
+        return _text({"active": False})
+    frontier = db.last_known_daily_date()
+    today = date.today().isoformat()
+    dates = [w["date"] for w in active["workouts"]] or [today]
+    start = min(dates)
+    end = max([today, *dates] + ([frontier] if frontier else []))
+    activities_by_date = plans.load_activities_by_date(start, end)
+    return _text(plans.build_plan_status(active, frontier, activities_by_date, today))
+
+
 ALL_TOOLS = [
     get_today_status,
     get_metric,
@@ -588,6 +725,9 @@ ALL_TOOLS = [
     list_user_notes,
     update_user_note,
     delete_user_note,
+    propose_training_plan,
+    revise_training_plan,
+    get_training_plan_status,
 ]
 
 
