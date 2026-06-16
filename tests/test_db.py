@@ -16,8 +16,19 @@ def dbp(tmp_path):
 
 
 def test_init_schema_idempotent(dbp):
-    # Calling again must not raise.
+    # Calling again must not raise (the guarded ALTER for activities.source
+    # would otherwise blow up with "duplicate column" on a second init).
     db.init_schema(dbp)
+    with db.connect(dbp) as conn:
+        tables = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "observations" in tables
+        act_cols = {r["name"] for r in conn.execute("PRAGMA table_info(activities)")}
+    assert "source" in act_cols
 
 
 def test_settings_roundtrip(dbp):

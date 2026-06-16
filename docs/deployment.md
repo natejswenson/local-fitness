@@ -47,6 +47,9 @@ services:
       # /mcp/ request 421s (DNS-rebinding guard). Default includes
       # fitness.home.local; set explicitly if you serve at a different host.
       - LOCAL_FITNESS_MCP_ALLOWED_HOSTS=${LOCAL_FITNESS_MCP_ALLOWED_HOSTS:-fitness.home.local,127.0.0.1,localhost}
+      # Display units for runner-facing output (mi, min/mi). Raw meters/sec-per-km
+      # are always present; non-"miles" only suppresses the *_mi fields. Default miles.
+      - LOCAL_FITNESS_DISPLAY_UNITS=${LOCAL_FITNESS_DISPLAY_UNITS:-miles}
     volumes:
       - ${HOME}/localrepo/local-fitness/data:/data
       - ${HOME}/localrepo/local-fitness/briefings:/briefings

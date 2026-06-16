@@ -300,3 +300,228 @@ def test_server_and_tool_names():
     names = tools.allowed_tool_names()
     assert len(names) == len(tools.ALL_TOOLS)
     assert all(n.startswith("mcp__fitness__") for n in names)
+
+
+# --- W4-T2: observation + manual-workout round-trip -----------------------
+
+def _obs_rows(db_path):
+    with db.connect(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM observations ORDER BY observation_id"
+        ).fetchall()
+
+
+def _activity_rows(db_path):
+    with db.connect(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM activities ORDER BY activity_id"
+        ).fetchall()
+
+
+def test_log_observation_numeric_and_text_roundtrip(seeded):
+    saved, err = call(tools.log_observation, {"obs_type": "weight", "value": 165})
+    assert not err and saved["logged"]
+    assert saved["observation"]["value_num"] == 165
+    assert saved["observation"]["value_text"] is None
+
+    saved2, err = call(tools.log_observation, {"obs_type": "note", "text": "felt flat"})
+    assert not err and saved2["logged"]
+    assert saved2["observation"]["value_text"] == "felt flat"
+    assert saved2["observation"]["value_num"] is None
+
+    listed, err = call(tools.list_observations, {})
+    assert not err
+    assert listed["count"] == 2
+    texts = {o["obs_type"] for o in listed["observations"]}
+    assert texts == {"weight", "note"}
+
+
+def test_log_observation_invalid_obs_type(seeded):
+    _payload, err = call(tools.log_observation, {"obs_type": "bogus", "value": 1})
+    assert err
+    assert not _obs_rows(seeded)  # nothing inserted
+
+
+def test_log_observation_numeric_missing_value(seeded):
+    _payload, err = call(tools.log_observation, {"obs_type": "weight"})
+    assert err
+    assert not _obs_rows(seeded)
+
+
+def test_log_observation_text_missing_text(seeded):
+    _payload, err = call(tools.log_observation, {"obs_type": "note"})
+    assert err
+    _payload, err = call(tools.log_observation, {"obs_type": "note", "text": "   "})
+    assert err
+    assert not _obs_rows(seeded)  # no empty rows
+
+
+def test_log_observation_bad_activity_id(seeded):
+    # Non-null activity_id that doesn't exist → _err, nothing inserted.
+    _payload, err = call(
+        tools.log_observation, {"obs_type": "rpe", "value": 8, "activity_id": 999999}
+    )
+    assert err
+    assert not _obs_rows(seeded)
+
+
+def test_log_observation_valid_activity_id(seeded):
+    # activity_id 1 exists in the seeded fixture.
+    saved, err = call(
+        tools.log_observation, {"obs_type": "rpe", "value": 8, "activity_id": 1}
+    )
+    assert not err and saved["logged"]
+    assert saved["observation"]["activity_id"] == 1
+
+
+def test_delete_observation_absent_and_present(seeded):
+    _payload, err = call(tools.delete_observation, {"observation_id": 4242})
+    assert err  # absent id
+
+    saved, _ = call(tools.log_observation, {"obs_type": "mood", "value": 7})
+    obs_id = saved["observation"]["observation_id"]
+    deleted, err = call(tools.delete_observation, {"observation_id": obs_id})
+    assert not err and deleted["deleted"]
+    assert not _obs_rows(seeded)
+
+
+def test_log_manual_workout_negative_ids_and_source(seeded):
+    today = date.today().isoformat()
+    first, err = call(
+        tools.log_manual_workout, {"activity_type": "strength", "duration_min": 45}
+    )
+    assert not err and first["logged"]
+    assert first["activity"]["activity_id"] == -1
+    assert first["activity"]["source"] == "manual"
+    assert first["activity"]["date"] == today  # date defaults to today
+
+    second, err = call(
+        tools.log_manual_workout, {"activity_type": "yoga", "duration_min": 30}
+    )
+    assert not err
+    assert second["activity"]["activity_id"] == -2
+
+
+def test_log_manual_workout_malformed_date(seeded):
+    before = len(_activity_rows(seeded))
+    _payload, err = call(
+        tools.log_manual_workout,
+        {"activity_type": "strength", "duration_min": 45, "date": "nope"},
+    )
+    assert err
+    assert len(_activity_rows(seeded)) == before  # no activities row written
+
+
+def test_delete_manual_workout_guardrails(seeded):
+    # Refuses non-negative ids (Garmin data protection).
+    _payload, err = call(tools.delete_manual_workout, {"activity_id": 1})
+    assert err
+    _payload, err = call(tools.delete_manual_workout, {"activity_id": 0})
+    assert err
+    # Absent negative id → _err.
+    _payload, err = call(tools.delete_manual_workout, {"activity_id": -99})
+    assert err
+
+
+def test_delete_manual_workout_detaches_observation(seeded):
+    saved, err = call(
+        tools.log_manual_workout, {"activity_type": "strength", "duration_min": 45}
+    )
+    assert not err
+    aid = saved["activity"]["activity_id"]
+    assert aid == -1
+
+    obs, err = call(
+        tools.log_observation, {"obs_type": "soreness", "value": 3, "activity_id": aid}
+    )
+    assert not err
+    obs_id = obs["observation"]["observation_id"]
+
+    deleted, err = call(tools.delete_manual_workout, {"activity_id": aid})
+    assert not err and deleted["deleted"]
+
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT * FROM observations WHERE observation_id = ?", (obs_id,)
+        ).fetchone()
+    assert row is not None  # observation still exists
+    assert row["activity_id"] is None  # ...but its activity_id is NULLed
+
+
+# --- W4-T3: recompute integration -----------------------------------------
+
+def _baseline_for(db_path, d):
+    with db.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT ctl, atl, tsb FROM baselines WHERE date = ?", (d,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def test_manual_workout_recompute_reflects_load(seeded):
+    today = date.today().isoformat()
+    before = _baseline_for(seeded, today)
+    assert before is not None  # fixture seeded a baselines row for today
+
+    saved, err = call(
+        tools.log_manual_workout,
+        {"activity_type": "strength", "duration_min": 60, "training_load": 120},
+    )
+    assert not err
+
+    after = _baseline_for(seeded, today)
+    assert after is not None
+    assert after["ctl"] is not None and after["atl"] is not None and after["tsb"] is not None
+    # The fixture wrote a fixed (ctl=40, atl=45) row; recompute overwrote it
+    # from real activity training_load, so the values must have changed.
+    assert (after["ctl"], after["atl"], after["tsb"]) != (
+        before["ctl"], before["atl"], before["tsb"]
+    )
+    assert after["ctl"] > 0
+
+
+def test_backdated_manual_workout_rewrites_own_date(seeded):
+    from local_fitness.ingest import baselines
+
+    backdate = (date.today() - timedelta(days=baselines.RECOMPUTE_LOOKBACK_DAYS + 10)).isoformat()
+    saved, err = call(
+        tools.log_manual_workout,
+        {
+            "activity_type": "cycling",
+            "duration_min": 90,
+            "date": backdate,
+            "training_load": 150,
+        },
+    )
+    assert not err
+    # The widened lookback must have written a baselines row for the backdated
+    # date, with the load reflected (CTL nonzero on/after that date).
+    row = _baseline_for(seeded, backdate)
+    assert row is not None
+    assert row["ctl"] is not None and row["ctl"] > 0
+
+
+def test_garmin_reingest_leaves_manual_row_untouched(seeded):
+    saved, err = call(
+        tools.log_manual_workout, {"activity_type": "strength", "duration_min": 45}
+    )
+    assert not err
+    manual_id = saved["activity"]["activity_id"]
+    assert manual_id == -1
+
+    # Simulate a Garmin re-ingest: INSERT OR REPLACE a positive activity_id.
+    today = date.today().isoformat()
+    with db.connect(seeded) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO activities "
+            "(activity_id, date, activity_type, activity_name, duration_seconds, "
+            "training_load, source) VALUES (2, ?, 'running', 'Re-ingest Run', 3600, 90.0, 'garmin')",
+            (today,),
+        )
+
+    with db.connect(seeded) as conn:
+        manual = conn.execute(
+            "SELECT * FROM activities WHERE activity_id = ?", (manual_id,)
+        ).fetchone()
+    assert manual is not None  # negative-id manual row survives the upsert
+    assert manual["source"] == "manual"
