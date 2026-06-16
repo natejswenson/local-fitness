@@ -8,17 +8,81 @@ column names — no user input ever interpolates into SQL except via params.
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from .. import db, notes
+from . import units
 
 
 SERVER_NAME = "fitness"
 
 BASELINE_METRICS = {"rhr", "sleep_seconds"}
+
+# The single source of truth for observation-type validation. Numeric types
+# (weight/rpe/soreness/energy/mood) store into value_num via `value`; free-text
+# types (feeling/injury/note) store into value_text via `text`.
+OBS_TYPES = frozenset({
+    "weight", "rpe", "soreness", "energy", "mood",
+    "feeling", "injury", "note",
+})
+# Single source of truth for which obs_types store into value_num (via `value`)
+# vs value_text (via `text`). Text types are derived so the two can't drift.
+NUMERIC_OBS_TYPES = frozenset({"weight", "rpe", "soreness", "energy", "mood"})
+assert NUMERIC_OBS_TYPES <= OBS_TYPES
+TEXT_OBS_TYPES = OBS_TYPES - NUMERIC_OBS_TYPES
+
+# Source of truth for the queryable table/column list advertised by run_sql and
+# rendered by the fitness://schema MCP resource. Keep these in sync by rendering
+# both from this one constant so the advertised list can't drift.
+QUERYABLE_SCHEMA: dict[str, list[str]] = {
+    "daily_metrics": [
+        "date", "sleep_seconds", "sleep_deep_seconds", "sleep_light_seconds",
+        "sleep_rem_seconds", "sleep_awake_seconds", "sleep_score",
+        "sleep_quality", "rhr", "avg_stress", "max_stress",
+        "body_battery_min", "body_battery_max", "body_battery_charged",
+        "body_battery_drained", "steps", "active_calories", "floors_climbed",
+        "avg_spo2", "respiration_avg", "vo2_max", "training_status",
+        "fitness_age", "intensity_minutes_moderate", "intensity_minutes_vigorous",
+    ],
+    "activities": [
+        "activity_id", "date", "start_time", "activity_type", "activity_name",
+        "duration_seconds", "moving_seconds", "distance_meters", "avg_hr",
+        "max_hr", "avg_pace_sec_per_km", "elevation_gain_meters",
+        "elevation_loss_meters", "calories", "aerobic_te", "anaerobic_te",
+        "training_load", "avg_cadence", "vo2_max_estimate", "weather_temp_c",
+        "weather_conditions", "source",
+    ],
+    "activity_splits": [
+        "activity_id", "split_index", "distance_meters", "duration_seconds",
+        "avg_hr", "avg_pace_sec_per_km", "elevation_gain_meters",
+    ],
+    "activity_hr_zones": ["activity_id", "zone", "seconds_in_zone"],
+    "body_battery_samples": ["date", "timestamp", "value"],
+    "stress_samples": ["date", "timestamp", "value"],
+    "baselines": [
+        "date", "rhr_60day_mean", "rhr_60day_sd",
+        "body_battery_max_60day_mean", "body_battery_min_60day_mean",
+        "sleep_seconds_60day_mean", "sleep_seconds_60day_sd",
+        "stress_60day_mean", "ctl", "atl", "tsb",
+    ],
+    "observations": [
+        "observation_id", "observed_on", "created_at", "obs_type",
+        "value_num", "value_text", "activity_id",
+    ],
+}
+
+
+def _render_schema() -> str:
+    """One-line `table(col, col, ...); ...` rendering of QUERYABLE_SCHEMA, used
+    in run_sql's advertised table list so it can't drift from the source."""
+    return "; ".join(
+        f"{table}({', '.join(cols)})" for table, cols in QUERYABLE_SCHEMA.items()
+    )
+
+
 DAILY_NUMERIC_METRICS = {
     "sleep_seconds", "sleep_score", "sleep_deep_seconds", "sleep_rem_seconds",
     "sleep_light_seconds", "sleep_awake_seconds",
@@ -38,6 +102,27 @@ def _text(payload: Any) -> dict:
 
 def _err(msg: str, **extra) -> dict:
     return {"content": [{"type": "text", "text": json.dumps({"error": msg, **extra})}], "is_error": True}
+
+
+def _augment_workout(w: dict) -> dict:
+    """Attach mile / formatted convenience fields ALONGSIDE the raw columns.
+
+    Raw fields (distance_meters, avg_pace_sec_per_km, duration_seconds) are
+    never dropped — correlate / run_sql depend on them. A convenience field is
+    only added when units.py returns non-None (null / zero → omitted). The
+    ``distance_mi`` field is suppressed entirely when display units aren't miles.
+    """
+    if units.display_units() == "miles":
+        distance_mi = units.to_miles(w.get("distance_meters"))
+        if distance_mi is not None:
+            w["distance_mi"] = distance_mi
+    pace = units.format_pace_min_per_mi(w.get("avg_pace_sec_per_km"))
+    if pace is not None:
+        w["pace_min_per_mi"] = pace
+    duration = units.format_duration(w.get("duration_seconds"))
+    if duration is not None:
+        w["duration_formatted"] = duration
+    return w
 
 
 @tool(
@@ -178,7 +263,7 @@ async def query_workouts(args: dict) -> dict:
                 FROM activities {where_sql} ORDER BY date DESC, start_time DESC LIMIT ?""",
             (*params, limit),
         ).fetchall()
-    return _text([dict(r) for r in rows])
+    return _text([_augment_workout(dict(r)) for r in rows])
 
 
 @tool(
@@ -203,7 +288,7 @@ async def get_workout_detail(args: dict) -> dict:
             "SELECT * FROM activity_splits WHERE activity_id = ? ORDER BY split_index",
             (aid,),
         ).fetchall()]
-    activity = dict(act)
+    activity = _augment_workout(dict(act))
     activity.pop("raw_json", None)
     return _text({"activity": activity, "hr_zones": zones, "splits": splits})
 
@@ -468,7 +553,9 @@ async def recovery_pattern(args: dict) -> dict:
 
 @tool(
     "run_sql",
-    "Execute a read-only SELECT or WITH query against the fitness DB. Tables: daily_metrics, activities, activity_splits, activity_hr_zones, body_battery_samples, stress_samples, baselines. Use this for ad-hoc analysis the other tools don't cover.",
+    "Execute a read-only SELECT or WITH query against the fitness DB. "
+    "Tables and columns: " + _render_schema() + ". "
+    "Use this for ad-hoc analysis the other tools don't cover.",
     {"query": str},
 )
 async def run_sql(args: dict) -> dict:
@@ -572,6 +659,258 @@ async def delete_user_note(args: dict) -> dict:
     return _text({"deleted": True, "line": line})
 
 
+@tool(
+    "daily_snapshot",
+    "The full daily snapshot — today's metrics with baseline deltas / trend "
+    "arrows, current CTL/ATL/TSB, recent workouts (with mile + formatted "
+    "fields), and saved user notes. The same payload the brief and coach "
+    "prompt share. Pure read.",
+    {},
+)
+async def daily_snapshot(_args: dict) -> dict:
+    # Lazy import: status.py imports DAILY_NUMERIC_METRICS from this module, so
+    # a top-level import here would be circular.
+    from .status import assemble_status
+    return _text(assemble_status())
+
+
+_LOG_OBSERVATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "obs_type": {
+            "type": "string",
+            "description": "One of: " + ", ".join(sorted(OBS_TYPES)) + ". "
+            "Numeric types (weight/rpe/soreness/energy/mood) use `value`; "
+            "free-text types (feeling/injury/note) use `text`.",
+        },
+        "value": {"type": "number", "description": "Numeric reading (weight/rpe/soreness/energy/mood)."},
+        "text": {"type": "string", "description": "Free text (feeling/injury/note)."},
+        "date": {"type": "string", "description": "ISO observed-on date, default today."},
+        "activity_id": {"type": "integer", "description": "Optional activity this observation refers to."},
+    },
+    "required": ["obs_type"],
+}
+
+
+@tool(
+    "log_observation",
+    "Record a subjective / manual observation (weight, RPE, soreness, energy, "
+    "mood, a feeling/injury note). Numeric types store `value`; text types "
+    "store `text`. Optionally tie it to an existing activity_id.",
+    _LOG_OBSERVATION_SCHEMA,
+)
+async def log_observation(args: dict) -> dict:
+    obs_type = args.get("obs_type")
+    if obs_type not in OBS_TYPES:
+        return _err(f"unknown obs_type '{obs_type}'", allowed=sorted(OBS_TYPES))
+    # Numeric types read `value`; text types read `text`. Reject an empty
+    # payload up front so we never insert a row with both columns NULL.
+    if obs_type in NUMERIC_OBS_TYPES:
+        if args.get("value") is None:
+            return _err(f"obs_type '{obs_type}' requires a numeric value")
+        value_num = args.get("value")
+        value_text = None
+    else:
+        text = args.get("text")
+        if not (text and str(text).strip()):
+            return _err(f"obs_type '{obs_type}' requires text")
+        value_num = None
+        value_text = text
+    observed_on = args.get("date") or date.today().isoformat()
+    created_at = datetime.now().isoformat()
+    activity_id = args.get("activity_id")
+    with db.connect() as conn:
+        if activity_id is not None:
+            exists = conn.execute(
+                "SELECT 1 FROM activities WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+            if not exists:
+                return _err("activity not found", activity_id=activity_id)
+        cur = conn.execute(
+            "INSERT INTO observations "
+            "(observed_on, created_at, obs_type, value_num, value_text, activity_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (observed_on, created_at, obs_type, value_num, value_text, activity_id),
+        )
+        obs_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT * FROM observations WHERE observation_id = ?", (obs_id,)
+        ).fetchone()
+    return _text({"logged": True, "observation": dict(row)})
+
+
+_LIST_OBSERVATIONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "days": {"type": "integer", "description": "Only observations from the last N days."},
+        "obs_type": {"type": "string", "description": "Filter to one obs_type."},
+    },
+    "required": [],
+}
+
+
+@tool(
+    "list_observations",
+    "List logged observations, most recent first. Optional filters: days "
+    "lookback and obs_type.",
+    _LIST_OBSERVATIONS_SCHEMA,
+)
+async def list_observations(args: dict) -> dict:
+    where: list[str] = []
+    params: list = []
+    if args.get("days"):
+        where.append("observed_on >= ?")
+        params.append((date.today() - timedelta(days=int(args["days"]))).isoformat())
+    if args.get("obs_type"):
+        where.append("obs_type = ?")
+        params.append(args["obs_type"])
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM observations {where_sql} "
+            "ORDER BY observed_on DESC, observation_id DESC",
+            params,
+        ).fetchall()
+    return _text({"observations": [dict(r) for r in rows], "count": len(rows)})
+
+
+@tool(
+    "delete_observation",
+    "Delete one logged observation by its observation_id. Use when the user "
+    "asks to drop a logged reading.",
+    {"observation_id": int},
+)
+async def delete_observation(args: dict) -> dict:
+    obs_id = int(args["observation_id"])
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM observations WHERE observation_id = ?", (obs_id,)
+        ).fetchone()
+        if not row:
+            return _err(f"no observation at id {obs_id}")
+        conn.execute("DELETE FROM observations WHERE observation_id = ?", (obs_id,))
+    return _text({"deleted": True, "observation_id": obs_id})
+
+
+_LOG_MANUAL_WORKOUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "activity_type": {"type": "string", "description": "e.g. 'strength', 'cycling', 'yoga'."},
+        "duration_min": {"type": "number", "description": "Workout duration in minutes."},
+        "date": {"type": "string", "description": "ISO date, default today. May be backdated."},
+        "distance_mi": {"type": "number", "description": "Optional distance in miles."},
+        "avg_hr": {"type": "integer"},
+        "training_load": {"type": "number", "description": "Optional TSS-style load; feeds CTL/ATL/TSB."},
+        "name": {"type": "string", "description": "Optional workout name."},
+    },
+    "required": ["activity_type", "duration_min"],
+}
+
+
+@tool(
+    "log_manual_workout",
+    "Record a workout Garmin didn't capture (strength, a class, an untracked "
+    "run). Gets a synthetic negative activity_id and source='manual', then "
+    "training load is recomputed so it shows up in CTL/ATL/TSB. May be backdated.",
+    _LOG_MANUAL_WORKOUT_SCHEMA,
+)
+async def log_manual_workout(args: dict) -> dict:
+    activity_type = args["activity_type"]
+    duration_min = args["duration_min"]
+    workout_date = args.get("date") or date.today().isoformat()
+    # Validate the user-supplied date BEFORE any write — a malformed string must
+    # not commit the activity row and then raise in the post-insert lookback.
+    try:
+        date.fromisoformat(workout_date)
+    except ValueError:
+        return _err(f"invalid date '{workout_date}', expected YYYY-MM-DD")
+    distance_meters = (
+        float(args["distance_mi"]) * units._METERS_PER_MILE
+        if args.get("distance_mi") is not None else None
+    )
+    duration_seconds = int(round(float(duration_min) * 60))
+    avg_hr = args.get("avg_hr")
+    training_load = args.get("training_load")
+    name = args.get("name") or f"Manual {activity_type}"
+
+    with db.connect() as conn:
+        # Serialize the id-allocation + insert so two concurrent manual logs
+        # can't read the same MIN() and collide on the PK. BEGIN IMMEDIATE
+        # takes a RESERVED lock up front; db.connect() commits on clean exit.
+        conn.execute("BEGIN IMMEDIATE")
+        # Floor the table-min at 0 BEFORE subtracting: first manual workout on
+        # an all-positive table → -1, then -2, -3, ...
+        row = conn.execute(
+            "SELECT MIN(MIN(activity_id), 0) - 1 AS next_id FROM activities"
+        ).fetchone()
+        new_id = row["next_id"] if row and row["next_id"] is not None else -1
+        conn.execute(
+            "INSERT INTO activities "
+            "(activity_id, date, activity_type, activity_name, duration_seconds, "
+            "distance_meters, avg_hr, training_load, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual')",
+            (new_id, workout_date, activity_type, name, duration_seconds,
+             distance_meters, avg_hr, training_load),
+        )
+        inserted = conn.execute(
+            "SELECT * FROM activities WHERE activity_id = ?", (new_id,)
+        ).fetchone()
+        result = dict(inserted)
+        result.pop("raw_json", None)
+
+    # Widen the lookback so a BACKDATED workout rewrites its OWN date's baseline
+    # row (and everything forward), not just the default 90-day window forward.
+    from ..ingest import baselines
+    wdate = date.fromisoformat(workout_date)
+    lookback = max(baselines.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
+    baselines.recompute(lookback_days=lookback)
+
+    return _text({
+        "logged": True,
+        "activity": _augment_workout(result),
+        "note": f"training load recomputed (lookback_days={lookback})",
+    })
+
+
+@tool(
+    "delete_manual_workout",
+    "Delete a manually-logged workout by its (negative) activity_id. Refuses "
+    "non-negative ids so Garmin data can never be deleted. Detaches any "
+    "referencing observations, then recomputes training load.",
+    {"activity_id": int},
+)
+async def delete_manual_workout(args: dict) -> dict:
+    aid = int(args["activity_id"])
+    if aid >= 0:
+        return _err("refusing to delete non-manual activity (id >= 0)", activity_id=aid)
+    with db.connect() as conn:
+        # (1) Read the date FIRST — needed for the widened lookback below.
+        row = conn.execute(
+            "SELECT date FROM activities WHERE activity_id = ?", (aid,)
+        ).fetchone()
+        if not row:
+            return _err(f"no manual workout at id {aid}")
+        workout_date = row["date"]
+        # (2) Detach referencing observations (don't orphan a dangling ref).
+        conn.execute(
+            "UPDATE observations SET activity_id = NULL WHERE activity_id = ?", (aid,)
+        )
+        # (3) Delete the activity row.
+        conn.execute("DELETE FROM activities WHERE activity_id = ?", (aid,))
+
+    # (4) Recompute with the same widened lookback covering that date.
+    from ..ingest import baselines
+    wdate = date.fromisoformat(workout_date)
+    lookback = max(baselines.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
+    baselines.recompute(lookback_days=lookback)
+
+    return _text({
+        "deleted": True,
+        "activity_id": aid,
+        "note": f"training load recomputed (lookback_days={lookback})",
+    })
+
+
 ALL_TOOLS = [
     get_today_status,
     get_metric,
@@ -588,6 +927,12 @@ ALL_TOOLS = [
     list_user_notes,
     update_user_note,
     delete_user_note,
+    daily_snapshot,
+    log_observation,
+    list_observations,
+    delete_observation,
+    log_manual_workout,
+    delete_manual_workout,
 ]
 
 
@@ -597,3 +942,28 @@ def make_server():
 
 def allowed_tool_names() -> list[str]:
     return [f"mcp__{SERVER_NAME}__{t.name}" for t in ALL_TOOLS]
+
+
+# Explicit ALLOW-LIST of the read-only analysis tools (not a denylist): the
+# brief loop runs with exactly this set, so its behavior stays unchanged as new
+# tools land. A future tool is excluded by default unless deliberately added
+# here. Excludes the note-write tools, all observation/manual-workout write
+# tools, and (deliberately) daily_snapshot + list_observations so the brief's
+# tool set is identical to before this issue.
+_READ_ONLY_TOOL_NAMES = (
+    "get_today_status",
+    "get_metric",
+    "get_metric_trend",
+    "query_workouts",
+    "get_workout_detail",
+    "compare_periods",
+    "find_anomalies",
+    "training_load_status",
+    "correlate",
+    "recovery_pattern",
+    "run_sql",
+)
+
+
+def read_only_tool_names() -> list[str]:
+    return [f"mcp__{SERVER_NAME}__{name}" for name in _READ_ONLY_TOOL_NAMES]
