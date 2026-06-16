@@ -15,12 +15,25 @@ Design: ``docs/plans/2026-06-16-fitness-mcp-server-design.md``.
 from __future__ import annotations
 
 import os
+from typing import Any
 
+from mcp import types
 from mcp.server.lowlevel import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
+from .. import db
+from ..agent import prompts
 from ..agent import tools as agent_tools
+from ..agent.briefing import DEFAULT_BRIEFINGS_DIR
+from ..agent.schemas import Brief
+from ..agent.status import assemble_status
+
+# MCP resource URIs. The schema doc and the latest brief are the two read-only
+# resources advertised to clients; the coach prompt is the one slash-command.
+_SCHEMA_URI = "fitness://schema"
+_BRIEF_LATEST_URI = "fitness://brief/latest"
 
 # Host allowlist for the streamable-HTTP transport's DNS-rebinding guard.
 # Empty allowlist + protection-on (the SDK default) returns 421 for every
@@ -34,9 +47,239 @@ def allowed_hosts() -> list[str]:
     return [h.strip() for h in raw.split(",") if h.strip()]
 
 
+def _user_name() -> str:
+    """Source user_name exactly like briefing.py does (settings → fallback)."""
+    return db.get_setting("user_name", prompts.DEFAULT_USER_NAME)
+
+
+def _render_status(status: dict[str, Any]) -> str:
+    """Readable markdown rendering of ``assemble_status()`` for the coach
+    prompt. Snapshot table, training-load read, and recent workouts in miles.
+    The active user notes are NOT rendered here — they're already in the
+    persona (``system_prompt`` injects them via ``render_for_prompt``)."""
+    lines: list[str] = []
+    lines.append(f"## Daily snapshot — {status.get('date', '')}")
+    lines.append("")
+
+    # Snapshot table of today's metrics.
+    metrics = status.get("metrics") or []
+    lines.append("| Metric | Value | Read |")
+    lines.append("| --- | --- | --- |")
+    for m in metrics:
+        name = m.get("metric", "")
+        value = m.get("value")
+        value_str = "—" if value is None else str(value)
+        treatment = m.get("treatment")
+        if treatment == "baseline_delta":
+            baseline = m.get("baseline")
+            delta_pct = m.get("delta_pct")
+            arrow = m.get("arrow") or ""
+            if baseline is not None and delta_pct is not None:
+                read = f"{arrow} {delta_pct:+}% vs baseline {baseline}"
+            elif baseline is not None:
+                read = f"baseline {baseline}"
+            else:
+                read = "no baseline yet"
+        elif treatment == "trend_arrow":
+            arrow = m.get("arrow")
+            read = f"7-day trend {arrow}" if arrow else "trend: too few points"
+        else:
+            read = ""
+        lines.append(f"| {name} | {value_str} | {read} |")
+    lines.append("")
+
+    # Training-load read.
+    tl = status.get("training_load") or {}
+    lines.append("## Training load")
+    lines.append(
+        f"CTL (fitness): {tl.get('ctl')} · ATL (fatigue): {tl.get('atl')} · "
+        f"TSB (freshness): {tl.get('tsb')} — {tl.get('interpretation', '')}"
+    )
+    lines.append("")
+
+    # Recent workouts (miles / formatted convenience fields from status.py).
+    workouts = status.get("recent_workouts") or []
+    lines.append("## Recent workouts")
+    if not workouts:
+        lines.append("No workouts logged yet.")
+    else:
+        for w in workouts:
+            parts: list[str] = [str(w.get("date", ""))]
+            atype = w.get("activity_name") or w.get("activity_type")
+            if atype:
+                parts.append(str(atype))
+            if w.get("distance_mi") is not None:
+                parts.append(f"{w['distance_mi']} mi")
+            if w.get("duration_formatted"):
+                parts.append(str(w["duration_formatted"]))
+            if w.get("pace_min_per_mi"):
+                parts.append(f"{w['pace_min_per_mi']} /mi")
+            if w.get("avg_hr") is not None:
+                parts.append(f"{w['avg_hr']} bpm avg")
+            lines.append(f"- {' · '.join(parts)}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _render_schema_resource() -> str:
+    """Markdown rendering of ``tools.QUERYABLE_SCHEMA`` (tables + columns) plus
+    the run_sql usage note. Single source of truth — rendered from the constant,
+    never hand-copied."""
+    lines: list[str] = ["# Fitness DB schema", ""]
+    lines.append(
+        "Read-only SQLite schema queryable via the `run_sql` tool. "
+        "`run_sql` accepts a single read-only `SELECT` or `WITH` query only — "
+        "no INSERT/UPDATE/DELETE/DDL. Values must be parameterized."
+    )
+    lines.append("")
+    for table, cols in agent_tools.QUERYABLE_SCHEMA.items():
+        lines.append(f"## `{table}`")
+        lines.append(", ".join(f"`{c}`" for c in cols))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _render_brief(brief: Brief) -> str:
+    """Markdown rendering of a persisted ``Brief`` (latest morning brief)."""
+    lines: list[str] = [f"# Morning brief — {brief.date}", ""]
+    if brief.generated_at:
+        lines.append(f"_Generated {brief.generated_at}_")
+        lines.append("")
+    for tk in brief.takeaways:
+        lines.append(f"## {tk.headline}")
+        lines.append(f"*{tk.tone}* — {tk.summary}")
+        lines.append("")
+        if tk.details:
+            lines.append(tk.details)
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _latest_brief_markdown() -> str:
+    """Glob the briefings dir for ``*.json``, pick the most recent by filename
+    date, deserialize the ``Brief`` model and render to markdown. Graceful on a
+    missing/empty dir (fresh clone) — never raises. ``load_today`` only loads
+    TODAY's file, so we do our own glob + pick-most-recent here."""
+    empty = "# Morning brief\n\nNo brief generated yet."
+    briefings_dir = DEFAULT_BRIEFINGS_DIR
+    if not briefings_dir.exists():
+        return empty
+    # Filenames are YYYY-MM-DD.json — lexical sort == chronological.
+    candidates = sorted(briefings_dir.glob("*.json"), key=lambda p: p.name)
+    for path in reversed(candidates):
+        try:
+            brief = Brief.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # skip unparseable/partial files, try the next most recent
+        return _render_brief(brief)
+    return empty
+
+
+def _register_prompts_and_resources(instance: Server) -> None:
+    """Register the coach prompt + the schema/brief resources on the low-level
+    Server BEFORE it's returned, so BOTH the stdio and streamable-HTTP
+    transports advertise these capabilities (the SDK only built tool handlers)."""
+
+    @instance.list_prompts()
+    async def _list_prompts() -> list[types.Prompt]:
+        return [
+            types.Prompt(
+                name="coach",
+                description=(
+                    "Load the running-coach persona pre-filled with today's "
+                    "fitness snapshot (metrics, training load, recent workouts, "
+                    "and the user's saved coaching preferences). Optional `focus` "
+                    "argument steers the coach toward a specific topic."
+                ),
+                arguments=[
+                    types.PromptArgument(
+                        name="focus",
+                        required=False,
+                        description=(
+                            "Optional topic to steer the coach toward "
+                            "(e.g. 'sleep', 'today's workout', 'recovery')."
+                        ),
+                    )
+                ],
+            )
+        ]
+
+    @instance.get_prompt()
+    async def _get_prompt(
+        name: str, arguments: dict[str, str] | None
+    ) -> types.GetPromptResult:
+        if name != "coach":
+            raise ValueError(f"unknown prompt: {name!r}")
+        # The persona ALREADY embeds the user's saved notes via
+        # render_for_prompt(); do NOT append them again here.
+        persona = prompts.system_prompt(_user_name())
+        snapshot = _render_status(assemble_status())
+        text = (
+            f"{persona}\n\n"
+            f"# Today's data (already retrieved — no tool call needed for this)\n"
+            f"{snapshot}"
+        )
+        if arguments:
+            focus = (arguments.get("focus") or "").strip()
+            if focus:
+                text += (
+                    f"\n# Focus\n{_user_name()} wants you to focus on: {focus}. "
+                    f"Lead with that.\n"
+                )
+        return types.GetPromptResult(
+            description="Running-coach persona with today's fitness snapshot.",
+            messages=[
+                types.PromptMessage(
+                    role="user",
+                    content=types.TextContent(type="text", text=text),
+                )
+            ],
+        )
+
+    @instance.list_resources()
+    async def _list_resources() -> list[types.Resource]:
+        return [
+            types.Resource(
+                uri=_SCHEMA_URI,  # type: ignore[arg-type]
+                name="Fitness DB schema",
+                description=(
+                    "Tables and columns queryable via the run_sql tool, plus its "
+                    "read-only usage note."
+                ),
+                mimeType="text/markdown",
+            ),
+            types.Resource(
+                uri=_BRIEF_LATEST_URI,  # type: ignore[arg-type]
+                name="Latest morning brief",
+                description=(
+                    "The most recent persisted morning brief, rendered as markdown."
+                ),
+                mimeType="text/markdown",
+            ),
+        ]
+
+    @instance.read_resource()
+    async def _read_resource(uri) -> list[ReadResourceContents]:
+        uri_str = str(uri)
+        if uri_str == _SCHEMA_URI:
+            text = _render_schema_resource()
+        elif uri_str == _BRIEF_LATEST_URI:
+            text = _latest_brief_markdown()
+        else:
+            raise ValueError(f"unknown resource: {uri_str!r}")
+        return [ReadResourceContents(content=text, mime_type="text/markdown")]
+
+
 def build_server() -> Server:
-    """The reused, fully-wired low-level MCP Server (one source of truth)."""
-    return agent_tools.make_server()["instance"]
+    """The reused, fully-wired low-level MCP Server (one source of truth).
+
+    The SDK's ``create_sdk_mcp_server`` only wires the TOOL handlers; we register
+    the coach PROMPT and the schema/brief RESOURCES on the same instance here so
+    both transports (stdio + streamable-HTTP) advertise all three primitives."""
+    instance = agent_tools.make_server()["instance"]
+    _register_prompts_and_resources(instance)
+    return instance
 
 
 def build_session_manager(
