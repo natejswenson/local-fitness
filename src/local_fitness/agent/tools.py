@@ -717,6 +717,15 @@ async def log_observation(args: dict) -> dict:
         value_num = None
         value_text = text
     observed_on = args.get("date") or date.today().isoformat()
+    # Validate the user-supplied date BEFORE any write — mirror log_manual_workout.
+    # A malformed string sorts wrong; a future date is silently excluded from the
+    # days-filtered list_observations lookback.
+    try:
+        parsed_date = date.fromisoformat(observed_on)
+    except ValueError:
+        return _err(f"invalid date '{observed_on}', expected YYYY-MM-DD")
+    if parsed_date > date.today():
+        return _err("date cannot be in the future")
     created_at = datetime.now().isoformat()
     activity_id = args.get("activity_id")
     with db.connect() as conn:
@@ -821,9 +830,20 @@ async def log_manual_workout(args: dict) -> dict:
     # Validate the user-supplied date BEFORE any write — a malformed string must
     # not commit the activity row and then raise in the post-insert lookback.
     try:
-        date.fromisoformat(workout_date)
+        parsed_date = date.fromisoformat(workout_date)
     except ValueError:
         return _err(f"invalid date '{workout_date}', expected YYYY-MM-DD")
+    # A non-positive duration would store garbage duration_seconds; reject it
+    # before any write.
+    try:
+        if float(duration_min) <= 0:
+            return _err("duration_min must be positive")
+    except (TypeError, ValueError):
+        return _err("duration_min must be positive")
+    # A future-dated workout would be stored but never feed CTL/ATL (recompute
+    # only walks dates <= today). Reject it before any write.
+    if parsed_date > date.today():
+        return _err("date cannot be in the future")
     distance_meters = (
         float(args["distance_mi"]) * units._METERS_PER_MILE
         if args.get("distance_mi") is not None else None
@@ -863,7 +883,23 @@ async def log_manual_workout(args: dict) -> dict:
     from ..ingest import baselines
     wdate = date.fromisoformat(workout_date)
     lookback = max(baselines.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
-    baselines.recompute(lookback_days=lookback)
+    # The activity row is ALREADY committed (db.connect() committed on block
+    # exit). recompute() runs on a fresh connection; if it raises (transient
+    # "database is locked", a bad stored date, ...) we must NOT propagate — a
+    # bare raise reads as a tool failure and a blind retry would insert a SECOND
+    # workout, double-counting load. Return a partial-success so the caller can
+    # tell the row landed and skip the retry.
+    try:
+        baselines.recompute(lookback_days=lookback)
+    except Exception as e:  # noqa: BLE001 — row is committed; never re-raise here
+        return _text({
+            "logged": True,
+            "activity": _augment_workout(result),
+            "recompute_failed": True,
+            "warning": "workout saved but training-load recompute failed; "
+                       "run `fitness baselines` to refresh",
+            "error_detail": str(e),
+        })
 
     return _text({
         "logged": True,
@@ -902,7 +938,20 @@ async def delete_manual_workout(args: dict) -> dict:
     from ..ingest import baselines
     wdate = date.fromisoformat(workout_date)
     lookback = max(baselines.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
-    baselines.recompute(lookback_days=lookback)
+    # The delete is ALREADY committed. recompute() runs on a fresh connection;
+    # if it raises, don't propagate a bare exception that implies the delete
+    # failed — the row is gone. Return a partial-success instead.
+    try:
+        baselines.recompute(lookback_days=lookback)
+    except Exception as e:  # noqa: BLE001 — delete is committed; never re-raise
+        return _text({
+            "deleted": True,
+            "activity_id": aid,
+            "recompute_failed": True,
+            "warning": "workout deleted but training-load recompute failed; "
+                       "run `fitness baselines` to refresh",
+            "error_detail": str(e),
+        })
 
     return _text({
         "deleted": True,
@@ -937,7 +986,7 @@ ALL_TOOLS = [
 
 
 def make_server():
-    return create_sdk_mcp_server(name=SERVER_NAME, version="0.1.0", tools=ALL_TOOLS)
+    return create_sdk_mcp_server(name=SERVER_NAME, version="0.3.0", tools=ALL_TOOLS)
 
 
 def allowed_tool_names() -> list[str]:

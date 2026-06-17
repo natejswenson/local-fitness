@@ -160,16 +160,22 @@ def append_note(text: str, path: Path | None = None) -> Note:
             handle.seek(0)
             handle.truncate()
             handle.write(kept)
+            final_text = kept
         else:
             if existing and not existing.endswith("\n"):
                 handle.write("\n")
             handle.write(new_line)
+            final_text = candidate
         handle.flush()
         os.fsync(handle.fileno())
     finally:
         handle.close()
     LOG.info("Saved user note (%d chars)", len(text))
-    return Note(line=-1, timestamp=ts, text=text)
+    # The appended bullet is the last line of the file; its raw line index
+    # (matching how read_notes/update_note/delete_note count via
+    # splitlines()) is the count of file lines minus one.
+    new_line_index = len(final_text.splitlines()) - 1
+    return Note(line=new_line_index, timestamp=ts, text=text)
 
 
 def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:

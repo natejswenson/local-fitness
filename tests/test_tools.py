@@ -365,6 +365,31 @@ def test_log_observation_bad_activity_id(seeded):
     assert not _obs_rows(seeded)
 
 
+def test_log_observation_malformed_date(seeded):
+    # A malformed observed_on must be rejected before any write — mirrors
+    # log_manual_workout's guard so bad dates never poison the sort order.
+    _payload, err = call(
+        tools.log_observation,
+        {"obs_type": "weight", "value": 165, "date": "not-a-date"},
+    )
+    assert err
+    assert "invalid date" in _payload["error"]
+    assert not _obs_rows(seeded)  # nothing inserted
+
+
+def test_log_observation_rejects_future_date(seeded):
+    # A future-dated observation is silently excluded from the days-filtered
+    # list_observations lookback, so reject it before any write.
+    future = (date.today() + timedelta(days=3)).isoformat()
+    _payload, err = call(
+        tools.log_observation,
+        {"obs_type": "weight", "value": 165, "date": future},
+    )
+    assert err
+    assert "future" in _payload["error"]
+    assert not _obs_rows(seeded)
+
+
 def test_log_observation_valid_activity_id(seeded):
     # activity_id 1 exists in the seeded fixture.
     saved, err = call(
@@ -410,6 +435,83 @@ def test_log_manual_workout_malformed_date(seeded):
     )
     assert err
     assert len(_activity_rows(seeded)) == before  # no activities row written
+
+
+def test_log_manual_workout_rejects_nonpositive_duration(seeded):
+    before = len(_activity_rows(seeded))
+    for bad in (0, -15):
+        _payload, err = call(
+            tools.log_manual_workout,
+            {"activity_type": "strength", "duration_min": bad},
+        )
+        assert err
+        assert "duration_min must be positive" in _payload["error"]
+    assert len(_activity_rows(seeded)) == before  # no activities row written
+
+
+def test_log_manual_workout_rejects_future_date(seeded):
+    before = len(_activity_rows(seeded))
+    future = (date.today() + timedelta(days=3)).isoformat()
+    _payload, err = call(
+        tools.log_manual_workout,
+        {"activity_type": "strength", "duration_min": 45, "date": future},
+    )
+    assert err
+    assert "future" in _payload["error"]
+    assert len(_activity_rows(seeded)) == before  # no activities row written
+
+
+def test_log_manual_workout_recompute_failure_persists_row(seeded, monkeypatch):
+    """If recompute() raises AFTER the row commits, the tool must NOT re-raise:
+    it returns logged=True/recompute_failed=True so the caller knows the row
+    landed and does NOT retry (which would duplicate the workout)."""
+    from local_fitness.ingest import baselines
+
+    before = len(_activity_rows(seeded))
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(baselines, "recompute", boom)
+
+    payload, err = call(
+        tools.log_manual_workout,
+        {"activity_type": "strength", "duration_min": 45},
+    )
+    # Partial-success: not an error, row persisted, recompute flagged failed.
+    assert not err
+    assert payload["logged"] is True
+    assert payload["recompute_failed"] is True
+    assert "recompute failed" in payload["warning"]
+    assert "database is locked" in payload["error_detail"]
+    # Exactly one new row — no duplicate, and it really persisted.
+    assert len(_activity_rows(seeded)) == before + 1
+
+
+def test_delete_manual_workout_recompute_failure_reports_deleted(seeded, monkeypatch):
+    from local_fitness.ingest import baselines
+
+    saved, err = call(
+        tools.log_manual_workout, {"activity_type": "strength", "duration_min": 45}
+    )
+    assert not err
+    aid = saved["activity"]["activity_id"]
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(baselines, "recompute", boom)
+
+    payload, err = call(tools.delete_manual_workout, {"activity_id": aid})
+    assert not err
+    assert payload["deleted"] is True
+    assert payload["recompute_failed"] is True
+    # The row really is gone despite the recompute failure.
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT * FROM activities WHERE activity_id = ?", (aid,)
+        ).fetchone()
+    assert row is None
 
 
 def test_delete_manual_workout_guardrails(seeded):

@@ -50,6 +50,23 @@ def test_render_newest_first_with_line_index(notes_path):
     assert lines[1] == "[0] first"
 
 
+def test_append_returns_real_line_index(notes_path):
+    # The returned line must be the real index read_notes assigns, so a
+    # client can immediately target the new note via update/delete.
+    n0 = notes.append_note("first", path=notes_path)
+    n1 = notes.append_note("second", path=notes_path)
+    assert n0.line == 0
+    assert n1.line == 1
+    got = notes.read_notes(notes_path)
+    assert got[n0.line].text == "first"
+    assert got[n1.line].text == "second"
+    # Deleting via the returned line removes exactly that note.
+    assert notes.delete_note(n1.line, path=notes_path) is True
+    remaining = notes.read_notes(notes_path)
+    assert len(remaining) == 1
+    assert remaining[0].text == "first"
+
+
 def test_update_note(notes_path):
     notes.append_note("old pref", path=notes_path)
     updated = notes.update_note(0, "new pref", path=notes_path)
