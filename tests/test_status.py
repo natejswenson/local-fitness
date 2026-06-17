@@ -131,5 +131,6 @@ def test_coach_prompt_includes_output_formatting_contract(seeded_status_db):
     )
     res = asyncio.run(handler(req))
     text = res.root.messages[0].content.text
-    assert "How to format your reply" in text
+    # The contract is inherited via the embedded system_prompt persona.
+    assert "Formatting your chat replies" in text
     assert "NOT one wide grid" in text

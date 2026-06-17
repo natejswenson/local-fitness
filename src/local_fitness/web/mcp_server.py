@@ -52,23 +52,6 @@ def _user_name() -> str:
     return db.get_setting("user_name", prompts.DEFAULT_USER_NAME)
 
 
-# Appended to the coach prompt so the model's reply renders cleanly in a
-# narrow / monospace chat pane (the MCP client). Wide markdown tables wrap
-# into mush there; this steers the model to compact, scannable layouts.
-_COACH_OUTPUT_FORMAT = """# How to format your reply (it's shown in a narrow chat — keep it clean)
-- Lead with the one-line answer, then the detail.
-- Tables: at most ~4 columns, every header one short word (abbreviate — "Wk",
-  "mi", "TSB"). NEVER put a sentence or a multi-item list inside a table cell;
-  a wide free-text column wraps into mush in this pane.
-- Anything with per-item detail (a training plan, a week-by-week schedule, a
-  workout breakdown) → one compact line per item, or short sections grouped by
-  phase — NOT one wide grid. Example line:
-  `Wk 5 · Jul 13 · Build · long 8mi · threshold 4×6min`.
-- Prefer `label: value · label: value` lines and short bullets over wide grids.
-- Assume ~70-character width. Bold at most the single most important thing.
-"""
-
-
 def _render_status(status: dict[str, Any]) -> str:
     """Readable markdown rendering of ``assemble_status()`` for the coach
     prompt. Snapshot table, training-load read, and recent workouts in miles.
@@ -235,8 +218,7 @@ def _register_prompts_and_resources(instance: Server) -> None:
         text = (
             f"{persona}\n\n"
             f"# Today's data (already retrieved — no tool call needed for this)\n"
-            f"{snapshot}\n\n"
-            f"{_COACH_OUTPUT_FORMAT}"
+            f"{snapshot}"
         )
         if arguments:
             focus = (arguments.get("focus") or "").strip()

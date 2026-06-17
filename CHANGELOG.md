@@ -20,12 +20,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MCP `serverInfo` version + `__version__` now track the package version.
 
 ### Changed
-- **Coach output renders cleanly in a narrow chat.** The `/fitness:coach`
-  prompt now carries an output-formatting contract steering the model away from
-  wide markdown tables (which wrap into mush in a monospace MCP pane) toward
-  compact per-item lines and phase-grouped sections — e.g. a training plan
-  renders as `Wk 5 · Jul 13 · Build · long 8mi · threshold 4×6min` lines, not a
-  6-column grid.
+- **Coach output renders cleanly in a narrow chat.** The shared `system_prompt`
+  now carries an output-formatting contract steering every conversational reply
+  (free chat *and* `/fitness:coach`) away from wide markdown tables (which wrap
+  into mush in a monospace MCP pane) toward compact per-item lines and
+  phase-grouped sections — e.g. a training plan renders as
+  `Wk 5 · Jul 13 · Build · long 8mi · threshold 4×6min` lines, not a 6-column
+  grid. Scoped to conversational prose only; the structured JSON brief and its
+  schema are unchanged (prompt scorer still 11/11).
 
 ## [0.3.0] - 2026-06-16
 

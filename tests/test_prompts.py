@@ -19,6 +19,15 @@ def test_system_prompt_default_user_name():
     assert prompts.DEFAULT_USER_NAME in p
 
 
+def test_system_prompt_has_chat_formatting_contract():
+    # Steers conversational replies away from wide tables that wrap in a
+    # narrow display, while leaving the JSON brief schema untouched.
+    p = prompts.system_prompt("Dana")
+    assert "Formatting your chat replies" in p
+    assert "NOT one wide grid" in p
+    assert "JSON brief" in p  # scopes the rule away from the structured brief
+
+
 def test_system_prompt_injects_notes(monkeypatch):
     monkeypatch.setattr(
         prompts.user_notes_mod, "render_for_prompt", lambda *a, **k: "[0] roast me"
