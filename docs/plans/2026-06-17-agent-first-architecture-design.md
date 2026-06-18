@@ -1,5 +1,5 @@
 ---
-ticket: "#NNN"
+ticket: "#25"
 title: "Agent-first split: data+compute server, synthesis in the agent"
 date: "2026-06-17"
 source: "design"
