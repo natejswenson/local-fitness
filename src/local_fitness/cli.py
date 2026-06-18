@@ -6,8 +6,6 @@ Subcommands:
   backfill <zip>        — load historical Garmin data export
   recompute-baselines   — recompute rolling baselines + CTL/ATL/TSB
   brief                 — pull + recompute + generate today's briefing
-  chat                  — interactive REPL with the agent
-  ask "<question>"      — one-shot question to the agent
   status                — show DB stats and last ingest run
 """
 from __future__ import annotations
@@ -28,7 +26,6 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from . import db
 from .agent import briefing as briefing_mod
-from .agent import chat as chat_mod
 from .ingest import auth, backfill as backfill_mod, baselines, daily as daily_ingest
 
 SONNET = "claude-sonnet-4-6"
@@ -91,8 +88,7 @@ def setup():
         "\nNext:\n"
         "  • `fitness pull`               – fetch live data\n"
         "  • `fitness backfill <zip>`     – load historical export ZIP\n"
-        "  • `fitness brief`              – generate today's briefing\n"
-        "  • `fitness chat`               – interactive REPL"
+        "  • `fitness brief`              – generate today's briefing"
     )
 
 
@@ -156,21 +152,6 @@ def brief(no_pull: bool, no_notify: bool, opus: bool):
             ],
             check=False,
         )
-
-
-@main.command(name="chat")
-@click.option("--opus", is_flag=True, help="Use Opus 4.7 instead of Sonnet 4.6")
-def chat_cmd(opus: bool):
-    """Interactive REPL with the fitness agent."""
-    chat_mod.run(model=OPUS if opus else SONNET)
-
-
-@main.command()
-@click.argument("question", nargs=-1, required=True)
-@click.option("--opus", is_flag=True, help="Use Opus 4.7 instead of Sonnet 4.6")
-def ask(question: tuple[str, ...], opus: bool):
-    """Ask the agent a one-shot question."""
-    chat_mod.ask(" ".join(question), model=OPUS if opus else SONNET)
 
 
 @main.group()

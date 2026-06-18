@@ -1,1 +1,1 @@
-"""Claude Agent SDK wiring: tools, prompts, briefings, chat."""
+"""Claude Agent SDK wiring: tools, prompts, briefings."""

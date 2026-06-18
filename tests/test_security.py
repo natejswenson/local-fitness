@@ -283,19 +283,6 @@ def test_plan_components_have_no_raw_html_sink():
     assert "dangerouslySetInnerHTML" not in plan_file.read_text()
 
 
-def test_chat_request_model_whitelist():
-    """The 3-way chat toggle must not pass an arbitrary model string to the SDK
-    — ChatRequest whitelists the three allowed IDs (design #4)."""
-    import pydantic
-
-    from local_fitness.web import server as srv
-
-    for m in ("claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"):
-        assert srv.ChatRequest(session_id="s", message="m", model=m).model == m
-    with pytest.raises(pydantic.ValidationError):
-        srv.ChatRequest(session_id="s", message="m", model="evil-model")
-
-
 def test_serve_refuses_non_loopback_without_token(monkeypatch):
     """Startup safety: binding to 0.0.0.0 without a token must hard-fail
     (the whole point of the audit)."""

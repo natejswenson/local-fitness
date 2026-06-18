@@ -11,7 +11,7 @@ from local_fitness.ingest import baselines
 
 def test_imports():
     """All modules import without errors."""
-    from local_fitness.agent import briefing, chat, prompts  # noqa
+    from local_fitness.agent import briefing, prompts  # noqa
     from local_fitness.ingest import auth, backfill, daily  # noqa
     from local_fitness import cli  # noqa
 

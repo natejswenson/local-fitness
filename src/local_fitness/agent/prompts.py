@@ -546,6 +546,6 @@ Return ONLY the JSON object. Nothing else.
 """
 
 
-# Backwards-compat (chat.py + tests still import these as constants)
+# Backwards-compat (tests still import these as constants)
 SYSTEM_PROMPT = system_prompt()
 BRIEFING_PROMPT = briefing_prompt()
