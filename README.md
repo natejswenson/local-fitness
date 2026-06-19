@@ -1,14 +1,19 @@
 # local-fitness
 
-A self-hosted personal fitness coach powered by Claude. It pulls your
-[Garmin Connect](https://connect.garmin.com) data into a local SQLite database,
-computes rolling recovery and training-load baselines, and uses a Claude agent
-to write you a daily morning briefing — or to answer questions about your
-training in a chat.
+A self-hosted, **agent-first** personal fitness coach. It pulls your
+[Garmin Connect](https://connect.garmin.com) data into a local SQLite database
+and computes rolling recovery and training-load baselines. You talk to your
+"coach" from an **MCP client** (Claude Desktop, Code, or Mobile) pointed at
+that data; a scheduled job composes a structured daily brief; and a localhost
+web UI gives you a fast visual glance.
 
-Everything runs on your own machine. Your health data never goes to a
-third-party service; the only thing that leaves is the handful of metrics the
-agent sends to Anthropic when it writes a briefing or answers a question.
+The web server itself runs **no Claude inference** — it serves your data and
+the deterministic compute (baselines, CTL/ATL/TSB, training plans) over REST
+and the [Model Context Protocol](https://modelcontextprotocol.io). All
+*synthesis* — the daily brief, conversational coaching, plan drafting — happens
+in the agent. Everything runs on your own machine; the only data that leaves is
+the handful of metrics the agent reads when you ask it something or it writes a
+brief.
 
 [![CI](https://github.com/natejswenson/local-fitness-dude/actions/workflows/ci.yml/badge.svg)](https://github.com/natejswenson/local-fitness-dude/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/natejswenson/local-fitness-dude)](https://github.com/natejswenson/local-fitness-dude/releases)
@@ -31,17 +36,22 @@ agent sends to Anthropic when it writes a briefing or answers a question.
 - **Pre-computed baselines:** 60-day rolling mean/SD for resting HR, sleep,
   Body Battery, and stress, plus the Banister **CTL/ATL/TSB** training-load
   model (fitness / fatigue / form).
-- **A local Claude agent** that queries the database through a set of grounded
-  tools. It writes a structured daily briefing and supports an interactive chat
-  that shows which data it pulled.
-- **An MCP server** so you can talk to your fitness data from any MCP client
-  (Claude Code, Claude Desktop, …) — not just the built-in UI. It exposes a
-  `/fitness:coach` slash-command that assembles your whole snapshot *and* the
-  coach persona in one shot, `fitness://schema` / `fitness://brief/latest`
-  resources, and a **write surface** to log manual workouts and subjective
-  notes (RPE, soreness, weight, mood…) conversationally — manual workouts feed
-  the CTL/ATL/TSB training-load model like any synced activity.
-- **A localhost web UI** (React + FastAPI) with Today, Trends, and Chat views.
+- **Agent-first — your coach lives in an MCP client.** The fitness data and a
+  set of grounded tools are exposed over the
+  [Model Context Protocol](https://modelcontextprotocol.io), so you talk to your
+  training from Claude Desktop, Code, or Mobile. The agent must call a tool to
+  read real values before any claim — it never invents numbers. It can also
+  *write*: compose a fresh daily brief, draft a training plan, log manual
+  workouts and subjective notes (RPE, soreness, weight, mood…), and remember
+  your preferences — all through the same tools. See
+  [MCP](#mcp--talk-to-your-data-from-claude-directly).
+- **A scheduled daily brief.** `fitness brief` (run on a `launchd`/cron
+  schedule) composes a structured morning briefing and saves it as JSON; both
+  the web UI and the MCP read it back. The composer is restricted to read-only
+  tools, so an automated run can never mutate your data.
+- **A localhost web UI** (React + FastAPI) — a fast visual glance, not a place
+  you converse: today's brief, Trends, Dashboards, and your Training Plan. It
+  reads your data over REST; the server runs no Claude inference.
 - **Runner-facing units:** distances and pace render in miles / min-per-mile by
   default (`LOCAL_FITNESS_DISPLAY_UNITS`); raw metric values are always present.
 - **Privacy by default:** the database, briefings, and logs stay on your
@@ -52,20 +62,23 @@ agent sends to Anthropic when it writes a briefing or answers a question.
 ```
 Garmin Connect ──pull──> SQLite (data/fitness.db) ──> baselines / CTL-ATL-TSB
                                                           │
-                                      shared tool layer ──┘
-                                          │
-                ┌─────────────────────────┼─────────────────────────┐
-             daily brief / chat        web UI                  MCP server
-            (briefings/*.md, REPL)  (Today/Trends/Chat)  (coach prompt, tools,
-                                                          resources, write surface)
+                            deterministic tool layer ─────┤
+                                                          │
+        ┌──────────────────┬──────────────────────────────┴───────────────┐
+     REST API           MCP server                         scheduled `fitness brief`
+   (web UI: a          (Claude Desktop/Code/Mobile:         (composes the brief →
+    visual glance)      coach + brief prompts, tools,        briefings/*.json)
+                        resources, write surface)
 ```
 
-The same grounded tool layer backs the brief, the chat, the web UI, and the MCP
-server — one source of truth, no duplication. The agent is grounded: it must
-call a tool to read real values before making any claim about your data — it
-never invents numbers. Over MCP, write tools are available to interactive
-clients but the brief generator is restricted to read-only tools, so an
-automated briefing can never mutate your data.
+The web-server process runs **no Claude inference** — it serves your data and
+the deterministic compute (baselines, CTL/ATL/TSB, plan grading) over REST and
+MCP. All synthesis — the daily brief, conversational coaching, plan drafting —
+happens in a client agent. The same grounded tool layer backs the REST API, the
+MCP server, and the scheduled brief composer, so there's one source of truth and
+no duplication. Over MCP, write tools are available to interactive clients, but
+the brief composer is restricted to read-only tools, so an automated briefing
+can never mutate your data.
 
 ### A note on devices
 
@@ -128,36 +141,42 @@ uv run fitness serve --open   # http://127.0.0.1:8765
 
 ```bash
 fitness pull                  # pull since last success
-fitness brief                 # pull + recompute + briefing → briefings/YYYY-MM-DD.md
+fitness brief                 # pull + recompute + briefing → briefings/YYYY-MM-DD.json
 fitness brief --opus          # use the larger Opus model for one run
-fitness chat                  # interactive REPL
 fitness serve                 # web UI at http://127.0.0.1:8765
-fitness ask "should I run hard today?"
-fitness ask "compare last 30 days vs prior 30 for RHR" --opus
+fitness mcp-stdio             # serve the tools to an MCP client over stdio
 fitness status                # DB row counts + last ingest run info
 ```
 
-The agent defaults to a fast Sonnet model and switches to Opus on demand
-(`--opus`). One daily briefing is a rounding error against a Claude
-subscription; long chat sessions use more.
+The brief composer defaults to a fast Sonnet model and switches to Opus on
+demand (`--opus`). One daily briefing is a rounding error against a Claude
+subscription. Conversational coaching now happens in your MCP client (see
+[MCP](#mcp--talk-to-your-data-from-claude-directly)), not a built-in REPL — the
+`chat`/`ask` commands were retired in the agent-first migration.
 
 ## Web UI
 
 `fitness serve` starts a localhost-only FastAPI server (default port 8765)
-that exposes the database and agent over REST + NDJSON-streamed chat, and
-serves the built React frontend. Three views:
+that exposes your data and the deterministic compute over REST, mounts the MCP
+endpoint at `/mcp/`, and serves the built React frontend. It runs **no Claude
+inference** — it's a viewer, not a conversation surface. Four views:
 
-- **Today** — the auto-generated morning brief at top, then stat cards for
-  Body Battery, RHR, sleep, and form (TSB) with sparklines and 60-day baseline
-  deltas, plus a recent-workouts table.
+- **Today** — the agent-written morning brief (key takeaways with embedded
+  charts), a year-at-a-glance activity heatmap, today's planned session (from
+  your active training plan), and a recent-workouts table. A banner nudges you
+  to ask your coach for a fresh brief when newer data has landed.
 - **Trends** — an interactive Banister CTL/ATL/TSB chart and a metric picker
   (RHR, sleep, Body Battery, stress, VO₂ max) with baseline overlays and a
   date-range toggle.
-- **Chat** — a streaming conversation with the agent; tool calls render as
-  inline pills so you can see what data it's pulling.
+- **Dashboards** — activity heatmap, pace-efficiency / fatigue, and
+  strength-volume views with range toggles.
+- **Training Plan** — your active plan's schedule, weekly mileage, and CTL
+  trajectory; review and commit (or delete) a draft your coach drafted over MCP.
 
-Dev mode: `cd web && pnpm dev` runs Vite at `:5173` with the API proxied to
-`fitness serve` at `:8765`.
+The conversational coaching that used to live in an in-app chat now happens in
+your MCP client. Each "ask your coach" affordance copies a ready-to-paste prompt
+to the clipboard. Dev mode: `cd web && pnpm dev` runs Vite at `:5173` with the
+API proxied to `fitness serve` at `:8765`.
 
 ### Authentication
 
@@ -173,16 +192,20 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 Put it in `.env` as `LOCAL_FITNESS_API_TOKEN=…`. On first load per device the
-web UI prompts for the same value and remembers it in `localStorage`.
-Cost-sensitive endpoints (`/api/chat`, `/api/brief/generate*`) are also
-rate-limited per IP as defense-in-depth against subscription drain.
+web UI prompts for the same value and remembers it in `localStorage`. The same
+token gates the MCP endpoint at `/mcp/`. Because the web server runs no Claude
+inference, there are no cost-sensitive API endpoints to drain a subscription; an
+in-memory per-IP rate limiter stays wired (currently a no-op) so any future
+Claude-cost path can be capped in one line.
 
 ## MCP — talk to your data from Claude directly
 
-The fitness tools are also exposed over the [Model Context
-Protocol](https://modelcontextprotocol.io), so any MCP client can query and
-update your data without the web UI. The same tool layer backs everything, so
-the MCP surface auto-tracks the agent — no duplication.
+The MCP is the **primary** way to interact with your coach. The fitness tools,
+prompts, and resources are exposed over the [Model Context
+Protocol](https://modelcontextprotocol.io), so any MCP client (Claude Desktop,
+Code, or Mobile) can read *and* write your data — without the web UI. The same
+tool layer backs everything, so the MCP surface auto-tracks the rest of the app
+— no duplication.
 
 **Connect (local, no token):**
 
@@ -198,23 +221,41 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get:
+Once connected you get **25 tools**, **2 prompts**, and **2 resources**:
 
-- **`/fitness:coach`** — a slash-command that assembles your full daily snapshot
-  (metrics vs. baseline, training load, recent workouts in miles) *and* the
-  coach persona + your saved preferences in one round-trip, then stays
-  conversational so you can ask follow-ups.
-- **Tools** — the read tools (status, trends, workouts, correlations, recovery
-  patterns, read-only SQL) plus a `daily_snapshot` one-call status and a
-  **write surface**: `log_observation` (RPE, soreness, weight, mood, feeling,
-  injury, notes) and `log_manual_workout` / `delete_manual_workout` for
-  non-Garmin sessions that feed the training-load model.
-- **Resources** — `fitness://schema` (queryable columns + SQL guide) and
-  `fitness://brief/latest` (your most recent brief as Markdown).
+- **Prompts**
+  - **`coach`** — assembles your full daily snapshot (metrics vs. baseline,
+    training load, recent workouts in miles) *and* the coach persona + your
+    saved preferences in one round-trip, then stays conversational for
+    follow-ups. This is the everyday "talk to my coach" entry point.
+  - **`brief`** — composes a fresh structured daily brief from the same snapshot
+    and persists it via `save_brief`, so your next web-UI glance is up to date.
+- **Read tools** — `daily_snapshot` (one-call status), `get_today_status`,
+  `get_metric` / `get_metric_trend`, `query_workouts` / `get_workout_detail`,
+  `compare_periods`, `correlate`, `find_anomalies`, `recovery_pattern`,
+  `training_load_status`, and `run_sql` (**read-only**, enforced at the SQLite
+  engine — any write/DDL fails regardless of phrasing).
+- **Write tools** — `save_brief` (write today's brief), the training-plan tools
+  `propose_training_plan` / `revise_training_plan` / `get_training_plan_status`
+  (the agent only drafts; committing or deleting a plan is a human action in the
+  UI), `log_observation` / `list_observations` / `delete_observation` (RPE,
+  soreness, weight, mood, feeling, injury, notes), `log_manual_workout` /
+  `delete_manual_workout` (non-Garmin sessions that feed the training-load
+  model), and the user-notes tools `save_user_note` / `list_user_notes` /
+  `update_user_note` / `delete_user_note` (durable coaching preferences).
+- **Resources** — `fitness://schema` (queryable columns + read-only SQL guide)
+  and `fitness://brief/latest` (your most recent brief as Markdown).
 
 The DNS-rebinding guard on the HTTP transport requires the served host to be in
 `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` (defaults to common local hosts; set it to
 your host or every request 421s).
+
+> **Scheduled brief credentials.** The scheduled `fitness brief` composer is the
+> one place the *server side* talks to Claude (a separate process from the web
+> server). It authenticates with your Claude subscription via
+> `CLAUDE_CODE_OAUTH_TOKEN` — put it in `.env` (the CLI auto-loads it, including
+> under `launchd`). The web server and the MCP endpoint don't need it. See
+> [`ops/`](ops/) and [`docs/deployment.md`](docs/deployment.md).
 
 ## Configuration
 
@@ -248,9 +289,11 @@ block, required env vars, and the token-rotation flow.
 
 SQLite at `./data/fitness.db` (override with `LOCAL_FITNESS_DATA_DIR`). Tables:
 `daily_metrics`, `body_battery_samples`, `stress_samples`, `activities`,
-`activity_hr_zones`, `activity_splits`, `baselines`, `ingest_runs`, `settings`.
-Raw Garmin JSON is preserved on every wellness/activity row, so new fields can
-be derived later without re-pulling.
+`activity_hr_zones`, `activity_splits`, `baselines`, `ingest_runs`, `settings`,
+`observations` (manual logs: RPE, soreness, weight, mood…), and
+`training_plans` / `plan_workouts` (goal-driven plans, single-active enforced by
+a partial unique index). Raw Garmin JSON is preserved on every wellness/activity
+row, so new fields can be derived later without re-pulling.
 
 ## Privacy & data
 
@@ -266,13 +309,14 @@ be derived later without re-pulling.
 
 ```
 src/local_fitness/
-├── db.py                  # SQLite schema + connection helpers
+├── db.py                  # SQLite schema + connection helpers (read-only mode for run_sql)
 ├── ingest/                # Garmin auth, daily pull, backfill, baselines
-├── agent/                 # Claude tools, prompts, briefing generator, chat
-├── web/server.py          # FastAPI app: REST + NDJSON-streamed chat + SPA
+├── agent/                 # tools, prompts, brief composer (briefing.py) + brief I/O (briefs.py)
+├── web/server.py          # FastAPI app: REST + MCP mount + SPA (no Claude inference)
+├── web/mcp_server.py      # MCP prompts/tools/resources wiring
 └── cli.py                 # `fitness` Click entry point
-web/                       # Vite + React + TS + Tailwind frontend
-ops/                       # macOS launchd plist + installer
+web/                       # Vite + React + TS + Tailwind frontend (a viewer)
+ops/                       # macOS launchd plist + installer for the scheduled brief
 scripts/score_prompt.py    # eval that scores agent/prompts.py (gates CI)
 tests/                     # pytest suite (run: uv run pytest)
 docs/deployment.md         # container / reverse-proxy deployment
