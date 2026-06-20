@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -39,11 +40,37 @@ from .briefs import (
     save_brief,
 )
 from .briefs import _FENCE_OPEN_RE, _LOOSE_DECODER
+from .render import fix_table_row_breaks
 from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+# Reasoning effort for the brief composer. Measured 2026-06-20: the brief's
+# wall-clock is dominated by extended thinking (~12.7k of ~14k output tokens,
+# ~208s of a ~230s brief). A controlled probe showed the SDK's `thinking`
+# `budget_tokens` knob is IGNORED on the Claude Code CLI / Max-OAuth path
+# (1024 vs 12000 produced the same output), but `effort` and a `disabled`
+# thinking config DO propagate — `effort="low"` roughly halved output tokens
+# while preserving reasoning. So `effort` is the working speed lever; the
+# default `None` behaves like "high". Env-tunable for A/B + container override.
+_DEFAULT_BRIEF_EFFORT = "low"
+_VALID_EFFORTS = ("low", "medium", "high", "max")
+
+
+def _brief_effort() -> str:
+    """Reasoning effort for the brief composer from the environment.
+
+    ``LOCAL_FITNESS_BRIEF_EFFORT`` ∈ {low, medium, high, max}; unset or
+    unrecognized → ``_DEFAULT_BRIEF_EFFORT``. Lower effort = less extended
+    thinking = faster brief.
+    """
+    raw = os.environ.get("LOCAL_FITNESS_BRIEF_EFFORT")
+    if raw is None:
+        return _DEFAULT_BRIEF_EFFORT
+    token = raw.strip().lower()
+    return token if token in _VALID_EFFORTS else _DEFAULT_BRIEF_EFFORT
 
 # Back-compat re-exports: existing callers import these from `briefing`
 # (server.py, mcp_server.py, ab_brief.py). They now live in `briefs.py`; the
@@ -137,6 +164,9 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         model=model,
         permission_mode="bypassPermissions",
         max_turns=20,
+        # Reasoning effort is the working lever on the measured dominant cost
+        # (extended thinking). See _brief_effort() / LOCAL_FITNESS_BRIEF_EFFORT.
+        effort=_brief_effort(),
         # Required for true mid-token streaming. Without this the SDK only
         # delivers AssistantMessage events at end-of-turn — meaning the
         # entire JSON brief lands in a single TextBlock at the end and our
@@ -161,6 +191,12 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     tool_duration_sum_ms = 0.0
     pending_tool_names: dict[str, str] = {}
     loop_exit_reason = "normal"
+    # Token-usage capture (Phase 0 latency attribution). The end-of-turn
+    # ResultMessage carries a usage payload; we keep the last one seen so the
+    # summary log can report output-token volume — the signal that tells us
+    # whether the brief's wall-clock is thinking/generation (high output
+    # tokens) vs. serial tool round-trips (many tool_use turns, modest output).
+    last_usage: dict | None = None
     recent_briefs = _recent_briefs_summary()
     if recent_briefs:
         # Count date headers (lines ending in ":" with no leading whitespace) —
@@ -180,6 +216,9 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             options=options,
         ):
             now = time.perf_counter()
+            _u = getattr(message, "usage", None)
+            if _u is not None:
+                last_usage = dict(_u) if isinstance(_u, dict) else getattr(_u, "__dict__", None)
             if t_first_msg is None:
                 t_first_msg = now
                 LOG.info(
@@ -293,6 +332,15 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         tool_duration_sum_ms,
         model,
     )
+    if last_usage is not None:
+        LOG.info(
+            "brief_usage output_tokens=%s input_tokens=%s "
+            "cache_read=%s cache_creation=%s",
+            last_usage.get("output_tokens"),
+            last_usage.get("input_tokens"),
+            last_usage.get("cache_read_input_tokens"),
+            last_usage.get("cache_creation_input_tokens"),
+        )
 
     # Final validation + save. If parsing fails after the stream completes,
     # surface the error event so the UI can show a clear message instead of
@@ -307,6 +355,12 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     payload.setdefault("date", date.today().isoformat())
     payload.setdefault("user_name", user_name)
     payload["generated_at"] = datetime.now().isoformat()
+    # Repair collapsed markdown tables in the common path so BOTH the save path
+    # (save_brief repairs again — idempotent) and the eval/save=False path emit
+    # clean tables. See agent/render.fix_table_row_breaks.
+    for _tk in payload.get("takeaways", []) or []:
+        if isinstance(_tk, dict) and isinstance(_tk.get("details"), str):
+            _tk["details"] = fix_table_row_breaks(_tk["details"])
 
     if save:
         # Persist through the single write gate. `save_brief` re-stamps,

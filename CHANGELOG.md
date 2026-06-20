@@ -4,6 +4,32 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-20
+
+### Changed
+- **Daily brief is ~2.5–3× faster (~230s → ~82–97s) with equal-or-better
+  quality.** Measurement (`scripts/phase0_*`) found the brief's wall-clock is
+  dominated by extended thinking (~93% of output tokens), not tools or
+  round-trips. The SDK `thinking.budget_tokens` knob is ignored on the Claude
+  Code CLI / Max-OAuth path, but reasoning `effort` propagates — so the brief
+  composer now runs at `effort="low"` by default. A blind LLM-judge A/B rated
+  low-effort briefs as good or better than the prior default on specificity,
+  coach-voice, non-repetition, and no-dead-weight. Tunable via
+  `LOCAL_FITNESS_BRIEF_EFFORT` (low|medium|high|max).
+- A fan-out (map-reduce) architecture was designed and quality-gated, then
+  **rejected by Phase 0 measurement** (concurrent `query()` parallelizes only
+  1.44× at 3-wide, under the 1.7× kill criterion). Design + outcome retained in
+  `docs/plans/2026-06-19-brief-fanout-and-cli-ux-design.md`.
+
+### Added
+- **Deterministic table rendering.** Shared `agent/render.py` `render_table`
+  (now the single source for the coach snapshot table in `mcp_server`) and a
+  `fix_table_row_breaks` repair applied at the brief save gate — eliminates the
+  collapsed-markdown-table defect (`|---|---|n| RHR |`) the model emits more
+  often at lower effort.
+- Brief token-usage instrumentation (`brief_usage` log line) for latency
+  attribution.
+
 ## [0.5.0] - 2026-06-18
 
 ### Changed

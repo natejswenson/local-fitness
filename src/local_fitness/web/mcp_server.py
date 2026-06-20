@@ -26,6 +26,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .. import db
 from ..agent import briefs, prompts
 from ..agent import tools as agent_tools
+from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
 from ..agent.schemas import Brief
 from ..agent.status import assemble_status
@@ -61,10 +62,10 @@ def _render_status(status: dict[str, Any]) -> str:
     lines.append(f"## Daily snapshot — {status.get('date', '')}")
     lines.append("")
 
-    # Snapshot table of today's metrics.
+    # Snapshot table of today's metrics — built via the shared render_table so
+    # the brief and the coach snapshot use one table renderer (one look).
     metrics = status.get("metrics") or []
-    lines.append("| Metric | Value | Read |")
-    lines.append("| --- | --- | --- |")
+    rows: list[list[str]] = []
     for m in metrics:
         name = m.get("metric", "")
         value = m.get("value")
@@ -85,7 +86,8 @@ def _render_status(status: dict[str, Any]) -> str:
             read = f"7-day trend {arrow}" if arrow else "trend: too few points"
         else:
             read = ""
-        lines.append(f"| {name} | {value_str} | {read} |")
+        rows.append([name, value_str, read])
+    lines.append(render_table(["Metric", "Value", "Read"], rows))
     lines.append("")
 
     # Training-load read.
