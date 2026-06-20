@@ -7,6 +7,32 @@ source: "design"
 
 # Brief fan-out (map-reduce) + top-grade CLI output
 
+## Phase 0 outcome (2026-06-20) — fan-out KILLED, shipped the fallback
+
+Phase 0 measurement overrode the fan-out architecture below. Recorded here so
+the design reads honestly; the fan-out sections are retained as the rejected
+alternative.
+
+- **Concurrency probe:** concurrent `query()` parallelizes only **1.44× at
+  3-wide** — under the pre-registered 1.7× kill criterion. Fan-out abandoned.
+- **Latency attribution:** a real instrumented brief showed ~208s of a ~230s
+  brief is one generation block emitting ~13.6k output tokens of which ~93% is
+  extended thinking. Serial tool round-trips are only ~15s. Thinking is the
+  cost.
+- **Working lever:** the SDK `thinking.budget_tokens` knob is **ignored** on
+  the Claude Code CLI / Max-OAuth path (1024 vs 12000 → same output), but
+  **`effort`** propagates. `effort="low"` cut the brief to **~82–97s** (~2.5–3×)
+  with **better** content (blind LLM-judge A/B: low ≥ high on all four
+  dimensions).
+- **Dimension 2 (kept, load-bearing):** at low effort the model occasionally
+  drops the backslash on a `\n` table row break (`|---|---|n| RHR |`),
+  collapsing the table. Shipped a shared `render_table` helper + a
+  `fix_table_row_breaks` repair at the save gate so every brief renders clean.
+
+**Shipped:** env-driven `effort` lever (`LOCAL_FITNESS_BRIEF_EFFORT`, default
+`low`) + token-usage instrumentation + deterministic table repair. No planner,
+no fan-out, no per-card validation. Probe scripts under `scripts/phase0_*`.
+
 ## Problem & evidence
 
 The daily brief takes ~6 minutes to generate. `uv run fitness brief` on

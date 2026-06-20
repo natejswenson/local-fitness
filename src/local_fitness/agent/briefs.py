@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .. import db
 from . import prompts
+from .render import fix_table_row_breaks
 from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
@@ -365,6 +366,14 @@ def save_brief(payload: dict) -> dict:
         payload = _extract_json(payload)
     else:
         payload = _salvage_takeaways(payload)
+
+    # 1b. Repair collapsed markdown tables in each takeaway's details (the
+    #     literal-`n` row-break the brief A/B surfaced at lower effort). Done at
+    #     the single write gate so every brief — fan-out, single-call, or
+    #     hand-authored — renders cleanly. No-op on details without a table.
+    for tk in payload.get("takeaways", []) or []:
+        if isinstance(tk, dict) and isinstance(tk.get("details"), str):
+            tk["details"] = fix_table_row_breaks(tk["details"])
 
     # 2. Stamp BEFORE validation. Mirrors briefing.generate_streaming's
     #    setdefault(date) / setdefault(user_name) / forced generated_at, but
