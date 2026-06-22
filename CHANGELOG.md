@@ -4,6 +4,30 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-22
+
+### Added
+- **`get_training_plan_progress` MCP tool** — returns the full graded training
+  plan day-by-day (every prescribed workout with its verdict:
+  done/partial/missed/compliant/pending), plus goal, days-to-race, adherence %,
+  and projected finish. Fills the gap that previously forced ad-hoc `sqlite3`
+  spelunking to answer "show my plan through today". Implemented as a deliberate
+  projection over `build_plan_detail` with a no-active-plan guard and a
+  `.get`-hardened `days_to_race`; kept out of the brief's read-only allow-list
+  so the brief stays cheap. Designed and `/quality-gate`-reviewed first
+  (`docs/plans/2026-06-22-fitness-qa-clean-output-design.md`).
+
+### Changed
+- The shared chat-formatting block in `system_prompt()` now tells the agent to
+  prefer the structured `mcp__fitness__*` tools, never shell out to
+  `sqlite3`/Bash for a DB read, and present answers cleanly instead of narrating
+  the lookup. Mirrored as a new "Answering fitness questions" section in
+  `CLAUDE.md` for the in-repo Claude Code surface. (Verified: static prompt
+  scorer green; the edit lives in the chat-only block and introduced no new
+  brief A/B divergence — the `ab_brief.py` `_generate` path fails identically
+  with and without the edit due to a pre-existing harness flake, unrelated to
+  this change.)
+
 ## [0.6.0] - 2026-06-20
 
 ### Changed

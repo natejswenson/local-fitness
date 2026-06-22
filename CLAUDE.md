@@ -93,6 +93,26 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
 - **Commit messages explain why.** Short subject, body when motivation
   isn't obvious from the diff. Co-authored-by line stays.
 
+## Answering fitness questions (in-repo Q&A)
+
+When the user asks an ad-hoc question about their data ("show my plan through
+today", "how's my training load", "what did I run last week"):
+
+- **Use the structured `mcp__fitness__*` tools.** There's one for almost
+  everything — `get_training_plan_progress` (full graded plan day-by-day),
+  `get_training_plan_status`, `query_workouts`, `get_metric_trend`,
+  `daily_snapshot`, `training_load_status`, etc. Reach for `run_sql` only when
+  no structured tool fits. **Never shell out to `sqlite3`/Bash for a DB read** —
+  the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
+  errors at the user. One tool call when a tool exists.
+- **Don't narrate the lookup.** The user wants the answer, not the mechanics.
+  Lead with a one-line answer, then a clean table (at most ~4 columns, one-word
+  headers, never a sentence in a cell) plus short coach text. Per-item detail
+  (a plan, a week schedule) → one compact `label: value · label: value` line per
+  item, not a wide grid.
+- This is advice, not an enforced gate — but with a tool that exists for the
+  job, there's no reason to query the DB by hand.
+
 ## What's already wired
 
 These are settled — don't redesign without a reason.
