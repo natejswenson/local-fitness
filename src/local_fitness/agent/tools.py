@@ -1185,6 +1185,76 @@ async def get_training_plan_status(_args: dict) -> dict:
     return _text(plans.build_plan_status(active, frontier, activities_by_date, today))
 
 
+# Riegel lookback for the projected-finish estimate. Mirrors the web route's
+# _RIEGEL_LOOKBACK_DAYS (web/server.py) — kept local so this module has no
+# dependency on the server.
+_PLAN_RIEGEL_LOOKBACK_DAYS = 120
+
+
+@tool(
+    "get_training_plan_progress",
+    "Full day-by-day progress of the ACTIVE training plan: every prescribed "
+    "workout with its graded verdict (done | partial | missed | compliant | "
+    "pending), plus goal, days-to-race, adherence %, and projected finish. "
+    "Returns {active: false} when there is no active plan. Prefer this over "
+    "get_training_plan_status (a slim one-day summary) to answer 'show my plan "
+    "through today' / 'how is my plan going' — never query the DB by hand for "
+    "this.",
+    {},
+)
+async def get_training_plan_progress(_args: dict) -> dict:
+    active = plans.get_active_plan()
+    if active is None:  # build_plan_detail has no None guard — guard here first.
+        return _text({"active": False})
+    frontier = db.last_known_daily_date()
+    today = date.today().isoformat()
+    # Mirror get_training_plan_status's frontier-INCLUSIVE end (parity: both plan
+    # tools compute identical grading windows), not the web tab's exclusive form.
+    dates = [w["date"] for w in active["workouts"]] or [today]
+    start = min(dates)
+    end = max([today, *dates] + ([frontier] if frontier else []))
+    activities_by_date = plans.load_activities_by_date(start, end)
+    cutoff = (date.today() - timedelta(days=_PLAN_RIEGEL_LOOKBACK_DAYS)).isoformat()
+    best_effort = plans.best_recent_effort(cutoff)
+    detail = plans.build_plan_detail(active, frontier, activities_by_date, best_effort)
+
+    # days_to_race is produced only by build_plan_status, not build_plan_detail —
+    # compute it here. Read via .get (absent key -> None, not KeyError) and parse
+    # defensively (NULL/unparseable -> None), matching build_plan_status's guard.
+    race = plans._parse_iso(active.get("race_date"))
+    today_d = plans._parse_iso(today)
+    days_to_race = (race - today_d).days if race and today_d else None
+
+    # Deliberate projection: keep the fields an agent needs to answer a
+    # plan-progress question; drop identifiers / internal rollups (plan_id,
+    # status, ability_snapshot, weekly_mileage, …) that build_plan_detail spreads.
+    workouts = [
+        {
+            "date": w.get("date"),
+            "week_index": w.get("week_index"),
+            "type": w.get("type"),
+            "target_distance_m": w.get("target_distance_m"),
+            "target_pace_sec_per_km": w.get("target_pace_sec_per_km"),
+            "target_duration_sec": w.get("target_duration_sec"),
+            "description": w.get("description"),
+            "verdict": w.get("verdict"),
+            "actual_distance_m": w.get("actual_distance_m"),
+            "actual_pace_sec_per_km": w.get("actual_pace_sec_per_km"),
+        }
+        for w in detail["workouts"]
+    ]
+    return _text({
+        "active": True,
+        "goal_type": detail.get("goal_type"),
+        "race_date": detail.get("race_date"),
+        "target_time_seconds": detail.get("target_time_seconds"),
+        "days_to_race": days_to_race,
+        "adherence_pct": detail.get("adherence_pct"),
+        "predicted_finish_seconds": detail.get("predicted_finish_seconds"),
+        "workouts": workouts,
+    })
+
+
 @tool(
     "save_brief",
     "Persist a composed daily brief. Pass the brief as JSON matching the Brief "
@@ -1230,6 +1300,7 @@ ALL_TOOLS = [
     propose_training_plan,
     revise_training_plan,
     get_training_plan_status,
+    get_training_plan_progress,
     save_brief,
 ]
 
