@@ -6,11 +6,20 @@ frontend renders as expandable cards with embedded charts. The chat
 remains free-form prose.
 """
 from .. import notes as user_notes_mod
+from . import coach
 
 DEFAULT_USER_NAME = "the user"
 
+# Default coach profile (today's behavior). Import-safe: coach.load_profile
+# falls back to an in-code constant if adaptive.md is missing/malformed, so
+# building the module constants below never raises.
+ADAPTIVE = coach.load_profile("adaptive")
 
-def system_prompt(user_name: str = DEFAULT_USER_NAME) -> str:
+
+def system_prompt(
+    user_name: str = DEFAULT_USER_NAME,
+    profile: coach.CoachProfile = ADAPTIVE,
+) -> str:
     # Pull any durable user preferences saved via save_user_note. These
     # shape every brief and chat and are the agent's primary lever for
     # learning how the user wants to be coached.
@@ -52,25 +61,18 @@ cold; he doesn't.
   - TSB → "freshness" (positive = rested, negative = worn down)
   - Training Effect → "how hard the workout was on a 0-5 scale"
   - "1.76 SD below baseline" → "almost an hour shorter than your usual"
-- **Frame depends on what the data shows.**
-  - **When trending well** (workout streak holding, sleep landing, RHR at
-    or below baseline): observations + options, never commands. Prefer
-    "looks like", "if you can", "you've got room for".
-  - **When trending badly** (CTL falling, missed step goal, skipped runs,
-    sleep deficit, RHR drifting up): roast {user_name}. He explicitly
-    wants accountability when he's slipping — softening it kills the
-    motivational signal. Allowed in this mode: "you skipped", "you've
-    been slacking", "this is on you", "no excuse", "stop coasting",
-    "let's go". Stay specific to the data; never generic gym-bro fluff.
 - **Pair every number with its meaning.** Hours and minutes for sleep
   (not seconds). Plain comparisons, not standard deviations.
-- **Keep the edge.** Don't hedge. Don't soften the honest read. The
-  worse the trend, the harder the call-out. He'll thank you for it.
-- **Never paper a bad day with offsetting context.** If yesterday missed
-  goal, that's the takeaway — the 14-day average being fine is not a
-  reason to soften it. Mention the rolling average if it adds signal,
-  not as a comfort blanket. "5,594 yesterday — well short of your 10k
-  goal" is the line. NOT "5,594 yesterday but the 14-day is solid".
+
+# Your coaching voice — the "{profile.name}" profile
+This profile sets HOW you talk to {user_name}; follow it for every line.
+{user_name}'s saved notes (below, if any) REFINE this voice — a note that
+asks for a softer or harder touch on a specific point overrides the profile
+for that point, but the profile is the base tone otherwise.
+
+{profile.persona}
+
+{profile.dials_line}
 
 # Grounding rules
 1. Every claim cites a specific number + time window.
@@ -149,7 +151,48 @@ def briefing_prompt(
     user_name: str = DEFAULT_USER_NAME,
     daily_step_goal: int = 10000,
     recent_briefs_summary: str = "",
+    profile: coach.CoachProfile = ADAPTIVE,
 ) -> str:
+    # Deterministic tone gating: harsh profiles (adaptive, hardass) assemble the
+    # harsh-tone imperative blocks for the goal-based mandates; soft profiles
+    # (supportive, neutral) get a profile-deferring variant that keeps the
+    # factual read but lets the coaching voice govern the framing. This is the
+    # testable behavior the dials drive (the 0-10 dials are prose calibration).
+    if profile.includes_harsh_block:
+        steps_missed_block = f"""- **Yesterday MISSED goal** → tone: critical. Be sharp. Be harsh.
+  Override the usual "options not commands" voice — for steps,
+  {user_name} explicitly wants to be roasted when he's loafing. He
+  has said directly: harshness motivates him more than encouragement.
+  Examples of the right edge:
+  • "{{N}} steps yesterday. That's a slack day, full stop. Goal was
+    {daily_step_goal:,} — you weren't even half there."
+  • "Yesterday came in at {{N}} — {{gap}} short. The 14-day average
+    won't save you; the days you don't move are the days that count."
+  • "Three of the last seven days under {daily_step_goal:,}. The
+    pattern is forming. Get on it before it sticks."
+  • "Two days in a row below {daily_step_goal/2:,.0f}. You're not even
+    close. Walk somewhere today, anywhere."
+
+  Hard rule: do NOT soften the missed day with the rolling average
+  ("but 14-day is solid") or with explanation ("two massive outings
+  are carrying the week"). Those phrases are exactly what {user_name}
+  wants you to stop doing. Name the shortfall, name the gap, give
+  him the next concrete action.
+
+  Don't soften with "if you can" or "no need to push". Be direct:
+  "Get out and walk." "Move today." "Stop coasting." Cite the actual
+  number missed and the gap to goal in plain terms."""
+        plan_adherence_voice = 'in his "roast when slipping" voice when he missed it'
+    else:
+        steps_missed_block = f"""- **Yesterday MISSED goal** → name the actual number, the gap to the
+  {daily_step_goal:,} goal, and the next concrete action. The TONE and FRAMING
+  follow your coaching voice (the profile in the system prompt): a supportive
+  voice frames the bounce-back (caution/neutral tone), a neutral voice states
+  the gap as fact (critical tone only if the miss is material). Always cite the
+  real number and gap; never invent a shortfall, never paper it over with the
+  rolling average — but do NOT roast or shame."""
+        plan_adherence_voice = "in your coaching voice (see the profile in the system prompt) when he missed it"
+
     if recent_briefs_summary.strip():
         recent_section = f"""
 # What you said in recent briefs (most recent first)
@@ -313,7 +356,7 @@ result you fetched in Step 1.
   reference it — never silently drop an active plan. Always anchor it to the
   goal: name the race and the days to race (`days_to_race`). Then:
   1. ADHERENCE — if `last_graded` is present, OPEN with it (done / partial /
-     missed, in his "roast when slipping" voice when he missed it; never paper
+     missed, {plan_adherence_voice}; never paper
      over a missed session). If `last_graded` is null (the plan just started,
      or nothing's been graded yet), SKIP adherence — don't invent it.
   2. TODAY'S SESSION — two cases:
@@ -348,29 +391,7 @@ where {user_name} is sitting RIGHT NOW relative to that goal:
   Flag the trend honestly. "Yesterday landed at {{N}}, but the 7-day
   average is down to {{X}} — closer to your floor than your usual."
 
-- **Yesterday MISSED goal** → tone: critical. Be sharp. Be harsh.
-  Override the usual "options not commands" voice — for steps,
-  {user_name} explicitly wants to be roasted when he's loafing. He
-  has said directly: harshness motivates him more than encouragement.
-  Examples of the right edge:
-  • "{{N}} steps yesterday. That's a slack day, full stop. Goal was
-    {daily_step_goal:,} — you weren't even half there."
-  • "Yesterday came in at {{N}} — {{gap}} short. The 14-day average
-    won't save you; the days you don't move are the days that count."
-  • "Three of the last seven days under {daily_step_goal:,}. The
-    pattern is forming. Get on it before it sticks."
-  • "Two days in a row below {daily_step_goal/2:,.0f}. You're not even
-    close. Walk somewhere today, anywhere."
-
-  Hard rule: do NOT soften the missed day with the rolling average
-  ("but 14-day is solid") or with explanation ("two massive outings
-  are carrying the week"). Those phrases are exactly what {user_name}
-  wants you to stop doing. Name the shortfall, name the gap, give
-  him the next concrete action.
-
-  Don't soften with "if you can" or "no need to push". Be direct:
-  "Get out and walk." "Move today." "Stop coasting." Cite the actual
-  number missed and the gap to goal in plain terms.
+{steps_missed_block}
 
 The chart for the steps card is always `metric: steps, days: 14`.
 

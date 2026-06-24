@@ -27,6 +27,7 @@ from claude_agent_sdk import (
 from pydantic import ValidationError
 
 from .. import db
+from . import coach
 from . import prompts
 from . import tools as agent_tools
 from .briefs import (
@@ -151,6 +152,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         daily_step_goal = int(db.get_setting("daily_step_goal", "10000") or "10000")
     except ValueError:
         daily_step_goal = 10000
+    coach_profile = coach.resolve_coach_profile()
     server = agent_tools.make_server()
     options = ClaudeAgentOptions(
         mcp_servers={agent_tools.SERVER_NAME: server},
@@ -160,7 +162,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         # — and therefore its behavior — unchanged. Chat + the web agent keep
         # the full set via allowed_tool_names().
         allowed_tools=agent_tools.read_only_tool_names(),
-        system_prompt=prompts.system_prompt(user_name),
+        system_prompt=prompts.system_prompt(user_name, coach_profile),
         model=model,
         permission_mode="bypassPermissions",
         max_turns=20,
@@ -212,7 +214,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         )
     try:
         async for message in query(
-            prompt=prompts.briefing_prompt(user_name, daily_step_goal, recent_briefs),
+            prompt=prompts.briefing_prompt(user_name, daily_step_goal, recent_briefs, coach_profile),
             options=options,
         ):
             now = time.perf_counter()

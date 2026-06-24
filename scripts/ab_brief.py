@@ -131,8 +131,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runs", type=int, default=2, help="generations per model")
     ap.add_argument("--run", action="store_true", help="actually call the models (default: dry-run)")
     ap.add_argument("--mock", help="JSON fixture {plan_active, briefs:{label: brief}} — no model calls")
+    ap.add_argument("--profile", default=None,
+                    help="coach tone profile to generate under (adaptive|supportive|neutral|hardass). "
+                         "Sets LOCAL_FITNESS_COACH_PROFILE for the run, so the brief speaks in that voice.")
     args = ap.parse_args(argv)
     models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if args.profile:
+        import os
+        os.environ["LOCAL_FITNESS_COACH_PROFILE"] = args.profile
+        print(f"Coach profile for this run: {args.profile}")
 
     if args.mock:
         with open(args.mock) as fh:

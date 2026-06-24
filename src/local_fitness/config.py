@@ -94,6 +94,20 @@ def grade_partial_fraction(db_path=None) -> float:
                     DEFAULT_PARTIAL_FRACTION, float, db_path)
 
 
+def _as_profile_name(s) -> str:
+    """Normalize a coach-profile name (lowercase/strip). The whitelist check
+    lives in coach.load_profile (unknown → adaptive), so this never raises —
+    keeping config free of a coach import (avoids a config↔coach cycle)."""
+    return str(s).strip().lower()
+
+
+def coach_profile(db_path=None) -> str:
+    """Selected coach tone profile name (DB > env > default 'adaptive'). The
+    returned name is whitelisted downstream by coach.load_profile."""
+    return _resolve("coach_profile", "LOCAL_FITNESS_COACH_PROFILE",
+                    "adaptive", _as_profile_name, db_path)
+
+
 def riegel_lookback_days(db_path=None) -> int:
     """Lookback window (days) for the projected-finish best effort. Clamps a
     nonsense value (< 1 or > ~10 years) to the default."""

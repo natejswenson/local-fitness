@@ -4,6 +4,38 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-23
+
+### Added
+- **Selectable coach tone profiles for the daily brief.** The coaching voice is
+  now a profile you pick instead of one hardcoded blend:
+  - `supportive` — always upbeat and encouraging; frames every read as a
+    bounce-back, never roasts;
+  - `neutral` — emotion out of it, tells you how it is against your goals;
+  - `hardass` — cynical and relentless; rips you for anything short of
+    overachieving and always pushes for more;
+  - `adaptive` *(default)* — today's "supportive when trending well, roast when
+    slipping" behavior, unchanged for a fresh clone.
+
+  Each profile is a fully-fleshed `agent/coach_profiles/<name>.md` (voice body +
+  numeric dials) with tunable characteristics: `harshness`/`warmth`/`push` (0–10
+  prose calibration) and `roast_threshold`/`praise_threshold` (fractions of goal).
+  The thresholds carry **deterministic** behavior — for goal-based mandates
+  (steps, plan adherence) a harsh profile assembles the harsh-tone imperative
+  block and a soft profile omits it (gated on `harshness`), which is unit-tested.
+  Select with `uv run fitness config set coach_profile hardass` or
+  `LOCAL_FITNESS_COACH_PROFILE`; override any dial (`coach_harshness`, …) the same
+  way — resolution is settings DB > env > the profile's own value.
+
+  Verification (every profile against expected outcomes, not eyeballed): a new
+  deterministic `scripts/score_profiles.py` (27 checks, CI-gated via
+  `test_coach.py`) asserts each profile keeps the schema/tone/jargon contracts
+  and that the harsh-block gating is correct per profile; `scripts/ab_brief.py
+  --profile <name>` runs a generative A/B per profile; the adaptive default's
+  cross-model A/B is `consistent` and `score_prompt.py` stays green unchanged.
+  Designed and `/quality-gate`-reviewed first
+  (`docs/plans/2026-06-23-coach-tone-profiles-design.md`).
+
 ## [0.9.0] - 2026-06-23
 
 ### Added

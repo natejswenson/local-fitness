@@ -24,7 +24,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .. import db
-from ..agent import briefs, prompts
+from ..agent import briefs, coach, prompts
 from ..agent import tools as agent_tools
 from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
@@ -182,7 +182,7 @@ def _coach_prompt(arguments: dict[str, str] | None) -> types.GetPromptResult:
     """The running-coach persona pre-filled with today's snapshot."""
     # The persona ALREADY embeds the user's saved notes via
     # render_for_prompt(); do NOT append them again here.
-    persona = prompts.system_prompt(_user_name())
+    persona = prompts.system_prompt(_user_name(), coach.resolve_coach_profile())
     snapshot = _render_status(assemble_status())
     text = (
         f"{persona}\n\n"
@@ -228,7 +228,8 @@ def _brief_prompt() -> types.GetPromptResult:
     user_name = _user_name()
     recent_briefs_summary = briefs._recent_briefs_summary()
     instructions = prompts.briefing_prompt(
-        user_name, _daily_step_goal(), recent_briefs_summary
+        user_name, _daily_step_goal(), recent_briefs_summary,
+        coach.resolve_coach_profile(),
     )
     snapshot = _render_status(assemble_status())
     text = (
