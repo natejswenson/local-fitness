@@ -1,14 +1,16 @@
 name: Release
 
-# Once CI is green on master, cut a GitHub Release for the version in
-# pyproject.toml — but only if that version hasn't been released yet. So a
-# normal merge is a no-op; bumping `version` in pyproject (with a matching
-# CHANGELOG entry) is what ships a release. Idempotent and version-driven.
+# Once CI is green on main (after a dev->main promotion), cut a GitHub Release
+# for the version in pyproject.toml — but only if that version hasn't been
+# released yet. So a normal promotion is a no-op; bumping `version` in pyproject
+# (with a matching CHANGELOG entry) is what ships a release. Idempotent and
+# version-driven. `workflow_run` always evaluates the DEFAULT branch's copy of
+# this file, so this `[main]` trigger must live on main to fire.
 on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
-    branches: [master]
+    branches: [main]
 
 jobs:
   release:

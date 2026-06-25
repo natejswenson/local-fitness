@@ -93,6 +93,32 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
 - **Commit messages explain why.** Short subject, body when motivation
   isn't obvious from the diff. Co-authored-by line stays.
 
+## Branching & release strategy
+
+Mirrors the `natejswenson.io` model, adapted for a public repo with a
+version-driven release.
+
+- **Topology**: `feature/* → dev → main`. `main` is the default /
+  production branch; `dev` is integration. Both are protected: a PR is
+  required (no direct push for normal flow), CI `validate` must be green,
+  linear history, squash-only, branch auto-deleted on merge. Reviews are
+  0-required (solo dev) so a green PR self-merges via native auto-merge
+  (`gh pr merge --auto --squash`).
+- **`enforce_admins: false`** is deliberate — Nate (sole admin) keeps a
+  direct-push break-glass path. Protection is a discipline gate for the
+  normal workflow, not a hard boundary.
+- **Auto-tag on promotion**: `release.yml` is version-driven and
+  retargeted to `[main]`. A `dev → main` promotion that bumps
+  `pyproject.toml` version (+ matching `CHANGELOG` entry) auto-cuts
+  `vX.Y.Z`; a no-bump promotion is an idempotent no-op release. This is
+  the existing [release policy] — code/prompt change ⇒ version bump.
+- **Dependabot** targets `dev` (`target-branch: dev` on all ecosystems),
+  so dependency bumps flow through the same `dev → main` promotion.
+  Dependabot PRs do not auto-merge for free — `gh pr merge --auto --squash`
+  per PR (or add a dependabot-automerge Action if it gets tedious).
+- **`workflow_run` evaluates the default branch's copy** of `release.yml`,
+  so any change to its trigger must land on `main` to take effect.
+
 ## Answering fitness questions (in-repo Q&A)
 
 When the user asks an ad-hoc question about their data ("show my plan through

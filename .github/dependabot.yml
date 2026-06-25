@@ -4,6 +4,7 @@ updates:
   # natively supported yet, but pip ecosystem covers the spec ranges).
   - package-ecosystem: pip
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
       day: monday
@@ -15,6 +16,7 @@ updates:
   # Frontend deps (pnpm via the npm ecosystem).
   - package-ecosystem: npm
     directory: /web
+    target-branch: dev
     schedule:
       interval: weekly
       day: monday
@@ -26,6 +28,7 @@ updates:
   # Container base images.
   - package-ecosystem: docker
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
       day: monday
@@ -37,6 +40,7 @@ updates:
   # we add CI workflows).
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
       day: monday

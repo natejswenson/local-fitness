@@ -330,8 +330,10 @@ uv run ruff check .                 # lint
 uv run python scripts/score_prompt.py  # score the agent prompt
 ```
 
-CI runs all three on every push/PR to `master`; a green build on `master`
-auto-cuts a GitHub Release for the version in `pyproject.toml`. See
+Work flows `feature/* → dev → main`; both `dev` and `main` are protected
+(CI green + a PR required). CI runs all three checks on every push/PR to
+`main`/`dev`; a `dev → main` promotion that bumps the version in
+`pyproject.toml` auto-cuts a GitHub Release for it. See
 [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Contributing

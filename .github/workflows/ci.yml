@@ -4,9 +4,9 @@ name: CI
 # coverage gate, and score the prompt. Fails the build if any pillar regresses.
 on:
   push:
-    branches: [master]
+    branches: [main, dev]
   pull_request:
-    branches: [master]
+    branches: [main, dev]
 
 jobs:
   validate:
