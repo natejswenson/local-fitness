@@ -18,7 +18,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from pydantic import ValidationError
 
 from .. import config, db, notes, plans
-from . import briefs, units
+from . import briefs, charts, units
 
 
 SERVER_NAME = "fitness"
@@ -249,6 +249,99 @@ async def get_metric_trend(args: dict) -> dict:
         if baseline["sd"]:
             payload["current_vs_baseline_sd"] = (values[-1] - baseline["m"]) / baseline["sd"]
     return _text(payload)
+
+
+# Metrics the chart tool can plot: every daily numeric column, the three
+# training-load series from `baselines` (fitness / fatigue / freshness), and one
+# derived series — Garmin's weekly-badge "active minutes" (moderate + 2×vigorous).
+# Used as a frozen whitelist before any column name reaches an f-string, same as
+# get_metric. Derived/baseline names are mapped to safe SQL below, never f-strung
+# from user input.
+_CHART_BASELINE_METRICS = frozenset({"ctl", "atl", "tsb"})
+_CHART_DERIVED_METRICS = frozenset({"intensity_minutes_weighted"})
+_CHART_METRICS = frozenset(DAILY_NUMERIC_METRICS) | _CHART_BASELINE_METRICS | _CHART_DERIVED_METRICS
+_CHART_STYLES = frozenset({"bar", "combo", "spark"})
+
+_CHART_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metric": {
+            "type": "string",
+            "description": (
+                "Any daily metric (rhr, sleep_seconds, steps, "
+                "intensity_minutes_moderate/vigorous, vo2_max, ...), a "
+                "training-load series (ctl=fitness, atl=fatigue, tsb=freshness), "
+                "or intensity_minutes_weighted (Garmin active minutes, mod+2×vig)."
+            ),
+        },
+        "days": {"type": "integer", "description": "Look back this many days"},
+        "style": {
+            "type": "string",
+            "enum": ["bar", "combo", "spark"],
+            "description": (
+                "bar = emoji-color horizontal bars (default); combo = 2D vertical "
+                "bars with a trend line overlaid (mono, handles negatives like "
+                "TSB); spark = one-line sparkline."
+            ),
+        },
+    },
+    "required": ["metric", "days"],
+}
+
+
+def _chart_value_fmt(metric: str):
+    """Per-metric value formatter so the chart shows hours / decimals sensibly."""
+    if metric.endswith("_seconds"):
+        return lambda v: f"{v / 3600:.1f}h"
+    if metric in _CHART_BASELINE_METRICS:
+        return lambda v: f"{v:.1f}"
+    return lambda v: f"{int(round(v))}"
+
+
+@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: bar (emoji-color, default), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
+async def chart(args: dict) -> dict:
+    metric = args["metric"]
+    if metric not in _CHART_METRICS:
+        return _err(f"unknown metric '{metric}'", allowed=sorted(_CHART_METRICS))
+    err = _validate_days(args["days"])
+    if err:
+        return _err(err)
+    style = args.get("style") or "bar"
+    if style not in _CHART_STYLES:
+        return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
+    days = args["days"]
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+
+    # metric is whitelisted above; the column name interpolated here can only be
+    # a frozen-set member, never raw user input — same contract as get_metric.
+    if metric in _CHART_BASELINE_METRICS:
+        sql = (f"SELECT date, {metric} AS v FROM baselines "
+               f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date")
+    elif metric == "intensity_minutes_weighted":
+        sql = ("SELECT date, (intensity_minutes_moderate + 2 * intensity_minutes_vigorous) AS v "
+               "FROM daily_metrics WHERE date >= ? AND intensity_minutes_moderate IS NOT NULL "
+               "AND intensity_minutes_vigorous IS NOT NULL ORDER BY date")
+    else:
+        sql = (f"SELECT date, {metric} AS v FROM daily_metrics "
+               f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date")
+
+    with db.connect() as conn:
+        rows = conn.execute(sql, (cutoff,)).fetchall()
+    if not rows:
+        return _err("no data in window", metric=metric, days=days)
+
+    labels = [r["date"][5:] for r in rows]  # MM-DD
+    values = [float(r["v"]) for r in rows]
+    fmt = _chart_value_fmt(metric)
+    title = f"{metric} · last {days}d · n={len(values)}"
+
+    if style == "spark":
+        body = f"{title}\n{charts.render_sparkline(values)}  {fmt(min(values))}..{fmt(max(values))}"
+    elif style == "combo":
+        body = charts.render_combo_chart(labels, values, value_fmt=fmt, title=title)
+    else:
+        body = charts.render_bar_chart(labels, values, value_fmt=fmt, title=title)
+    return _text(body)
 
 
 _QUERY_WORKOUTS_SCHEMA = {
@@ -1276,6 +1369,7 @@ ALL_TOOLS = [
     get_today_status,
     get_metric,
     get_metric_trend,
+    chart,
     query_workouts,
     get_workout_detail,
     compare_periods,
@@ -1303,7 +1397,7 @@ ALL_TOOLS = [
 
 
 def make_server():
-    return create_sdk_mcp_server(name=SERVER_NAME, version="0.4.0", tools=ALL_TOOLS)
+    return create_sdk_mcp_server(name=SERVER_NAME, version="0.5.0", tools=ALL_TOOLS)
 
 
 def allowed_tool_names() -> list[str]:

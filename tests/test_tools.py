@@ -111,6 +111,68 @@ def test_get_metric_trend_no_data(seeded):
     assert err  # vo2_max never seeded → no rows in window
 
 
+def test_chart_bar_default(seeded):
+    text, err = call(tools.chart, {"metric": "rhr", "days": 14})
+    assert not err
+    assert "rhr · last 14d" in text
+    assert any(sq in text for sq in tools.charts._HEAT)  # emoji-color bars
+
+
+def test_chart_combo_has_trendline(seeded):
+    # sleep_seconds varies across the window (steps is flat in the fixture), so
+    # bars and the overlaid trend line are both visible.
+    text, err = call(tools.chart, {"metric": "sleep_seconds", "days": 14, "style": "combo"})
+    assert not err
+    assert "█" in text and "•" in text and "┤" in text
+    assert "h" in text  # seconds formatted as hours on the axis
+
+
+def test_chart_spark(seeded):
+    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "spark"})
+    assert not err
+    assert any(b in text for b in tools.charts._BLOCKS)
+
+
+def test_chart_derived_weighted_intensity(seeded):
+    # mod(20) + 2×vig(5) = 30 for every seeded day; the tool must accept the
+    # derived metric name and not 500 on the computed column.
+    text, err = call(tools.chart, {"metric": "intensity_minutes_weighted", "days": 7})
+    assert not err
+    assert "intensity_minutes_weighted" in text
+
+
+def test_chart_baseline_metric_tsb(seeded):
+    text, err = call(tools.chart, {"metric": "tsb", "days": 14, "style": "combo"})
+    assert not err
+    assert "tsb" in text  # pulled from baselines, not daily_metrics
+
+
+def test_chart_unknown_metric(seeded):
+    payload, err = call(tools.chart, {"metric": "bogus", "days": 14})
+    assert err
+    assert "unknown metric" in payload["error"]
+
+
+def test_chart_unknown_style(seeded):
+    payload, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "pie"})
+    assert err
+    assert "unknown style" in payload["error"]
+
+
+def test_chart_no_data(seeded):
+    payload, err = call(tools.chart, {"metric": "vo2_max", "days": 14})
+    assert err  # vo2_max never seeded → no rows in window
+
+
+def test_chart_excluded_from_brief_toolset(seeded):
+    # The brief renders its own UI cards; terminal ASCII has no place there.
+    # chart is callable (it's in ALL_TOOLS) but deliberately NOT in the brief's
+    # read-only allow-list — mirrors the daily_snapshot precedent.
+    read_only = tools.read_only_tool_names()
+    assert "mcp__fitness__chart" not in read_only
+    assert "mcp__fitness__chart" in tools.allowed_tool_names()
+
+
 def test_query_workouts_filters(seeded):
     payload, err = call(
         tools.query_workouts,

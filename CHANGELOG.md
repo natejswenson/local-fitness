@@ -4,6 +4,23 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-06-25
+
+### Added
+- **`chart` MCP tool — terminal graphs from your data.** A new read-only tool
+  (`mcp__fitness__chart`) renders any daily metric, the training-load series
+  (`ctl`/`atl`/`tsb` = fitness/fatigue/freshness), or the derived
+  `intensity_minutes_weighted` (Garmin "active minutes" = moderate + 2×vigorous)
+  as a terminal chart. Three styles: `bar` (emoji-color horizontal, default),
+  `combo` (2D vertical bars with a least-squares trend line overlaid — handles
+  negative series like TSB), and `spark` (one-line sparkline). A prototype
+  against the live terminal established that ANSI color is stripped on the way
+  to the display, so color is carried by emoji glyphs, not escape codes. The
+  renderers live in `agent/charts.py` as pure functions. The tool is available
+  to the chat/coach loop but deliberately excluded from the brief's tool set
+  (the brief renders its own UI cards), mirroring the `daily_snapshot`
+  precedent.
+
 ## [0.12.0] - 2026-06-24
 
 ### Changed
