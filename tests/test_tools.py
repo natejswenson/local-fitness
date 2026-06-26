@@ -144,6 +144,18 @@ def test_chart_calendar_cumulative_steps_weekly_sum(seeded):
     assert "63000" in text
 
 
+def test_chart_line_style(seeded):
+    # The colored value-line: heat emoji on an invisible canvas, not the calendar
+    # grid and not a visible ⬛ background.
+    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "line"})
+    assert not err
+    assert "rhr · last 14d" in text
+    assert tools.charts._GAP in text              # invisible-canvas line
+    assert "⬛" not in text
+    assert "Mon→Sun" not in text                  # NOT the calendar
+    assert any(s in text for s in tools.charts._HEAT)
+
+
 def test_chart_combo_has_trendline(seeded):
     # sleep_seconds varies across the window (steps is flat in the fixture), so
     # bars and the overlaid trend line are both visible.

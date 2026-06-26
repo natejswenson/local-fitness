@@ -270,3 +270,65 @@ def test_calendar_single_day():
     out = charts.render_calendar(["2026-06-03"], [7.0])
     assert any(s in out for s in charts._HEAT)
     assert len(out.splitlines()) <= 4
+
+
+# --- render_line --------------------------------------------------------------
+
+def test_line_empty_returns_no_data():
+    assert charts.render_line([], []) == charts._NO_DATA
+    assert charts.render_line([], [], title="rhr").startswith("rhr\n")
+
+
+def test_line_uses_invisible_canvas_not_a_visible_grid():
+    # Background cells are the full-width (wide) space — invisible — NOT a visible
+    # ⬛ grid. This is the fix that turned the "tetris board" into a clean line.
+    out = charts.render_line(_days_from("2026-06-01", 10), [50.0 + (i % 4) for i in range(10)])
+    assert charts._GAP in out                     # invisible canvas present
+    assert "⬛" not in out                         # no visible background grid
+    assert any(s in out for s in charts._HEAT)     # the colored line itself
+
+
+def _line_grid_widths(out):
+    cells = set(charts._HEAT) | {charts._GAP}
+    return [sum(ln.split("│", 1)[1].count(c) for c in cells)
+            for ln in out.splitlines() if "│" in ln]
+
+
+def test_line_short_window_is_daily_and_aligned():
+    # <= weekly_after days → one column per day; every grid row is the same width.
+    out = charts.render_line(_days_from("2026-06-01", 10),
+                             [float(50 + i) for i in range(10)], weekly_after=35)
+    assert "06-01 → 06-10" in out                 # daily endpoints
+    widths = _line_grid_widths(out)
+    assert widths and all(w == 10 for w in widths)  # 10 daily columns, uniform
+
+
+def test_line_long_window_collapses_to_weekly():
+    # > weekly_after days → one point per ISO week, so a 90-day window is ~13-14
+    # columns (fully visible), never 90; rows stay uniform width (aligned).
+    out = charts.render_line(_days_from("2026-03-27", 91),
+                             [float(50 + (i % 7)) for i in range(91)])
+    widths = _line_grid_widths(out)
+    assert widths
+    assert 10 <= widths[0] <= 16                   # weeks, not 91 daily columns
+    assert all(w == widths[0] for w in widths)     # aligned
+
+
+def test_line_axis_labels_are_data_min_and_max():
+    out = charts.render_line(_days_from("2026-06-01", 5), [49.0, 52.0, 57.0, 51.0, 53.0],
+                             value_fmt=_ints, weekly_after=35)
+    assert "57 │" in out                           # top axis = window max
+    assert "49 │" in out                           # bottom axis = window min
+
+
+def test_line_handles_negative_series():
+    out = charts.render_line(_days_from("2026-06-01", 6),
+                             [-30.0, -25.0, -20.0, -28.0, -15.0, -22.0],
+                             value_fmt=lambda v: f"{v:.0f}", weekly_after=35)
+    assert "-30" in out and "-15" in out
+    assert any(s in out for s in charts._HEAT)
+
+
+def test_line_single_point():
+    out = charts.render_line(["2026-06-03"], [52.0])
+    assert any(s in out for s in charts._HEAT)

@@ -27,12 +27,16 @@ from datetime import date, timedelta
 
 __all__ = [
     "render_bar_chart", "render_combo_chart", "render_sparkline", "render_calendar",
+    "render_line",
 ]
 
 # Low→high "heat" ramp. Neutral magnitude, NOT good/bad — a metric where high is
 # good (sleep) and one where high is bad (RHR) both read as "more = warmer".
 _HEAT = ("🟦", "🟩", "🟨", "🟧", "🟥")
 _BLOCKS = "▁▂▃▄▅▆▇█"
+# Full-width (Unicode "Wide") space: invisible, but the same display width as an
+# emoji square, so a 2D emoji canvas stays aligned without a visible background.
+_GAP = "　"
 
 _NO_DATA = "(no data in window)"
 
@@ -246,4 +250,76 @@ def render_calendar(
             agg = value_fmt(wk)
         lines.append(f"{week_start.strftime('%b %d'):<8}{''.join(cells)}   {agg}")
         week_start += timedelta(days=7)
+    return "\n".join(lines)
+
+
+def _weekly_means(dates: Sequence[str], values: Sequence[float]):
+    """Collapse a daily series to one mean per ISO week (Mon-anchored), preserving
+    order. Same weekly notion as render_calendar's right-hand column, so the line
+    and calendar styles tell a consistent story. Labels are each week's Monday."""
+    order, buckets = [], {}
+    for d, v in zip(dates, values):
+        mon = date.fromisoformat(d) - timedelta(days=date.fromisoformat(d).weekday())
+        if mon not in buckets:
+            buckets[mon] = []
+            order.append(mon)
+        buckets[mon].append(v)
+    labels = [m.strftime("%b %d") for m in order]
+    vals = [sum(buckets[m]) / len(buckets[m]) for m in order]
+    return labels, vals
+
+
+def render_line(
+    dates: Sequence[str],
+    values: Sequence[float],
+    *,
+    value_fmt: Callable[[float], str] = lambda v: f"{v:g}",
+    title: str | None = None,
+    height: int = 9,
+    weekly_after: int = 35,
+) -> str:
+    """A *colored* line chart: a connected value-path drawn in heat-colored emoji
+    squares on an invisible full-width-space canvas (so it reads as a line, not a
+    grid), with a y-axis and a baseline. Color and height both encode the value.
+
+    A thin one-cell hairline isn't possible here — color needs double-width emoji,
+    which can't be a 1-cell glyph — so the line is one emoji thick. Windows longer
+    than ``weekly_after`` days collapse to one point per ISO week so the whole span
+    stays visible (a daily 90-point line would be ~180 cells wide and wrap); short
+    windows plot one point per day. ``dates`` are ISO ``YYYY-MM-DD`` strings."""
+    if not values:
+        return f"{title}\n{_NO_DATA}" if title else _NO_DATA
+    if len(values) > weekly_after:
+        labels, values = _weekly_means(dates, values)
+    else:
+        labels = [d[5:] for d in dates]
+    lo, hi, span = _norm(values)
+    H = max(3, height)
+    W = len(values)
+
+    def row_of(v: float) -> int:
+        return round((v - lo) / span * (H - 1))
+
+    grid = [[_GAP] * W for _ in range(H)]
+    prev = None
+    for x, v in enumerate(values):
+        r = row_of(v)
+        color = _heat((v - lo) / span)
+        if prev is not None:                       # fill the riser between points
+            for rr in range(min(prev, r), max(prev, r) + 1):
+                grid[rr][x] = color
+        grid[r][x] = color
+        prev = r
+
+    axis_w = max(len(value_fmt(lo)), len(value_fmt(hi)))
+    lines = [title] if title else []
+    lines.append(f"🟦 {value_fmt(lo)} (low) → 🟥 {value_fmt(hi)} (high)")
+    for y in range(H - 1, -1, -1):
+        if y in (H - 1, H // 2, 0):
+            label = f"{value_fmt(lo + span * y / (H - 1)):>{axis_w}}"
+        else:
+            label = " " * axis_w
+        lines.append(f"{label} │{''.join(grid[y])}")
+    lines.append(f"{' ' * axis_w} └{'──' * W}")
+    lines.append(f"{' ' * axis_w}  {labels[0]} → {labels[-1]}")
     return "\n".join(lines)

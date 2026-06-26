@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`chart` `line` style — a colored line chart.** A connected value-path drawn
+  in heat-colored emoji squares on an *invisible* full-width-space canvas (so it
+  reads as a line floating with a y-axis + baseline, not a tetris grid), with
+  color and height both encoding the value. Windows longer than ~5 weeks collapse
+  to one mean per ISO week (matching the calendar's weekly notion) so the whole
+  span stays visible; shorter windows plot one point per day. (`agent/charts.py`
+  `render_line`.) A true 1-cell hairline isn't possible — color requires
+  double-width emoji — so the line is one emoji thick; `combo` remains the option
+  for a thin mono hairline + trend line.
+
 ### Fixed
 - **Calendar chart alignment.** The heat-grid mixed cell widths — ASCII `· `
   pads and an `M T W T F S S` header are narrower than the double-width emoji
