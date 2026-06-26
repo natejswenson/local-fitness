@@ -4,6 +4,21 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`chart` calendar style — the new default, fixes the truncation/compression
+  bug.** Multi-week colored charts were rendered one row per day, so a 60-day
+  window was 60 lines that the terminal truncated to a cramped ~14-line slice.
+  The new `calendar` style (`agent/charts.py` `render_calendar`) lays the data
+  out as a week-stacked emoji heat-grid — one colored square per day, weeks
+  stacked top→bottom, Mon→Sun left→right — so any window stays compact (90 days
+  ≈ 13 rows) and fully visible. Missing in-window days render as ⬜; the
+  right-hand weekly column is a sum for additive metrics (steps, intensity
+  minutes) and the mean of present days otherwise. `calendar` is now the tool
+  default; `bar` (one row per day) remains for short ≤2-week windows, alongside
+  `combo` and `spark`.
+
 ## [0.13.0] - 2026-06-25
 
 ### Added
