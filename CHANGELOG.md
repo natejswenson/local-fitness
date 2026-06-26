@@ -4,7 +4,7 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.15.0] - 2026-06-26
 
 ### Added
 - **Public-share readiness hardening** (from a comprehensive readiness audit):
@@ -18,7 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ab_brief --run` flakiness honest in its docstring, anchored the prompt
   scorer's tone check to the enumerated schema block, and corrected doc drift
   (tool count 25→27, stale "43% gate", `.env.example` allow-list comment) +
-  a `docs/` index.
+  a `docs/` index. Added the repo's **first frontend tests** (Vitest + 5
+  auth-path cases, run in CI) and a regression net over `briefing.py`'s
+  streaming loop (30→82%), lifting total coverage to ~93%.
 - **`chart` `line` style — a clean box-drawing line chart.** Drawn with 1-cell
   box-drawing glyphs (`─ ╭ ╮ ╰ ╯ │`) that connect into a smooth curve, with a
   y-axis + baseline. Two things keep it clean rather than stair-stepped: the

@@ -1,6 +1,6 @@
 [project]
 name = "local-fitness"
-version = "0.14.0"
+version = "0.15.0"
 description = "Local Garmin-data agent: hands-off ingest + Claude-powered daily briefings"
 readme = "README.md"
 authors = [
