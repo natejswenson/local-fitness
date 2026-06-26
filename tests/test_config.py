@@ -20,45 +20,7 @@ def dbp(tmp_path, monkeypatch):
 
 
 def test_defaults_when_unset(dbp):
-    assert config.count_walks_easy() is True
-    assert config.count_walks_mileage() is False
-    assert config.grade_done_fraction() == 0.80
-    assert config.grade_partial_fraction() == 0.40
     assert config.riegel_lookback_days() == 120
-
-
-def test_env_overrides_default(dbp, monkeypatch):
-    monkeypatch.setenv("LOCAL_FITNESS_COUNT_WALKS_EASY", "false")
-    monkeypatch.setenv("LOCAL_FITNESS_GRADE_DONE_FRACTION", "0.9")
-    assert config.count_walks_easy() is False
-    assert config.grade_done_fraction() == 0.9
-
-
-def test_db_overrides_env(dbp, monkeypatch):
-    monkeypatch.setenv("LOCAL_FITNESS_COUNT_WALKS_EASY", "false")
-    db.set_setting("count_walks_easy", "true")
-    assert config.count_walks_easy() is True  # DB wins over env
-
-
-def test_blank_db_falls_through_to_env(dbp, monkeypatch):
-    monkeypatch.setenv("LOCAL_FITNESS_COUNT_WALKS_EASY", "false")
-    db.set_setting("count_walks_easy", "   ")  # blank → unset → env
-    assert config.count_walks_easy() is False
-
-
-def test_blank_env_falls_to_default(dbp, monkeypatch):
-    monkeypatch.setenv("LOCAL_FITNESS_COUNT_WALKS_EASY", "")  # blank → default
-    assert config.count_walks_easy() is True
-
-
-def test_unrecognized_bool_falls_to_default_not_false(dbp):
-    db.set_setting("count_walks_easy", "maybe")
-    assert config.count_walks_easy() is True  # NOT silently False (SIG-1)
-
-
-def test_bad_float_falls_to_default(dbp):
-    db.set_setting("grade_done_fraction", "abc")
-    assert config.grade_done_fraction() == 0.80
 
 
 def test_as_bool_tokens():

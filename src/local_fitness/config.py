@@ -72,28 +72,6 @@ def _resolve_from(settings: dict, key, env, default, cast):
 # --- standalone accessors (single-knob; the grading path uses the batched
 #     resolve_grading_config in plans.py instead) -----------------------------
 
-def count_walks_easy(db_path=None) -> bool:
-    return _resolve("count_walks_easy", "LOCAL_FITNESS_COUNT_WALKS_EASY",
-                    DEFAULT_COUNT_WALKS_EASY, _as_bool, db_path)
-
-
-def count_walks_mileage(db_path=None) -> bool:
-    return _resolve("count_walks_mileage", "LOCAL_FITNESS_COUNT_WALKS_MILEAGE",
-                    DEFAULT_COUNT_WALKS_MILEAGE, _as_bool, db_path)
-
-
-def grade_done_fraction(db_path=None) -> float:
-    # NOTE: unvalidated against partial here — the band path MUST go through
-    # plans.resolve_grading_config, which validates the (partial, done) pair.
-    return _resolve("grade_done_fraction", "LOCAL_FITNESS_GRADE_DONE_FRACTION",
-                    DEFAULT_DONE_FRACTION, float, db_path)
-
-
-def grade_partial_fraction(db_path=None) -> float:
-    return _resolve("grade_partial_fraction", "LOCAL_FITNESS_GRADE_PARTIAL_FRACTION",
-                    DEFAULT_PARTIAL_FRACTION, float, db_path)
-
-
 def _as_profile_name(s) -> str:
     """Normalize a coach-profile name (lowercase/strip). The whitelist check
     lives in coach.load_profile (unknown → adaptive), so this never raises —
