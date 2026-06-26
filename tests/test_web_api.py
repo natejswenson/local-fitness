@@ -12,6 +12,7 @@ Mirrors the ``srv`` fixture + reload pattern from ``test_web_plan.py`` /
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib
 from datetime import date, datetime, timedelta
@@ -141,12 +142,15 @@ async def test_status(srv):
 
 @pytest.mark.anyio
 async def test_config(srv):
+    db.set_setting("user_name", "Tester")
     async with _client(srv) as c:
         r = await c.get("/api/config")
     assert r.status_code == 200
     body = r.json()
-    assert "user_name" in body
-    assert "settings" in body
+    # The seeded setting must surface in both the top-level name and the
+    # passthrough settings map, not just be present as a key.
+    assert body["user_name"] == "Tester"
+    assert body["settings"]["user_name"] == "Tester"
 
 
 @pytest.mark.anyio
@@ -609,11 +613,15 @@ async def test_schedule_retry_cancels_prior_task(srv, monkeypatch):
     srv._schedule_retry()
     second = srv._retry_task
     assert second is not first and srv._retry_count == 2
-    assert first.cancelled() or first.cancelling() or True  # cancellation requested
-    for t in (first, second):
-        t.cancel()
-        with contextlib.suppress(BaseException):
-            await t
+    # The second arm must have cancelled the still-pending first task. Let the
+    # cancellation propagate, then observe that it actually happened — if the
+    # impl dropped its `_retry_task.cancel()`, `first` would still be pending
+    # (with a 3600s backoff it never completes on its own) and this fails.
+    await asyncio.sleep(0)
+    assert first.cancelled()
+    second.cancel()
+    with contextlib.suppress(BaseException):
+        await second
 
 
 # ---------------------------------------------------------------- SPA-shell public path --

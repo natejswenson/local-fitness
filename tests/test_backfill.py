@@ -271,15 +271,30 @@ def test_vo2_prefers_running_over_higher_other(fresh_db, tmp_path):
     assert _row(fresh_db, "2026-05-01")["vo2_max"] == 50.0
 
 
-def test_vo2_running_not_overwritten_by_later_higher_other(fresh_db, tmp_path):
-    # RUNNING first, then a higher non-running reading. RUNNING set; the later
-    # higher value is NOT running and not > nothing-new logic — running stays.
+def test_vo2_later_higher_value_overwrites_regardless_of_type(fresh_db, tmp_path):
+    # Within a single export batch, "prefer running" does NOT make a running
+    # reading sticky: a later, HIGHER non-running reading still wins via the
+    # `v > existing` clause in _ingest_vo2. (Running stickiness ACROSS separate
+    # exports is provided independently by the COALESCE write, not by this loop.)
     payload = [
         {"calendarDate": "2026-05-02", "sport": "RUNNING", "vo2MaxValue": 49.0},
         {"calendarDate": "2026-05-02", "sport": "CYCLING", "vo2MaxValue": 60.0},
     ]
     backfill.backfill(_make_zip(tmp_path, {_vo2_member(): payload}))
     assert _row(fresh_db, "2026-05-02")["vo2_max"] == 60.0  # 60 > 49 → highest wins
+
+
+def test_vo2_running_value_survives_later_lower_nonrunning(fresh_db, tmp_path):
+    # Genuine within-batch prefer-running behavior: once a RUNNING reading is
+    # set, a later LOWER non-running reading does not displace it — the
+    # `v > existing` clause is false and the `sport == "RUNNING"` clause doesn't
+    # fire for the cycling entry, so the running value persists.
+    payload = [
+        {"calendarDate": "2026-05-05", "sport": "RUNNING", "vo2MaxValue": 50.0},
+        {"calendarDate": "2026-05-05", "sport": "CYCLING", "vo2MaxValue": 45.0},
+    ]
+    backfill.backfill(_make_zip(tmp_path, {_vo2_member(): payload}))
+    assert _row(fresh_db, "2026-05-05")["vo2_max"] == 50.0
 
 
 def test_vo2_highest_when_no_running(fresh_db, tmp_path):
@@ -407,14 +422,21 @@ def test_activities_dict_container_shape(fresh_db, tmp_path):
     payload = {"summarizedActivitiesExport": [_sample_activity(activityId=222)]}
     counts = backfill.backfill(_make_zip(tmp_path, {_act_member(): payload}))
     assert counts["activity_rows"] == 1
-    assert _activities(fresh_db, 222) is not None
+    a = _activities(fresh_db, 222)
+    assert a is not None
+    # Prove a real transform ran through this entry point, not just a row count.
+    assert a["activity_type"] == "running"
+    assert a["distance_meters"] == 5000.0
 
 
 def test_activities_plain_list_shape(fresh_db, tmp_path):
     payload = [_sample_activity(activityId=333)]
     counts = backfill.backfill(_make_zip(tmp_path, {_act_member(): payload}))
     assert counts["activity_rows"] == 1
-    assert _activities(fresh_db, 333) is not None
+    a = _activities(fresh_db, 333)
+    assert a is not None
+    assert a["activity_type"] == "running"
+    assert a["distance_meters"] == 5000.0
 
 
 def test_activities_string_activity_type_and_name_fallback(fresh_db, tmp_path):

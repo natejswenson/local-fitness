@@ -146,6 +146,7 @@ def test_save_brief_salvages_nested_takeaways_dict(briefs_dir):
     result = briefs.save_brief(payload)
     assert result["saved"] is True
     assert len(result["brief"].takeaways) == 1
+    assert result["brief"].takeaways[0].headline == _valid_takeaway()["headline"]
     assert (briefs_dir / f"{date.today().isoformat()}.json").exists()
 
 
@@ -236,11 +237,11 @@ def _write_raw_json(out_dir, d: str, text: str):
     (out_dir / f"{d}.json").write_text(text, encoding="utf-8")
 
 
-def test_recent_briefs_summary_skips_unparseable_and_emptyish(briefs_dir, monkeypatch):
+def test_recent_briefs_summary_skips_unparseable_and_emptyish(briefs_dir):
     """The lookback loop must survive a corrupt file, a takeaway-less brief,
     and a takeaway with no headline — all three are skipped, leaving only the
     one good headline rendered."""
-    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", briefs_dir)
+    # The briefs_dir fixture already points DEFAULT_BRIEFINGS_DIR at this dir.
     anchor = date(2026, 6, 16)
     d1 = (anchor - timedelta(days=1)).isoformat()
     d2 = (anchor - timedelta(days=2)).isoformat()

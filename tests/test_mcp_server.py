@@ -161,12 +161,15 @@ def test_read_brief_resource_renders_persisted_brief(monkeypatch, tmp_path):
     _seed_db()
     bdir = tmp_path / "briefings"
     bdir.mkdir()
-    (bdir / "2026-06-01.json").write_text("{ not valid json", encoding="utf-8")
-    (bdir / "2026-06-20.json").write_text(
+    # The NEWEST file is invalid → exercises the `except (OSError, ValueError):
+    # continue` skip branch in _latest_brief_markdown; the loop then falls
+    # through to the older, valid file.
+    (bdir / "2026-06-20.json").write_text("{ not valid json", encoding="utf-8")
+    (bdir / "2026-06-01.json").write_text(
         json.dumps({
-            "date": "2026-06-20",
+            "date": "2026-06-01",
             "user_name": "Nate",
-            "generated_at": "2026-06-20T06:30:00",
+            "generated_at": "2026-06-01T06:30:00",
             "takeaways": [{
                 "headline": "Rest day earned",
                 "summary": "TSB positive, RHR steady.",
@@ -185,7 +188,7 @@ def test_read_brief_resource_renders_persisted_brief(monkeypatch, tmp_path):
     )
     res = asyncio.run(handler(req))
     text = res.root.contents[0].text
-    assert "Morning brief — 2026-06-20" in text
+    assert "Morning brief — 2026-06-01" in text
     assert "Rest day earned" in text
     assert "Full deep-dive markdown here." in text
 

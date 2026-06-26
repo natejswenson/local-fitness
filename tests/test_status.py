@@ -69,7 +69,7 @@ def test_assemble_status_empty_db_well_formed(empty_db):
     assert isinstance(status["metrics"], list) and status["metrics"]
     tl = status["training_load"]
     assert tl["ctl"] is None and tl["atl"] is None and tl["tsb"] is None
-    assert "no" in tl["interpretation"] and "yet" in tl["interpretation"]
+    assert tl["interpretation"] == "no training-load data yet"
     assert status["recent_workouts"] == []
     assert status["user_notes"] == []
 

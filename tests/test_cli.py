@@ -198,15 +198,21 @@ def test_pull_error_result_exits_1(runner, monkeypatch):
 def test_backfill_happy_path(runner, monkeypatch, tmp_path):
     zip_path = tmp_path / "export.zip"
     zip_path.write_text("not really a zip, just needs to exist")
-    monkeypatch.setattr(
-        cli.backfill_mod, "backfill",
-        lambda p: {"activities": 12, "daily_metrics": 30},
-    )
+    captured = {}
+
+    def _fake_backfill(p):
+        captured["path"] = p
+        return {"activities": 12, "daily_metrics": 30}
+
+    monkeypatch.setattr(cli.backfill_mod, "backfill", _fake_backfill)
     result = runner.invoke(cli.main, ["backfill", str(zip_path)])
     assert result.exit_code == 0
     assert "Backfill complete:" in result.output
     assert "activities: 12" in result.output
     assert "daily_metrics: 30" in result.output
+    # The resolved zip Path (click.Path(path_type=Path)) is wired through.
+    assert captured["path"] == zip_path
+    assert isinstance(captured["path"], Path)
 
 
 def test_backfill_missing_file_exit_2(runner):
