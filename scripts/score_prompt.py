@@ -69,8 +69,16 @@ def build_checks() -> list[tuple[str, bool]]:
         else set()
     )
     metrics_consistent = bool(prompt_metrics) and prompt_metrics <= allowed_metrics
-    # The prompt enumerates tones as `positive | caution | critical | neutral`.
-    prompt_tones = {t for t in allowed_tones if t in brief_low}
+    # The briefing prompt's JSON example pins tones in a `"tone": "a | b | c"`
+    # block. Anchor to that enumerated block (same shape as the metric block
+    # above) rather than a loose substring scan — the tone words also appear in
+    # prose, so a bare `in brief_low` check can't actually catch a drift.
+    tone_block = re.search(r'"tone":\s*"([a-z |]+)"', briefing)
+    prompt_tones = (
+        {t.strip() for t in tone_block.group(1).split("|") if t.strip()}
+        if tone_block
+        else set()
+    )
     tones_consistent = prompt_tones == allowed_tones
 
     # --- user-notes injection is wired (the durable-preferences lever). ---

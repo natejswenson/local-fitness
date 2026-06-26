@@ -17,6 +17,9 @@ Cost discipline (per the project's "quote spend + hard cap" rule):
   * `--mock <file>` runs the whole comparison on canned briefs with zero model
     calls (used by the unit test and for CI).
 
+NOTE: `--run` is currently flaky (brief-JSON parse errors); use `--mock` for the
+deterministic compare. See devlog.
+
 Usage:
   uv run python scripts/ab_brief.py                      # dry-run: show the plan + estimate
   uv run python scripts/ab_brief.py --run                # generate sonnet+opus x2 and compare

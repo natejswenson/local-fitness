@@ -112,7 +112,7 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   builds from the `../local-fitness` working tree, so the checked-out branch is
   what ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
-  (43% coverage gate), `ruff`, the prompt scorer, and `pnpm build`
+  (85% coverage gate), `ruff`, the prompt scorer, and `pnpm build`
   (`tsc -b && vite build`) for the frontend. It does **NOT** run
   `docker build`. So a green CI proves the Python suite + the frontend
   build/type-check pass — but a `node`/base-image bump or `Dockerfile`

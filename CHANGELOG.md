@@ -7,6 +7,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Public-share readiness hardening** (from a comprehensive readiness audit):
+  CI now **compiles the Docker image** on every push/PR (`docker-build` job) so
+  the container deploy can't silently break, runs on the same **Node 26 +
+  corepack** as the image, and gained least-privilege `permissions`, a
+  `concurrency` cancel, a pnpm cache, and Codecov upload + badge. Added
+  **CodeQL** (python + js/ts) and **dependency-review** workflows; enabled
+  secret-scanning / push-protection / Dependabot security updates. Fixed a
+  shipped prompt that hardcoded the owner's name (now `{user_name}`), made the
+  `ab_brief --run` flakiness honest in its docstring, anchored the prompt
+  scorer's tone check to the enumerated schema block, and corrected doc drift
+  (tool count 25→27, stale "43% gate", `.env.example` allow-list comment) +
+  a `docs/` index.
 - **`chart` `line` style — a clean box-drawing line chart.** Drawn with 1-cell
   box-drawing glyphs (`─ ╭ ╮ ╰ ╯ │`) that connect into a smooth curve, with a
   y-axis + baseline. Two things keep it clean rather than stair-stepped: the

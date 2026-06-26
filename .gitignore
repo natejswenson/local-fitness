@@ -25,11 +25,6 @@ logs/
 .env
 .env.local
 
-# Rendered launchd plist (install-launchd.sh substitutes host paths into
-# the .template — the rendered output is host-specific, not portable)
-ops/*.plist.rendered
-ops/com.local-fitness.daily.plist
-
 # Frontend (web/)
 web/node_modules/
 web/dist/
