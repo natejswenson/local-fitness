@@ -4,6 +4,44 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-06-26
+
+### Added
+- **Public-share readiness hardening** (from a comprehensive readiness audit):
+  CI now **compiles the Docker image** on every push/PR (`docker-build` job) so
+  the container deploy can't silently break, runs on the same **Node 26 +
+  corepack** as the image, and gained least-privilege `permissions`, a
+  `concurrency` cancel, a pnpm cache, and Codecov upload + badge. Added
+  **CodeQL** (python + js/ts) and **dependency-review** workflows; enabled
+  secret-scanning / push-protection / Dependabot security updates. Fixed a
+  shipped prompt that hardcoded the owner's name (now `{user_name}`), made the
+  `ab_brief --run` flakiness honest in its docstring, anchored the prompt
+  scorer's tone check to the enumerated schema block, and corrected doc drift
+  (tool count 25→27, stale "43% gate", `.env.example` allow-list comment) +
+  a `docs/` index. Added the repo's **first frontend tests** (Vitest + 5
+  auth-path cases, run in CI) and a regression net over `briefing.py`'s
+  streaming loop (30→82%), lifting total coverage to ~93%.
+- **`chart` `line` style — a clean box-drawing line chart.** Drawn with 1-cell
+  box-drawing glyphs (`─ ╭ ╮ ╰ ╯ │`) that connect into a smooth curve, with a
+  y-axis + baseline. Two things keep it clean rather than stair-stepped: the
+  series is **heavily smoothed** (centered moving average scaled to the window)
+  and **down-sampled to a lower column count**, so each change is a gentle slope
+  instead of a one-column riser. Box-drawing renders reliably everywhere (a
+  braille prototype was smoother in principle but font-dependent, so it was
+  dropped). Monochrome by design — a colored line needs chunky double-width
+  emoji; `calendar` is the style for color. (`agent/charts.py` `render_line`.)
+  (Earlier emoji / braille / under-smoothed line prototypes from this same
+  `[Unreleased]` cycle were replaced.)
+
+### Fixed
+- **Calendar chart alignment.** The heat-grid mixed cell widths — ASCII `· `
+  pads and an `M T W T F S S` header are narrower than the double-width emoji
+  squares, so columns didn't line up. Every grid cell is now a single emoji
+  (`⬛` for out-of-window days instead of dots), and the un-alignable ASCII
+  weekday header is dropped in favor of a `rows = weeks (Mon→Sun)` note in the
+  legend. Rows are now uniform 7-cell weeks that align cleanly. Regression test
+  asserts every grid row is exactly 7 emoji cells with no ASCII pad.
+
 ## [0.14.0] - 2026-06-26
 
 ### Added

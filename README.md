@@ -16,6 +16,7 @@ the handful of metrics the agent reads when you ask it something or it writes a
 brief.
 
 [![CI](https://github.com/natejswenson/local-fitness/actions/workflows/ci.yml/badge.svg)](https://github.com/natejswenson/local-fitness/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/natejswenson/local-fitness/branch/main/graph/badge.svg)](https://codecov.io/gh/natejswenson/local-fitness)
 [![Release](https://img.shields.io/github/v/release/natejswenson/local-fitness)](https://github.com/natejswenson/local-fitness/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
@@ -221,7 +222,7 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **25 tools**, **2 prompts**, and **2 resources**:
+Once connected you get **27 tools**, **2 prompts**, and **2 resources**:
 
 - **Prompts**
   - **`coach`** — assembles your full daily snapshot (metrics vs. baseline,
@@ -231,14 +232,16 @@ Once connected you get **25 tools**, **2 prompts**, and **2 resources**:
   - **`brief`** — composes a fresh structured daily brief from the same snapshot
     and persists it via `save_brief`, so your next web-UI glance is up to date.
 - **Read tools** — `daily_snapshot` (one-call status), `get_today_status`,
-  `get_metric` / `get_metric_trend`, `query_workouts` / `get_workout_detail`,
-  `compare_periods`, `correlate`, `find_anomalies`, `recovery_pattern`,
-  `training_load_status`, and `run_sql` (**read-only**, enforced at the SQLite
-  engine — any write/DDL fails regardless of phrasing).
+  `get_metric` / `get_metric_trend`, `chart` (render a metric to an image),
+  `query_workouts` / `get_workout_detail`, `compare_periods`, `correlate`,
+  `find_anomalies`, `recovery_pattern`, `training_load_status`, and `run_sql`
+  (**read-only**, enforced at the SQLite engine — any write/DDL fails regardless
+  of phrasing).
 - **Write tools** — `save_brief` (write today's brief), the training-plan tools
-  `propose_training_plan` / `revise_training_plan` / `get_training_plan_status`
-  (the agent only drafts; committing or deleting a plan is a human action in the
-  UI), `log_observation` / `list_observations` / `delete_observation` (RPE,
+  `propose_training_plan` / `revise_training_plan` / `get_training_plan_status` /
+  `get_training_plan_progress` (the agent only drafts; committing or deleting a
+  plan is a human action in the UI), `log_observation` / `list_observations` /
+  `delete_observation` (RPE,
   soreness, weight, mood, feeling, injury, notes), `log_manual_workout` /
   `delete_manual_workout` (non-Garmin sessions that feed the training-load
   model), and the user-notes tools `save_user_note` / `list_user_notes` /

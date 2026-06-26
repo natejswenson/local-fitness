@@ -16,6 +16,10 @@ only color that survives is emoji/Unicode *glyphs*. That forces a split:
   The default for the tool: it stays compact for any window (a 90-day range is
   ~13 rows), so it renders fully instead of getting truncated the way a
   one-row-per-day bar chart does once the window grows past a couple weeks.
+- ``render_line`` — a clean thin line chart in 1-cell box-drawing glyphs
+  (``─ ╭ ╮ ╰ ╯ │``), heavily smoothed + down-sampled so it's a flowing curve, not
+  stair-steps. Monochrome (box-drawing renders everywhere; braille was tried but
+  is font-dependent); a colored line would need chunky double-width emoji.
 
 Callers pass a ``value_fmt`` callable so unit formatting (seconds→hours, etc.)
 stays in the tool layer; the renderers only deal with floats.
@@ -27,6 +31,7 @@ from datetime import date, timedelta
 
 __all__ = [
     "render_bar_chart", "render_combo_chart", "render_sparkline", "render_calendar",
+    "render_line",
 ]
 
 # Low→high "heat" ramp. Neutral magnitude, NOT good/bad — a metric where high is
@@ -217,16 +222,23 @@ def render_calendar(
     lo, hi, span = _norm(values)
     start, end = min(by_date), max(by_date)
 
+    # Every grid cell is a single emoji (heat / ⬜ / ⬛) so columns line up — an
+    # emoji renders wider than an ASCII char in most terminals, so mixing the two
+    # (a "· " pad, or an "M T W…" weekday header) breaks alignment. We drop the
+    # ASCII weekday header entirely and spell the Mon→Sun convention in the legend.
     lines = [title] if title else []
-    lines.append(f"⬜ none   🟦 {value_fmt(lo)} (low) → 🟥 {value_fmt(hi)} (high)")
-    lines.append(f"{'':<8}M  T  W  T  F  S  S    wk")
+    agg_kind = "sum" if cumulative else "avg"
+    lines.append(
+        f"🟦 {value_fmt(lo)} (low) → 🟥 {value_fmt(hi)} (high)   "
+        f"⬜ no data · ⬛ outside · rows = weeks (Mon→Sun) · right = wk {agg_kind}"
+    )
     week_start = start - timedelta(days=start.weekday())  # Monday on/before start
     while week_start <= end:
         cells, present = [], []
         for i in range(7):
             d = week_start + timedelta(days=i)
             if d < start or d > end:
-                cells.append("· ")            # outside the window — alignment pad
+                cells.append("⬛")            # outside the window (emoji-width pad)
             elif d in by_date:
                 v = by_date[d]
                 cells.append(_heat((v - lo) / span))
@@ -240,3 +252,76 @@ def render_calendar(
         lines.append(f"{week_start.strftime('%b %d'):<8}{''.join(cells)}   {agg}")
         week_start += timedelta(days=7)
     return "\n".join(lines)
+
+
+def _smooth(values: Sequence[float], window: int) -> list[float]:
+    """Centered moving average. window<=1 returns the series unchanged."""
+    if window <= 1:
+        return list(values)
+    n = len(values)
+    half = window // 2
+    out = []
+    for i in range(n):
+        a, b = max(0, i - half), min(n, i + half + 1)
+        out.append(sum(values[a:b]) / (b - a))
+    return out
+
+
+def render_line(
+    dates: Sequence[str],
+    values: Sequence[float],
+    *,
+    value_fmt: Callable[[float], str] = lambda v: f"{v:g}",
+    title: str | None = None,
+    height: int = 14,
+    max_width: int = 58,
+) -> str:
+    """A clean line chart drawn with 1-cell box-drawing glyphs (``─ ╭ ╮ ╰ ╯ │``)
+    that connect into a smooth curve, with a y-axis + baseline.
+
+    Two things keep it clean rather than stair-stepped: the series is **heavily
+    smoothed** (a centered moving average scaled to the window) so it reads as the
+    trend, and it's **down-sampled to a lower column count** so each change is a
+    gentle slope, not a one-column riser. Monochrome by design — a colored line
+    would need double-width emoji squares, which read as chunky blocks; use
+    ``calendar`` when you want color. ``dates`` are ISO ``YYYY-MM-DD`` strings."""
+    if not values:
+        return f"{title}\n{_NO_DATA}" if title else _NO_DATA
+    vals = _smooth([float(v) for v in values], min(30, max(1, len(values) // 4)))
+    labels = [d[5:] for d in dates]
+    if len(vals) > max_width:                       # lower resolution → fewer steps
+        size = -(-len(vals) // max_width)           # ceil
+        labels = [labels[i] for i in range(0, len(labels), size)]
+        vals = [sum(vals[i:i + size]) / len(vals[i:i + size]) for i in range(0, len(vals), size)]
+
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1.0
+    rows = max(2, height - 1)
+
+    def yv(v: float) -> int:                        # value → row index, 0 = bottom
+        return round((v - lo) / span * rows)
+
+    n = len(vals)
+    grid = [[" "] * n for _ in range(rows + 1)]
+    if n == 1:
+        grid[rows - yv(vals[0])][0] = "─"
+    for x in range(n - 1):                           # one box-glyph segment per step
+        y0, y1 = yv(vals[x]), yv(vals[x + 1])
+        if y0 == y1:
+            grid[rows - y0][x] = "─"
+        else:
+            grid[rows - y1][x] = "╭" if y1 > y0 else "╰"
+            grid[rows - y0][x] = "╯" if y1 > y0 else "╮"
+            for y in range(min(y0, y1) + 1, max(y0, y1)):
+                grid[rows - y][x] = "│"
+
+    axis_w = max(len(value_fmt(lo)), len(value_fmt(hi)))
+    out = [title] if title else []
+    for yi in range(rows + 1):                       # top (yi=0) → bottom (yi=rows)
+        v_at = lo + span * (rows - yi) / rows
+        lab = f"{value_fmt(v_at):>{axis_w}}" if yi in (0, rows // 2, rows) else " " * axis_w
+        out.append(f"{lab} ┤{''.join(grid[yi])}")
+    out.append(f"{' ' * axis_w} └{'─' * n}")
+    pad = max(1, n - len(labels[0]) - len(labels[-1]))
+    out.append(f"{' ' * axis_w}  {labels[0]}{' ' * pad}{labels[-1]}")
+    return "\n".join(out)

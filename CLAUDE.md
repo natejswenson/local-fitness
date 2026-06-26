@@ -98,14 +98,21 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   build` + `pnpm tsc --noEmit` for the frontend, `docker compose up
   -d --build local-fitness` for the container path. For UI, take a
   screenshot — never claim something looks better without the PNG.
-- **Rebuild the container after every change.** It's the live
-  deployment at `https://fitness.home.local`; stale containers serve
-  stale code. This is durable: rebuild even when you "only" changed
-  the frontend (the SPA gets baked into stage 1). Compose lives in the
-  Traefik repo: `docker compose up -d --build local-fitness` from
-  `/Users/natejswenson/localrepo/traefik`.
+- **The live deployment tracks `dev`, not `main`.** Nate's daily-use app at
+  `https://fitness.home.local` (and the host `uv run fitness ...`) runs from the
+  `dev` working branch — that's where all tested work lands. `main` is the
+  public-consumption snapshot only (see *Branching & release strategy*). So the
+  default loop is: land work on `dev`, then rebuild the container **from a `dev`
+  checkout** so the live app is current. Do **not** promote to `main` or cut a
+  release as part of normal work — that happens only when Nate explicitly asks.
+- **Rebuild the container after every change.** Stale containers serve stale
+  code. This is durable: rebuild even when you "only" changed the frontend (the
+  SPA gets baked into stage 1). Check out `dev` first, then `docker compose up
+  -d --build local-fitness` from `/Users/natejswenson/localrepo/traefik` (compose
+  builds from the `../local-fitness` working tree, so the checked-out branch is
+  what ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
-  (43% coverage gate), `ruff`, the prompt scorer, and `pnpm build`
+  (85% coverage gate), `ruff`, the prompt scorer, and `pnpm build`
   (`tsc -b && vite build`) for the frontend. It does **NOT** run
   `docker build`. So a green CI proves the Python suite + the frontend
   build/type-check pass — but a `node`/base-image bump or `Dockerfile`
@@ -135,9 +142,13 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
 Mirrors the `natejswenson.io` model, adapted for a public repo with a
 version-driven release.
 
-- **Topology**: `feature/* → dev → main`. `main` is the default /
-  production branch; `dev` is integration. Both are protected: a PR is
-  required (no direct push for normal flow), CI `validate` must be green,
+- **Topology**: `feature/* → dev → main`. **`dev` is the live working branch**
+  — all tested work lands there and the local container deploys from it (see
+  *The live deployment tracks `dev`* above). **`main` is the public-consumption
+  snapshot**: promoted from `dev` only deliberately and rarely (when Nate
+  explicitly asks to release), never per-commit. `main` is the default branch on
+  GitHub purely so the public lands on a stable snapshot. Both are protected: a
+  PR is required (no direct push for normal flow), CI `validate` must be green,
   linear history, squash-only, branch auto-deleted on merge. Reviews are
   0-required (solo dev) so a green PR self-merges via native auto-merge
   (`gh pr merge --auto --squash`).
@@ -188,6 +199,14 @@ today", "how's my training load", "what did I run last week"):
   headers, never a sentence in a cell) plus short coach text. Per-item detail
   (a plan, a week schedule) → one compact `label: value · label: value` line per
   item, not a wide grid.
+- **Always render charts fully *in the reply*, never in a collapsed tool call.**
+  When you produce a chart/graph (the `chart` styles, or an ad-hoc render),
+  paste the full output into the message in a fenced code block so it shows
+  expanded by default — then add the coach read. It's fine to compute the chart
+  by running the renderer via Bash, but a chart left only in the Bash/tool-call
+  output is collapsed in the UI and forces the user to hit Ctrl-O to see it,
+  which Nate flagged as "very unfriendly." Reproduce the exact output in the
+  reply. Applies to every chart, every time.
 - This is advice, not an enforced gate — but with a tool that exists for the
   job, there's no reason to query the DB by hand.
 

@@ -112,13 +112,13 @@ def test_get_metric_trend_no_data(seeded):
 
 
 def test_chart_default_is_compact_calendar(seeded):
-    # No style -> calendar (the default). It must be the week-stacked grid (the
-    # "M  T  W  T  F  S  S" header is its signature) and COMPACT: a 30-day window
-    # is a handful of week-rows, never one row per day (the truncation bug fix).
+    # No style -> calendar (the default). It must be the week-stacked grid (its
+    # "Mon→Sun" legend is the signature) and COMPACT: a 30-day window is a handful
+    # of week-rows, never one row per day (the truncation bug fix).
     text, err = call(tools.chart, {"metric": "rhr", "days": 30})
     assert not err
     assert "rhr · last 30d" in text
-    assert "M  T  W  T  F  S  S" in text          # calendar header
+    assert "Mon→Sun" in text          # calendar legend signature
     assert any(sq in text for sq in tools.charts._HEAT)
     assert len(text.splitlines()) <= 10           # ~30 days -> <=5 weeks + headers
 
@@ -129,7 +129,7 @@ def test_chart_bar_style_is_one_row_per_day(seeded):
     text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "bar"})
     assert not err
     assert any(sq in text for sq in tools.charts._HEAT)
-    assert "M  T  W  T  F  S  S" not in text       # NOT the calendar
+    assert "Mon→Sun" not in text                  # NOT the calendar
     assert len([ln for ln in text.splitlines() if any(s in ln for s in tools.charts._HEAT)]) >= 10
 
 
@@ -140,8 +140,19 @@ def test_chart_calendar_cumulative_steps_weekly_sum(seeded):
     # routes steps with cumulative=True).
     text, err = call(tools.chart, {"metric": "steps", "days": 14})
     assert not err
-    assert "M  T  W  T  F  S  S" in text
+    assert "Mon→Sun" in text
     assert "63000" in text
+
+
+def test_chart_line_style(seeded):
+    # A clean box-drawing line (mono) — not braille, not the calendar grid, not emoji.
+    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "line"})
+    assert not err
+    assert "rhr · last 14d" in text
+    assert any(g in text for g in "─╭╮╰╯│")       # box-drawing line
+    assert not any(0x2800 <= ord(c) <= 0x28FF for c in text)  # NOT braille
+    assert "Mon→Sun" not in text                  # NOT the calendar
+    assert all(sq not in text for sq in tools.charts._HEAT)   # mono — no emoji
 
 
 def test_chart_combo_has_trendline(seeded):

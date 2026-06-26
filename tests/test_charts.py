@@ -238,9 +238,24 @@ def test_calendar_missing_in_window_day_is_blank_square():
 
 def test_calendar_pads_days_before_window_start():
     # Start mid-week (2026-06-03 is a Wednesday): Mon/Tue of that week are
-    # out-of-window pads, not data cells.
+    # out-of-window pads, rendered as the emoji-width ⬛ (not a narrow ASCII dot).
     out = charts.render_calendar(_days_from("2026-06-03", 5), [1.0, 2.0, 3.0, 4.0, 5.0])
-    assert "·" in out                                # "·" alignment pad
+    assert "⬛" in out                               # emoji-width out-of-window pad
+
+
+def test_calendar_grid_rows_have_uniform_emoji_width_no_ascii_pad():
+    # The alignment fix: every grid row is exactly 7 emoji cells (heat / ⬜ / ⬛),
+    # never a narrow ASCII "·" pad — mixing ASCII and emoji widths is what broke
+    # column alignment. Use a window with leading AND trailing partial weeks.
+    dates = _days_from("2026-06-03", 10)             # Wed start → both-end pads
+    out = charts.render_calendar(dates, [50.0 + (i % 5) for i in range(10)])
+    cells = set(charts._HEAT) | {"⬜", "⬛"}
+    grid_rows = [ln for ln in out.splitlines()
+                 if "(low)" not in ln and any(c in ln for c in cells)]
+    assert grid_rows
+    for ln in grid_rows:
+        assert "·" not in ln                         # no ASCII dot pad in the grid
+        assert sum(ln.count(c) for c in cells) == 7  # uniform 7-cell weeks
 
 
 def test_calendar_handles_negative_series():
@@ -255,3 +270,75 @@ def test_calendar_single_day():
     out = charts.render_calendar(["2026-06-03"], [7.0])
     assert any(s in out for s in charts._HEAT)
     assert len(out.splitlines()) <= 4
+
+
+# --- render_line --------------------------------------------------------------
+
+_BOX = "─╭╮╰╯│"
+
+
+def _has_braille(s):
+    return any(0x2800 <= ord(c) <= 0x28FF for c in s)
+
+
+def test_line_empty_returns_no_data():
+    assert charts.render_line([], []) == charts._NO_DATA
+    assert charts.render_line([], [], title="rhr").startswith("rhr\n")
+
+
+def test_line_draws_box_glyphs_not_braille_or_emoji():
+    # The line is 1-cell box-drawing glyphs (render everywhere) — NOT braille
+    # (font-dependent) and NOT emoji squares (chunky). y-axis (┤) + baseline (└).
+    out = charts.render_line(_days_from("2026-06-01", 12),
+                             [49.0 + (i % 5) for i in range(12)], value_fmt=_ints)
+    assert any(g in out for g in _BOX)             # a box-drawing line
+    assert "┤" in out and "└" in out               # y-axis + baseline
+    assert not _has_braille(out)                    # not braille
+    assert all(sq not in out for sq in charts._HEAT)   # not emoji
+
+
+def _first_glyph_col(out):
+    """Per chart row, the column of its first drawn (non-space) glyph."""
+    rows = [ln.split("┤", 1)[1] for ln in out.splitlines() if "┤" in ln]
+    return [next((i for i, ch in enumerate(r) if ch != " "), None) for r in rows]
+
+
+def test_line_rising_series_trends_up_left_to_right():
+    # A monotonic rise: the high part of the curve (top row) sits to the RIGHT of
+    # the low part (bottom row). Small series → light/no smoothing.
+    out = charts.render_line(_days_from("2026-06-01", 6), [49.0, 51, 52, 54, 56, 57],
+                             value_fmt=_ints)
+    cols = _first_glyph_col(out)
+    top, bottom = cols[0], cols[-1]
+    assert top is not None and bottom is not None
+    assert top > bottom        # the peak is reached later (further right) than the trough
+
+
+def test_line_axis_labels_are_data_min_and_max():
+    # Small series (no smoothing) → top/bottom axis labels are the exact min/max.
+    out = charts.render_line(_days_from("2026-06-01", 5), [49.0, 52.0, 57.0, 51.0, 53.0],
+                             value_fmt=_ints)
+    assert "57 ┤" in out                           # top axis = window max
+    assert "49 ┤" in out                           # bottom axis = window min
+
+
+def test_line_down_samples_long_window_to_max_width():
+    # A long window is down-sampled so the baseline never exceeds max_width columns
+    # (the key to a clean, non-stair-stepped curve + staying on one screen).
+    out = charts.render_line(_days_from("2026-01-01", 300),
+                             [50.0 + (i % 9) for i in range(300)], max_width=58)
+    base = next(ln for ln in out.splitlines() if "└" in ln)
+    assert len(base.split("└", 1)[1]) <= 58
+
+
+def test_line_handles_negative_series():
+    out = charts.render_line(_days_from("2026-06-01", 6),
+                             [-30.0, -25.0, -20.0, -28.0, -15.0, -22.0],
+                             value_fmt=lambda v: f"{v:.0f}")
+    assert "-30" in out and "-15" in out
+    assert any(g in out for g in _BOX)
+
+
+def test_line_single_point():
+    out = charts.render_line(["2026-06-03"], [52.0], value_fmt=_ints)
+    assert "─" in out

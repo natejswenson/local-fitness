@@ -272,7 +272,7 @@ conditioning or HR is the bigger story today ("fitness is collapsing",
 
 # No dead weight rule
 Every takeaway must be USABLE to {user_name}. Before including one,
-ask: "What does Nate DO with this today?" If the answer is "nothing,
+ask: "What does {user_name} DO with this today?" If the answer is "nothing,
 it's just a number", cut it or merge it into a takeaway that has an
 action. Concrete bans:
 
