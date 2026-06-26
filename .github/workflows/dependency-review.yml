@@ -1,0 +1,21 @@
+name: Dependency Review
+
+# On every PR, fail if a newly-introduced dependency carries a known
+# vulnerability or an incompatible license. Complements Dependabot (which bumps
+# existing deps) by gating NEW ones at review time. Free for public repos.
+on:
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high

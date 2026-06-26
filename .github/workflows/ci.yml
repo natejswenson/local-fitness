@@ -1,12 +1,21 @@
 name: CI
 
 # Treat the agent as code: lint it, test the deterministic core behind a
-# coverage gate, and score the prompt. Fails the build if any pillar regresses.
+# coverage gate, score the prompt, build the frontend, AND compile the Docker
+# image — so the documented container deploy can't silently break (a base-image
+# bump that passes the host build but breaks `docker compose up --build`).
 on:
   push:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
@@ -27,21 +36,61 @@ jobs:
         run: uv run ruff check .
 
       - name: Run tests with coverage gate
-        run: uv run pytest
+        run: uv run pytest --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false  # badge/upload is informational; the gate lives in pytest
 
       - name: Score the agent prompt
         run: uv run python scripts/score_prompt.py
 
-      # Frontend: type-check + production build. CI does NOT build the Docker
-      # image, but this catches TS errors / broken builds before merge.
+      # Frontend: type-check + production build on the SAME Node major as the
+      # Docker web-builder stage (node:26), with corepack installed explicitly
+      # (node:26 dropped the bundled shim — this mirrors the Dockerfile exactly).
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 26
+
+      - name: Enable corepack (pnpm)
+        run: npm install -g corepack@latest && corepack enable
+
+      - name: Resolve pnpm store dir
+        id: pnpm-store
+        working-directory: web
+        run: echo "dir=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.dir }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
 
       - name: Build frontend (tsc -b && vite build)
+        working-directory: web
         run: |
-          corepack enable
-          cd web
           pnpm install --frozen-lockfile
           pnpm build
+
+  docker-build:
+    # Compile the multi-stage image (web-builder + python runtime) — the path CI
+    # otherwise never exercises. No push; GHA layer cache keeps it fast. Catches
+    # the node:26 / corepack regression class and any Dockerfile/base-image drift.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

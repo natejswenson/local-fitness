@@ -16,6 +16,7 @@ the handful of metrics the agent reads when you ask it something or it writes a
 brief.
 
 [![CI](https://github.com/natejswenson/local-fitness/actions/workflows/ci.yml/badge.svg)](https://github.com/natejswenson/local-fitness/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/natejswenson/local-fitness/branch/main/graph/badge.svg)](https://codecov.io/gh/natejswenson/local-fitness)
 [![Release](https://img.shields.io/github/v/release/natejswenson/local-fitness)](https://github.com/natejswenson/local-fitness/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
