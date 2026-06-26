@@ -194,6 +194,16 @@ today", "how's my training load", "what did I run last week"):
   no structured tool fits. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
+- **The agent owns plan writes; the web UI is view-only.** When the user wants
+  to change their plan (move a long run, swap days, adjust a session), edit it
+  with `update_plan_workout(date, type/distance_mi/pace_min_per_mi/description)`
+  — it re-prescribes one day on the *active* plan (`type='rest'` clears
+  distance/pace). Do **not** route them through the draft→commit-in-UI flow; the
+  UI is for visual display. Structure changes (whole new plan) still go through
+  `propose_training_plan`/`revise_training_plan` (drafts). The write boundary is
+  enforced in `plans.py` (`update_active_workout` whitelists prescription columns
+  only — it can't re-key/re-status/restructure). Don't hand-write `UPDATE` SQL —
+  the tool exists.
 - **Don't narrate the lookup.** The user wants the answer, not the mechanics.
   Lead with a one-line answer, then a clean table (at most ~4 columns, one-word
   headers, never a sentence in a cell) plus short coach text. Per-item detail

@@ -389,12 +389,18 @@ def score_plan(workouts: list[dict], race_date: str | None = None) -> dict:
 
 
 # ===========================================================================
-# Persistence — the first agent→SQLite write path. The AI writes ONLY drafts:
-# `status` is never an input, `insert_draft` hardcodes 'draft', `revise_draft`
-# whitelists editable columns (excluding status) and guards the target is a
-# draft. Activation/deletion (commit_plan/delete_plan) are human-driven via
-# the REST layer. Single-active is enforced by the partial unique index in the
-# schema; commit relies on it as the race backstop.
+# Persistence — the agent→SQLite write path.
+#
+# Plan *structure* is still draft-gated: `insert_draft` hardcodes 'draft',
+# `revise_draft` is draft-only, and activation/deletion (commit_plan/delete_plan)
+# flip status. Single-active is enforced by the partial unique index; commit
+# relies on it as the race backstop.
+#
+# Per-day prescriptions on the ACTIVE plan, however, are agent-writable via
+# `update_active_workout` — the agent is the plan write path and the web UI is
+# view-only (owner's design decision). That edit whitelists prescription columns
+# only (never date/seq/week_index/plan_id/status), so it can re-prescribe a day
+# but can never re-key, re-status, or restructure the plan.
 # ===========================================================================
 
 #: columns the AI may edit on a draft — status/committed_at/plan_id/created_at
@@ -408,6 +414,16 @@ _WORKOUT_COLS = (
     "target_distance_m", "target_pace_sec_per_km", "target_duration_sec", "description",
 )
 
+#: the prescription columns the agent may edit on an ACTIVE plan's workout.
+#: date/seq/week_index/plan_id/workout_id are identity/structure — never editable
+#: here, so a day can be re-prescribed but the plan can't be re-keyed or moved.
+_EDITABLE_WORKOUT_COLS = frozenset(
+    {"type", "target_distance_m", "target_pace_sec_per_km", "target_duration_sec", "description"}
+)
+
+#: valid plan_workouts.type values (mirrors the schema CHECK in db.py).
+WORKOUT_TYPES = frozenset({"easy", "long", "tempo", "interval", "rest", "race", "cross"})
+
 
 class PlanNotFoundError(Exception):
     """Raised when a plan_id does not exist."""
@@ -415,6 +431,10 @@ class PlanNotFoundError(Exception):
 
 class NotDraftError(Exception):
     """Raised when a write/commit targets a plan that is not in 'draft' status."""
+
+
+class NoActivePlanError(Exception):
+    """Raised when an active-plan edit finds no active plan."""
 
 
 def _insert_workouts(conn, plan_id: int, workouts: list[dict]) -> None:
@@ -486,6 +506,51 @@ def revise_draft(
         if workouts is not None:
             conn.execute("DELETE FROM plan_workouts WHERE plan_id=?", (plan_id,))
             _insert_workouts(conn, plan_id, workouts)
+
+
+def update_active_workout(
+    date: str,
+    fields: dict,
+    db_path: Path | None = None,
+    seq: int = 1,
+) -> dict:
+    """Edit one day's prescription (by date + seq) on the ACTIVE plan.
+
+    The agent owns plan writes — this is the active-plan counterpart to
+    ``revise_draft``. Only prescription columns in ``_EDITABLE_WORKOUT_COLS`` may
+    change (so a day can be re-prescribed but the plan can't be re-keyed/moved);
+    ``type`` is validated against ``WORKOUT_TYPES``. Returns the updated row as a
+    dict. Raises ``NoActivePlanError`` (no active plan), ``ValueError`` (bad
+    field / unknown type / no workout on that date / nothing to update).
+    """
+    bad = set(fields) - _EDITABLE_WORKOUT_COLS
+    if bad:
+        raise ValueError(f"non-editable workout field(s): {sorted(bad)}")
+    if not fields:
+        raise ValueError("no fields to update")
+    if "type" in fields and fields["type"] not in WORKOUT_TYPES:
+        raise ValueError(f"unknown workout type '{fields['type']}'")
+
+    with db.connect(db_path) as conn:
+        active = conn.execute(
+            "SELECT plan_id FROM training_plans WHERE status='active'"
+        ).fetchone()
+        if active is None:
+            raise NoActivePlanError("no active plan")
+        plan_id = active["plan_id"]
+        sets = ", ".join(f"{c}=:{c}" for c in fields)  # keys whitelisted above
+        cur = conn.execute(
+            f"UPDATE plan_workouts SET {sets} "
+            "WHERE plan_id=:plan_id AND date=:date AND seq=:seq",
+            {**fields, "plan_id": plan_id, "date": date, "seq": seq},
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"no workout on {date} (seq {seq}) in the active plan")
+        row = conn.execute(
+            "SELECT * FROM plan_workouts WHERE plan_id=? AND date=? AND seq=?",
+            (plan_id, date, seq),
+        ).fetchone()
+        return dict(row)
 
 
 def commit_plan(plan_id: int, now: str, db_path: Path | None = None) -> None:

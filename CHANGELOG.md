@@ -4,6 +4,20 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`update_plan_workout` tool — the agent is now the plan write path.** A new
+  MCP tool re-prescribes a single day on the *active* training plan (move a long
+  run, swap days, adjust a session): `update_plan_workout(date, type?,
+  distance_mi?, pace_min_per_mi?, description?)`, with `type='rest'` clearing
+  distance/pace. Backed by `plans.update_active_workout`, which whitelists
+  *prescription* columns only — it can re-prescribe a day but can never re-key,
+  re-status, or restructure the plan (the single-active invariant and draft
+  gating for plan *structure* are untouched). This makes the agent the source of
+  truth for plan edits and the web UI view-only (owner's design decision);
+  whole-plan changes still go through the draft `propose`/`revise` flow.
+
 ## [0.15.0] - 2026-06-26
 
 ### Added
