@@ -259,7 +259,14 @@ async def get_metric_trend(args: dict) -> dict:
 _CHART_BASELINE_METRICS = frozenset({"ctl", "atl", "tsb"})
 _CHART_DERIVED_METRICS = frozenset({"intensity_minutes_weighted"})
 _CHART_METRICS = frozenset(DAILY_NUMERIC_METRICS) | _CHART_BASELINE_METRICS | _CHART_DERIVED_METRICS
-_CHART_STYLES = frozenset({"bar", "combo", "spark"})
+_CHART_STYLES = frozenset({"calendar", "bar", "combo", "spark"})
+# Additive metrics get a weekly SUM in the calendar's right column; everything
+# else (level metrics like rhr/tsb/vo2) gets the weekly mean of present days.
+_CHART_CUMULATIVE_METRICS = frozenset({
+    "steps", "active_calories", "floors_climbed",
+    "intensity_minutes_moderate", "intensity_minutes_vigorous",
+    "intensity_minutes_weighted", "body_battery_charged", "body_battery_drained",
+})
 
 _CHART_SCHEMA = {
     "type": "object",
@@ -276,11 +283,13 @@ _CHART_SCHEMA = {
         "days": {"type": "integer", "description": "Look back this many days"},
         "style": {
             "type": "string",
-            "enum": ["bar", "combo", "spark"],
+            "enum": ["calendar", "bar", "combo", "spark"],
             "description": (
-                "bar = emoji-color horizontal bars (default); combo = 2D vertical "
-                "bars with a trend line overlaid (mono, handles negatives like "
-                "TSB); spark = one-line sparkline."
+                "calendar = week-stacked emoji heat-grid (default; stays compact "
+                "and fully visible for any window — use for multi-week requests); "
+                "bar = emoji-color horizontal bars, one row per day (best ≤ ~2 "
+                "weeks); combo = 2D vertical bars + trend line (mono, handles "
+                "negatives like TSB); spark = one-line sparkline."
             ),
         },
     },
@@ -301,7 +310,7 @@ def _chart_value_fmt(metric: str):
     return lambda v: f"{int(round(v))}"
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: bar (emoji-color, default), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
+@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
 async def chart(args: dict) -> dict:
     metric = args["metric"]
     if metric not in _CHART_METRICS:
@@ -309,7 +318,7 @@ async def chart(args: dict) -> dict:
     err = _validate_days(args["days"])
     if err:
         return _err(err)
-    style = args.get("style") or "bar"
+    style = args.get("style") or "calendar"
     if style not in _CHART_STYLES:
         return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
     days = args["days"]
@@ -333,7 +342,8 @@ async def chart(args: dict) -> dict:
     if not rows:
         return _err("no data in window", metric=metric, days=days)
 
-    labels = [r["date"][5:] for r in rows]  # MM-DD
+    dates = [r["date"] for r in rows]       # ISO YYYY-MM-DD
+    labels = [d[5:] for d in dates]         # MM-DD
     values = [float(r["v"]) for r in rows]
     fmt = _chart_value_fmt(metric)
     title = f"{metric} · last {days}d · n={len(values)}"
@@ -342,8 +352,13 @@ async def chart(args: dict) -> dict:
         body = f"{title}\n{charts.render_sparkline(values)}  {fmt(min(values))}..{fmt(max(values))}"
     elif style == "combo":
         body = charts.render_combo_chart(labels, values, value_fmt=fmt, title=title)
-    else:
+    elif style == "bar":
         body = charts.render_bar_chart(labels, values, value_fmt=fmt, title=title)
+    else:  # calendar (default)
+        body = charts.render_calendar(
+            dates, values, value_fmt=fmt, title=title,
+            cumulative=metric in _CHART_CUMULATIVE_METRICS,
+        )
     return _text(body)
 
 

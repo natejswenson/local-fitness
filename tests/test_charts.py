@@ -5,7 +5,24 @@ and the edge cases that bit the prototype (empty windows, flat series, single
 points, and negative series like TSB / freshness)."""
 from __future__ import annotations
 
+import datetime as dt
+
 from local_fitness.agent import charts
+
+
+def _ints(v):
+    return str(int(round(v)))
+
+
+def _days_from(start_iso, n):
+    d0 = dt.date.fromisoformat(start_iso)
+    return [(d0 + dt.timedelta(days=i)).isoformat() for i in range(n)]
+
+
+def _monday_week():
+    mon = dt.date(2026, 6, 1)
+    mon -= dt.timedelta(days=mon.weekday())  # force a real Monday regardless
+    return [(mon + dt.timedelta(days=i)).isoformat() for i in range(7)]
 
 
 # --- render_bar_chart ---------------------------------------------------------
@@ -175,3 +192,66 @@ def test_sparkline_flat_and_single_and_empty():
     assert charts.render_sparkline([7, 7, 7]) == "▁▁▁"  # flat → lowest block, no div/0
     assert len(charts.render_sparkline([42])) == 1
     assert charts.render_sparkline([]) == charts._NO_DATA
+
+
+# --- render_calendar ----------------------------------------------------------
+
+def test_calendar_empty_returns_no_data():
+    assert charts.render_calendar([], []) == charts._NO_DATA
+    assert charts.render_calendar([], [], title="rhr").startswith("rhr\n")
+
+
+def test_calendar_is_compact_for_a_long_window():
+    # The whole point of the format: 60 distinct days render in a handful of
+    # week-rows, NOT one row per day (the truncation bug we're fixing).
+    dates = _days_from("2026-04-27", 60)
+    out = charts.render_calendar(dates, [float(i % 10) for i in range(60)])
+    n = len(out.splitlines())
+    assert n < 60 and n <= 13          # ~9 week-rows + 2 header lines
+
+
+def test_calendar_weekly_aggregate_mean_vs_cumulative():
+    # One clean Mon-Sun week, values 2..14. Mean of present days = 8, sum = 56.
+    dates = _monday_week()
+    vals = [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0]
+
+    def row(out):
+        # the data row has heat squares AND is not the legend ("(low)" marker)
+        return next(ln for ln in out.splitlines()
+                    if any(s in ln for s in charts._HEAT) and "(low)" not in ln).rstrip()
+
+    mean_out = charts.render_calendar(dates, vals, value_fmt=_ints)
+    sum_out = charts.render_calendar(dates, vals, value_fmt=_ints, cumulative=True)
+    assert row(mean_out).endswith("8")     # mean of the 7 present days
+    assert row(sum_out).endswith("56")     # additive metric -> weekly sum
+
+
+def test_calendar_missing_in_window_day_is_blank_square():
+    # A Mon-Sun week with Wednesday absent from the data: that in-window day is
+    # the no-data square; the present days are heat squares.
+    week = _monday_week()
+    present = [d for i, d in enumerate(week) if i != 2]   # drop Wednesday
+    out = charts.render_calendar(present, [5.0] * len(present))
+    assert "⬜" in out                                # ⬜ for the gap
+    assert any(s in out for s in charts._HEAT)
+
+
+def test_calendar_pads_days_before_window_start():
+    # Start mid-week (2026-06-03 is a Wednesday): Mon/Tue of that week are
+    # out-of-window pads, not data cells.
+    out = charts.render_calendar(_days_from("2026-06-03", 5), [1.0, 2.0, 3.0, 4.0, 5.0])
+    assert "·" in out                                # "·" alignment pad
+
+
+def test_calendar_handles_negative_series():
+    # TSB lives below zero; must render without crashing and label the range.
+    out = charts.render_calendar(_days_from("2026-06-01", 10),
+                                 [-30.0 + i for i in range(10)], title="tsb")
+    assert "tsb" in out and "-30" in out
+    assert any(s in out for s in charts._HEAT)
+
+
+def test_calendar_single_day():
+    out = charts.render_calendar(["2026-06-03"], [7.0])
+    assert any(s in out for s in charts._HEAT)
+    assert len(out.splitlines()) <= 4

@@ -81,6 +81,19 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
 - **Plan first.** Non-trivial changes get a written plan (affected
   files, trade-offs, verification approach) before any code lands.
   Ask clarifying questions one at a time when the spec is ambiguous.
+- **Everything gets tested — no exceptions.** Every change ships *with* tests
+  in the same commit/PR: a new function or module gets its own test cases, a
+  bugfix gets a regression test that fails before the fix and passes after, a
+  new branch/edge case gets a case that exercises it. Tests must assert real
+  behavior to our standard — **never coverage theater**: no `assert x is not
+  None` stand-ins, no asserting a mock/stub replays its own canned value, no
+  trivially-true checks. The bar is "would this test FAIL if the code under
+  test were broken?" — if not, it isn't a test. Pin the actual transformed
+  values, the real status/branch taken, the exact error. Cover the edge cases
+  (empty, single, flat, negative, missing-data, boundary). The CI coverage gate
+  is **85%** (`--cov-fail-under=85`); a PR that drops coverage or adds untested
+  code is incomplete. Stop short of testing pure I/O glue (network/LLM/uvicorn)
+  only where a test would merely assert a mock — and say so explicitly.
 - **Test before claiming done.** `uv run pytest -x` for Python, `pnpm
   build` + `pnpm tsc --noEmit` for the frontend, `docker compose up
   -d --build local-fitness` for the container path. For UI, take a

@@ -12,6 +12,10 @@ only color that survives is emoji/Unicode *glyphs*. That forces a split:
   line overlaid. Monochrome (thin box-drawing glyphs align; emoji wouldn't), but
   it carries a y-axis and handles negative series (TSB / freshness).
 - ``render_sparkline`` — a one-line block-glyph mini chart for dense windows.
+- ``render_calendar`` — a week-stacked heat-grid (one colored square per day).
+  The default for the tool: it stays compact for any window (a 90-day range is
+  ~13 rows), so it renders fully instead of getting truncated the way a
+  one-row-per-day bar chart does once the window grows past a couple weeks.
 
 Callers pass a ``value_fmt`` callable so unit formatting (seconds→hours, etc.)
 stays in the tool layer; the renderers only deal with floats.
@@ -19,8 +23,11 @@ stays in the tool layer; the renderers only deal with floats.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import date, timedelta
 
-__all__ = ["render_bar_chart", "render_combo_chart", "render_sparkline"]
+__all__ = [
+    "render_bar_chart", "render_combo_chart", "render_sparkline", "render_calendar",
+]
 
 # Low→high "heat" ramp. Neutral magnitude, NOT good/bad — a metric where high is
 # good (sleep) and one where high is bad (RHR) both read as "more = warmer".
@@ -182,3 +189,54 @@ def render_sparkline(values: Sequence[float]) -> str:
         return _NO_DATA
     lo, _, span = _norm(values)
     return "".join(_BLOCKS[min(7, round((v - lo) / span * 7))] for v in values)
+
+
+def render_calendar(
+    dates: Sequence[str],
+    values: Sequence[float],
+    *,
+    value_fmt: Callable[[float], str] = lambda v: f"{v:g}",
+    title: str | None = None,
+    cumulative: bool = False,
+) -> str:
+    """Week-stacked calendar heat-grid: one colored square per day, weeks stacked
+    top→bottom, Mon→Sun left→right, color by the day's magnitude in the window.
+
+    This is the compact answer to "show me N days of a metric": a 60-day window
+    is ~9 rows and a 90-day window ~13, so the whole timeframe renders at once
+    instead of scrolling off / getting truncated the way one-row-per-day bars do.
+
+    ``dates`` are ISO ``YYYY-MM-DD`` strings aligned with ``values`` (the series
+    the DB returned, which skips null days). Days inside the window with no value
+    render as ⬜. The right-hand weekly aggregate is a sum when ``cumulative``
+    (steps / intensity minutes) and the mean of present days otherwise (rhr, tsb…).
+    """
+    if not values:
+        return f"{title}\n{_NO_DATA}" if title else _NO_DATA
+    by_date = {date.fromisoformat(d): v for d, v in zip(dates, values)}
+    lo, hi, span = _norm(values)
+    start, end = min(by_date), max(by_date)
+
+    lines = [title] if title else []
+    lines.append(f"⬜ none   🟦 {value_fmt(lo)} (low) → 🟥 {value_fmt(hi)} (high)")
+    lines.append(f"{'':<8}M  T  W  T  F  S  S    wk")
+    week_start = start - timedelta(days=start.weekday())  # Monday on/before start
+    while week_start <= end:
+        cells, present = [], []
+        for i in range(7):
+            d = week_start + timedelta(days=i)
+            if d < start or d > end:
+                cells.append("· ")            # outside the window — alignment pad
+            elif d in by_date:
+                v = by_date[d]
+                cells.append(_heat((v - lo) / span))
+                present.append(v)
+            else:
+                cells.append("⬜")            # in-window day with no data
+        agg = ""
+        if present:
+            wk = sum(present) if cumulative else sum(present) / len(present)
+            agg = value_fmt(wk)
+        lines.append(f"{week_start.strftime('%b %d'):<8}{''.join(cells)}   {agg}")
+        week_start += timedelta(days=7)
+    return "\n".join(lines)

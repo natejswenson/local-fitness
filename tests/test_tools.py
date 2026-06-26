@@ -111,11 +111,37 @@ def test_get_metric_trend_no_data(seeded):
     assert err  # vo2_max never seeded → no rows in window
 
 
-def test_chart_bar_default(seeded):
-    text, err = call(tools.chart, {"metric": "rhr", "days": 14})
+def test_chart_default_is_compact_calendar(seeded):
+    # No style -> calendar (the default). It must be the week-stacked grid (the
+    # "M  T  W  T  F  S  S" header is its signature) and COMPACT: a 30-day window
+    # is a handful of week-rows, never one row per day (the truncation bug fix).
+    text, err = call(tools.chart, {"metric": "rhr", "days": 30})
     assert not err
-    assert "rhr · last 14d" in text
-    assert any(sq in text for sq in tools.charts._HEAT)  # emoji-color bars
+    assert "rhr · last 30d" in text
+    assert "M  T  W  T  F  S  S" in text          # calendar header
+    assert any(sq in text for sq in tools.charts._HEAT)
+    assert len(text.splitlines()) <= 10           # ~30 days -> <=5 weeks + headers
+
+
+def test_chart_bar_style_is_one_row_per_day(seeded):
+    # Explicit bar style is still available and is one row per day (best for
+    # short windows) — distinctly taller than the calendar for the same window.
+    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "bar"})
+    assert not err
+    assert any(sq in text for sq in tools.charts._HEAT)
+    assert "M  T  W  T  F  S  S" not in text       # NOT the calendar
+    assert len([ln for ln in text.splitlines() if any(s in ln for s in tools.charts._HEAT)]) >= 10
+
+
+def test_chart_calendar_cumulative_steps_weekly_sum(seeded):
+    # steps is an additive metric -> the calendar's weekly column is a SUM, not a
+    # mean. The fixture seeds 9000 steps/day and any 14-day window contains a full
+    # Mon-Sun week, so a 7*9000 = 63000 weekly total must appear (proves the tool
+    # routes steps with cumulative=True).
+    text, err = call(tools.chart, {"metric": "steps", "days": 14})
+    assert not err
+    assert "M  T  W  T  F  S  S" in text
+    assert "63000" in text
 
 
 def test_chart_combo_has_trendline(seeded):
