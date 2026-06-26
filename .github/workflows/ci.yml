@@ -76,6 +76,10 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      - name: Test frontend (vitest)
+        working-directory: web
+        run: pnpm test
+
   docker-build:
     # Compile the multi-stage image (web-builder + python runtime) — the path CI
     # otherwise never exercises. No push; GHA layer cache keeps it fast. Catches
