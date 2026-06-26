@@ -266,63 +266,80 @@ def _smooth(values: Sequence[float], window: int) -> list[float]:
     return out
 
 
+# Braille dot bit per (row-in-cell 0..3, col-in-cell 0..1) — a char cell packs a
+# 2×4 dot matrix, so a line drawn on the dot grid gets 8× the resolution of plain
+# characters and reads as a smooth curve (the youplot / plotille approach).
+_BRAILLE = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
+
+
 def render_line(
     dates: Sequence[str],
     values: Sequence[float],
     *,
     value_fmt: Callable[[float], str] = lambda v: f"{v:g}",
     title: str | None = None,
-    height: int = 12,
-    max_width: int = 96,
+    height: int = 8,
+    width: int = 78,
 ) -> str:
-    """A clean line chart drawn with 1-cell box-drawing glyphs (``─ ╭ ╮ ╰ ╯ │``)
-    that connect into an actual thin line (the asciichart approach).
+    """A clean, smooth line chart drawn in braille (each cell is a 2×4 dot matrix,
+    so the curve has 8× the resolution of plain box-drawing and connects without
+    the staircase look). Consecutive points are joined with a straight run of dots
+    so the line is continuous, with a y-axis + baseline.
 
-    Monochrome on purpose: a colored line would need double-width emoji, which
-    can't be a 1-cell glyph and reads as chunky blocks — use ``calendar`` when you
-    want color. The series is lightly smoothed (a centered moving average scaled
-    to the window) so the trend reads cleanly instead of as daily jitter, then
-    bucket-averaged down to ``max_width`` columns if a window is very long.
-    ``dates`` are ISO ``YYYY-MM-DD`` strings."""
+    Monochrome on purpose: a colored line would need double-width emoji, which read
+    as chunky blocks, not a line — use ``calendar`` when you want color. The series
+    is lightly smoothed (a centered moving average) so it reads as the trend, not
+    daily jitter. ``dates`` are ISO ``YYYY-MM-DD`` strings."""
     if not values:
         return f"{title}\n{_NO_DATA}" if title else _NO_DATA
-    vals = [float(v) for v in values]
+    vals = _smooth([float(v) for v in values], max(1, len(values) // 14))
     labels = [d[5:] for d in dates]
-    if len(vals) > max_width:                      # keep it on one screen
-        size = -(-len(vals) // max_width)          # ceil
-        labels = [labels[i] for i in range(0, len(labels), size)]
-        vals = [sum(vals[i:i + size]) / len(vals[i:i + size]) for i in range(0, len(vals), size)]
-    vals = _smooth(vals, max(1, len(vals) // 12))  # de-jitter without flattening
-
     lo, hi = min(vals), max(vals)
     span = (hi - lo) or 1.0
-    rows = max(2, height - 1)
-
-    def yv(v: float) -> int:                       # value → row index, 0 = bottom
-        return round((v - lo) / span * rows)
-
+    H = max(2, height)
+    W = max(10, width)
+    dot_h, dot_w = 4 * H, 2 * W
     n = len(vals)
-    grid = [[" "] * n for _ in range(rows + 1)]
+
+    cells = [[0] * W for _ in range(H)]
+
+    def plot(dx: int, dy: int) -> None:
+        if 0 <= dx < dot_w and 0 <= dy < dot_h:
+            cells[dy // 4][dx // 2] |= _BRAILLE[dy % 4][dx % 2]
+
+    def dot_xy(i: int, v: float) -> tuple[int, int]:
+        dx = round(i / (n - 1) * (dot_w - 1)) if n > 1 else 0
+        dy = round((1 - (v - lo) / span) * (dot_h - 1))   # dy=0 is top (hi)
+        return dx, dy
+
+    pts = [dot_xy(i, vals[i]) for i in range(n)]
     if n == 1:
-        grid[rows - yv(vals[0])][0] = "─"
-    for x in range(n - 1):                          # one box-glyph segment per step
-        y0, y1 = yv(vals[x]), yv(vals[x + 1])
-        if y0 == y1:
-            grid[rows - y0][x] = "─"
-        else:
-            grid[rows - y1][x] = "╭" if y1 > y0 else "╰"
-            grid[rows - y0][x] = "╯" if y1 > y0 else "╮"
-            for y in range(min(y0, y1) + 1, max(y0, y1)):
-                grid[rows - y][x] = "│"
+        plot(*pts[0])
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):           # Bresenham between points
+        ddx, ddy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = ddx + ddy
+        x, y = x0, y0
+        while True:
+            plot(x, y)
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 >= ddy:
+                err += ddy
+                x += sx
+            if e2 <= ddx:
+                err += ddx
+                y += sy
 
     axis_w = max(len(value_fmt(lo)), len(value_fmt(hi)))
-    label_rows = {0, rows // 4, rows // 2, (3 * rows) // 4, rows}
     out = [title] if title else []
-    for yi in range(rows + 1):                      # top (yi=0) → bottom (yi=rows)
-        v_at = lo + span * (rows - yi) / rows
-        lab = f"{value_fmt(v_at):>{axis_w}}" if yi in label_rows else " " * axis_w
-        out.append(f"{lab} ┤{''.join(grid[yi])}")
-    out.append(f"{' ' * axis_w} └{'─' * n}")
-    pad = max(1, n - len(labels[0]) - len(labels[-1]))
+    for r in range(H):
+        v_at = hi - (hi - lo) * (r / (H - 1) if H > 1 else 0)   # top row = hi
+        lab = f"{value_fmt(v_at):>{axis_w}}" if r in (0, H // 2, H - 1) else " " * axis_w
+        row = "".join(chr(0x2800 + cells[r][c]) if cells[r][c] else " " for c in range(W))
+        out.append(f"{lab} ┤{row}")
+    out.append(f"{' ' * axis_w} └{'─' * W}")
+    pad = max(1, W - len(labels[0]) - len(labels[-1]))
     out.append(f"{' ' * axis_w}  {labels[0]}{' ' * pad}{labels[-1]}")
     return "\n".join(out)

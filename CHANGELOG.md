@@ -7,15 +7,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- **`chart` `line` style — a real terminal line chart.** Drawn with 1-cell
-  box-drawing glyphs (`─ ╭ ╮ ╰ ╯ │`) that connect into a genuine thin line (the
-  asciichart approach), with a y-axis and a baseline. The series is lightly
-  smoothed (a centered moving average) so it reads as the trend rather than daily
-  jitter, and bucket-averaged down to a max width for very long windows.
-  Monochrome by design: a *colored* line would need double-width emoji squares,
-  which read as chunky blocks, not a line — `calendar` is the style to use when
-  you want color. (`agent/charts.py` `render_line`.) (Earlier emoji-based line
-  prototypes from this same `[Unreleased]` cycle were replaced wholesale.)
+- **`chart` `line` style — a clean braille line chart.** Rendered in braille:
+  each character cell is a 2×4 dot matrix, so the curve is drawn at 8× the
+  resolution of plain characters and reads as a smooth line (the youplot /
+  plotille approach) instead of a stair-stepped box-drawing path. Consecutive
+  points are joined with a Bresenham run of dots so the line is continuous, with
+  a y-axis + baseline. Lightly smoothed (centered moving average) so it reads as
+  the trend, not daily jitter. Monochrome by design: a *colored* line would need
+  double-width emoji squares, which read as chunky blocks — `calendar` is the
+  style for color. (`agent/charts.py` `render_line`.) (Earlier emoji and
+  box-drawing line prototypes from this same `[Unreleased]` cycle were replaced.)
 
 ### Fixed
 - **Calendar chart alignment.** The heat-grid mixed cell widths — ASCII `· `

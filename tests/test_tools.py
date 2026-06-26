@@ -145,11 +145,11 @@ def test_chart_calendar_cumulative_steps_weekly_sum(seeded):
 
 
 def test_chart_line_style(seeded):
-    # A genuine thin box-drawing line (mono) — not the calendar grid, not emoji.
+    # A smooth braille line (mono) — not the calendar grid, not emoji.
     text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "line"})
     assert not err
     assert "rhr · last 14d" in text
-    assert any(g in text for g in "─╭╮╰╯│")       # box-drawing line
+    assert any(0x2800 <= ord(c) <= 0x28FF for c in text)     # braille line
     assert "┤" in text                            # y-axis
     assert "Mon→Sun" not in text                  # NOT the calendar
     assert all(sq not in text for sq in tools.charts._HEAT)   # mono — no emoji
