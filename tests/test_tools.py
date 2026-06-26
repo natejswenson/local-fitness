@@ -145,15 +145,14 @@ def test_chart_calendar_cumulative_steps_weekly_sum(seeded):
 
 
 def test_chart_line_style(seeded):
-    # The colored value-line: heat emoji on an invisible canvas, not the calendar
-    # grid and not a visible ⬛ background.
+    # A genuine thin box-drawing line (mono) — not the calendar grid, not emoji.
     text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "line"})
     assert not err
     assert "rhr · last 14d" in text
-    assert tools.charts._GAP in text              # invisible-canvas line
-    assert "⬛" not in text
+    assert any(g in text for g in "─╭╮╰╯│")       # box-drawing line
+    assert "┤" in text                            # y-axis
     assert "Mon→Sun" not in text                  # NOT the calendar
-    assert any(s in text for s in tools.charts._HEAT)
+    assert all(sq not in text for sq in tools.charts._HEAT)   # mono — no emoji
 
 
 def test_chart_combo_has_trendline(seeded):

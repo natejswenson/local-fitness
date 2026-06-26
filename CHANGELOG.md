@@ -7,16 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- **`chart` `line` style — a colored line chart.** A connected value-path drawn
-  in heat-colored emoji squares on an *invisible* full-width-space canvas (so it
-  reads as a line floating with a y-axis + baseline, not a tetris grid), with
-  color and height both encoding the value. The series is **interpolated across a
-  wide (~48-column) canvas** so it reads as a flowing slope rather than a few
-  points stacking into vertical risers. Windows longer than ~5 weeks collapse to
-  one mean per ISO week (matching the calendar's weekly notion); shorter windows
-  plot daily. (`agent/charts.py` `render_line`.) A true 1-cell hairline isn't
-  possible — color requires double-width emoji — so the line is one emoji thick;
-  `combo` remains the option for a thin mono hairline + trend line.
+- **`chart` `line` style — a real terminal line chart.** Drawn with 1-cell
+  box-drawing glyphs (`─ ╭ ╮ ╰ ╯ │`) that connect into a genuine thin line (the
+  asciichart approach), with a y-axis and a baseline. The series is lightly
+  smoothed (a centered moving average) so it reads as the trend rather than daily
+  jitter, and bucket-averaged down to a max width for very long windows.
+  Monochrome by design: a *colored* line would need double-width emoji squares,
+  which read as chunky blocks, not a line — `calendar` is the style to use when
+  you want color. (`agent/charts.py` `render_line`.) (Earlier emoji-based line
+  prototypes from this same `[Unreleased]` cycle were replaced wholesale.)
 
 ### Fixed
 - **Calendar chart alignment.** The heat-grid mixed cell widths — ASCII `· `

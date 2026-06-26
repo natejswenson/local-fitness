@@ -16,6 +16,9 @@ only color that survives is emoji/Unicode *glyphs*. That forces a split:
   The default for the tool: it stays compact for any window (a 90-day range is
   ~13 rows), so it renders fully instead of getting truncated the way a
   one-row-per-day bar chart does once the window grows past a couple weeks.
+- ``render_line`` — a genuine thin line chart drawn with 1-cell box-drawing
+  glyphs (``─ ╭ ╮ ╰ ╯ │``), lightly smoothed. Monochrome: a colored line would
+  need double-width emoji, which read as chunky blocks, not a line.
 
 Callers pass a ``value_fmt`` callable so unit formatting (seconds→hours, etc.)
 stays in the tool layer; the renderers only deal with floats.
@@ -34,9 +37,6 @@ __all__ = [
 # good (sleep) and one where high is bad (RHR) both read as "more = warmer".
 _HEAT = ("🟦", "🟩", "🟨", "🟧", "🟥")
 _BLOCKS = "▁▂▃▄▅▆▇█"
-# Full-width (Unicode "Wide") space: invisible, but the same display width as an
-# emoji square, so a 2D emoji canvas stays aligned without a visible background.
-_GAP = "　"
 
 _NO_DATA = "(no data in window)"
 
@@ -253,20 +253,17 @@ def render_calendar(
     return "\n".join(lines)
 
 
-def _weekly_means(dates: Sequence[str], values: Sequence[float]):
-    """Collapse a daily series to one mean per ISO week (Mon-anchored), preserving
-    order. Same weekly notion as render_calendar's right-hand column, so the line
-    and calendar styles tell a consistent story. Labels are each week's Monday."""
-    order, buckets = [], {}
-    for d, v in zip(dates, values):
-        mon = date.fromisoformat(d) - timedelta(days=date.fromisoformat(d).weekday())
-        if mon not in buckets:
-            buckets[mon] = []
-            order.append(mon)
-        buckets[mon].append(v)
-    labels = [m.strftime("%b %d") for m in order]
-    vals = [sum(buckets[m]) / len(buckets[m]) for m in order]
-    return labels, vals
+def _smooth(values: Sequence[float], window: int) -> list[float]:
+    """Centered moving average. window<=1 returns the series unchanged."""
+    if window <= 1:
+        return list(values)
+    n = len(values)
+    half = window // 2
+    out = []
+    for i in range(n):
+        a, b = max(0, i - half), min(n, i + half + 1)
+        out.append(sum(values[a:b]) / (b - a))
+    return out
 
 
 def render_line(
@@ -275,68 +272,57 @@ def render_line(
     *,
     value_fmt: Callable[[float], str] = lambda v: f"{v:g}",
     title: str | None = None,
-    height: int = 11,
-    width: int = 48,
-    weekly_after: int = 35,
+    height: int = 12,
+    max_width: int = 96,
 ) -> str:
-    """A *colored* line chart: a connected value-path drawn in heat-colored emoji
-    squares on an invisible full-width-space canvas (so it reads as a line, not a
-    grid), with a y-axis and a baseline. Color and height both encode the value.
+    """A clean line chart drawn with 1-cell box-drawing glyphs (``─ ╭ ╮ ╰ ╯ │``)
+    that connect into an actual thin line (the asciichart approach).
 
-    A thin one-cell hairline isn't possible here — color needs double-width emoji,
-    which can't be a 1-cell glyph — so the line is one emoji thick. Windows longer
-    than ``weekly_after`` days collapse to one point per ISO week so the whole span
-    stays visible (a daily 90-point line would be ~180 cells wide and wrap); short
-    windows plot one point per day. ``dates`` are ISO ``YYYY-MM-DD`` strings."""
+    Monochrome on purpose: a colored line would need double-width emoji, which
+    can't be a 1-cell glyph and reads as chunky blocks — use ``calendar`` when you
+    want color. The series is lightly smoothed (a centered moving average scaled
+    to the window) so the trend reads cleanly instead of as daily jitter, then
+    bucket-averaged down to ``max_width`` columns if a window is very long.
+    ``dates`` are ISO ``YYYY-MM-DD`` strings."""
     if not values:
         return f"{title}\n{_NO_DATA}" if title else _NO_DATA
-    if len(values) > weekly_after:
-        labels, values = _weekly_means(dates, values)
-    else:
-        labels = [d[5:] for d in dates]
-    lo, hi, span = _norm(values)
-    H = max(3, height)
-    m = len(values)
-    # Up-sample to ~`width` columns by linear interpolation between the data
-    # points. The horizontal room is what makes it read as a *line*: a slope
-    # spread across many columns of single cells, instead of a few points
-    # stacking into tall vertical risers. Color + height track the interpolated
-    # value; the y-scale stays anchored to the real data range.
-    cols_n = max(m, width)
-    if m == 1:
-        col_vals = [values[0]] * cols_n
-    else:
-        col_vals = []
-        for x in range(cols_n):
-            t = x / (cols_n - 1) * (m - 1)
-            i = int(t)
-            frac = t - i
-            col_vals.append(values[i] if i + 1 >= m
-                            else values[i] * (1 - frac) + values[i + 1] * frac)
+    vals = [float(v) for v in values]
+    labels = [d[5:] for d in dates]
+    if len(vals) > max_width:                      # keep it on one screen
+        size = -(-len(vals) // max_width)          # ceil
+        labels = [labels[i] for i in range(0, len(labels), size)]
+        vals = [sum(vals[i:i + size]) / len(vals[i:i + size]) for i in range(0, len(vals), size)]
+    vals = _smooth(vals, max(1, len(vals) // 12))  # de-jitter without flattening
 
-    def row_of(v: float) -> int:
-        return round((v - lo) / span * (H - 1))
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1.0
+    rows = max(2, height - 1)
 
-    grid = [[_GAP] * cols_n for _ in range(H)]
-    prev = None
-    for x, v in enumerate(col_vals):
-        r = row_of(v)
-        color = _heat((v - lo) / span)
-        if prev is not None:                       # fill the (now-small) riser
-            for rr in range(min(prev, r), max(prev, r) + 1):
-                grid[rr][x] = color
-        grid[r][x] = color
-        prev = r
+    def yv(v: float) -> int:                       # value → row index, 0 = bottom
+        return round((v - lo) / span * rows)
+
+    n = len(vals)
+    grid = [[" "] * n for _ in range(rows + 1)]
+    if n == 1:
+        grid[rows - yv(vals[0])][0] = "─"
+    for x in range(n - 1):                          # one box-glyph segment per step
+        y0, y1 = yv(vals[x]), yv(vals[x + 1])
+        if y0 == y1:
+            grid[rows - y0][x] = "─"
+        else:
+            grid[rows - y1][x] = "╭" if y1 > y0 else "╰"
+            grid[rows - y0][x] = "╯" if y1 > y0 else "╮"
+            for y in range(min(y0, y1) + 1, max(y0, y1)):
+                grid[rows - y][x] = "│"
 
     axis_w = max(len(value_fmt(lo)), len(value_fmt(hi)))
-    lines = [title] if title else []
-    lines.append(f"🟦 {value_fmt(lo)} (low) → 🟥 {value_fmt(hi)} (high)")
-    for y in range(H - 1, -1, -1):
-        if y in (H - 1, H // 2, 0):
-            label = f"{value_fmt(lo + span * y / (H - 1)):>{axis_w}}"
-        else:
-            label = " " * axis_w
-        lines.append(f"{label} │{''.join(grid[y])}")
-    lines.append(f"{' ' * axis_w} └{'──' * cols_n}")
-    lines.append(f"{' ' * axis_w}  {labels[0]}{' ' * (2 * cols_n - len(labels[0]) - len(labels[-1]))}{labels[-1]}")
-    return "\n".join(lines)
+    label_rows = {0, rows // 4, rows // 2, (3 * rows) // 4, rows}
+    out = [title] if title else []
+    for yi in range(rows + 1):                      # top (yi=0) → bottom (yi=rows)
+        v_at = lo + span * (rows - yi) / rows
+        lab = f"{value_fmt(v_at):>{axis_w}}" if yi in label_rows else " " * axis_w
+        out.append(f"{lab} ┤{''.join(grid[yi])}")
+    out.append(f"{' ' * axis_w} └{'─' * n}")
+    pad = max(1, n - len(labels[0]) - len(labels[-1]))
+    out.append(f"{' ' * axis_w}  {labels[0]}{' ' * pad}{labels[-1]}")
+    return "\n".join(out)

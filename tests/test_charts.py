@@ -274,70 +274,70 @@ def test_calendar_single_day():
 
 # --- render_line --------------------------------------------------------------
 
+_BOX = "─╭╮╰╯│"
+
+
 def test_line_empty_returns_no_data():
     assert charts.render_line([], []) == charts._NO_DATA
     assert charts.render_line([], [], title="rhr").startswith("rhr\n")
 
 
-def test_line_uses_invisible_canvas_not_a_visible_grid():
-    # Background cells are the full-width (wide) space — invisible — NOT a visible
-    # ⬛ grid. This is the fix that turned the "tetris board" into a clean line.
-    out = charts.render_line(_days_from("2026-06-01", 10), [50.0 + (i % 4) for i in range(10)])
-    assert charts._GAP in out                     # invisible canvas present
-    assert "⬛" not in out                         # no visible background grid
-    assert any(s in out for s in charts._HEAT)     # the colored line itself
+def test_line_draws_a_box_glyph_line_not_emoji():
+    # A genuine thin line of 1-cell box-drawing glyphs — NOT emoji squares (which
+    # read as chunky blocks). Has a y-axis (┤) and a baseline (└).
+    out = charts.render_line(_days_from("2026-06-01", 12),
+                             [49.0 + (i % 5) for i in range(12)], value_fmt=_ints)
+    assert any(g in out for g in _BOX)             # an actual box-drawing line
+    assert "┤" in out and "└" in out               # y-axis + baseline
+    assert all(sq not in out for sq in charts._HEAT)   # mono — no emoji squares
 
 
-def _line_grid_widths(out):
-    cells = set(charts._HEAT) | {charts._GAP}
-    return [sum(ln.split("│", 1)[1].count(c) for c in cells)
-            for ln in out.splitlines() if "│" in ln]
+def _glyph_cols(out):
+    """Per grid row, the column index of its first drawn (non-space) glyph."""
+    rows = [ln.split("┤", 1)[1] for ln in out.splitlines() if "┤" in ln]
+    cols = []
+    for r in rows:
+        c = next((i for i, ch in enumerate(r) if ch != " "), None)
+        cols.append(c)
+    return rows, cols
 
 
-def test_line_interpolates_to_wide_canvas_and_aligns():
-    # The line is up-sampled to ~`width` columns so it reads as a slope across many
-    # cells, not a few points stacking into vertical risers. Every grid row is the
-    # same (wide) width, and a short window shows its daily endpoints.
-    out = charts.render_line(_days_from("2026-06-01", 10),
-                             [float(50 + i) for i in range(10)], weekly_after=35, width=48)
-    assert "06-01" in out and "06-10" in out      # daily endpoints on the x-axis
-    widths = _line_grid_widths(out)
-    assert widths and all(w == widths[0] for w in widths)   # uniform → aligned
-    assert widths[0] == 48                        # interpolated up to the target width
-
-
-def test_line_long_window_stays_compact_and_aligned():
-    # A 90-day window collapses to weekly means then interpolates onto the
-    # fixed-width canvas — bounded to `width` columns, never 90+, rows uniform.
-    out = charts.render_line(_days_from("2026-03-27", 91),
-                             [float(50 + (i % 7)) for i in range(91)], width=48)
-    widths = _line_grid_widths(out)
-    assert widths and all(w == 48 for w in widths)
-
-
-def test_weekly_means_aggregates_by_iso_week():
-    # 2026-06-01 is a Monday → two clean Mon-Sun weeks with distinct means.
-    dates = _days_from("2026-06-01", 14)
-    labels, means = charts._weekly_means(dates, [10.0] * 7 + [20.0] * 7)
-    assert means == [10.0, 20.0]
-    assert labels[0].startswith("Jun")
+def test_line_rising_series_trends_up_left_to_right():
+    # A monotonic rise: the high part of the line (top grid row) sits to the RIGHT
+    # of the low part (bottom grid row). Small series → no smoothing.
+    out = charts.render_line(_days_from("2026-06-01", 6), [49.0, 51, 52, 54, 56, 57],
+                             value_fmt=_ints)
+    rows, cols = _glyph_cols(out)
+    top, bottom = cols[0], cols[-1]
+    assert top is not None and bottom is not None
+    assert top > bottom        # the peak is reached later (further right) than the trough
 
 
 def test_line_axis_labels_are_data_min_and_max():
+    # Small series (no smoothing) → top/bottom axis labels are the exact min/max.
     out = charts.render_line(_days_from("2026-06-01", 5), [49.0, 52.0, 57.0, 51.0, 53.0],
-                             value_fmt=_ints, weekly_after=35)
-    assert "57 │" in out                           # top axis = window max
-    assert "49 │" in out                           # bottom axis = window min
+                             value_fmt=_ints)
+    assert "57 ┤" in out                           # top axis = window max
+    assert "49 ┤" in out                           # bottom axis = window min
+
+
+def test_line_long_window_fits_max_width():
+    # A 200-day window is bucket-averaged down so the baseline never exceeds
+    # max_width columns (stays on one screen).
+    out = charts.render_line(_days_from("2026-01-01", 200),
+                             [50.0 + (i % 7) for i in range(200)], max_width=96)
+    base = next(ln for ln in out.splitlines() if "└" in ln)
+    assert len(base.split("└", 1)[1]) <= 96
 
 
 def test_line_handles_negative_series():
     out = charts.render_line(_days_from("2026-06-01", 6),
                              [-30.0, -25.0, -20.0, -28.0, -15.0, -22.0],
-                             value_fmt=lambda v: f"{v:.0f}", weekly_after=35)
+                             value_fmt=lambda v: f"{v:.0f}")
     assert "-30" in out and "-15" in out
-    assert any(s in out for s in charts._HEAT)
+    assert any(g in out for g in _BOX)
 
 
 def test_line_single_point():
-    out = charts.render_line(["2026-06-03"], [52.0])
-    assert any(s in out for s in charts._HEAT)
+    out = charts.render_line(["2026-06-03"], [52.0], value_fmt=_ints)
+    assert "─" in out
