@@ -44,6 +44,13 @@ import eval_fixtures
 
 _BASELINE_PATH = cb._BASELINE_PATH
 _V2_ENV = "LOCAL_FITNESS_BRIEF_V2"
+# Invention-rate budget: V1-with-tools fetches real numbers so its rate ≈ 0; the
+# committed baseline stores fingerprints only (no prose to score retroactively),
+# so the gate is an absolute budget rather than "≤ baseline". Loose because the
+# signal is advisory (occasional false positives) — it catches gross invention,
+# not every near-miss. A scenario whose V2 briefs invent in >half their takeaways
+# fails parity.
+_INVENTION_BUDGET = 0.5
 
 
 def _median_count(fingerprints: list[dict]) -> int | None:
@@ -85,6 +92,12 @@ def parity_report(baseline_doc: dict, shadow: dict[str, dict]) -> dict:
                     "mentions_plan flipped on a non-plan scenario — ab_brief "
                     "plan-keyword noise on 'today's session' phrasing (advisory)")
 
+        # Invention-rate gate (the second half) — only when the shadow record
+        # carries it (the live path computes it via grounding.invention_rate).
+        inv = rec.get("invention_rate")
+        if inv is not None:
+            checks["invention_rate"] = inv <= _INVENTION_BUDGET
+
         parity = all(checks.values())
         overall = overall and parity
         scenarios[name] = {
@@ -93,27 +106,76 @@ def parity_report(baseline_doc: dict, shadow: dict[str, dict]) -> dict:
             "warnings": warnings,
             "baseline_median_count": b_med,
             "shadow_median_count": s_med,
+            "invention_rate": inv,
             "flakes": len(rec.get("flakes", [])),
         }
+    enforced = any("invention_rate" in s["checks"] for s in scenarios.values())
+    gate = (f"ENFORCED (invention_rate ≤ {_INVENTION_BUDGET})" if enforced
+            else "pending — run live (--run) to compute invention_rate via grounding")
     return {
         "overall_parity": overall,
-        "invention_rate_gate": "pending Phase 4 (grounding.flag) — structural parity only",
+        "invention_rate_gate": gate,
         "scenarios": scenarios,
     }
 
 
-def _run_shadow_live(scenarios: list[str], model: str, runs: int) -> dict[str, dict]:
-    """Capture V2 fingerprints by forcing the flag ON around the shared
-    live-capture harness, then restoring it."""
-    prior = os.environ.get(_V2_ENV)
-    os.environ[_V2_ENV] = "1"
-    try:
-        return cb._capture_live(scenarios, model, runs)
-    finally:
-        if prior is None:
-            os.environ.pop(_V2_ENV, None)
+def _restore_env(saved: dict[str, str | None]) -> None:
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
         else:
-            os.environ[_V2_ENV] = prior
+            os.environ[k] = v
+
+
+def _capture_v2(scenarios: list[str], model: str, runs: int) -> dict[str, dict]:
+    """Live: force V2 ON, run the generator per fixture (save=False), and record
+    structural fingerprints PLUS the grounding invention-rate per scenario.
+
+    Glue over the LLM composer (not unit-tested — a test would only assert a mock
+    replays itself); the parity verdict it feeds (parity_report) is unit-tested.
+    """
+    import asyncio
+    import tempfile
+
+    from local_fitness import db
+    from local_fitness.agent import brief_planner, briefing, grounding
+
+    keys = (_V2_ENV, "LOCAL_FITNESS_NOTES_PATH", "LOCAL_FITNESS_BRIEFINGS_DIR")
+    saved = {k: os.environ.get(k) for k in keys}
+    orig_db = db.DEFAULT_DB_PATH
+    out: dict[str, dict] = {}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            os.environ[_V2_ENV] = "1"
+            os.environ["LOCAL_FITNESS_NOTES_PATH"] = str(root / "notes.md")
+            os.environ["LOCAL_FITNESS_BRIEFINGS_DIR"] = str(root / "briefings")
+            for scenario in scenarios:
+                fixture = eval_fixtures.build_fixture_db(scenario, root / scenario / "fitness.db")
+                db.DEFAULT_DB_PATH = fixture
+                # Same context the V2 generator assembles internally (same DB +
+                # today) → invention_rate is scored against the right pool.
+                context = brief_planner.assemble_brief_context()
+                results: list[dict] = []
+                rates: list[float] = []
+                for _ in range(runs):
+                    try:
+                        brief = asyncio.run(briefing._generate(model=model, save=False))
+                        results.append(brief.model_dump())
+                        rates.append(grounding.invention_rate(brief, context))
+                    except Exception as e:  # noqa: BLE001 — one bad gen ≠ abort
+                        results.append({"error": str(e)})
+                rec = cb.aggregate_scenario(
+                    results, plan_active=scenario in cb._PLAN_ACTIVE_SCENARIOS)
+                rec["invention_rate"] = round(sum(rates) / len(rates), 3) if rates else None
+                out[scenario] = rec
+                print(f"  {scenario}: {rec['schema_valid']}/{rec['runs']} valid, "
+                      f"inv_rate={rec['invention_rate']}, "
+                      f"consistent={rec['consistency']['consistent']}")
+    finally:
+        db.DEFAULT_DB_PATH = orig_db
+        _restore_env(saved)
+    return out
 
 
 def _print_report(report: dict) -> None:
@@ -123,15 +185,18 @@ def _print_report(report: dict) -> None:
         failed = [k for k, v in rec["checks"].items() if not v]
         print(f"  {name}: {verdict}  "
               f"(baseline_count={rec['baseline_median_count']} "
-              f"shadow_count={rec['shadow_median_count']} flakes={rec['flakes']})")
+              f"shadow_count={rec['shadow_median_count']} "
+              f"inv_rate={rec['invention_rate']} flakes={rec['flakes']})")
         for f in failed:
             print(f"      FAILED CHECK: {f}")
         for w in rec["warnings"]:
             print(f"      warning: {w}")
     print(f"\n  invention-rate gate: {report['invention_rate_gate']}")
     if report["overall_parity"]:
-        print("\nOVERALL: STRUCTURAL PARITY HOLDS — safe to flip the flag once "
-              "invention-rate ≤ baseline is wired (Phase 4).")
+        enforced = "ENFORCED" in report["invention_rate_gate"]
+        extra = "" if enforced else (" Run --run to also enforce the invention-rate "
+                                     "budget before flipping the flag.")
+        print(f"\nOVERALL: PARITY HOLDS.{extra}")
     else:
         print("\nOVERALL: PARITY FAILED — keep the flag OFF; investigate the "
               "mismatched scenarios before retry.")
@@ -184,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(f"Shadow-running V2: {est['generations']} generations (save=False)...")
-    shadow = _run_shadow_live(scenarios, args.model, args.runs)
+    shadow = _capture_v2(scenarios, args.model, args.runs)
     report = parity_report(baseline_doc, shadow)
     _print_report(report)
     _maybe_write(args.out, report)

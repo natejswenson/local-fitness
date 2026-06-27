@@ -16,9 +16,12 @@ def _fp(n=3, steps=True, plan=False):
             "metrics": [], "tones": []}
 
 
-def _rec(fps, schema_invalid=0, flakes=()):
-    return {"fingerprints": list(fps), "schema_invalid": schema_invalid,
-            "flakes": list(flakes)}
+def _rec(fps, schema_invalid=0, flakes=(), invention_rate=None):
+    rec = {"fingerprints": list(fps), "schema_invalid": schema_invalid,
+           "flakes": list(flakes)}
+    if invention_rate is not None:
+        rec["invention_rate"] = invention_rate
+    return rec
 
 
 def _baseline(**scen_fps):
@@ -103,10 +106,30 @@ def test_scenario_absent_from_baseline_cannot_prove_parity():
     assert report["overall_parity"] is False
 
 
-def test_invention_rate_gate_is_flagged_pending():
+def test_invention_rate_gate_pending_without_a_rate():
+    # Structural-only records (no invention_rate) → the gate reports pending and
+    # does NOT add an invention check.
     report = sr.parity_report(_baseline(green_light=[_fp()]),
                               {"green_light": _rec([_fp()])})
-    assert "Phase 4" in report["invention_rate_gate"]
+    assert "pending" in report["invention_rate_gate"]
+    assert "invention_rate" not in report["scenarios"]["green_light"]["checks"]
+
+
+def test_invention_rate_within_budget_passes():
+    base = _baseline(green_light=[_fp(), _fp()])
+    shadow = {"green_light": _rec([_fp(), _fp()], invention_rate=0.0)}
+    report = sr.parity_report(base, shadow)
+    assert report["scenarios"]["green_light"]["checks"]["invention_rate"] is True
+    assert report["overall_parity"] is True
+    assert "ENFORCED" in report["invention_rate_gate"]
+
+
+def test_invention_rate_over_budget_breaks_parity():
+    base = _baseline(green_light=[_fp(), _fp()])
+    shadow = {"green_light": _rec([_fp(), _fp()], invention_rate=0.8)}  # > 0.5
+    report = sr.parity_report(base, shadow)
+    assert report["scenarios"]["green_light"]["checks"]["invention_rate"] is False
+    assert report["overall_parity"] is False
 
 
 # --- CLI guards -----------------------------------------------------------

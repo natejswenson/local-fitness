@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from .. import db
 from . import brief_planner
 from . import coach
+from . import grounding
 from . import prompts
 from . import tools as agent_tools
 from .briefs import (
@@ -85,6 +86,20 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 def _brief_v2_enabled() -> bool:
     return os.environ.get(_BRIEF_V2_ENV, "").strip().lower() in _TRUTHY
+
+
+def _log_grounding(brief: Brief, context) -> None:
+    """ADVISORY: log the invention-rate signal for a finished V2 brief. Runs once,
+    after validation, never alters/gates the brief, and swallows its own errors —
+    a measurement, never a corrective round-trip (the generator is single-turn)."""
+    try:
+        flags = grounding.flag(brief, context)
+        rate = grounding.invention_rate(brief, context)
+        detail = "".join(
+            f" [{f.nearest_metric}:{f.token}Δ{f.delta}]" for f in flags[:5])
+        LOG.info("brief_grounding invention_rate=%.3f flags=%d%s", rate, len(flags), detail)
+    except Exception:  # noqa: BLE001 — an advisory signal must never break the brief
+        LOG.exception("brief_grounding failed (advisory, ignored)")
 
 # Back-compat re-exports: existing callers import these from `briefing`
 # (server.py, mcp_server.py, ab_brief.py). They now live in `briefs.py`; the
@@ -167,13 +182,16 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         daily_step_goal = 10000
     coach_profile = coach.resolve_coach_profile()
     recent_briefs = _recent_briefs_summary()
+    # The V2 BriefContext, kept for the post-stream advisory grounding check.
+    # None on the V1 path (no toolless context → nothing to ground against).
+    brief_context = None
     if _brief_v2_enabled():
         # V2 (agent/code separation): the deterministic planner gathers the data,
         # evaluates triggers, and ranks candidates; ONE toolless generator
         # (no MCP server attached, max_turns=1) writes the prose from the typed
         # BriefContext. Toolless is what makes grounding sound — the model cannot
         # obtain a number outside the context it was handed.
-        context = brief_planner.assemble_brief_context(today=date.today().isoformat())
+        brief_context = brief_planner.assemble_brief_context(today=date.today().isoformat())
         options = ClaudeAgentOptions(
             system_prompt=prompts.brief_v2_system_prompt(user_name, coach_profile),
             model=model,
@@ -183,7 +201,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             include_partial_messages=True,
         )
         prompt_text = prompts.brief_v2_user_prompt(
-            context, user_name, daily_step_goal, recent_briefs, coach_profile)
+            brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
     else:
         server = agent_tools.make_server()
         options = ClaudeAgentOptions(
@@ -408,6 +426,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
             yield {"type": "error", "message": f"Brief failed validation: {e}"}
             return
+        if brief_context is not None:
+            _log_grounding(result["brief"], brief_context)
         yield {"type": "done", "brief": result["brief"].model_dump()}
         return
 
@@ -419,6 +439,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
         yield {"type": "error", "message": f"Brief failed validation: {e}"}
         return
+    if brief_context is not None:
+        _log_grounding(brief, brief_context)
     yield {"type": "done", "brief": brief.model_dump()}
 
 

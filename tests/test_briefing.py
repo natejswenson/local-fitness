@@ -576,3 +576,30 @@ def test_v2_path_streams_takeaways_and_validates(stream_env, monkeypatch):
     events = _drain(save=True)
     assert [e for e in events if e["type"] == "error"]
     assert list(stream_env.glob("*.json")) == []
+
+
+def test_v2_logs_grounding_signal_without_altering_brief(stream_env, monkeypatch, caplog):
+    """The V2 path runs the advisory grounding check post-validation: it logs an
+    invention-rate signal and leaves the brief byte-identical (never gates)."""
+    import logging
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.briefing"):
+        events = _drain(save=True)
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1
+    assert any("brief_grounding" in r.message and "invention_rate" in r.message
+               for r in caplog.records)
+    # The advisory signal must not have changed the saved brief.
+    assert done[0]["brief"]["takeaways"][0]["headline"] == _TAKEAWAY["headline"]
+
+
+def test_v1_path_does_not_run_grounding(stream_env, monkeypatch, caplog):
+    """V1 has no BriefContext → no grounding log (nothing to ground against)."""
+    import logging
+    monkeypatch.delenv("LOCAL_FITNESS_BRIEF_V2", raising=False)
+    _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.briefing"):
+        _drain(save=True)
+    assert not any("brief_grounding" in r.message for r in caplog.records)
