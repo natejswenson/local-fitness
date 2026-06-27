@@ -242,6 +242,18 @@ def test_payload_groundedvalues_present(tmp_path):
     assert ctx.step_goal == 10000
 
 
+def test_snapshot_exposes_baseline_reference_values(tmp_path):
+    # Baselines must be citable so the toolless generator quotes the REAL "52
+    # baseline" instead of deriving it (which grounding can't trace).
+    p = _build("fatigued_recovery", tmp_path)
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    by_name = {g.name: g for g in ctx.snapshot}
+    assert "rhr_baseline" in by_name
+    assert by_name["rhr_baseline"].value == 52.0        # the fixture's rhr_60day_mean
+    assert by_name["rhr_baseline"].display == "52 bpm"
+    assert "sleep_baseline" in by_name and "stress_baseline" in by_name
+
+
 def test_empty_db_does_not_raise(tmp_path, monkeypatch):
     p = tmp_path / "empty.db"
     db.init_schema(p)

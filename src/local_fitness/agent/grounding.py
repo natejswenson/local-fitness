@@ -37,6 +37,12 @@ from .schemas import Brief, BriefContext, GroundedValue
 # "120%" (and "7h 12m" as 7 then 12, "45-60" as 45 then -60).
 _NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?\s*[kK%]?")
 
+# A number immediately followed by a time-window word ("14 days", "7-day",
+# "two-week") is a window, never a metric claim — skip it. (Coach prose is full
+# of "14 days" / "60-day baseline", which would otherwise collide with metric
+# magnitudes and produce false positives.)
+_WINDOW_AFTER = re.compile(r"[\s-]*(?:day|week|month|year)s?\b", re.IGNORECASE)
+
 # Per the design: relative bands. A token within EXACT of a known number counts
 # as faithful; within NEARBY (but past EXACT) is a close-but-unequal mis-state;
 # beyond NEARBY is a different quantity and is ignored. ABS_FLOOR keeps tiny
@@ -127,7 +133,10 @@ def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
     flags: list[GroundingFlag] = []
     for i, tk in enumerate(brief.takeaways):
         text = f"{tk.headline} {tk.summary} {tk.details}"
-        for tok in _NUM_RE.findall(text):
+        for m in _NUM_RE.finditer(text):
+            if _WINDOW_AFTER.match(text, m.end()):
+                continue  # a time window ("14 days"), not a metric claim
+            tok = m.group()
             x = _parse(tok)
             if x is None:  # pragma: no cover - defensive; _NUM_RE only matches parseable tokens
                 continue

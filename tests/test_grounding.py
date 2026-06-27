@@ -54,6 +54,14 @@ def test_corrupted_metric_value_is_flagged_with_delta():
     assert g.invention_rate(b, _ctx()) == 1.0
 
 
+def test_time_window_numbers_are_not_flagged():
+    # "14 days" / "7-day" are windows, not metric claims — even though 14 sits
+    # near a metric magnitude, the trailing time-unit word suppresses the flag.
+    ctx = _ctx(snapshot=[GroundedValue(name="imm", value=15, unit="min", display="15")])
+    assert g.flag(_brief("3 runs in 14 days, down from the prior 14-day block"), ctx) == []
+    assert g.flag(_brief("your 7-day average held over 4 weeks"), ctx) == []
+
+
 def test_wild_number_is_ignored_as_a_different_quantity():
     # 90 is far from every known metric → reads as a prescription, not a
     # mis-stated metric → not flagged (contradiction-only).

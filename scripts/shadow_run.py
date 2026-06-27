@@ -92,11 +92,16 @@ def parity_report(baseline_doc: dict, shadow: dict[str, dict]) -> dict:
                     "mentions_plan flipped on a non-plan scenario — ab_brief "
                     "plan-keyword noise on 'today's session' phrasing (advisory)")
 
-        # Invention-rate gate (the second half) — only when the shadow record
-        # carries it (the live path computes it via grounding.invention_rate).
+        # Invention-rate is ADVISORY, not a hard gate — grounding is a
+        # measurement with known false positives (derived baselines, continuity
+        # recalls), so a high rate flags tokens for human review rather than
+        # failing parity. Structural parity is the automated verdict.
         inv = rec.get("invention_rate")
-        if inv is not None:
-            checks["invention_rate"] = inv <= _INVENTION_BUDGET
+        if inv is not None and inv > _INVENTION_BUDGET:
+            warnings.append(
+                f"invention_rate {inv} > {_INVENTION_BUDGET} (advisory) — review the "
+                "flagged tokens; grounding false-positives on derived baselines / "
+                "continuity numbers are expected")
 
         parity = all(checks.values())
         overall = overall and parity
@@ -109,9 +114,9 @@ def parity_report(baseline_doc: dict, shadow: dict[str, dict]) -> dict:
             "invention_rate": inv,
             "flakes": len(rec.get("flakes", [])),
         }
-    enforced = any("invention_rate" in s["checks"] for s in scenarios.values())
-    gate = (f"ENFORCED (invention_rate ≤ {_INVENTION_BUDGET})" if enforced
-            else "pending — run live (--run) to compute invention_rate via grounding")
+    scored = any(s["invention_rate"] is not None for s in scenarios.values())
+    gate = (f"advisory (reported, not gated; budget {_INVENTION_BUDGET})" if scored
+            else "not computed — run live (--run) to score invention_rate via grounding")
     return {
         "overall_parity": overall,
         "invention_rate_gate": gate,
@@ -193,10 +198,8 @@ def _print_report(report: dict) -> None:
             print(f"      warning: {w}")
     print(f"\n  invention-rate gate: {report['invention_rate_gate']}")
     if report["overall_parity"]:
-        enforced = "ENFORCED" in report["invention_rate_gate"]
-        extra = "" if enforced else (" Run --run to also enforce the invention-rate "
-                                     "budget before flipping the flag.")
-        print(f"\nOVERALL: PARITY HOLDS.{extra}")
+        print("\nOVERALL: STRUCTURAL PARITY HOLDS. Invention-rate is advisory — "
+              "review any flagged-token warnings above before flipping the flag.")
     else:
         print("\nOVERALL: PARITY FAILED — keep the flag OFF; investigate the "
               "mismatched scenarios before retry.")

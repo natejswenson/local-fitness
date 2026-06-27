@@ -23,7 +23,6 @@ from pathlib import Path
 
 from .. import db
 from . import status as status_mod
-from . import units
 from .coach import CoachProfile, resolve_coach_profile
 from .schemas import BriefContext, CandidateTakeaway, GroundedValue, TakeawayMetric, Tone
 
@@ -375,7 +374,7 @@ def _recovery_candidate(sig: Signals, profile: CoachProfile) -> CandidateTakeawa
         _gv("rhr_delta_bpm", rhr_delta, "bpm", _signed(rhr_delta)),
         _gv("rhr_days_elevated", sig.rhr_days_elevated, "count", _plain(sig.rhr_days_elevated)),
         _gv("sleep_score", sig.sleep_score_today, "none", _plain(sig.sleep_score_today)),
-        _gv("sleep_short_seconds", sleep_short, "sec", units.format_duration(sleep_short) or "0"),
+        _gv("sleep_short_seconds", sleep_short, "sec", _hm(sleep_short)),
         _gv("bb_low_nights", sig.bb_low_nights, "count", _plain(sig.bb_low_nights)),
         _gv("stress_7d_avg", sig.stress_7d_avg, "none", _plain(sig.stress_7d_avg)),
     ) if m is not None]
@@ -424,6 +423,15 @@ def _plain(v: float | None) -> str:
 
 def _commas(v: float | None) -> str:
     return f"{int(v):,}" if v is not None else ""
+
+
+def _hm(seconds: float | None) -> str:
+    """Render a duration as the coach-voice ``"7h 28m"`` (no seconds) — how sleep
+    is talked about, and so grounding's pool isn't polluted by stray seconds."""
+    if seconds is None:
+        return ""
+    h, m = divmod(int(round(seconds)) // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
 def _workout_evidence(sig: Signals) -> str:
@@ -571,7 +579,7 @@ def _plan_today(db_path: Path | None, today: str) -> dict:
 # --- snapshot / training_load / trends payload -----------------------------
 _SNAPSHOT_UNITS = {
     "rhr": ("bpm", lambda v: f"{int(v)} bpm"),
-    "sleep_seconds": ("sec", lambda v: units.format_duration(v) or _plain(v)),
+    "sleep_seconds": ("sec", _hm),
     "sleep_score": ("none", _plain),
     "avg_stress": ("none", _plain),
     "max_stress": ("none", _plain),
@@ -592,6 +600,29 @@ def _snapshot_values(metric_rows: list[dict]) -> list[GroundedValue]:
             continue
         unit, render = _SNAPSHOT_UNITS[name]
         gv = _gv(name, value, unit, render(value))
+        if gv is not None:
+            out.append(gv)
+    return out
+
+
+# 60-day baseline reference values the brief routinely cites ("+6 above your 52
+# baseline"). Exposed so the toolless generator quotes the REAL baseline instead
+# of deriving it — and so grounding can trace that citation.
+_BASELINE_RENDER = {
+    "rhr_60day_mean": ("rhr_baseline", "bpm", lambda v: f"{int(round(v))} bpm"),
+    "sleep_seconds_60day_mean": ("sleep_baseline", "sec", _hm),
+    "body_battery_max_60day_mean": ("body_battery_max_baseline", "none", _plain),
+    "stress_60day_mean": ("stress_baseline", "none", _plain),
+}
+
+
+def _baseline_values(baseline: dict | None) -> list[GroundedValue]:
+    if not baseline:
+        return []
+    out = []
+    for col, (name, unit, render) in _BASELINE_RENDER.items():
+        v = baseline.get(col)
+        gv = _gv(name, v, unit, render(v)) if v is not None else None
         if gv is not None:
             out.append(gv)
     return out
@@ -648,7 +679,7 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
 
     return BriefContext(
         date=today, user_name=user_name, candidates=candidates,
-        snapshot=_snapshot_values(metric_rows),
+        snapshot=_snapshot_values(metric_rows) + _baseline_values(baseline),
         training_load=_training_load_values(training_load),
         trends=_snapshot_values([r for r in metric_rows if r["metric"] in
                                  ("rhr", "sleep_score", "steps", "body_battery_max")]),

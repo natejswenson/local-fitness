@@ -106,30 +106,28 @@ def test_scenario_absent_from_baseline_cannot_prove_parity():
     assert report["overall_parity"] is False
 
 
-def test_invention_rate_gate_pending_without_a_rate():
-    # Structural-only records (no invention_rate) → the gate reports pending and
-    # does NOT add an invention check.
+def test_invention_rate_not_computed_without_a_rate():
+    # Structural-only records (no invention_rate) → the gate reports not-computed
+    # and never adds an invention check.
     report = sr.parity_report(_baseline(green_light=[_fp()]),
                               {"green_light": _rec([_fp()])})
-    assert "pending" in report["invention_rate_gate"]
+    assert "not computed" in report["invention_rate_gate"]
     assert "invention_rate" not in report["scenarios"]["green_light"]["checks"]
 
 
-def test_invention_rate_within_budget_passes():
+def test_invention_rate_is_advisory_not_a_parity_gate():
+    # Invention is ADVISORY: within budget → no warning; over budget → a warning,
+    # but structural parity is UNAFFECTED either way.
     base = _baseline(green_light=[_fp(), _fp()])
-    shadow = {"green_light": _rec([_fp(), _fp()], invention_rate=0.0)}
-    report = sr.parity_report(base, shadow)
-    assert report["scenarios"]["green_light"]["checks"]["invention_rate"] is True
-    assert report["overall_parity"] is True
-    assert "ENFORCED" in report["invention_rate_gate"]
+    low = sr.parity_report(base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.0)})
+    assert low["overall_parity"] is True
+    assert not low["scenarios"]["green_light"]["warnings"]
+    assert "advisory" in low["invention_rate_gate"]
 
-
-def test_invention_rate_over_budget_breaks_parity():
-    base = _baseline(green_light=[_fp(), _fp()])
-    shadow = {"green_light": _rec([_fp(), _fp()], invention_rate=0.8)}  # > 0.5
-    report = sr.parity_report(base, shadow)
-    assert report["scenarios"]["green_light"]["checks"]["invention_rate"] is False
-    assert report["overall_parity"] is False
+    high = sr.parity_report(base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.8)})
+    assert high["overall_parity"] is True       # NOT broken by high invention
+    assert "invention_rate" not in high["scenarios"]["green_light"]["checks"]
+    assert any("invention_rate 0.8" in w for w in high["scenarios"]["green_light"]["warnings"])
 
 
 # --- CLI guards -----------------------------------------------------------
