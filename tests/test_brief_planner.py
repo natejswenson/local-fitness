@@ -242,6 +242,19 @@ def test_payload_groundedvalues_present(tmp_path):
     assert ctx.step_goal == 10000
 
 
+def test_workouts_14d_carries_actual_runs_not_just_counts(tmp_path):
+    # The generator must be able to cite yesterday's concrete run (distance/TE),
+    # not just "13 runs in 14 days". fatigued_recovery seeds a 16km run yesterday.
+    p = _build("fatigued_recovery", tmp_path)
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    assert ctx.workouts_14d, "workouts_14d must carry the actual workout list"
+    latest = ctx.workouts_14d[0]
+    assert latest["date"] == (_FIXED - timedelta(days=1)).isoformat()
+    assert latest["type"] == "running"
+    assert latest["distance_mi"] == pytest.approx(9.94, abs=0.05)  # 16000 m
+    assert latest["aerobic_te"] == pytest.approx(4.2, abs=0.05)
+
+
 def test_snapshot_exposes_baseline_reference_values(tmp_path):
     # Baselines must be citable so the toolless generator quotes the REAL "52
     # baseline" instead of deriving it (which grounding can't trace).

@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .. import db
 from . import status as status_mod
+from . import units
 from .coach import CoachProfile, resolve_coach_profile
 from .schemas import BriefContext, CandidateTakeaway, GroundedValue, TakeawayMetric, Tone
 
@@ -664,6 +665,7 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
         training_load = status_mod._training_load(baseline)
         sig = _compute_signals(conn, today, baseline, step_goal,
                                plan_today.get("today") if plan_today else None, days_to_race)
+        workouts_14d = _workouts_payload(conn, today)
 
     candidates = [
         _workout_candidate(sig, profile),
@@ -683,7 +685,7 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
         training_load=_training_load_values(training_load),
         trends=_snapshot_values([r for r in metric_rows if r["metric"] in
                                  ("rhr", "sleep_score", "steps", "body_battery_max")]),
-        workouts_14d=_workouts_payload(sig),
+        workouts_14d=workouts_14d,
         anomalies=list(sig.anomalies),
         continuity=continuity,
         plan_today=plan_today,
@@ -692,14 +694,38 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
     )
 
 
-def _workouts_payload(sig: Signals) -> list[dict]:
-    """Compact 14-day run summary the generator can cite without a tool."""
-    return [{
-        "runs_14d": sig.runs_14d,
-        "runs_prior_14d": sig.runs_prior_14d,
-        "days_since_last_run": sig.days_since_last_run,
-        "recent_aerobic_te": list(sig.recent_te),
-    }]
+def _workouts_payload(conn, today: str) -> list[dict]:
+    """The ACTUAL workouts in the last 14 days (most recent first) — date, type,
+    distance, pace, duration, TE, load — so the toolless generator can cite
+    'yesterday's 6-mile long run' concretely (was query_workouts(days=14); the
+    summary counts live on the conditioning candidate's metrics)."""
+    cutoff = (date.fromisoformat(today) - timedelta(days=_LOOKBACK_DAYS)).isoformat()
+    rows = conn.execute(
+        "SELECT date, activity_type, distance_meters, duration_seconds, avg_hr, "
+        "avg_pace_sec_per_km, aerobic_te, training_load FROM activities "
+        "WHERE date >= ? AND date <= ? ORDER BY date DESC, start_time DESC",
+        (cutoff, today),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        w: dict = {"date": r["date"], "type": r["activity_type"]}
+        mi = units.to_miles(r["distance_meters"])
+        if mi is not None:
+            w["distance_mi"] = round(mi, 2)
+        pace = units.format_pace_min_per_mi(r["avg_pace_sec_per_km"])
+        if pace:
+            w["pace_min_per_mi"] = pace
+        dur = units.format_duration(r["duration_seconds"])
+        if dur:
+            w["duration"] = dur
+        if r["aerobic_te"] is not None:
+            w["aerobic_te"] = round(r["aerobic_te"], 1)
+        if r["training_load"] is not None:
+            w["training_load"] = round(r["training_load"], 1)
+        if r["avg_hr"] is not None:
+            w["avg_hr"] = r["avg_hr"]
+        out.append(w)
+    return out
 
 
 def _continuity(recent_briefs: list[dict] | None) -> list[str]:

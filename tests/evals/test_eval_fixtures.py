@@ -81,7 +81,7 @@ def test_today_is_injected(tmp_path):
 
 def test_green_light_is_a_push_day(at):
     at("green_light")
-    s = assemble_status()
+    s = assemble_status(_FIXED.isoformat())
     tl = s["training_load"]
     assert (tl["ctl"], tl["atl"], tl["tsb"]) == (14.2, 11.0, 3.2)  # positive freshness
     rhr = next(m for m in s["metrics"] if m["metric"] == "rhr")
@@ -91,7 +91,7 @@ def test_green_light_is_a_push_day(at):
 
 def test_fatigued_recovery_is_red(at):
     at("fatigued_recovery")
-    s = assemble_status()
+    s = assemble_status(_FIXED.isoformat())
     tl = s["training_load"]
     assert tl["tsb"] == -22.0 and tl["interpretation"] == "very fatigued"
     rhr = next(m for m in s["metrics"] if m["metric"] == "rhr")
@@ -105,7 +105,7 @@ def test_sliding_fitness_has_a_run_gap(at):
     with db.connect(p) as conn:
         last = conn.execute("SELECT MAX(date) FROM activities").fetchone()[0]
     assert last == (_FIXED - timedelta(days=6)).isoformat()
-    s = assemble_status()
+    s = assemble_status(_FIXED.isoformat())
     assert s["training_load"]["ctl"] == 9.1
 
 
@@ -121,7 +121,7 @@ def test_missed_steps_under_goal(at):
 
 def test_sparse_does_not_raise_and_has_no_load(at):
     at("sparse")
-    s = assemble_status()  # must not raise on the near-empty DB
+    s = assemble_status(_FIXED.isoformat())  # must not raise on the near-empty DB
     tl = s["training_load"]
     assert tl["ctl"] is None and tl["interpretation"] == "no training-load data yet"
     assert s["recent_workouts"] == []

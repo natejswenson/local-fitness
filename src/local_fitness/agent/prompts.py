@@ -644,11 +644,14 @@ def _v2_voice_mandates(user_name: str, daily_step_goal: int,
     return f"""# How each takeaway should read (voice — tone is advisory, override when the whole picture warrants)
 - **Workout** (always, usually the lead): prescribe ONE specific session
   (duration + intensity) tied to a data signal (TSB / recent volume / recovery).
+  ANCHOR it in recent training — cite the most recent run from `workouts_14d`
+  concretely when it bears on today ("after yesterday's 6.0 mi long run, TSB is …").
   Green light → positive and push; fatigued/red flags → caution, ease off;
-  fitness sliding with no recent training → critical, no hedge. If an active
-  plan is present, fold it in: name the race + days-to-race, open with adherence
-  if graded, reconcile today's prescribed session against recovery (recovery
-  takes precedence). One takeaway — never a separate "plan" card.
+  fitness sliding with no recent training → critical, no hedge. If an active plan
+  is present, fold it in and make it specific: NAME the race goal + days-to-race
+  (from `plan_today`), state today's prescribed session, open with adherence when
+  there's a graded session, and reconcile the prescription against recovery
+  (recovery takes precedence). One takeaway — never a separate "plan" card.
 - **Steps** (always): {steps_missed} Hit goal + 7-day avg holding → positive;
   hit goal but average slipping → caution.
 - **Conditioning** (when it fired): cite the actual CTL trend or run-count delta
