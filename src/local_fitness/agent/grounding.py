@@ -26,11 +26,14 @@ metric). An occasional false positive is tolerable noise in an advisory signal.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from pydantic import BaseModel
 
 from .schemas import Brief, BriefContext, GroundedValue
+
+_LOG = logging.getLogger(__name__)
 
 # Any number in prose: optional sign, digit groups with commas, optional
 # decimal, optional k/% suffix. Catches "56", "-22", "+3.2", "11,000", "9.2k",
@@ -159,3 +162,19 @@ def invention_rate(brief: Brief, context: BriefContext) -> float:
     In [0.0, 1.0]. (Brief enforces ≥1 takeaway, so the denominator is never 0.)"""
     flagged = {f.takeaway_index for f in flag(brief, context)}
     return round(len(flagged) / len(brief.takeaways), 3)
+
+
+def log_grounding(brief: Brief, context: BriefContext) -> None:
+    """ADVISORY: log the invention-rate signal for a finished brief. The single
+    shared logging wrapper every brief-composing caller that HOLDS its context can
+    run (today: the in-process composer). Runs once, after validation; never
+    alters/gates the brief; swallows its own errors — a measurement, not a
+    corrective round-trip. Emits on the ``grounding`` logger."""
+    try:
+        flags = flag(brief, context)
+        rate = invention_rate(brief, context)
+        detail = "".join(
+            f" [{f.nearest_metric}:{f.token}Δ{f.delta}]" for f in flags[:5])
+        _LOG.info("brief_grounding invention_rate=%.3f flags=%d%s", rate, len(flags), detail)
+    except Exception:  # noqa: BLE001 — an advisory signal must never break the brief
+        _LOG.exception("brief_grounding failed (advisory, ignored)")

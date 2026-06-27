@@ -91,19 +91,6 @@ def _brief_v2_enabled() -> bool:
     return os.environ.get(_BRIEF_V2_ENV, "").strip().lower() not in _FALSY
 
 
-def _log_grounding(brief: Brief, context) -> None:
-    """ADVISORY: log the invention-rate signal for a finished V2 brief. Runs once,
-    after validation, never alters/gates the brief, and swallows its own errors —
-    a measurement, never a corrective round-trip (the generator is single-turn)."""
-    try:
-        flags = grounding.flag(brief, context)
-        rate = grounding.invention_rate(brief, context)
-        detail = "".join(
-            f" [{f.nearest_metric}:{f.token}Δ{f.delta}]" for f in flags[:5])
-        LOG.info("brief_grounding invention_rate=%.3f flags=%d%s", rate, len(flags), detail)
-    except Exception:  # noqa: BLE001 — an advisory signal must never break the brief
-        LOG.exception("brief_grounding failed (advisory, ignored)")
-
 # Back-compat re-exports: existing callers import these from `briefing`
 # (server.py, mcp_server.py, ab_brief.py). They now live in `briefs.py`; the
 # composer persists THROUGH `briefs.save_brief` and reads via these helpers.
@@ -430,7 +417,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             yield {"type": "error", "message": f"Brief failed validation: {e}"}
             return
         if brief_context is not None:
-            _log_grounding(result["brief"], brief_context)
+            grounding.log_grounding(result["brief"], brief_context)
         yield {"type": "done", "brief": result["brief"].model_dump()}
         return
 
@@ -443,7 +430,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         yield {"type": "error", "message": f"Brief failed validation: {e}"}
         return
     if brief_context is not None:
-        _log_grounding(brief, brief_context)
+        grounding.log_grounding(brief, brief_context)
     yield {"type": "done", "brief": brief.model_dump()}
 
 

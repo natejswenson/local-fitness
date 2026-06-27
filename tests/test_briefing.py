@@ -589,7 +589,7 @@ def test_v2_logs_grounding_signal_without_altering_brief(stream_env, monkeypatch
     monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
     monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
     _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
-    with caplog.at_level(logging.INFO, logger="local_fitness.agent.briefing"):
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.grounding"):
         events = _drain(save=True)
     done = [e for e in events if e["type"] == "done"]
     assert len(done) == 1
@@ -604,6 +604,6 @@ def test_v1_path_does_not_run_grounding(stream_env, monkeypatch, caplog):
     import logging
     monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
     _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
-    with caplog.at_level(logging.INFO, logger="local_fitness.agent.briefing"):
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.grounding"):
         _drain(save=True)
     assert not any("brief_grounding" in r.message for r in caplog.records)

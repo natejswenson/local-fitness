@@ -65,6 +65,29 @@ def test_brief_prompt_resolves_with_instructions_and_save_brief():
     assert "save_brief" in text
 
 
+def test_brief_prompt_is_v2_context_driven():
+    """Phase 2: the MCP `brief` prompt composes from the deterministic planner's
+    BriefContext (reasoning-in-code) with a persist-via-tool tail — NOT the V1
+    `briefing_prompt()` tool-orchestration text."""
+    _seed_db()
+    server = mcp_server.build_server()
+    handler = server.request_handlers[types.GetPromptRequest]
+    req = types.GetPromptRequest(
+        method="prompts/get",
+        params=types.GetPromptRequestParams(name="brief", arguments=None),
+    )
+    text = asyncio.run(handler(req)).root.messages[0].content.text
+    # Embeds the serialized BriefContext (a candidate) + the V2 voice mandates.
+    assert '"category"' in text
+    assert "How each takeaway should read" in text
+    # Persist-via-tool tail, and the system prompt folded into the user text.
+    assert "call the `save_brief` tool" in text
+    assert "You have NO tools" in text  # brief_v2_system_prompt folded in
+    # NOT the V1 monolith's Step-1 tool orchestration.
+    assert "get_training_plan_status" not in text
+    assert "# Step 1 — gather the data" not in text
+
+
 def test_coach_prompt_still_resolves():
     _seed_db()
     server = mcp_server.build_server()

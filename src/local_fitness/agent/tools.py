@@ -1454,8 +1454,28 @@ async def save_brief(args: dict) -> dict:
     return _text({"saved": True, "date": result["date"], "path": result["path"]})
 
 
+@tool(
+    "get_brief_context",
+    "Today's pre-assembled brief context — the deterministic planner's typed "
+    "output in ONE call: priority-ordered candidate takeaways (which triggers "
+    "fired, the citable metrics with their display rendering, an advisory tone), "
+    "today's snapshot + 60-day baselines, training load (ctl/atl/tsb), the actual "
+    "14-day workout list, RHR anomalies, active-plan status + adherence + "
+    "days-to-race, and recent-brief continuity. Prefer this over orchestrating "
+    "many tools when answering 'how am I doing / what's today's read / what should "
+    "I do today' — every number is pre-computed and traceable to the data.",
+    {},
+)
+async def get_brief_context(_args: dict) -> dict:
+    # Lazy import: brief_planner -> status -> tools would cycle at import time.
+    from . import brief_planner
+
+    return _text(brief_planner.assemble_brief_context().model_dump())
+
+
 ALL_TOOLS = [
     get_today_status,
+    get_brief_context,
     get_metric,
     get_metric_trend,
     chart,

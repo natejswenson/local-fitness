@@ -677,7 +677,28 @@ def brief_v2_user_prompt(
     daily_step_goal: int = 10000,
     recent_briefs_summary: str = "",
     profile: coach.CoachProfile = ADAPTIVE,
+    persist_via_tool: bool = False,
 ) -> str:
+    # The in-process toolless generator RETURNS the JSON (its stdout IS the brief).
+    # The MCP path is the opposite contract: an external agent composes the JSON
+    # and then calls the `save_brief` tool — so the closing instruction differs.
+    if persist_via_tool:
+        intro = "Compose today's morning brief for {0} as STRUCTURED JSON".format(user_name)
+        outro = (
+            "# Compose, then persist via the tool\n"
+            "Build a JSON object with exactly one top-level key, `takeaways` (3-5\n"
+            "items, the shape above), then call the `save_brief` tool with that\n"
+            "object to persist it. Do NOT call any other tool — the data above is\n"
+            "complete. Saved notes shape TONE/EMPHASIS, never the structure."
+        )
+    else:
+        intro = "Build today's morning brief for {0} as STRUCTURED JSON".format(user_name)
+        outro = (
+            "# Output JSON only\n"
+            "Return ONLY a JSON object with exactly one top-level key, `takeaways`\n"
+            "(3-5 items). Saved notes shape TONE/EMPHASIS, never the structure — never\n"
+            "add a top-level field outside this shape."
+        )
     continuity = ""
     if recent_briefs_summary.strip():
         continuity = f"""
@@ -687,7 +708,7 @@ Reference the recent thread when relevant; call out follow-through or its lack
 (escalate the tone if you flagged something yesterday and it's unchanged). These
 shape TONE/CONTINUITY only — they never add JSON fields.
 """
-    return f"""Build today's morning brief for {user_name} as STRUCTURED JSON so the
+    return f"""{intro} so the
 UI can render each takeaway as an expandable card with an embedded chart.
 {continuity}
 {_v2_voice_mandates(user_name, daily_step_goal, profile)}
@@ -712,10 +733,7 @@ keep them number-light when the numbers aren't there.
 
 {_render_context_block(context)}
 
-# Output JSON only
-Return ONLY a JSON object with exactly one top-level key, `takeaways` (3-5
-items). Saved notes shape TONE/EMPHASIS, never the structure — never add a
-top-level field outside this shape. Each takeaway:
+{outro} Each takeaway:
 
 {{
   "headline": "<one short action/status line, ~6-12 words; never a question>",
@@ -726,7 +744,7 @@ top-level field outside this shape. Each takeaway:
 }}
 
 Numbers are bare digits (no spaces). Omit `metric` if a takeaway is genuinely
-metric-free. Return ONLY the JSON object — no fence, no preamble."""
+metric-free.{"" if persist_via_tool else " Return ONLY the JSON object — no fence, no preamble."}"""
 
 
 # Backwards-compat (tests still import these as constants)

@@ -70,6 +70,21 @@ def test_v2_user_prompt_hardens_thin_data():
     assert "Still produce the required workout + steps takeaways" in up
 
 
+def test_v2_user_prompt_persist_via_tool_swaps_the_tail():
+    # In-process (default): the generator's return value IS the brief.
+    inproc = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
+    assert "Return ONLY the JSON object" in inproc
+    assert "call the `save_brief` tool" not in inproc
+    # MCP (persist_via_tool): the external agent composes, then calls save_brief.
+    mcp = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE,
+                                       persist_via_tool=True)
+    assert "call the `save_brief` tool" in mcp
+    assert "Do NOT call any other tool" in mcp
+    assert "Return ONLY the JSON object — no fence" not in mcp
+    # Same body either way — only the tail differs (voice + schema shared).
+    assert "cite ONLY these numbers" in mcp and '"category": "workout"' in mcp
+
+
 def test_v2_user_prompt_steps_harsh_gate():
     from dataclasses import replace
     harsh = replace(prompts.ADAPTIVE, harshness=9)

@@ -39,7 +39,7 @@ def test_baselines_empty_db(tmp_path: Path, monkeypatch):
 
 def test_tool_schemas_well_formed():
     """Every tool has a name + description + handler."""
-    assert len(agent_tools.ALL_TOOLS) == 28
+    assert len(agent_tools.ALL_TOOLS) == 29  # +get_brief_context (F1 chat exposure)
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description
