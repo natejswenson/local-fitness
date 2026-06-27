@@ -1164,11 +1164,13 @@ async def delete_manual_workout(args: dict) -> dict:
 
 # --- Training plans (the first agent->SQLite write path; DRAFT-ONLY) -------
 #
-# The model can only ever create/edit DRAFT plans. `status` is never an input:
-# propose hardcodes 'draft', revise builds its update from named goal params
-# only (never status), and revise refuses a non-draft target. Activating or
-# deleting a plan is a human action via the REST layer — there is no tool for
-# it. See plans.py for the enforced write boundary.
+# Plan STRUCTURE stays draft-gated: propose/revise only touch drafts, `status`
+# is never an input, and activation/deletion is a human action via REST. But the
+# agent is the plan write path for per-day prescriptions: `update_plan_workout`
+# re-prescribes a single day on the ACTIVE plan (the web UI is view-only). It
+# edits prescription columns only — it can move a long run or swap a session, but
+# it cannot re-key, re-status, or restructure the plan. See plans.py for the
+# enforced write boundary.
 
 _PROPOSE_PLAN_SCHEMA = {
     "type": "object",
@@ -1276,6 +1278,72 @@ async def revise_training_plan(args: dict) -> dict:
     except (plans.PlanNotFoundError, plans.NotDraftError, ValueError) as e:
         return _err(str(e))
     return _text({"plan_id": plan_id, "status": "draft"})
+
+
+_UPDATE_WORKOUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "date": {"type": "string", "description": "ISO YYYY-MM-DD of the day to re-prescribe in the ACTIVE plan"},
+        "type": {"type": "string", "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"]},
+        "distance_mi": {"type": "number", "description": "target distance in miles (omit for rest / by-feel)"},
+        "pace_min_per_mi": {"type": "number", "description": "target pace in min/mi, e.g. 9.65 for 9:39/mi"},
+        "description": {"type": "string", "description": "prose prescription for the day"},
+    },
+    "required": ["date"],
+}
+
+
+@tool(
+    "update_plan_workout",
+    "Re-prescribe ONE day on the ACTIVE training plan (the agent is the plan "
+    "write path; the web UI is view-only). Pass the date plus any of "
+    "type/distance_mi/pace_min_per_mi/description — use it to move a long run, "
+    "swap days, or adjust a session. type='rest' clears distance & pace. Edits "
+    "the prescription only; it cannot re-key or restructure the plan.",
+    _UPDATE_WORKOUT_SCHEMA,
+)
+async def update_plan_workout(args: dict) -> dict:
+    date_str = args.get("date")
+    try:
+        date.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        return _err("date must be ISO YYYY-MM-DD")
+
+    fields: dict = {}
+    wtype = args.get("type")
+    if wtype is not None:
+        if wtype not in plans.WORKOUT_TYPES:
+            return _err(f"unknown type '{wtype}'", allowed=sorted(plans.WORKOUT_TYPES))
+        fields["type"] = wtype
+    if args.get("distance_mi") is not None:
+        fields["target_distance_m"] = float(args["distance_mi"]) * 1609.344
+    if args.get("pace_min_per_mi") is not None:
+        # min/mi → sec/km: minutes*60 sec/mi, then /1.609344 km-per-mile.
+        fields["target_pace_sec_per_km"] = float(args["pace_min_per_mi"]) * 60.0 / 1.609344
+    if args.get("description") is not None:
+        fields["description"] = args["description"]
+    # A rest day carries no distance/pace/duration — clear them so a stale
+    # prescription can't linger when a session becomes a rest.
+    if fields.get("type") == "rest":
+        fields["target_distance_m"] = None
+        fields["target_pace_sec_per_km"] = None
+        fields["target_duration_sec"] = None
+    if not fields:
+        return _err("nothing to update — pass type / distance_mi / pace_min_per_mi / description")
+
+    try:
+        row = plans.update_active_workout(date_str, fields)
+    except plans.NoActivePlanError:
+        return _err("no active training plan")
+    except ValueError as e:
+        return _err(str(e))
+
+    return _text(_augment_workout({
+        "date": row["date"], "type": row["type"],
+        "distance_meters": row["target_distance_m"],
+        "avg_pace_sec_per_km": row["target_pace_sec_per_km"],
+        "description": row["description"],
+    }))
 
 
 @tool(
@@ -1386,8 +1454,28 @@ async def save_brief(args: dict) -> dict:
     return _text({"saved": True, "date": result["date"], "path": result["path"]})
 
 
+@tool(
+    "get_brief_context",
+    "Today's pre-assembled brief context — the deterministic planner's typed "
+    "output in ONE call: priority-ordered candidate takeaways (which triggers "
+    "fired, the citable metrics with their display rendering, an advisory tone), "
+    "today's snapshot + 60-day baselines, training load (ctl/atl/tsb), the actual "
+    "14-day workout list, RHR anomalies, active-plan status + adherence + "
+    "days-to-race, and recent-brief continuity. Prefer this over orchestrating "
+    "many tools when answering 'how am I doing / what's today's read / what should "
+    "I do today' — every number is pre-computed and traceable to the data.",
+    {},
+)
+async def get_brief_context(_args: dict) -> dict:
+    # Lazy import: brief_planner -> status -> tools would cycle at import time.
+    from . import brief_planner
+
+    return _text(brief_planner.assemble_brief_context().model_dump())
+
+
 ALL_TOOLS = [
     get_today_status,
+    get_brief_context,
     get_metric,
     get_metric_trend,
     chart,
@@ -1411,6 +1499,7 @@ ALL_TOOLS = [
     delete_manual_workout,
     propose_training_plan,
     revise_training_plan,
+    update_plan_workout,
     get_training_plan_status,
     get_training_plan_progress,
     save_brief,
@@ -1418,7 +1507,7 @@ ALL_TOOLS = [
 
 
 def make_server():
-    return create_sdk_mcp_server(name=SERVER_NAME, version="0.5.0", tools=ALL_TOOLS)
+    return create_sdk_mcp_server(name=SERVER_NAME, version="0.6.0", tools=ALL_TOOLS)
 
 
 def allowed_tool_names() -> list[str]:

@@ -172,3 +172,68 @@ def test_progress_verdict_parity_with_status(seeded):
     progress, _ = call(tools.get_training_plan_progress, {})
     today_wk = next(w for w in progress["workouts"] if w["date"] == t.isoformat())
     assert today_wk["verdict"] == status["today"]["verdict"]
+
+
+# --- update_plan_workout (agent edits the ACTIVE plan; UI is view-only) ------
+
+def _active_plan(seeded):
+    body, _ = call(tools.propose_training_plan, _args())
+    plans.commit_plan(body["plan_id"], now="2026-06-26T00:00:00", db_path=seeded)
+    return (date.today() + timedelta(days=1)).isoformat()  # the seeded workout's date
+
+
+def test_update_plan_workout_represcribes_active_day(seeded):
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout,
+                     {"date": d, "type": "long", "distance_mi": 6, "description": "Long run 6mi"})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute("SELECT type, target_distance_m, description FROM plan_workouts WHERE date=?", (d,)).fetchone()
+    assert row["type"] == "long"
+    assert abs(row["target_distance_m"] - 6 * 1609.344) < 1   # miles → meters
+    assert row["description"] == "Long run 6mi"
+
+
+def test_update_plan_workout_rest_clears_distance(seeded):
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout, {"date": d, "type": "rest", "description": "Rest"})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute("SELECT type, target_distance_m, target_pace_sec_per_km FROM plan_workouts WHERE date=?", (d,)).fetchone()
+    assert row["type"] == "rest" and row["target_distance_m"] is None and row["target_pace_sec_per_km"] is None
+
+
+def test_update_plan_workout_no_active_plan(seeded):
+    call(tools.propose_training_plan, _args())  # a draft, not active
+    body, err = call(tools.update_plan_workout, {"date": (date.today() + timedelta(days=1)).isoformat(), "type": "long"})
+    assert err and "no active" in body["error"]
+
+
+def test_update_plan_workout_bad_date(seeded):
+    _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": "not-a-date", "type": "easy"})
+    assert err and "date" in body["error"]
+
+
+def test_update_plan_workout_bad_type(seeded):
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": d, "type": "sprint"})
+    assert err and "unknown type" in body["error"]
+
+
+def test_update_plan_workout_no_fields(seeded):
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": d})
+    assert err and "nothing to update" in body["error"]
+
+
+def test_update_plan_workout_unknown_date(seeded):
+    _active_plan(seeded)
+    far = (date.today() + timedelta(days=999)).isoformat()
+    body, err = call(tools.update_plan_workout, {"date": far, "type": "easy"})
+    assert err and "no workout" in body["error"]
+
+
+def test_update_plan_workout_is_a_write_tool_not_in_brief(seeded):
+    assert "mcp__fitness__update_plan_workout" in tools.allowed_tool_names()
+    assert "mcp__fitness__update_plan_workout" not in tools.read_only_tool_names()

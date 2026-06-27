@@ -97,3 +97,41 @@ def test_dry_run_is_default_and_free(capsys):
     out = capsys.readouterr().out
     assert "dry-run" not in out.lower() or "Re-run with --run" in out
     assert "generations" in out
+
+
+# --- Phase 0: --run is robust — failures are recorded, not crashes; save=False --
+
+def test_generate_features_records_failure_gracefully(monkeypatch):
+    import asyncio
+
+    from local_fitness.agent import briefing
+    from local_fitness.agent.schemas import Brief
+
+    seen_save = []
+
+    async def fake_generate(model, save=False):
+        seen_save.append(save)
+        if model == "bad":
+            raise ValueError("Could not parse brief JSON")
+        return Brief.model_validate(
+            {"date": "2026-06-15", "user_name": "Nate",
+             "takeaways": [{"headline": "h", "summary": "steps were low",
+                            "tone": "neutral", "details": "d"}]}
+        )
+
+    monkeypatch.setattr(briefing, "_generate", fake_generate)
+    feats = asyncio.run(ab_brief._generate_features(["good", "bad"], runs=1))
+
+    assert "error" in feats["bad#1"]                 # failure recorded, not raised
+    assert feats["good#1"]["n_takeaways"] == 1       # the good generation still parsed
+    assert seen_save == [False, False]               # eval path is always save=False
+
+    res = ab_brief.compare(feats, plan_active=False)
+    assert res["failures"] and not res["consistent"]  # flake surfaced + flagged
+    ab_brief._report(feats, res)                       # must not crash on an error entry
+
+
+def test_compare_all_failures_is_not_consistent():
+    feats = {"a#1": {"error": "boom"}, "b#1": {"error": "boom"}}
+    res = ab_brief.compare(feats, plan_active=False)
+    assert not res["consistent"] and len(res["failures"]) == 2

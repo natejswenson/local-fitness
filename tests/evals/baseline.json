@@ -1,0 +1,287 @@
+{
+  "captured_at": "2026-06-26T22:07:54",
+  "model": "claude-sonnet-4-6",
+  "note": "Structural baseline of the CURRENT (pre-shrink) brief prompt. Phase-3 shadow-run must hold structural parity vs this before the LOCAL_FITNESS_BRIEF_V2 cutover. Invention-rate is backfilled in Phase 4 (needs grounding.flag).",
+  "runs_per_scenario": 2,
+  "scenarios": {
+    "fatigued_recovery": {
+      "consistency": {
+        "consistent": true,
+        "divergences": []
+      },
+      "fingerprints": [
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "rhr",
+            "steps",
+            "tsb"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "caution",
+              1
+            ],
+            [
+              "critical",
+              2
+            ]
+          ]
+        },
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "rhr",
+            "steps",
+            "tsb"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "caution",
+              1
+            ],
+            [
+              "critical",
+              2
+            ]
+          ]
+        }
+      ],
+      "flakes": [],
+      "plan_active": false,
+      "runs": 2,
+      "schema_invalid": 0,
+      "schema_valid": 2
+    },
+    "green_light": {
+      "consistency": {
+        "consistent": true,
+        "divergences": []
+      },
+      "fingerprints": [
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "ctl",
+            "rhr",
+            "steps"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "positive",
+              3
+            ]
+          ]
+        },
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "ctl",
+            "steps",
+            "tsb"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "positive",
+              3
+            ]
+          ]
+        }
+      ],
+      "flakes": [],
+      "plan_active": false,
+      "runs": 2,
+      "schema_invalid": 0,
+      "schema_valid": 2
+    },
+    "missed_steps": {
+      "consistency": {
+        "consistent": true,
+        "divergences": []
+      },
+      "fingerprints": [
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "ctl",
+            "steps",
+            "tsb"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "critical",
+              2
+            ],
+            [
+              "positive",
+              1
+            ]
+          ]
+        }
+      ],
+      "flakes": [
+        "Could not parse brief JSON: could not parse JSON from agent response: Expecting ',' delimiter: line 1 column 739 (char 738)"
+      ],
+      "plan_active": false,
+      "runs": 2,
+      "schema_invalid": 0,
+      "schema_valid": 1
+    },
+    "sliding_fitness": {
+      "consistency": {
+        "consistent": false,
+        "divergences": [
+          "plan content present with NO active plan in: ['run#1']"
+        ]
+      },
+      "fingerprints": [
+        {
+          "has_steps": true,
+          "mentions_plan": true,
+          "metrics": [
+            "ctl",
+            "steps"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "critical",
+              3
+            ]
+          ]
+        },
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "ctl",
+            "steps"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "critical",
+              3
+            ]
+          ]
+        }
+      ],
+      "flakes": [],
+      "plan_active": false,
+      "runs": 2,
+      "schema_invalid": 0,
+      "schema_valid": 2
+    },
+    "sparse": {
+      "consistency": {
+        "consistent": true,
+        "divergences": []
+      },
+      "fingerprints": [
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "rhr",
+            "steps"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "critical",
+              2
+            ],
+            [
+              "positive",
+              1
+            ]
+          ]
+        },
+        {
+          "has_steps": true,
+          "mentions_plan": false,
+          "metrics": [
+            "rhr",
+            "steps"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "critical",
+              3
+            ]
+          ]
+        }
+      ],
+      "flakes": [],
+      "plan_active": false,
+      "runs": 2,
+      "schema_invalid": 0,
+      "schema_valid": 2
+    },
+    "taper_plan": {
+      "consistency": {
+        "consistent": true,
+        "divergences": []
+      },
+      "fingerprints": [
+        {
+          "has_steps": true,
+          "mentions_plan": true,
+          "metrics": [
+            "ctl",
+            "steps",
+            "tsb"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "critical",
+              1
+            ],
+            [
+              "positive",
+              2
+            ]
+          ]
+        },
+        {
+          "has_steps": true,
+          "mentions_plan": true,
+          "metrics": [
+            "ctl",
+            "steps",
+            "tsb"
+          ],
+          "n_takeaways": 3,
+          "tones": [
+            [
+              "caution",
+              2
+            ],
+            [
+              "positive",
+              1
+            ]
+          ]
+        }
+      ],
+      "flakes": [],
+      "plan_active": true,
+      "runs": 2,
+      "schema_invalid": 0,
+      "schema_valid": 2
+    }
+  },
+  "version": 1
+}

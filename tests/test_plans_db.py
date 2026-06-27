@@ -241,3 +241,71 @@ def test_build_plan_status_active_slices():
     assert status["last_graded"]["verdict"] == "done"
     assert len(status["last_graded"]["description"]) <= 130  # capped
     assert status["today"]["type"] == "tempo"
+
+
+# --- active-plan prescription edits (update_active_workout) ------------------
+
+def _active(dbp, workouts=None):
+    pid = plans.insert_draft(
+        _plan(),
+        workouts or [_wk(date="2026-07-01"),
+                     _wk(date="2026-07-02", type="long", target_distance_m=12000.0, description="12km long")],
+        db_path=dbp,
+    )
+    plans.commit_plan(pid, now="2026-06-15T00:00:00", db_path=dbp)
+    return pid
+
+
+def test_update_active_workout_represcribes_day(dbp):
+    _active(dbp)
+    row = plans.update_active_workout(
+        "2026-07-01", {"type": "long", "target_distance_m": 9656.0, "description": "moved up"}, db_path=dbp)
+    assert row["type"] == "long" and row["target_distance_m"] == 9656.0 and row["description"] == "moved up"
+    with db.connect(dbp) as conn:  # the other day is untouched
+        other = conn.execute("SELECT type FROM plan_workouts WHERE date='2026-07-02'").fetchone()
+    assert other["type"] == "long"
+
+
+def test_update_active_workout_rest_nulls_distance(dbp):
+    _active(dbp)
+    row = plans.update_active_workout(
+        "2026-07-01", {"type": "rest", "target_distance_m": None, "target_pace_sec_per_km": None}, db_path=dbp)
+    assert row["type"] == "rest" and row["target_distance_m"] is None and row["target_pace_sec_per_km"] is None
+
+
+def test_update_active_workout_no_active_raises(dbp):
+    plans.insert_draft(_plan(), [_wk()], db_path=dbp)  # a draft, never committed
+    with pytest.raises(plans.NoActivePlanError):
+        plans.update_active_workout("2026-07-01", {"type": "easy"}, db_path=dbp)
+
+
+def test_update_active_workout_unknown_date_raises(dbp):
+    _active(dbp)
+    with pytest.raises(ValueError, match="no workout"):
+        plans.update_active_workout("2099-01-01", {"type": "easy"}, db_path=dbp)
+
+
+def test_update_active_workout_rejects_non_editable_cols(dbp):
+    _active(dbp)
+    with pytest.raises(ValueError, match="non-editable"):
+        plans.update_active_workout("2026-07-01", {"date": "2026-07-05"}, db_path=dbp)
+    with pytest.raises(ValueError, match="non-editable"):
+        plans.update_active_workout("2026-07-01", {"plan_id": 99}, db_path=dbp)
+
+
+def test_update_active_workout_rejects_bad_type(dbp):
+    _active(dbp)
+    with pytest.raises(ValueError, match="unknown workout type"):
+        plans.update_active_workout("2026-07-01", {"type": "sprint"}, db_path=dbp)
+
+
+def test_update_active_workout_only_touches_active_plan(dbp):
+    pid_active = _active(dbp)
+    pid_draft = plans.insert_draft(_plan(title="draft"),
+                                   [_wk(date="2026-07-01", description="draft day")], db_path=dbp)
+    plans.update_active_workout("2026-07-01", {"description": "active edit"}, db_path=dbp)
+    with db.connect(dbp) as conn:
+        a = conn.execute("SELECT description FROM plan_workouts WHERE plan_id=? AND date='2026-07-01'", (pid_active,)).fetchone()
+        d = conn.execute("SELECT description FROM plan_workouts WHERE plan_id=? AND date='2026-07-01'", (pid_draft,)).fetchone()
+    assert a["description"] == "active edit"
+    assert d["description"] == "draft day"  # the draft's day is left alone

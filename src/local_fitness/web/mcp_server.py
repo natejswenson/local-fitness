@@ -24,7 +24,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .. import db
-from ..agent import briefs, coach, prompts
+from ..agent import brief_planner, briefs, coach, prompts
 from ..agent import tools as agent_tools
 from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
@@ -218,27 +218,30 @@ def _daily_step_goal() -> int:
 
 
 def _brief_prompt() -> types.GetPromptResult:
-    """The briefing instructions + today's assembled data + recent-brief
-    continuity, resolved IN-PROCESS exactly as the brief loop did, so an agent
-    can compose a schema-valid Brief and persist it via the save_brief tool.
+    """V2 brief composition for an external MCP agent: the deterministic planner
+    pre-assembles today's typed ``BriefContext`` (the same one the in-process
+    composer uses), rendered through the V2 prompt with a persist-via-tool tail —
+    the agent writes the brief from the context and calls ``save_brief``.
 
-    One source of truth: the instructions/schema come from
-    ``prompts.briefing_prompt()`` (the same text the brief composer uses), and
-    the continuity from ``briefs._recent_briefs_summary()`` — no Claude loop in
-    the import graph."""
+    Reasoning-in-code is ported here (the agent reads a pre-reasoned context
+    instead of orchestrating tools). Grounding is NOT — an externally-composed
+    brief is ungrounded by construction: this prompt handler returns text and
+    never sees the agent's composition (which lands later at the separate,
+    Claude-free ``save_brief`` tool, in a different stateless request). No Claude
+    loop enters the import graph.
+
+    The MCP prompt message has no system channel, so the V2 system prompt is
+    folded into the user text (same pattern as ``_coach_prompt``)."""
     user_name = _user_name()
+    profile = coach.resolve_coach_profile()
     recent_briefs_summary = briefs._recent_briefs_summary()
-    instructions = prompts.briefing_prompt(
-        user_name, _daily_step_goal(), recent_briefs_summary,
-        coach.resolve_coach_profile(),
+    context = brief_planner.assemble_brief_context()
+    system = prompts.brief_v2_system_prompt(user_name, profile)
+    user = prompts.brief_v2_user_prompt(
+        context, user_name, _daily_step_goal(), recent_briefs_summary, profile,
+        persist_via_tool=True,
     )
-    snapshot = _render_status(assemble_status())
-    text = (
-        f"{instructions}\n\n"
-        "Compose the brief as JSON per the schema above, then call the "
-        "`save_brief` tool with it to persist. Today's snapshot for "
-        f"grounding:\n\n{snapshot}"
-    )
+    text = f"{system}\n\n{user}"
     return types.GetPromptResult(
         description="Compose + save today's brief.",
         messages=[

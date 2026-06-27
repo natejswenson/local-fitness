@@ -82,6 +82,29 @@ def test_daily_snapshot_tool_empty_db(empty_db):
     assert "metrics" in payload
 
 
+def test_assemble_status_honors_injected_today(empty_db):
+    """An injected `today` drives both the snapshot date AND the trend-window
+    cutoff (the latent bug: _metric_rows used wall-clock date.today())."""
+    from datetime import date, timedelta
+
+    target = (date.today() - timedelta(days=400)).isoformat()
+    # A steps row only on the injected `today`; the 7-day trend window must
+    # therefore see exactly one point relative to `target`, not wall-clock.
+    with db.connect(empty_db) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)", (target, 8200)
+        )
+    status = assemble_status(today=target)
+    assert status["date"] == target
+    steps_row = next(m for m in status["metrics"] if m["metric"] == "steps")
+    assert steps_row["value"] == 8200  # the row on `target` was found in-window
+
+
+def test_assemble_status_defaults_to_today(empty_db):
+    status = assemble_status()  # no arg → wall-clock, unchanged for bare callers
+    assert status["date"] == date.today().isoformat()
+
+
 def test_assemble_status_baseline_delta_and_workout(seeded_status_db):
     status = assemble_status()
 

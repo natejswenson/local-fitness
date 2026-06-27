@@ -27,7 +27,9 @@ from claude_agent_sdk import (
 from pydantic import ValidationError
 
 from .. import db
+from . import brief_planner
 from . import coach
+from . import grounding
 from . import prompts
 from . import tools as agent_tools
 from .briefs import (
@@ -72,6 +74,22 @@ def _brief_effort() -> str:
         return _DEFAULT_BRIEF_EFFORT
     token = raw.strip().lower()
     return token if token in _VALID_EFFORTS else _DEFAULT_BRIEF_EFFORT
+
+
+# Agent/code-separation composer. ON by default (cut over 2026-06-27 after
+# shadow-run parity held on all 6 fixtures): the deterministic brief_planner
+# assembles a BriefContext and a single TOOLLESS generator writes the prose from
+# it. The V1 monolith (MCP tools, max_turns=20) is retained as the instant
+# rollback — set LOCAL_FITNESS_BRIEF_V2=0 (or false/no/off) to fall back to it.
+_BRIEF_V2_ENV = "LOCAL_FITNESS_BRIEF_V2"
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def _brief_v2_enabled() -> bool:
+    """V2 unless explicitly disabled. Default (unset) → True; only an explicit
+    0/false/no/off rolls back to the V1 tool-driven monolith."""
+    return os.environ.get(_BRIEF_V2_ENV, "").strip().lower() not in _FALSY
+
 
 # Back-compat re-exports: existing callers import these from `briefing`
 # (server.py, mcp_server.py, ab_brief.py). They now live in `briefs.py`; the
@@ -153,31 +171,55 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     except ValueError:
         daily_step_goal = 10000
     coach_profile = coach.resolve_coach_profile()
-    server = agent_tools.make_server()
-    options = ClaudeAgentOptions(
-        mcp_servers={agent_tools.SERVER_NAME: server},
-        # Brief generation is restricted to read-only tools: it must never be
-        # able to mutate data (log workouts/observations, delete notes), and
-        # excluding daily_snapshot/list_observations keeps the brief's tool set
-        # — and therefore its behavior — unchanged. Chat + the web agent keep
-        # the full set via allowed_tool_names().
-        allowed_tools=agent_tools.read_only_tool_names(),
-        system_prompt=prompts.system_prompt(user_name, coach_profile),
-        model=model,
-        permission_mode="bypassPermissions",
-        max_turns=20,
-        # Reasoning effort is the working lever on the measured dominant cost
-        # (extended thinking). See _brief_effort() / LOCAL_FITNESS_BRIEF_EFFORT.
-        effort=_brief_effort(),
-        # Required for true mid-token streaming. Without this the SDK only
-        # delivers AssistantMessage events at end-of-turn — meaning the
-        # entire JSON brief lands in a single TextBlock at the end and our
-        # partial-takeaway parser has nothing to chew on until the model
-        # is already finished. With it on we receive StreamEvent records
-        # carrying the raw Anthropic content_block_delta events, so each
-        # token chunk is visible in real time.
-        include_partial_messages=True,
-    )
+    recent_briefs = _recent_briefs_summary()
+    # The V2 BriefContext, kept for the post-stream advisory grounding check.
+    # None on the V1 path (no toolless context → nothing to ground against).
+    brief_context = None
+    if _brief_v2_enabled():
+        # V2 (agent/code separation): the deterministic planner gathers the data,
+        # evaluates triggers, and ranks candidates; ONE toolless generator
+        # (no MCP server attached, max_turns=1) writes the prose from the typed
+        # BriefContext. Toolless is what makes grounding sound — the model cannot
+        # obtain a number outside the context it was handed.
+        brief_context = brief_planner.assemble_brief_context(today=date.today().isoformat())
+        options = ClaudeAgentOptions(
+            system_prompt=prompts.brief_v2_system_prompt(user_name, coach_profile),
+            model=model,
+            permission_mode="bypassPermissions",
+            max_turns=1,
+            effort=_brief_effort(),
+            include_partial_messages=True,
+        )
+        prompt_text = prompts.brief_v2_user_prompt(
+            brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
+    else:
+        server = agent_tools.make_server()
+        options = ClaudeAgentOptions(
+            mcp_servers={agent_tools.SERVER_NAME: server},
+            # Brief generation is restricted to read-only tools: it must never be
+            # able to mutate data (log workouts/observations, delete notes), and
+            # excluding daily_snapshot/list_observations keeps the brief's tool set
+            # — and therefore its behavior — unchanged. Chat + the web agent keep
+            # the full set via allowed_tool_names().
+            allowed_tools=agent_tools.read_only_tool_names(),
+            system_prompt=prompts.system_prompt(user_name, coach_profile),
+            model=model,
+            permission_mode="bypassPermissions",
+            max_turns=20,
+            # Reasoning effort is the working lever on the measured dominant cost
+            # (extended thinking). See _brief_effort() / LOCAL_FITNESS_BRIEF_EFFORT.
+            effort=_brief_effort(),
+            # Required for true mid-token streaming. Without this the SDK only
+            # delivers AssistantMessage events at end-of-turn — meaning the
+            # entire JSON brief lands in a single TextBlock at the end and our
+            # partial-takeaway parser has nothing to chew on until the model
+            # is already finished. With it on we receive StreamEvent records
+            # carrying the raw Anthropic content_block_delta events, so each
+            # token chunk is visible in real time.
+            include_partial_messages=True,
+        )
+        prompt_text = prompts.briefing_prompt(
+            user_name, daily_step_goal, recent_briefs, coach_profile)
     chunks: list[str] = []
     # NDJSON state — yield each takeaway exactly once as it appears in the
     # accumulating model output.
@@ -199,7 +241,6 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     # whether the brief's wall-clock is thinking/generation (high output
     # tokens) vs. serial tool round-trips (many tool_use turns, modest output).
     last_usage: dict | None = None
-    recent_briefs = _recent_briefs_summary()
     if recent_briefs:
         # Count date headers (lines ending in ":" with no leading whitespace) —
         # one per past brief included.
@@ -214,7 +255,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         )
     try:
         async for message in query(
-            prompt=prompts.briefing_prompt(user_name, daily_step_goal, recent_briefs, coach_profile),
+            prompt=prompt_text,
             options=options,
         ):
             now = time.perf_counter()
@@ -375,6 +416,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
             yield {"type": "error", "message": f"Brief failed validation: {e}"}
             return
+        if brief_context is not None:
+            grounding.log_grounding(result["brief"], brief_context)
         yield {"type": "done", "brief": result["brief"].model_dump()}
         return
 
@@ -386,14 +429,20 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
         yield {"type": "error", "message": f"Brief failed validation: {e}"}
         return
+    if brief_context is not None:
+        grounding.log_grounding(brief, brief_context)
     yield {"type": "done", "brief": brief.model_dump()}
 
 
-async def _generate(model: str = DEFAULT_MODEL) -> Brief:
-    """Drain the streaming generator into a complete Brief. Used by the
-    non-streaming endpoint and the CLI brief command."""
+async def _generate(model: str = DEFAULT_MODEL, save: bool = False) -> Brief:
+    """Drain the streaming generator into a complete Brief.
+
+    Eval / read helper (the A/B harness is the only caller; ``/api/brief`` reads
+    the saved file, it does not generate). Defaults ``save=False`` so it can
+    NEVER overwrite the live ``briefings/<date>.json`` — the production save path
+    is ``generate_and_save`` (which uses ``generate_streaming(save=True)``)."""
     last_brief: dict | None = None
-    async for evt in generate_streaming(model=model):
+    async for evt in generate_streaming(model=model, save=save):
         if evt["type"] == "done":
             last_brief = evt["brief"]
         elif evt["type"] == "error":

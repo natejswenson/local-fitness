@@ -2,6 +2,95 @@
 from __future__ import annotations
 
 from local_fitness.agent import prompts
+from local_fitness.agent.schemas import (
+    BriefContext,
+    CandidateTakeaway,
+    GroundedValue,
+    TakeawayMetric,
+)
+
+
+def _ctx() -> BriefContext:
+    return BriefContext(
+        date="2026-06-26", user_name="Nate",
+        candidates=[CandidateTakeaway(
+            category="workout", fired_triggers=["workout_mandate"],
+            metrics=[GroundedValue(name="tsb", value=3.2, unit="none", display="+3.2")],
+            suggested_tone="positive",
+            chart_metric=TakeawayMetric(metric="tsb", days=30),
+            evidence="TSB +3.2 — fresh")],
+        step_goal=10000)
+
+
+def test_v2_system_prompt_is_toolless_but_keeps_voice():
+    sp = prompts.brief_v2_system_prompt("Nate", prompts.ADAPTIVE)
+    assert "mcp__fitness__" not in sp          # no tool-orchestration
+    assert "NO tools" in sp and "Use ONLY the numbers provided" in sp
+    assert prompts.ADAPTIVE.persona.split("\n", 1)[0] in sp  # voice/persona kept
+    for j in ("CTL", "ATL", "TSB"):
+        assert j in sp                          # metric translation kept
+
+
+def test_v2_system_prompt_is_shorter_than_v1():
+    # The shrink: V1's tool + chat-formatting + preferences sections are gone.
+    assert len(prompts.brief_v2_system_prompt("Nate", prompts.ADAPTIVE)) < \
+        len(prompts.system_prompt("Nate", prompts.ADAPTIVE))
+
+
+def test_v2_user_prompt_embeds_context_and_keeps_schema():
+    up = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
+    assert '"category": "workout"' in up        # the serialized candidate
+    assert "+3.2" in up                         # the citable display value
+    assert "cite ONLY these numbers" in up      # grounding instruction
+    for field in ("headline", "summary", "tone", "metric", "details"):
+        assert field in up                      # output schema kept
+    assert "takeaways" in up
+
+
+def test_v2_user_prompt_drops_v1_orchestration_and_chart_map():
+    up = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
+    assert "get_training_plan_status" not in up    # no Step-1 tool list
+    assert "get_metric_trend" not in up
+    assert 'metric: ctl, days: 60' not in up       # no chart-metric map
+
+
+def test_v2_user_prompt_continuity_section_is_conditional():
+    without = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
+    assert "Recent briefs" not in without
+    withc = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000,
+                                         "2026-06-25:\n  Easy 5k done", prompts.ADAPTIVE)
+    assert "Recent briefs" in withc and "Easy 5k done" in withc
+
+
+def test_v2_user_prompt_hardens_thin_data():
+    up = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
+    assert "When the data is thin" in up
+    assert "do NOT estimate" in up and "BY FEEL" in up
+    # Still keeps the 3-5 / mandate contract (don't drop below the count gate).
+    assert "Still produce the required workout + steps takeaways" in up
+
+
+def test_v2_user_prompt_persist_via_tool_swaps_the_tail():
+    # In-process (default): the generator's return value IS the brief.
+    inproc = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
+    assert "Return ONLY the JSON object" in inproc
+    assert "call the `save_brief` tool" not in inproc
+    # MCP (persist_via_tool): the external agent composes, then calls save_brief.
+    mcp = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE,
+                                       persist_via_tool=True)
+    assert "call the `save_brief` tool" in mcp
+    assert "Do NOT call any other tool" in mcp
+    assert "Return ONLY the JSON object — no fence" not in mcp
+    # Same body either way — only the tail differs (voice + schema shared).
+    assert "cite ONLY these numbers" in mcp and '"category": "workout"' in mcp
+
+
+def test_v2_user_prompt_steps_harsh_gate():
+    from dataclasses import replace
+    harsh = replace(prompts.ADAPTIVE, harshness=9)
+    soft = replace(prompts.ADAPTIVE, harshness=1)
+    assert "be sharp and harsh" in prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", harsh)
+    assert "never roast" in prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", soft)
 
 
 def test_system_prompt_core_contract():

@@ -126,7 +126,9 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
             continue
 
         if metric in _TREND_METRICS:
-            cutoff = (date.today() - timedelta(days=_TREND_WINDOW_DAYS)).isoformat()
+            # Window is relative to the passed `today`, NOT wall-clock — so an
+            # injected `today` (fixtures / brief_planner) is reproducible.
+            cutoff = (date.fromisoformat(today) - timedelta(days=_TREND_WINDOW_DAYS)).isoformat()
             series = [
                 r["v"] for r in conn.execute(
                     f"SELECT {metric} AS v FROM daily_metrics "
@@ -191,13 +193,17 @@ def _recent_workouts(conn, limit: int = 5) -> list[dict[str, Any]]:
     return out
 
 
-def assemble_status() -> dict[str, Any]:
+def assemble_status(today: str | None = None) -> dict[str, Any]:
     """Assemble the daily snapshot. Pure read; never raises on an empty DB.
+
+    ``today`` (ISO ``YYYY-MM-DD``) is injectable so callers (fixtures, the brief
+    planner) get reproducible output; it defaults to ``date.today()`` so existing
+    bare callers are unchanged.
 
     Returns a dict with keys: ``date``, ``metrics``, ``training_load``,
     ``recent_workouts``, ``user_notes``.
     """
-    today = date.today().isoformat()
+    today = today or date.today().isoformat()
     with db.connect() as conn:
         baseline = _baseline_row(conn, today)
         metrics = _metric_rows(conn, today, baseline)

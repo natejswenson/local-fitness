@@ -1,0 +1,52 @@
+version: "1.0"
+title: "Agent/Code Separation — brief-planner + scoped generator + evals"
+date: "2026-06-26"
+source: design
+revision: 2  # after quality-gate round 1
+
+api_surface:
+  - module: agent/brief_planner.py
+    functions:
+      - "assemble_brief_context(db_path: Path|None=None, *, today: str, notes: str|None=None, recent_briefs: list[dict]|None=None) -> BriefContext"
+      - "suggest_tone(category: str, metrics: list[GroundedValue], profile: CoachProfile) -> Tone   # advisory prior, generator may override"
+  - module: agent/schemas.py
+    types:
+      - "GroundedValue{name: str, value: float, unit: Literal['bpm','sec','min','mi','steps','count','sd','pct','none'], display: str}"
+      - "CandidateTakeaway{category, fired_triggers, metrics: list[GroundedValue], suggested_tone, chart_metric, evidence}"
+      - "BriefContext{date, user_name, candidates, snapshot: list[GroundedValue], training_load: list[GroundedValue], trends: list[GroundedValue], workouts_14d, anomalies, continuity, plan_today, step_goal, days_to_race}"
+  - module: agent/grounding.py
+    functions:
+      - "flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]   # runs once on whole brief; union-match on `display`; advisory; never raises/gates/drops/reprompts"
+      - "invention_rate(brief: Brief, context: BriefContext) -> float        # the report-only signal"
+  - module: agent/coach.py
+    types:
+      - "PROFILE_TONE_BANDS: dict[str, frozenset[Tone]]"
+
+invariants:
+  checkable:
+    - "The generator runs with no MCP server attached and max_turns=1 (toolless); BriefContext is its sole data source."
+    - "brief_planner, grounding, and schemas import no Claude Agent SDK."
+    - "The shrunk generator prompt keeps a one-line schema-fix instruction + the voice/continuity exemplars; it deletes only the tool-orchestration, chart-metric, and JSON-defense blocks."
+    - "The evals CI job always runs (no-ops to success when the CI OAuth token is absent) and is report-only / non-blocking — never a required merge check; path-filtered to agent/prompts.py|brief*.py|tests/evals/**; excludes dependabot[bot]."
+  testable:
+    - "assemble_brief_context is deterministic over its FULL input set (DB + user_notes.md + briefings/ + injected today) — identical inputs yield an identical BriefContext."
+    - "Each trigger predicate fires exactly on its documented condition (fabricated-snapshot unit tests)."
+    - "grounding.flag (union-match on `display`) flags a deliberately-corrupted metric value AND does not flag a correctly-converted miles/pace/duration token — a LOW false-positive rate on the golden fixtures (advisory signal, not a zero-FP gate)."
+    - "suggest_tone reproduces every per-mandate tone branch + the harsh-block boolean gating. (Helper band-membership is informational; final-tone band hit-rate is a report-only metric, not a gate.)"
+    - "After the prompt shrink, CI validate stays green: the retargeted score_prompt.py + tests/test_prompts.py + tests/test_briefing.py + tests/test_coach.py all pass."
+
+integration_points:
+  - "briefing.generate_streaming: assemble_brief_context -> toolless generate (max_turns=1, no MCP; streaming UX unchanged) -> grounding.flag ONCE on the assembled brief after the stream (advisory, no reprompt) -> save_brief."
+  - "Thread `today` through assemble_status/_metric_rows (they currently call date.today() internally) so fixtures are reproducible."
+  - "ci.yml gains a report-only `evals` job (dedicated CI OAuth token, count-capped, path-filtered, dependabot-excluded); the deterministic property checks run inside `validate`."
+  - "score_prompt.py + score_profiles.py are retargeted in the same phase that shrinks the prompt, or CI validate goes red."
+
+ambiguity_resolutions:
+  - "Architecture: deterministic pre-pass + ONE toolless scoped generator (not full multi-agent) — user decision."
+  - "Eval gating: REVISED from the user's 'required per-PR live gate' — quality-gate F4 found a non-deterministic required gate blocks unrelated PRs and the auth/cost premise was wrong (OAuth, no per-token billing). Live evals run per-PR REPORT-ONLY; only the deterministic property subset can gate. USER MUST CONFIRM this reversal."
+  - "Grounding runs ONCE on the complete brief (union-match on `display`), is purely advisory (an invention-rate signal — never a save-gate, never drops a takeaway, never reprompts; a single-turn generator has no corrective round-trip) — quality-gate F1, r2."
+  - "Generator is toolless (max_turns=1, no MCP); BriefContext carries the FULL data payload (snapshot, training_load, trends, 14d workouts, anomalies, plan, step goal, days-to-race, continuity) so every citable number is present and groundable — quality-gate F2, r2."
+  - "Phase-3 cutover gate is deterministic only (structural parity via extract_features + invention-rate <= baseline); the LLM-judge is deferred/nightly/report-only and is NOT in the cutover decision — quality-gate r2."
+  - "CI-scorer retarget scope includes the pytest assertions (test_prompts.py, test_briefing.py, test_coach.py), not just score_prompt.py — quality-gate F5, r2."
+  - "Phasing reordered: flakiness root-cause -> eval harness + baseline -> code extraction -> flagged cutover with shadow-run parity -> grounding. Eval net + baseline land BEFORE the live cutover — quality-gate F6."
+  - "Salience float dropped for the prompt's existing fixed priority order; LLM-judge is reactive/nightly report-only, not v1 — YAGNI."

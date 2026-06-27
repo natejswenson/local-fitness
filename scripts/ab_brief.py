@@ -17,8 +17,11 @@ Cost discipline (per the project's "quote spend + hard cap" rule):
   * `--mock <file>` runs the whole comparison on canned briefs with zero model
     calls (used by the unit test and for CI).
 
-NOTE: `--run` is currently flaky (brief-JSON parse errors); use `--mock` for the
-deterministic compare. See devlog.
+`--run` is now robust: each generation runs with `save=False` (it can NEVER
+overwrite the live `briefings/<date>.json`), and a generation that fails to parse
+is recorded as a flake (reported as a flake rate) instead of aborting the whole
+run. The residual LLM-parse non-determinism is thus *measured*, not a crash.
+Use `--mock` for a fully deterministic, zero-cost compare (CI).
 
 Usage:
   uv run python scripts/ab_brief.py                      # dry-run: show the plan + estimate
@@ -63,9 +66,19 @@ def extract_features(brief: dict) -> dict:
 
 
 def compare(features_by_label: dict[str, dict], plan_active: bool) -> dict:
-    """Flag divergences across briefs. Returns {consistent, divergences}."""
-    feats = features_by_label
+    """Flag divergences across briefs. Returns {consistent, divergences, failures}.
+
+    A generation that failed to parse is recorded as ``{"error": ...}`` upstream;
+    those are surfaced as a flake count rather than crashing the comparison.
+    """
+    failures = {lbl: f["error"] for lbl, f in features_by_label.items() if "error" in f}
+    feats = {lbl: f for lbl, f in features_by_label.items() if "error" not in f}
     divergences: list[str] = []
+    if failures:
+        divergences.append(f"generation failures (flake): {sorted(failures)}")
+    if not feats:
+        return {"consistent": False, "divergences": divergences or ["all generations failed"],
+                "failures": failures}
 
     missing_steps = [lbl for lbl, f in feats.items() if not f["has_steps"]]
     if missing_steps:
@@ -86,7 +99,7 @@ def compare(features_by_label: dict[str, dict], plan_active: bool) -> dict:
         if leaked:
             divergences.append(f"plan content present with NO active plan in: {leaked}")
 
-    return {"consistent": not divergences, "divergences": divergences}
+    return {"consistent": not divergences, "divergences": divergences, "failures": failures}
 
 
 def estimate(models: list[str], runs: int) -> dict:
@@ -104,8 +117,13 @@ async def _generate_features(models: list[str], runs: int) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for model in models:
         for r in range(runs):
-            brief = await briefing._generate(model=model)
-            out[f"{model}#{r + 1}"] = extract_features(brief.model_dump())
+            label = f"{model}#{r + 1}"
+            try:
+                # save=False: the eval path must NEVER overwrite the live brief.
+                brief = await briefing._generate(model=model, save=False)
+                out[label] = extract_features(brief.model_dump())
+            except Exception as e:  # noqa: BLE001 — one bad generation must not abort the run
+                out[label] = {"error": str(e)}
     return out
 
 
@@ -118,8 +136,13 @@ def _plan_active() -> bool:
 def _report(feats: dict[str, dict], result: dict) -> None:
     print("\n=== A/B brief feature comparison ===")
     for label, f in feats.items():
+        if "error" in f:
+            print(f"  {label}: FAILED ({f['error']})")
+            continue
         print(f"  {label}: takeaways={f['n_takeaways']} steps={f['has_steps']} "
               f"plan={f['mentions_plan']} tones={f['tones']} metrics={f['metrics']}")
+    if result.get("failures"):
+        print(f"\nflake rate: {len(result['failures'])}/{len(feats)} generations failed to parse")
     if result["consistent"]:
         print("\nCONSISTENT: no divergences across models/runs.")
     else:

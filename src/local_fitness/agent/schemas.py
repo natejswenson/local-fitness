@@ -87,3 +87,60 @@ class Brief(BaseModel):
     # when newer data has landed since the brief was written.
     generated_at: str | None = None
     takeaways: list[Takeaway] = Field(..., min_length=1, max_length=5)
+
+
+# --- Agent/code-separation: planner-produced context ----------------------
+# These types are the contract between the DETERMINISTIC pre-pass
+# (`agent/brief_planner.py`, tested) and the NON-DETERMINISTIC generator
+# (eval'd). `BriefContext` is the generator's SOLE data source — every number
+# it may legitimately cite is present here, which is also the exact set
+# `grounding.flag` (Phase 4) matches prose numbers against. See
+# docs/plans/2026-06-26-agent-code-separation-design.md.
+
+#: Unit of a GroundedValue, so grounding matches value+unit (not a bare float).
+#: ``none`` = a dimensionless count/score with no rendered unit.
+GroundedUnit = Literal[
+    "bpm", "sec", "min", "mi", "steps", "count", "sd", "pct", "none",
+]
+
+
+class GroundedValue(BaseModel):
+    """A single number the generator MAY cite, paired with its coach-ready
+    rendering. ``display`` is what grounding matches prose tokens against
+    (post unit-conversion — the DB is SI, the prose is miles/pace/``h m``)."""
+    name: str                      # e.g. "rhr", "tsb", "sleep_seconds"
+    value: float
+    unit: GroundedUnit
+    display: str                   # e.g. "56 bpm", "7h 12m", "-22"
+
+
+class CandidateTakeaway(BaseModel):
+    """One over-generated, priority-ranked takeaway candidate. The generator
+    SELECTS 3-5 of these, prioritizes the lead, and writes the prose; it may
+    override ``suggested_tone`` (an advisory prior, not a command)."""
+    category: str                  # workout | steps | conditioning | recovery | wildcard
+    fired_triggers: list[str]      # which predicate(s) fired, by name
+    metrics: list[GroundedValue]   # the citable numbers backing this candidate
+    suggested_tone: Tone           # advisory prior
+    chart_metric: TakeawayMetric | None = None
+    evidence: str                  # one-line human-readable "why it fired"
+
+
+class BriefContext(BaseModel):
+    """The complete, typed input to the toolless generator — the SOLE data
+    source. Carries the full payload the prompt used to fetch via 8 tool calls
+    so the generator never needs a tool (and grounding stays sound)."""
+    date: str
+    user_name: str
+    candidates: list[CandidateTakeaway]   # priority-ordered, over-generated
+    # Full data payload — every citable number lives in candidates[].metrics
+    # ∪ snapshot ∪ training_load ∪ trends, the exact set grounding matches.
+    snapshot: list[GroundedValue] = Field(default_factory=list)
+    training_load: list[GroundedValue] = Field(default_factory=list)
+    trends: list[GroundedValue] = Field(default_factory=list)
+    workouts_14d: list[dict] = Field(default_factory=list)
+    anomalies: list[dict] = Field(default_factory=list)
+    continuity: list[str] = Field(default_factory=list)   # last-7 brief headlines
+    plan_today: dict | None = None
+    step_goal: int | None = None
+    days_to_race: int | None = None

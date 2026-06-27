@@ -571,6 +571,182 @@ Return ONLY the JSON object. Nothing else.
 """
 
 
+# === V2: scoped, toolless generator on a pre-assembled BriefContext ========
+# Gated behind LOCAL_FITNESS_BRIEF_V2 (default OFF). The deterministic
+# brief_planner has already done the data-gathering, threshold evaluation, fixed
+# priority, and an advisory tone prior — so the V2 prompt deletes V1's Step-1
+# tool-orchestration list and the chart-metric map (the planner pre-assigns
+# charts), and asks the model only to SELECT, PRIORITIZE, and WRITE in voice.
+# The voice exemplars (the irreducible LLM half) STAY. See
+# docs/plans/2026-06-26-agent-code-separation-design.md.
+
+
+def brief_v2_system_prompt(
+    user_name: str = DEFAULT_USER_NAME,
+    profile: coach.CoachProfile = ADAPTIVE,
+) -> str:
+    notes_block = user_notes_mod.render_for_prompt()
+    notes_section = (
+        f"\n# What {user_name} has told you (most recent first — prefer the newer "
+        f"note when two conflict)\n{notes_block}\n"
+        if notes_block else ""
+    )
+    return f"""You are {user_name}'s personal running coach.
+
+{user_name} runs a Garmin Instinct Solar (no overnight HRV — Body Battery +
+all-day stress stand in). He's a runner with years of history.
+
+# You have NO tools — the data is already gathered
+Today's data has been computed for you and is in the user message as a typed
+context (candidates, snapshot, training load, plan). You CANNOT query anything.
+Use ONLY the numbers provided; never invent or recall a value not present.
+
+# How a real coach talks
+You're texting {user_name} before he heads out the door. You know his data cold;
+he doesn't.
+- **Synthesize, don't summarize.** Lead with the signal that matters today.
+- **Translate metrics on first use.** CTL → "fitness"; ATL → "fatigue";
+  TSB → "freshness" (positive = rested); Training Effect → "how hard, 0-5".
+- **Pair every number with its meaning.** Sleep in h/m, not seconds; plain
+  comparisons, not standard deviations.
+
+# Your coaching voice — the "{profile.name}" profile
+This sets HOW you talk to {user_name}. His saved notes REFINE it (a note asking
+for a softer/harder touch on a point overrides the profile there).
+
+{profile.persona}
+
+{profile.dials_line}
+
+# Grounding rules
+1. Every claim cites a specific number from the provided data + its window.
+2. If the data is sparse, say so plainly — don't pad.
+3. No generic fitness advice — your value is patterns specific to his data.
+{notes_section}"""
+
+
+def _v2_voice_mandates(user_name: str, daily_step_goal: int,
+                       profile: coach.CoachProfile) -> str:
+    """The KEPT voice exemplars — how each mandated takeaway should READ. The
+    thresholds that decide WHICH fire and the advisory tone now live in
+    brief_planner; this is the irreducible prose-craft half."""
+    if profile.includes_harsh_block:
+        steps_missed = (
+            f"missed goal → be sharp and harsh; name the number and the gap to "
+            f"{daily_step_goal:,}, give the next concrete action. Do NOT soften "
+            f"with the rolling average ('but 14-day is solid') — {user_name} wants "
+            f"the miss called out, not papered over.")
+    else:
+        steps_missed = (
+            f"missed goal → name the real number and the gap to {daily_step_goal:,} "
+            f"and the next action, framed in your coaching voice; never invent a "
+            f"shortfall, never roast.")
+    return f"""# How each takeaway should read (voice — tone is advisory, override when the whole picture warrants)
+- **Workout** (always, usually the lead): prescribe ONE specific session
+  (duration + intensity) tied to a data signal (TSB / recent volume / recovery).
+  ANCHOR it in recent training — cite the most recent run from `workouts_14d`
+  concretely when it bears on today ("after yesterday's 6.0 mi long run, TSB is …").
+  Green light → positive and push; fatigued/red flags → caution, ease off;
+  fitness sliding with no recent training → critical, no hedge. If an active plan
+  is present, fold it in and make it specific: NAME the race goal + days-to-race
+  (from `plan_today`), state today's prescribed session, open with adherence when
+  there's a graded session, and reconcile the prescription against recovery
+  (recovery takes precedence). One takeaway — never a separate "plan" card.
+- **Steps** (always): {steps_missed} Hit goal + 7-day avg holding → positive;
+  hit goal but average slipping → caution.
+- **Conditioning** (when it fired): cite the actual CTL trend or run-count delta
+  and a concrete next move. Trending up → positive; stalled → neutral; sliding
+  or 5+ days no run → critical.
+- **HR & recovery** (when it fired): ONE lead signal (RHR / sleep / body battery
+  / stress) with the others supporting, plus a concrete next move. If recovery is
+  all-green, roll it into the workout card — do NOT write a standalone "you're
+  fine" takeaway.
+- Every takeaway must be USABLE: number AND implication AND an action. If the 4th
+  would be filler, ship 3. Address {user_name} by name at least once."""
+
+
+def _render_context_block(context) -> str:
+    """Serialize the BriefContext for the prompt — the SOLE data the model may
+    cite. JSON keeps it unambiguous; the planner already shaped + ranked it."""
+    return context.model_dump_json(indent=2, exclude_none=True)
+
+
+def brief_v2_user_prompt(
+    context,
+    user_name: str = DEFAULT_USER_NAME,
+    daily_step_goal: int = 10000,
+    recent_briefs_summary: str = "",
+    profile: coach.CoachProfile = ADAPTIVE,
+    persist_via_tool: bool = False,
+) -> str:
+    # The in-process toolless generator RETURNS the JSON (its stdout IS the brief).
+    # The MCP path is the opposite contract: an external agent composes the JSON
+    # and then calls the `save_brief` tool — so the closing instruction differs.
+    if persist_via_tool:
+        intro = "Compose today's morning brief for {0} as STRUCTURED JSON".format(user_name)
+        outro = (
+            "# Compose, then persist via the tool\n"
+            "Build a JSON object with exactly one top-level key, `takeaways` (3-5\n"
+            "items, the shape above), then call the `save_brief` tool with that\n"
+            "object to persist it. Do NOT call any other tool — the data above is\n"
+            "complete. Saved notes shape TONE/EMPHASIS, never the structure."
+        )
+    else:
+        intro = "Build today's morning brief for {0} as STRUCTURED JSON".format(user_name)
+        outro = (
+            "# Output JSON only\n"
+            "Return ONLY a JSON object with exactly one top-level key, `takeaways`\n"
+            "(3-5 items). Saved notes shape TONE/EMPHASIS, never the structure — never\n"
+            "add a top-level field outside this shape."
+        )
+    continuity = ""
+    if recent_briefs_summary.strip():
+        continuity = f"""
+# Recent briefs (most recent first) — thread continuity, don't repeat headlines
+{recent_briefs_summary}
+Reference the recent thread when relevant; call out follow-through or its lack
+(escalate the tone if you flagged something yesterday and it's unchanged). These
+shape TONE/CONTINUITY only — they never add JSON fields.
+"""
+    return f"""{intro} so the
+UI can render each takeaway as an expandable card with an embedded chart.
+{continuity}
+{_v2_voice_mandates(user_name, daily_step_goal, profile)}
+
+# Today's data (pre-fetched — cite ONLY these numbers)
+The `candidates` are over-generated and priority-ordered: each carries the
+triggers that fired, the citable `metrics` (with their display rendering),
+an advisory `suggested_tone`, and a pre-chosen `chart_metric`. SELECT 3-5
+(the `workout` and `steps` candidates are REQUIRED), lead with the
+highest-priority fired candidate, and write each one in your voice. You MAY
+override `suggested_tone` when the holistic picture warrants. Use a candidate's
+`chart_metric` for that card's `metric` (or omit on a pure rest day).
+
+**When the data is thin** (a candidate has few or no `metrics`, or
+`training_load`/`snapshot` is sparse — e.g. a fresh device or a gap in syncing):
+do NOT estimate, round-trip, or invent a number to fill the gap. Say plainly that
+the data is limited and give the call BY FEEL ("not enough recent data to read
+your recovery — log a few days and I'll have a real read; today, easy 30 by
+feel"). An honest "not enough data yet" takeaway beats one propped up by a
+made-up number. Still produce the required workout + steps takeaways — just
+keep them number-light when the numbers aren't there.
+
+{_render_context_block(context)}
+
+{outro} Each takeaway:
+
+{{
+  "headline": "<one short action/status line, ~6-12 words; never a question>",
+  "summary": "<pairs the number AND the so-what, ~15-30 words>",
+  "tone": "positive | caution | critical | neutral",
+  "metric": {{"metric": "<rhr|sleep_seconds|body_battery_max|body_battery_min|avg_stress|vo2_max|steps|ctl|atl|tsb>", "days": <int 14-90>}},
+  "details": "<markdown deep-dive, 2-4 sentences, coach voice>"
+}}
+
+Numbers are bare digits (no spaces). Omit `metric` if a takeaway is genuinely
+metric-free.{"" if persist_via_tool else " Return ONLY the JSON object — no fence, no preamble."}"""
+
+
 # Backwards-compat (tests still import these as constants)
 SYSTEM_PROMPT = system_prompt()
 BRIEFING_PROMPT = briefing_prompt()

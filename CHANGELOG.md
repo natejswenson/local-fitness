@@ -4,6 +4,52 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.15.1] - 2026-06-27
+
+### Changed
+- **Brief composer cut over to V2 (agent/code separation), default ON.** The
+  daily brief now runs a deterministic `brief_planner` (triggers, fixed
+  priority, advisory tone → a typed `BriefContext`) → ONE **toolless** generator
+  (`max_turns=1`, no MCP) on the shrunk `brief_v2_*` prompt → an advisory
+  `grounding.flag` invention-rate *signal* (logged, never a gate). The V1
+  tool-driven monolith (`max_turns=20`, MCP tools) is retained as the instant
+  rollback: `LOCAL_FITNESS_BRIEF_V2=0` (or `false`/`no`/`off`). Gated on a live
+  shadow-run that held structural parity across all six golden fixtures. Only
+  the in-process composer is V2 — the `mcp__fitness__*` tools and the MCP chat
+  brief still use the V1 tool-driven path (deliberate scope choice).
+
+### Added
+- **`get_brief_context` MCP tool** — returns the planner's typed `BriefContext`
+  (candidates + snapshot + baselines + training load + 14d workouts + anomalies
+  + plan + continuity) in one call, porting reasoning-in-code to the external
+  MCP chat path. The MCP `_brief_prompt` now composes from
+  `assemble_brief_context()` through the V2 prompt instead of the V1
+  `briefing_prompt()`.
+- **`grounding.log_grounding(brief, context)`** — a shared public grounding
+  function (the advisory invention-rate signal; never gates or mutates the
+  brief), with golden eval fixtures, a committed `baseline.json`, and
+  `scripts/{capture_baseline,shadow_run}.py` for cost-capped live structural
+  parity checks.
+- **`update_plan_workout` tool — the agent is now the plan write path.** A new
+  MCP tool re-prescribes a single day on the *active* training plan (move a long
+  run, swap days, adjust a session): `update_plan_workout(date, type?,
+  distance_mi?, pace_min_per_mi?, description?)`, with `type='rest'` clearing
+  distance/pace. Backed by `plans.update_active_workout`, which whitelists
+  *prescription* columns only — it can re-prescribe a day but can never re-key,
+  re-status, or restructure the plan (the single-active invariant and draft
+  gating for plan *structure* are untouched). This makes the agent the source of
+  truth for plan edits and the web UI view-only (owner's design decision);
+  whole-plan changes still go through the draft `propose`/`revise` flow.
+
+### Fixed
+- `ab_brief --run` no longer overwrites the live `briefings/<date>.json` (the
+  eval `_generate` now defaults `save=False`) and no longer aborts the whole run
+  on a single unparseable generation — per-generation failures are recorded as a
+  flake *rate* instead of crashing. Threaded `today` through `assemble_status`,
+  fixing a latent wall-clock reproducibility bug in the trend window.
+
 ## [0.15.0] - 2026-06-26
 
 ### Added
