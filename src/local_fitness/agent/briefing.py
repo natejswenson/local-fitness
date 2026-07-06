@@ -202,6 +202,115 @@ def _reshape_gemma4_slots(raw: str) -> str:
     return json.dumps(payload)
 
 
+def _format_race_goal_time(seconds: int | None) -> str | None:
+    """``6420`` -> ``"1:47:00"``; sub-hour goals drop the leading ``0:``."""
+    if seconds is None:
+        return None
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _gemma4_plan_prompt_facts(plan_today: dict) -> str:
+    """A pre-computed plan-facts block appended to gemma4's user prompt when
+    an active training plan is present.
+
+    Manual testing (2026-07-06) showed gemma4 fabricates these facts when
+    asked to derive them itself: it reported "14 days" to race when the real
+    value was 10, and reported adherence as "on track" when the last graded
+    session's verdict was actually "missed" — the OPPOSITE. Stating them
+    here reduces (doesn't guarantee — see ``_gemma4_plan_status_appendix``
+    for the guaranteed part) the chance the model's own prose contradicts
+    the facts. Gemma4-specific: Claude's live path already derives these
+    correctly, so this never touches the shared ``brief_v2_user_prompt``.
+    """
+    goal_type = plan_today.get("goal_type") or "race"
+    goal_time = _format_race_goal_time(plan_today.get("target_time_seconds"))
+    goal_desc = f"sub-{goal_time} {goal_type}" if goal_time else goal_type
+    days = plan_today.get("days_to_race")
+    countdown = f"{days} days out" if days is not None else "date not set"
+    last_graded = plan_today.get("last_graded")
+    adherence = (
+        "no session graded yet — do not invent a status" if last_graded is None
+        else f'last graded session ("{last_graded.get("description", "?")}") '
+             f'verdict: {last_graded.get("verdict", "unknown").upper()}')
+    today = plan_today.get("today")
+    prescription = (
+        "no session scheduled today on the plan" if today is None
+        else f'plan prescribes: "{today.get("description", "?")}"')
+    return (
+        "\n# Plan facts (pre-computed — CITE THESE VERBATIM, do not "
+        "recompute days-to-race or re-derive the adherence verdict)\n"
+        f"- Goal: {goal_desc}, {countdown}\n"
+        f"- Adherence: {adherence}\n"
+        f"- Today's prescription: {prescription}\n"
+        "Reconcile the prescription against today's recovery signals "
+        "(RHR/TSB/sleep) in your OWN words — but the three facts above are "
+        "ground truth; never contradict or restate a different number/"
+        "verdict.\n"
+    )
+
+
+def _gemma4_plan_status_appendix(plan_today: dict) -> str:
+    """A deterministic plan-status sentence appended to the workout
+    takeaway's ``details`` AFTER generation — not left to the model.
+
+    Where ``_gemma4_plan_prompt_facts`` only reduces the odds of
+    contradiction, this guarantees correctness: computed in Python from the
+    same ground-truth plan data Claude already reasons over correctly, so it
+    can never invent a countdown or invert a verdict. It also reliably
+    matches ``ab_brief._PLAN_KEYWORDS`` (the shadow-run parity gate's
+    plan-mention check) since the phrasing is fixed, unlike the model's own
+    free-text prose. The model's own headline/summary/details still carry
+    the actual coaching judgment (reconciling the prescription against
+    today's recovery signals) — only the fact-retrieval step is templated.
+    """
+    goal_type = plan_today.get("goal_type") or "race"
+    goal_time = _format_race_goal_time(plan_today.get("target_time_seconds"))
+    goal_desc = f"sub-{goal_time} {goal_type}" if goal_time else goal_type
+    days = plan_today.get("days_to_race")
+    countdown = (f"{days} days to race day" if days is not None
+                 else "race day date not yet set")
+    last_graded = plan_today.get("last_graded")
+    adherence = (
+        "no session graded yet on the plan" if last_graded is None
+        else f'adherence on the last graded session '
+             f'("{last_graded.get("description", "?")}") was '
+             f'{last_graded.get("verdict", "unknown").upper()}')
+    today = plan_today.get("today")
+    prescription = (
+        "the plan calls for no session today" if today is None
+        else f'the plan calls for: "{today.get("description", "?")}"')
+    return (
+        f"\n\n**Training plan status:** {goal_desc}, {countdown}. "
+        f"{adherence[0].upper()}{adherence[1:]}. "
+        f"Today's session — {prescription}."
+    )
+
+
+def _append_gemma4_plan_status(raw: str, plan_today: dict | None) -> str:
+    """Append ``_gemma4_plan_status_appendix`` to the workout takeaway's
+    ``details`` — always ``takeaways[0]`` post-``_reshape_gemma4_slots``.
+
+    A no-op when there's no active plan, or if ``raw`` doesn't parse or has
+    no takeaways — those fall through to the normal parse-failure path.
+    """
+    if plan_today is None:
+        return raw
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    takeaways = payload.get("takeaways")
+    if not isinstance(takeaways, list) or not takeaways:
+        return raw
+    workout = takeaways[0]
+    if not isinstance(workout, dict):
+        return raw
+    workout["details"] = (workout.get("details") or "") + _gemma4_plan_status_appendix(plan_today)
+    return json.dumps(payload)
+
+
 def _assert_fixture_only_data() -> None:
     """Refuse to call a local model unless the DB *and* recent-briefs data are
     fixture-only (both resolve under the system temp dir).
@@ -388,6 +497,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         local_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
         local_prompt_text = prompts.brief_v2_user_prompt(
             brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
+        if local_model_name == "gemma4" and brief_context.plan_today is not None:
+            local_prompt_text += _gemma4_plan_prompt_facts(brief_context.plan_today)
         _assert_fixture_only_data()
         if local_model_name == "gemma4":
             local_format = _gemma4_format_schema()
@@ -402,6 +513,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         )).strip()
         if local_model_name == "gemma4":
             raw = _reshape_gemma4_slots(raw)
+            raw = _append_gemma4_plan_status(raw, brief_context.plan_today)
         async for evt in _finalize_brief(raw, user_name, save, brief_context):
             yield evt
         return

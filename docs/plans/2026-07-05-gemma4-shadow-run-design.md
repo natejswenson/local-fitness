@@ -308,13 +308,80 @@ original category-mandate gap — it's the model not attending to a specific
 input field under grammar-constrained decoding, not a structural coverage
 problem — and is not yet resolved.
 
-**Revised conclusion:** gemma4 has gone from "not ready" to "close, with one
-remaining known gap." Schema compliance, category-mandate coverage, and
-fabrication are all solved. Plan-aware workout takeaways (a minority case —
-1 of 6 fixture scenarios, and only relevant when the user has an active
-training plan) are not yet solved. Whether to keep iterating on that gap or
-accept it as a documented limitation is an open decision, not a technical
-blocker on the shadow-run infrastructure itself.
+**Revised conclusion (superseded below):** gemma4 has gone from "not ready"
+to "close, with one remaining known gap." Schema compliance, category-mandate
+coverage, and fabrication are all solved. Plan-aware workout takeaways (a
+minority case — 1 of 6 fixture scenarios, and only relevant when the user has
+an active training plan) are not yet solved. Whether to keep iterating on
+that gap or accept it as a documented limitation is an open decision, not a
+technical blocker on the shadow-run infrastructure itself.
+
+## Outcome update (2026-07-06, plan-fold gap)
+
+Investigated the `taper_plan` gap further. First attempt: add a required
+`plan_status` sub-object (race/adherence/prescription fields) to the
+workout slot, on the theory that required object keys — reliable for
+everything else this session — would force the model to derive these facts
+correctly. It did NOT: the sub-object was reliably populated (structural
+compliance held), but the CONTENT was fabricated — `days_to_race` (actually
+10) came back as "14 days" in 2 of 3 runs, and `adherence` was reported as
+"on_track"/"Good" in every run despite the real `last_graded.verdict` being
+`"missed"` — the opposite. A required field forces *something*, not
+*correctness*; this is a grounding/reasoning failure, not a structural gap,
+and schema engineering can't reach it.
+
+Fix: stop asking the model to derive these facts at all. `days_to_race`,
+the race goal/time, the last-graded verdict, and today's prescribed session
+are all already known, deterministic values in `BriefContext.plan_today` —
+the same data Claude already reasons over correctly. Two new gemma4-only
+functions in `briefing.py` (never touching the shared `brief_v2_user_prompt`
+Claude's live path also calls):
+
+- `_gemma4_plan_prompt_facts()` — appends a pre-computed facts block to the
+  PROMPT ("cite these VERBATIM"), to reduce (not guarantee) the odds the
+  model's own prose contradicts them.
+- `_gemma4_plan_status_appendix()` + `_append_gemma4_plan_status()` —
+  appends a deterministic, always-correct plan-status sentence to the
+  workout takeaway's `details` AFTER generation, independent of what the
+  model wrote. This is the load-bearing fix: correctness is guaranteed by
+  construction (computed in Python), and the fixed phrasing reliably hits
+  `ab_brief._PLAN_KEYWORDS` regardless of the model's own wording (manual
+  testing showed gemma4's free-text phrasing hit those keywords 0/4 times
+  even when factually correct).
+
+Verified before wiring in: 4/4 manual runs on `taper_plan` showed the
+appended facts were exactly correct every time (guaranteed by construction)
+and `ab_brief.extract_features(...)["mentions_plan"]` was `True` 4/4 (up
+from 0/4 with prompt-only facts). One residual, non-blocking risk observed:
+in 1 of 4 runs the model's OWN earlier prose (before the appendix)
+recommended a different session than the plan prescribed — an internal
+inconsistency within the card, though the correct fact is always present
+and stated last.
+
+**Full shadow-run gate result, post-fix (`--model ollama:gemma4 --run`, 12
+generations):** `taper_plan` no longer fails `plan_parity` — confirmed via
+the per-scenario `FAILED CHECK` list, which no longer names it. A separate,
+pre-existing flake surfaced in this run: `steps_mandate` failed for
+`taper_plan` and, notably, `fatigued_recovery` (a scenario with NO active
+plan — proof this is unrelated to the plan-fold change). Manual re-run (4
+generations × 2 scenarios) confirmed this is `temperature=0.8` sampling
+noise, not a regression: the steps takeaway is structurally present every
+time (the required-slot mechanism holds), but ~1-in-4 times the model's
+free-text phrasing doesn't happen to contain the literal substring `"step"`
+(e.g. "Focus on Consistency Over Peak Efforts") that `ab_brief`'s naive
+keyword check looks for — a heuristic-precision issue, not a missing
+takeaway. Not fixed here; flagged as a known, pre-existing, orthogonal risk
+of the `temperature=0.8` choice (see `_gemma4_format_schema`'s docstring)
+that predates this round of work.
+
+**Final conclusion:** the plan-fold gap is resolved for the failure mode
+that mattered (fabricated/inverted facts) and for the structural parity
+check (`plan_parity` passes). The category mandate, schema compliance, and
+fabrication are all solved. The one remaining known risk is `has_steps`
+keyword-matching flakiness (~25% in small samples) from temperature-driven
+phrasing variance — orthogonal to everything fixed this round, low-severity
+(the content is present, just not always using the exact expected word),
+and a reasonable place to stop this fine-tuning pass.
 
 ## Testing / verification approach
 

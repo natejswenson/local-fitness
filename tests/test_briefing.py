@@ -39,7 +39,7 @@ from local_fitness.agent import briefing
 from local_fitness.agent import briefs
 from local_fitness.agent import coach
 from local_fitness.agent import prompts
-from local_fitness.agent.schemas import Brief
+from local_fitness.agent.schemas import Brief, BriefContext
 
 
 # --- _iter_partial_takeaways: the streaming partial-JSON parser ------------
@@ -856,3 +856,142 @@ def test_local_model_client_failure_propagates(stream_env, monkeypatch):
     monkeypatch.setattr(briefing.local_model, "generate_local_completion", boom)
     with pytest.raises(RuntimeError, match="ollama call failed"):
         _drain_model("ollama:gemma4", save=False)
+
+
+# --- Plan-fold gap: gemma4 fabricates plan facts when asked to derive them
+# itself (2026-07-06 manual testing: invented a wrong days-to-race count and
+# inverted a "missed" verdict to "on track"). Fixed by pre-computing the
+# facts in Python instead of asking the model to re-derive them. ----------
+
+_PLAN_TODAY = {
+    "goal_type": "half",
+    "target_time_seconds": 6420,  # 1:47:00
+    "days_to_race": 10,
+    "last_graded": {"description": "20min tempo at half-marathon effort", "verdict": "missed"},
+    "today": {"description": "Easy 5k, conversational pace"},
+}
+
+
+def test_format_race_goal_time():
+    assert briefing._format_race_goal_time(6420) == "1:47:00"
+    assert briefing._format_race_goal_time(154) == "2:34"
+    assert briefing._format_race_goal_time(None) is None
+
+
+def test_gemma4_plan_prompt_facts_cites_precomputed_values():
+    text = briefing._gemma4_plan_prompt_facts(_PLAN_TODAY)
+    assert "CITE THESE VERBATIM" in text
+    assert "sub-1:47:00 half" in text
+    assert "10 days out" in text
+    assert "MISSED" in text
+    assert "Easy 5k, conversational pace" in text
+
+
+def test_gemma4_plan_prompt_facts_handles_no_graded_session_or_no_session_today():
+    text = briefing._gemma4_plan_prompt_facts({
+        "goal_type": "marathon", "target_time_seconds": None, "days_to_race": None,
+        "last_graded": None, "today": None,
+    })
+    assert "do not invent a status" in text
+    assert "no session scheduled today" in text
+
+
+def test_gemma4_plan_status_appendix_is_correct_and_keyword_bearing():
+    """The appendix must be both factually correct (computed, not generated)
+    and hit ab_brief._PLAN_KEYWORDS reliably, since gemma4's own free-text
+    phrasing was shown not to (2026-07-06 shadow-run: 0/4 runs matched)."""
+    text = briefing._gemma4_plan_status_appendix(_PLAN_TODAY)
+    assert "sub-1:47:00 half" in text
+    assert "10 days to race day" in text
+    assert "MISSED" in text
+    assert 'the plan calls for: "Easy 5k, conversational pace"' in text
+    # Matches ab_brief._PLAN_KEYWORDS's exact substrings.
+    lowered = text.lower()
+    for keyword in ("training plan", "race day", "adherence", "plan calls for"):
+        assert keyword in lowered, keyword
+
+
+def test_gemma4_plan_status_appendix_handles_no_active_plan_data():
+    text = briefing._gemma4_plan_status_appendix({
+        "goal_type": "marathon", "target_time_seconds": None, "days_to_race": None,
+        "last_graded": None, "today": None,
+    })
+    assert "race day date not yet set" in text
+    assert "session graded yet on the plan" in text
+    assert "the plan calls for no session today" in text
+
+
+def test_append_gemma4_plan_status_appends_to_workout_takeaway_details():
+    raw = _brief_json([_takeaway(headline="Workout"), _takeaway(headline="Steps")])
+    result = json.loads(briefing._append_gemma4_plan_status(raw, _PLAN_TODAY))
+    assert "Training plan status" in result["takeaways"][0]["details"]
+    assert "MISSED" in result["takeaways"][0]["details"]
+    # Only the workout slot (index 0) is touched.
+    assert "Training plan status" not in result["takeaways"][1]["details"]
+
+
+def test_append_gemma4_plan_status_noop_when_no_active_plan():
+    raw = _brief_json([_takeaway()])
+    assert briefing._append_gemma4_plan_status(raw, None) == raw
+
+
+def test_append_gemma4_plan_status_noop_on_malformed_or_empty_takeaways():
+    assert briefing._append_gemma4_plan_status("not json", _PLAN_TODAY) == "not json"
+    raw = json.dumps({"takeaways": []})
+    assert briefing._append_gemma4_plan_status(raw, _PLAN_TODAY) == raw
+
+
+def _fake_plan_context(plan_today: dict) -> BriefContext:
+    return BriefContext(date=date_today(), user_name="Nate", candidates=[], plan_today=plan_today)
+
+
+def test_local_model_gemma4_folds_plan_status_into_workout_takeaway(stream_env, monkeypatch):
+    """End-to-end: an active plan flows through the gemma4 dispatch branch —
+    the prompt gets the pre-computed facts block, and the final saved brief's
+    workout takeaway carries the deterministic, correct plan-status
+    appendix regardless of what the (here, faked) model returned."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.brief_planner, "assemble_brief_context",
+                        lambda **kw: _fake_plan_context(_PLAN_TODAY))
+    calls: list[str] = []
+
+    def fake_local_completion(system_prompt, user_prompt, **kw):
+        calls.append(user_prompt)
+        return _gemma4_slot_json(
+            _takeaway(headline="Workout"), _takeaway(headline="Steps"), [])
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        fake_local_completion)
+    events = _drain_model("ollama:gemma4", save=True)
+
+    assert "CITE THESE VERBATIM" in calls[0]
+    assert "10 days out" in calls[0]
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1
+    details = done[0]["brief"]["takeaways"][0]["details"]
+    assert "Training plan status" in details
+    assert "MISSED" in details
+
+
+def test_local_model_gemma4_skips_plan_facts_when_no_active_plan(stream_env, monkeypatch):
+    """No active plan → no prompt facts block, no appendix — the plan-fold
+    machinery is a no-op path, not always-on."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.brief_planner, "assemble_brief_context",
+                        lambda **kw: _fake_plan_context(None))
+    calls: list[str] = []
+
+    def fake_local_completion(system_prompt, user_prompt, **kw):
+        calls.append(user_prompt)
+        return _gemma4_slot_json(
+            _takeaway(headline="Workout"), _takeaway(headline="Steps"), [])
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        fake_local_completion)
+    events = _drain_model("ollama:gemma4", save=True)
+
+    assert "CITE THESE VERBATIM" not in calls[0]
+    done = [e for e in events if e["type"] == "done"]
+    assert "Training plan status" not in done[0]["brief"]["takeaways"][0]["details"]
