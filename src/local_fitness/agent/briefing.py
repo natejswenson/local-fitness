@@ -109,6 +109,99 @@ def _local_model_name(model: str) -> str | None:
     return None
 
 
+def _gemma4_format_schema() -> dict:
+    """A tightened variant of Brief's JSON schema for gemma4's structured-
+    output constraint.
+
+    Plain ``Brief.model_json_schema()`` fixed schema-COMPLIANCE (12/12 valid,
+    0 flakes — see docs/plans/2026-07-05-gemma4-shadow-run-design.md) but the
+    model leaned on the schema's stated defaults instead of actively choosing
+    values: every ``tone`` came back ``"neutral"`` (its default) and every
+    ``metric`` came back ``null`` (its default), even when real, varied data
+    was available. Stripping ``tone``'s default and making ``metric``
+    required-non-null (removing the null option) forces the grammar-
+    constrained decoder to commit to a concrete choice — empirically verified
+    to fix the defaulting behavior (varied, contextually-appropriate tones
+    and populated metrics on manual spot-checks before this was wired in).
+
+    The prompt also mandates exactly one "workout" and one "steps" takeaway in
+    every brief (see prompts.py's Workout/Steps mandate sections) — a
+    free-form ``takeaways`` array can't structurally enforce that. A single
+    ``contains`` constraint reliably forced one mandated category in testing,
+    but combining two via ``allOf`` was NOT reliably honored by Ollama's
+    grammar-constrained decoder (one fixture produced zero of either mandated
+    category across 3 runs despite the constraint, and still validated as
+    schema-conformant — see the design doc's Outcome section). Required
+    object keys have been reliable throughout instead (same mechanism as the
+    tone/metric fix above), so the mandate is expressed as two required
+    slots — ``workout_takeaway`` / ``steps_takeaway`` — plus a free
+    ``other_takeaways`` array for the rest (conditioning / HR-recovery /
+    wildcard). Verified 9/9 across 3 fixtures before being wired in here.
+    ``_reshape_gemma4_slots`` flattens this back into Brief's real
+    ``takeaways`` list before validation, so every other consumer of the
+    parsed payload only ever sees the one real shape.
+
+    Only affects the schema handed to Ollama for decoding guidance — the
+    real ``Brief.model_validate()`` in ``_finalize_brief`` still validates
+    against the actual (untightened) application schema, so this can never
+    make validation MORE permissive, only guide generation to commit to
+    values within the schema's existing constraints.
+    """
+    schema = Brief.model_json_schema()
+    takeaway = schema["$defs"]["Takeaway"]
+    takeaway["properties"]["tone"].pop("default", None)
+    takeaway["properties"]["metric"] = {
+        "$ref": "#/$defs/TakeawayMetric",
+        "description": takeaway["properties"]["metric"].get("description", ""),
+    }
+    takeaway["required"] = ["headline", "summary", "tone", "metric", "details"]
+
+    schema["properties"].pop("takeaways")
+    schema["properties"]["workout_takeaway"] = {"$ref": "#/$defs/Takeaway"}
+    schema["properties"]["steps_takeaway"] = {"$ref": "#/$defs/Takeaway"}
+    schema["properties"]["other_takeaways"] = {
+        "type": "array",
+        "items": {"$ref": "#/$defs/Takeaway"},
+        "minItems": 1,
+        "maxItems": 3,
+    }
+    schema["required"] = [r for r in schema["required"] if r != "takeaways"] + [
+        "workout_takeaway", "steps_takeaway", "other_takeaways",
+    ]
+    return schema
+
+
+def _reshape_gemma4_slots(raw: str) -> str:
+    """Undo ``_gemma4_format_schema``'s explicit-slot shape back into Brief's
+    real ``takeaways`` list, so ``_finalize_brief``'s parse/validate path
+    stays identical for every model.
+
+    Deliberately does NOT go through ``_extract_json`` — that helper's
+    ``_salvage_takeaways`` step would find ``other_takeaways`` (a
+    list-of-dicts-with-``headline``) and salvage it AS the takeaways list,
+    silently discarding ``workout_takeaway``/``steps_takeaway`` before this
+    function ever sees them. Ollama's structured-output mode (``format=``)
+    returns strict, unfenced JSON, so a plain decode is sufficient here; a
+    genuinely malformed response falls through unchanged and gets the full
+    fence-stripping/salvage treatment from ``_extract_json`` inside
+    ``_finalize_brief``, reporting the real parse error instead of a
+    misleading one from a half-applied salvage.
+    """
+    try:
+        payload = _LOOSE_DECODER.decode(_strip_inline_control_chars(raw.strip()))
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    if "workout_takeaway" not in payload or "steps_takeaway" not in payload:
+        return raw
+    workout = payload.pop("workout_takeaway")
+    steps = payload.pop("steps_takeaway")
+    others = payload.pop("other_takeaways", None) or []
+    payload["takeaways"] = [workout, steps, *others]
+    return json.dumps(payload)
+
+
 def _assert_fixture_only_data() -> None:
     """Refuse to call a local model unless the DB *and* recent-briefs data are
     fixture-only (both resolve under the system temp dir).
@@ -281,29 +374,34 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
                 'local models ("ollama:...") are only supported on the V2 '
                 "toolless path — refusing to give one MCP tool access")
         brief_context = brief_planner.assemble_brief_context(today=date.today().isoformat())
-        # gemma4 gets a stricter, model-specific prompt (see prompts.py's
-        # "gemma4-specific variants" section) — round 1 of the shadow-run
-        # showed it never fabricates numbers but frequently violates the
-        # JSON schema in ways redundant, concrete correction targets directly.
-        # Any other local model falls back to the shared V2 prompt.
-        if local_model_name == "gemma4":
-            local_system_prompt = prompts.brief_v2_system_prompt_gemma4(user_name, coach_profile)
-            local_prompt_text = prompts.brief_v2_user_prompt_gemma4(
-                brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
-        else:
-            local_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
-            local_prompt_text = prompts.brief_v2_user_prompt(
-                brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
+        # Round 2 finding (2026-07-05): a gemma4-specific prompt appendix
+        # (prompts.brief_v2_system_prompt_gemma4/user_prompt_gemma4) did NOT
+        # improve schema compliance, and structured output alone fixed
+        # compliance but revealed the model leaning on schema DEFAULTS
+        # (tone="neutral", metric=null) instead of actively choosing values —
+        # redundant prose instructions compete with content reasoning rather
+        # than helping it. So: base (shared, Claude-identical) prompt for
+        # narrative content, and for gemma4 specifically, a TIGHTENED format
+        # schema (no tone default, metric required-non-null) plus a higher
+        # temperature (fabrication was never the risk, so 0.4 was overly
+        # conservative) — this fixed the defaulting behavior empirically.
+        local_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
+        local_prompt_text = prompts.brief_v2_user_prompt(
+            brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
         _assert_fixture_only_data()
-        # Structured-output constraint: fixes the schema-compliance failures
-        # a stricter prompt alone couldn't (capitalized enums, bare-string
-        # `metric`, missing fields) via grammar-constrained decoding rather
-        # than relying on the model to follow written instructions.
+        if local_model_name == "gemma4":
+            local_format = _gemma4_format_schema()
+            local_temperature = 0.8
+        else:
+            local_format = Brief.model_json_schema()
+            local_temperature = 0.4
         raw = (await asyncio.to_thread(
             local_model.generate_local_completion,
             local_system_prompt, local_prompt_text, model=local_model_name,
-            format=Brief.model_json_schema(),
+            format=local_format, temperature=local_temperature,
         )).strip()
+        if local_model_name == "gemma4":
+            raw = _reshape_gemma4_slots(raw)
         async for evt in _finalize_brief(raw, user_name, save, brief_context):
             yield evt
         return

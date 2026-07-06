@@ -240,18 +240,81 @@ address the model's actual instruction-following/reasoning capacity for
 free-text semantic requirements. JSON Schema constrains structure; it has no
 mechanism to enforce "must include a steps takeaway."
 
-**Conclusion:** gemma4 (8B, Q4_K_M, this Ollama install) is not ready to
-replace or supplement Claude for the daily brief. The fabrication risk that
-originally killed local-model brief generation is resolved for this model,
-but a different, still-blocking gap (content-mandate adherence) was
-discovered and not resolved by the interventions tried. The shadow-run
-infrastructure itself (the `"ollama:"` dispatch branch, `local_model.py`,
-the fixed data-isolation bug, the gemma4-specific prompt variants, and
-structured-output support) is sound, tested, and reusable — for this model,
-for a future larger/more capable local model, or for further iteration
-(e.g., a model better at instruction-following under grammar constraints,
-or restructuring the prompt so mandated-candidate selection is itself
-part of the enforced schema rather than a free-text instruction).
+**Conclusion (superseded by the 2026-07-06 update below):** gemma4 (8B,
+Q4_K_M, this Ollama install) is not ready to replace or supplement Claude for
+the daily brief. The fabrication risk that originally killed local-model
+brief generation is resolved for this model, but a different, still-blocking
+gap (content-mandate adherence) was discovered and not resolved by the
+interventions tried. The shadow-run infrastructure itself (the `"ollama:"`
+dispatch branch, `local_model.py`, the fixed data-isolation bug, the
+gemma4-specific prompt variants, and structured-output support) is sound,
+tested, and reusable — for this model, for a future larger/more capable
+local model, or for further iteration (e.g., a model better at
+instruction-following under grammar constraints, or restructuring the
+prompt so mandated-candidate selection is itself part of the enforced
+schema rather than a free-text instruction).
+
+## Outcome update (2026-07-06, category-mandate schema restructuring)
+
+Picked back up on the "content-mandate adherence" gap above. The insight:
+the tone/metric-defaulting fix already proved that **required object keys**
+are reliably honored by Ollama's grammar-constrained decoder for gemma4,
+while the two JSON-Schema mechanisms tried for forcing category coverage in
+a free-form `takeaways` array were not:
+
+- A single `contains` constraint (force one `category: X` to appear)
+  worked reliably in isolated testing.
+- Combining two `contains` clauses via `allOf` (force BOTH `category:
+  workout` and `category: steps`) did **not** — across 3 fixtures it
+  produced inconsistent results, including one case (`fatigued_recovery`)
+  where the output satisfied *neither* mandated category across all 3 runs
+  and still validated as schema-conformant. `allOf`+`contains` composition
+  is not reliably enforced by this decoder.
+
+Fix: restructure `_gemma4_format_schema()` to drop the free-form
+`takeaways` array entirely and replace it with two **required** slots —
+`workout_takeaway`, `steps_takeaway` — plus a bounded `other_takeaways`
+array (1-3 items) for the rest. A new `_reshape_gemma4_slots()` flattens
+this back into Brief's real `takeaways` list immediately after the Ollama
+call, so `_finalize_brief` (parse/validate/save/grounding) is unchanged and
+identical across every model. Verified 9/9 (3 fixtures × 3 runs) before
+being wired into `briefing.py`.
+
+**Full shadow-run gate result (`--model ollama:gemma4 --run`, 12
+generations across all 6 fixtures):**
+
+| Scenario | Schema-valid | Parity | Invention rate |
+|---|---|---|---|
+| green_light | 2/2 | PARITY | 0.0 |
+| sliding_fitness | 2/2 | PARITY | 0.0 |
+| fatigued_recovery | 2/2 | PARITY | 0.0 |
+| missed_steps | 2/2 | PARITY | 0.167 |
+| taper_plan | 2/2 | **MISMATCH** (plan_parity) | 0.333 |
+| sparse | 2/2 | PARITY | 0.333 |
+
+12/12 schema-valid, 0 flakes, 5/6 scenarios at full structural parity — up
+from 0/6 in the prior conclusion. The workout+steps category mandate is now
+reliably satisfied.
+
+**New, narrower gap found:** `taper_plan` (the only scenario with an active
+training plan) fails `plan_parity` — the workout takeaway doesn't fold in
+the plan's prescribed session. Manual inspection of the raw output (2 runs)
+confirmed this is a real content miss, not an `ab_brief` keyword-heuristic
+false negative: the takeaways were generic training advice ("Recovery
+Focus," "Tempo Work: Maintain Pace") with no reference to the specific
+prescribed workout, pace, or plan adherence status carried in
+`BriefContext.plan_today`. This is a different failure mode than the
+original category-mandate gap — it's the model not attending to a specific
+input field under grammar-constrained decoding, not a structural coverage
+problem — and is not yet resolved.
+
+**Revised conclusion:** gemma4 has gone from "not ready" to "close, with one
+remaining known gap." Schema compliance, category-mandate coverage, and
+fabrication are all solved. Plan-aware workout takeaways (a minority case —
+1 of 6 fixture scenarios, and only relevant when the user has an active
+training plan) are not yet solved. Whether to keep iterating on that gap or
+accept it as a documented limitation is an open decision, not a technical
+blocker on the shadow-run infrastructure itself.
 
 ## Testing / verification approach
 
