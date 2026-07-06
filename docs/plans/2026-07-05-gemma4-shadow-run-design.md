@@ -214,6 +214,45 @@ Ollama + gemma4 install:
 6. Only then decide, as an explicitly separate future step, whether any of
    this warrants touching the live production path.
 
+## Outcome (2026-07-05, post-implementation)
+
+Ran the full shadow-run gate against gemma4 across four configurations,
+each a real, measured data point:
+
+| Configuration | Schema compliance | Content quality |
+|---|---|---|
+| Baseline V2 prompt (shared with Claude) | ~5/12 valid, frequent crashes (capitalized enums, bare-string `metric`, missing fields) | invention_rate=0.0 where valid |
+| + gemma4-specific stricter prompt (`brief_v2_*_prompt_gemma4`) | Still ~5/12 valid — different crash shapes, no net improvement | invention_rate=0.0 where valid |
+| + Ollama structured output (`format=Brief.model_json_schema()`) | **12/12 valid, 0 flakes** — fully solved | Degraded: missing mandated workout/steps takeaways, generic headlines, `tone` defaulting to "neutral", `metric` defaulting to `null` |
+| + `think=True` on top of structured output | N/A | Worse — takeaway count dropped further, required fields empty, ~20x slower (17-20s vs sub-second per call) |
+
+**invention_rate was 0.0 in every configuration where a brief was schema-valid.**
+The original 2026-06-16 failure mode ("small models fabricate numbers") does
+not reproduce with gemma4 — that specific concern is empirically resolved for
+this model.
+
+**What remains unresolved: content-mandate compliance.** The prompt requires
+specific mandated takeaways (workout, steps) and asks the model to actively
+select a meaningful tone and cite a metric. None of the four levers tried
+here — all formatting/decoding-side interventions (prompt wording, grammar-
+constrained decoding, reasoning budget) — reached this, because none of them
+address the model's actual instruction-following/reasoning capacity for
+free-text semantic requirements. JSON Schema constrains structure; it has no
+mechanism to enforce "must include a steps takeaway."
+
+**Conclusion:** gemma4 (8B, Q4_K_M, this Ollama install) is not ready to
+replace or supplement Claude for the daily brief. The fabrication risk that
+originally killed local-model brief generation is resolved for this model,
+but a different, still-blocking gap (content-mandate adherence) was
+discovered and not resolved by the interventions tried. The shadow-run
+infrastructure itself (the `"ollama:"` dispatch branch, `local_model.py`,
+the fixed data-isolation bug, the gemma4-specific prompt variants, and
+structured-output support) is sound, tested, and reusable — for this model,
+for a future larger/more capable local model, or for further iteration
+(e.g., a model better at instruction-following under grammar constraints,
+or restructuring the prompt so mandated-candidate selection is itself
+part of the enforced schema rather than a free-text instruction).
+
 ## Testing / verification approach
 
 Follows this codebase's existing pattern: `parity_report()` and

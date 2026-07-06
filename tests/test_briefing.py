@@ -37,6 +37,7 @@ from claude_agent_sdk import (
 from local_fitness import db
 from local_fitness.agent import briefing
 from local_fitness.agent import briefs
+from local_fitness.agent.schemas import Brief
 
 
 # --- _iter_partial_takeaways: the streaming partial-JSON parser ------------
@@ -607,3 +608,134 @@ def test_v1_path_does_not_run_grounding(stream_env, monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="local_fitness.agent.grounding"):
         _drain(save=True)
     assert not any("brief_grounding" in r.message for r in caplog.records)
+
+
+# --- gemma4/Ollama shadow-run dispatch --------------------------------------
+# See docs/plans/2026-07-05-gemma4-shadow-run-design.md. These test the new
+# "ollama:"-prefixed model dispatch in isolation from any real network call:
+# briefing.local_model.generate_local_completion is monkeypatched to a plain
+# (sync) fake, matching how asyncio.to_thread calls it in production.
+
+def _drain_model(model: str, save: bool = False) -> list[dict]:
+    async def go():
+        return [evt async for evt in briefing.generate_streaming(model=model, save=save)]
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("ollama:gemma4", "gemma4"),
+    ("ollama:llama3.1:8b", "llama3.1:8b"),
+    ("claude-sonnet-4-6", None),
+    ("gemma4", None),  # no prefix -> not treated as local, even if the name matches
+])
+def test_local_model_name_prefix_parsing(model, expected):
+    assert briefing._local_model_name(model) == expected
+
+
+def test_assert_fixture_only_data_passes_under_tmp_path(stream_env):
+    # stream_env's fixture already points db.DEFAULT_DB_PATH and
+    # briefs.DEFAULT_BRIEFINGS_DIR at pytest's tmp_path, which is guaranteed
+    # to live under the system temp root.
+    briefing._assert_fixture_only_data()  # must not raise
+
+
+def test_assert_fixture_only_data_raises_for_real_db_path(monkeypatch, stream_env):
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", db._PROJECT_ROOT / "data" / "fitness.db")
+    with pytest.raises(RuntimeError, match="db.DEFAULT_DB_PATH"):
+        briefing._assert_fixture_only_data()
+
+
+def test_assert_fixture_only_data_raises_for_real_briefings_dir(monkeypatch, stream_env):
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", db._PROJECT_ROOT / "briefings")
+    with pytest.raises(RuntimeError, match="briefs.DEFAULT_BRIEFINGS_DIR"):
+        briefing._assert_fixture_only_data()
+
+
+def test_local_model_refused_under_v1(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
+    with pytest.raises(ValueError, match="toolless path"):
+        _drain_model("ollama:gemma4", save=False)
+
+
+def test_local_model_routes_to_local_client_and_saves(stream_env, monkeypatch):
+    """V2 + an 'ollama:' model calls local_model.generate_local_completion
+    (not claude_agent_sdk.query) and flows through the same parse/validate/
+    save/grounding tail as the Claude path."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    calls: list[dict] = []
+
+    def fake_local_completion(system_prompt, user_prompt, *, model, format=None, **kw):  # noqa: A002
+        calls.append({"system": system_prompt, "user": user_prompt, "model": model,
+                      "format": format})
+        return _brief_json([_takeaway()])
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        fake_local_completion)
+    events = _drain_model("ollama:gemma4", save=True)
+
+    assert len(calls) == 1 and calls[0]["model"] == "gemma4"
+    # Same prompt-construction call the Claude V2 path uses — parity by
+    # construction, not by discipline.
+    assert "cite ONLY these numbers" in calls[0]["user"]
+    # Structured-output constraint: forces schema-conformant JSON via
+    # grammar-constrained decoding rather than relying on instructions alone.
+    assert calls[0]["format"] == Brief.model_json_schema()
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1 and not [e for e in events if e["type"] == "error"]
+    assert (stream_env / f"{date_today()}.json").exists()
+
+
+def test_local_model_parse_failure_surfaces_error_and_does_not_save(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        lambda *a, **kw: "not json at all")
+    events = _drain_model("ollama:gemma4", save=True)
+    assert [e for e in events if e["type"] == "error"]
+    assert list(stream_env.glob("*.json")) == []
+
+
+def test_local_model_gemma4_gets_stricter_prompt(stream_env, monkeypatch):
+    """model="ollama:gemma4" specifically routes to the gemma4-tuned prompt
+    variants (prompts.py's "gemma4-specific variants" section), not the
+    shared Claude prompt."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    calls: list[dict] = []
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        lambda sp, up, **kw: calls.append({"system": sp, "user": up})
+                        or _brief_json([_takeaway()]))
+    _drain_model("ollama:gemma4", save=False)
+    assert "Output format is a hard contract" in calls[0]["system"]
+    assert "Before you output, verify against this checklist" in calls[0]["user"]
+
+
+def test_local_model_other_model_gets_shared_prompt(stream_env, monkeypatch):
+    """A non-gemma4 local model falls back to the shared V2 prompt — the
+    gemma4-specific appendix is NOT applied to a model it wasn't tuned for."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    calls: list[dict] = []
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        lambda sp, up, **kw: calls.append({"system": sp, "user": up})
+                        or _brief_json([_takeaway()]))
+    _drain_model("ollama:llama3.1:8b", save=False)
+    assert "Output format is a hard contract" not in calls[0]["system"]
+    assert "Before you output, verify against this checklist" not in calls[0]["user"]
+
+
+def test_local_model_client_failure_propagates(stream_env, monkeypatch):
+    """A generate_local_completion failure (e.g. Ollama unreachable) is not
+    swallowed here — it propagates so callers (shadow_run.py's per-run
+    try/except) record it as a flake rather than a silent empty result."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+
+    def boom(*a, **kw):
+        raise RuntimeError("ollama call failed (connection): refused")
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion", boom)
+    with pytest.raises(RuntimeError, match="ollama call failed"):
+        _drain_model("ollama:gemma4", save=False)

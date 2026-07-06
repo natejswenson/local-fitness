@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -28,8 +29,10 @@ from pydantic import ValidationError
 
 from .. import db
 from . import brief_planner
+from . import briefs
 from . import coach
 from . import grounding
+from . import local_model
 from . import prompts
 from . import tools as agent_tools
 from .briefs import (
@@ -89,6 +92,45 @@ def _brief_v2_enabled() -> bool:
     """V2 unless explicitly disabled. Default (unset) → True; only an explicit
     0/false/no/off rolls back to the V1 tool-driven monolith."""
     return os.environ.get(_BRIEF_V2_ENV, "").strip().lower() not in _FALSY
+
+
+# Local-model (Ollama) shadow-run support. See
+# docs/plans/2026-07-05-gemma4-shadow-run-design.md. A "model" string prefixed
+# "ollama:" is dispatched to local_model.generate_local_completion() instead
+# of claude_agent_sdk.query() — shadow-run comparison only, never the live
+# production path unless a future, separate decision promotes it.
+_LOCAL_MODEL_PREFIX = "ollama:"
+
+
+def _local_model_name(model: str) -> str | None:
+    """The Ollama model name if ``model`` is a local-model request, else None."""
+    if model.startswith(_LOCAL_MODEL_PREFIX):
+        return model[len(_LOCAL_MODEL_PREFIX):]
+    return None
+
+
+def _assert_fixture_only_data() -> None:
+    """Refuse to call a local model unless the DB *and* recent-briefs data are
+    fixture-only (both resolve under the system temp dir).
+
+    Local models run outside Claude's data-handling boundary, so this must be
+    an ALLOW-list check — it positively confirms fixture isolation rather than
+    merely failing to match one hardcoded "real" path. A deny-list check
+    against the dev-host default DB path would silently pass under a container
+    deployment (LOCAL_FITNESS_DATA_DIR=/data) where the real path differs from
+    that literal — see the design doc's round-2 findings.
+    """
+    tmp_root = Path(tempfile.gettempdir()).resolve()
+    for label, path in (
+        ("db.DEFAULT_DB_PATH", db.DEFAULT_DB_PATH),
+        ("briefs.DEFAULT_BRIEFINGS_DIR", briefs.DEFAULT_BRIEFINGS_DIR),
+    ):
+        resolved = Path(path).resolve()
+        if not resolved.is_relative_to(tmp_root):
+            raise RuntimeError(
+                f"refusing local-model call: {label}={resolved} is not under "
+                f"the system temp dir ({tmp_root}) — local models must only "
+                "ever see fixture data, never real personal data")
 
 
 # Back-compat re-exports: existing callers import these from `briefing`
@@ -152,6 +194,59 @@ def _iter_partial_takeaways(text: str, skip_count: int):
         pos = end
 
 
+async def _finalize_brief(raw: str, user_name: str, save: bool, brief_context):
+    """Shared tail: parse -> validate -> (optionally save) -> ground -> yield.
+
+    Used by both the Claude streaming path and the local-model (non-streaming)
+    path in ``generate_streaming`` so parsing/validation/grounding logic lives
+    in exactly one place — any quality difference between models is
+    attributable to the model, not to divergently-implemented post-processing.
+    """
+    try:
+        payload = _extract_json(raw)
+    except ValueError as e:
+        LOG.error("Brief JSON parse failed: %s", e)
+        yield {"type": "error", "message": f"Could not parse brief JSON: {e}"}
+        return
+    payload.setdefault("date", date.today().isoformat())
+    payload.setdefault("user_name", user_name)
+    payload["generated_at"] = datetime.now().isoformat()
+    # Repair collapsed markdown tables in the common path so BOTH the save path
+    # (save_brief repairs again — idempotent) and the eval/save=False path emit
+    # clean tables. See agent/render.fix_table_row_breaks.
+    for _tk in payload.get("takeaways", []) or []:
+        if isinstance(_tk, dict) and isinstance(_tk.get("details"), str):
+            _tk["details"] = fix_table_row_breaks(_tk["details"])
+
+    if save:
+        # Persist through the single write gate. `save_brief` re-stamps,
+        # validates ONCE, and returns the validated Brief — we emit THAT object
+        # so the on-disk and streamed briefs are identical (no parallel
+        # in-composer validate on the save path).
+        try:
+            result = save_brief(payload)
+        except ValidationError as e:
+            LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
+            yield {"type": "error", "message": f"Brief failed validation: {e}"}
+            return
+        if brief_context is not None:
+            grounding.log_grounding(result["brief"], brief_context)
+        yield {"type": "done", "brief": result["brief"].model_dump()}
+        return
+
+    # save=False (eval/scoring): validate locally to produce the done Brief
+    # without persisting.
+    try:
+        brief = Brief.model_validate(payload)
+    except ValidationError as e:
+        LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
+        yield {"type": "error", "message": f"Brief failed validation: {e}"}
+        return
+    if brief_context is not None:
+        grounding.log_grounding(brief, brief_context)
+    yield {"type": "done", "brief": brief.model_dump()}
+
+
 async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     """Run the briefing agent and yield NDJSON-shaped events as the model emits.
 
@@ -175,6 +270,44 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     # The V2 BriefContext, kept for the post-stream advisory grounding check.
     # None on the V1 path (no toolless context → nothing to ground against).
     brief_context = None
+
+    local_model_name = _local_model_name(model)
+    if local_model_name is not None:
+        # Shadow-run-only path (see docs/plans/2026-07-05-gemma4-shadow-run-
+        # design.md): local models are toolless-V2-only, never the tool-calling
+        # V1 monolith, so a local model can never be given MCP tool access.
+        if not _brief_v2_enabled():
+            raise ValueError(
+                'local models ("ollama:...") are only supported on the V2 '
+                "toolless path — refusing to give one MCP tool access")
+        brief_context = brief_planner.assemble_brief_context(today=date.today().isoformat())
+        # gemma4 gets a stricter, model-specific prompt (see prompts.py's
+        # "gemma4-specific variants" section) — round 1 of the shadow-run
+        # showed it never fabricates numbers but frequently violates the
+        # JSON schema in ways redundant, concrete correction targets directly.
+        # Any other local model falls back to the shared V2 prompt.
+        if local_model_name == "gemma4":
+            local_system_prompt = prompts.brief_v2_system_prompt_gemma4(user_name, coach_profile)
+            local_prompt_text = prompts.brief_v2_user_prompt_gemma4(
+                brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
+        else:
+            local_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
+            local_prompt_text = prompts.brief_v2_user_prompt(
+                brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
+        _assert_fixture_only_data()
+        # Structured-output constraint: fixes the schema-compliance failures
+        # a stricter prompt alone couldn't (capitalized enums, bare-string
+        # `metric`, missing fields) via grammar-constrained decoding rather
+        # than relying on the model to follow written instructions.
+        raw = (await asyncio.to_thread(
+            local_model.generate_local_completion,
+            local_system_prompt, local_prompt_text, model=local_model_name,
+            format=Brief.model_json_schema(),
+        )).strip()
+        async for evt in _finalize_brief(raw, user_name, save, brief_context):
+            yield evt
+        return
+
     if _brief_v2_enabled():
         # V2 (agent/code separation): the deterministic planner gathers the data,
         # evaluates triggers, and ranks candidates; ONE toolless generator
@@ -389,49 +522,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     # surface the error event so the UI can show a clear message instead of
     # silently leaving the placeholder cards.
     raw = "\n".join(chunks).strip()
-    try:
-        payload = _extract_json(raw)
-    except ValueError as e:
-        LOG.error("Brief JSON parse failed: %s", e)
-        yield {"type": "error", "message": f"Could not parse brief JSON: {e}"}
-        return
-    payload.setdefault("date", date.today().isoformat())
-    payload.setdefault("user_name", user_name)
-    payload["generated_at"] = datetime.now().isoformat()
-    # Repair collapsed markdown tables in the common path so BOTH the save path
-    # (save_brief repairs again — idempotent) and the eval/save=False path emit
-    # clean tables. See agent/render.fix_table_row_breaks.
-    for _tk in payload.get("takeaways", []) or []:
-        if isinstance(_tk, dict) and isinstance(_tk.get("details"), str):
-            _tk["details"] = fix_table_row_breaks(_tk["details"])
-
-    if save:
-        # Persist through the single write gate. `save_brief` re-stamps,
-        # validates ONCE, and returns the validated Brief — we emit THAT object
-        # so the on-disk and streamed briefs are identical (no parallel
-        # in-composer validate on the save path).
-        try:
-            result = save_brief(payload)
-        except ValidationError as e:
-            LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
-            yield {"type": "error", "message": f"Brief failed validation: {e}"}
-            return
-        if brief_context is not None:
-            grounding.log_grounding(result["brief"], brief_context)
-        yield {"type": "done", "brief": result["brief"].model_dump()}
-        return
-
-    # save=False (eval/scoring): validate locally to produce the done Brief
-    # without persisting.
-    try:
-        brief = Brief.model_validate(payload)
-    except ValidationError as e:
-        LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
-        yield {"type": "error", "message": f"Brief failed validation: {e}"}
-        return
-    if brief_context is not None:
-        grounding.log_grounding(brief, brief_context)
-    yield {"type": "done", "brief": brief.model_dump()}
+    async for evt in _finalize_brief(raw, user_name, save, brief_context):
+        yield evt
 
 
 async def _generate(model: str = DEFAULT_MODEL, save: bool = False) -> Brief:
