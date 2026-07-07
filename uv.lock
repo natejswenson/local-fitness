@@ -716,7 +716,7 @@ wheels = [
 
 [[package]]
 name = "local-fitness"
-version = "0.15.1"
+version = "0.16.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
