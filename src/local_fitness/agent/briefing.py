@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -28,8 +29,10 @@ from pydantic import ValidationError
 
 from .. import db
 from . import brief_planner
+from . import briefs
 from . import coach
 from . import grounding
+from . import local_model
 from . import prompts
 from . import tools as agent_tools
 from .briefs import (
@@ -89,6 +92,247 @@ def _brief_v2_enabled() -> bool:
     """V2 unless explicitly disabled. Default (unset) → True; only an explicit
     0/false/no/off rolls back to the V1 tool-driven monolith."""
     return os.environ.get(_BRIEF_V2_ENV, "").strip().lower() not in _FALSY
+
+
+# Local-model (Ollama) shadow-run support. See
+# docs/plans/2026-07-05-gemma4-shadow-run-design.md. A "model" string prefixed
+# "ollama:" is dispatched to local_model.generate_local_completion() instead
+# of claude_agent_sdk.query() — shadow-run comparison only, never the live
+# production path unless a future, separate decision promotes it.
+_LOCAL_MODEL_PREFIX = "ollama:"
+
+
+def _local_model_name(model: str) -> str | None:
+    """The Ollama model name if ``model`` is a local-model request, else None."""
+    if model.startswith(_LOCAL_MODEL_PREFIX):
+        return model[len(_LOCAL_MODEL_PREFIX):]
+    return None
+
+
+def _gemma4_format_schema() -> dict:
+    """A tightened variant of Brief's JSON schema for gemma4's structured-
+    output constraint.
+
+    Plain ``Brief.model_json_schema()`` fixed schema-COMPLIANCE (12/12 valid,
+    0 flakes — see docs/plans/2026-07-05-gemma4-shadow-run-design.md) but the
+    model leaned on the schema's stated defaults instead of actively choosing
+    values: every ``tone`` came back ``"neutral"`` (its default) and every
+    ``metric`` came back ``null`` (its default), even when real, varied data
+    was available. Stripping ``tone``'s default and making ``metric``
+    required-non-null (removing the null option) forces the grammar-
+    constrained decoder to commit to a concrete choice — empirically verified
+    to fix the defaulting behavior (varied, contextually-appropriate tones
+    and populated metrics on manual spot-checks before this was wired in).
+
+    The prompt also mandates exactly one "workout" and one "steps" takeaway in
+    every brief (see prompts.py's Workout/Steps mandate sections) — a
+    free-form ``takeaways`` array can't structurally enforce that. A single
+    ``contains`` constraint reliably forced one mandated category in testing,
+    but combining two via ``allOf`` was NOT reliably honored by Ollama's
+    grammar-constrained decoder (one fixture produced zero of either mandated
+    category across 3 runs despite the constraint, and still validated as
+    schema-conformant — see the design doc's Outcome section). Required
+    object keys have been reliable throughout instead (same mechanism as the
+    tone/metric fix above), so the mandate is expressed as two required
+    slots — ``workout_takeaway`` / ``steps_takeaway`` — plus a free
+    ``other_takeaways`` array for the rest (conditioning / HR-recovery /
+    wildcard). Verified 9/9 across 3 fixtures before being wired in here.
+    ``_reshape_gemma4_slots`` flattens this back into Brief's real
+    ``takeaways`` list before validation, so every other consumer of the
+    parsed payload only ever sees the one real shape.
+
+    Only affects the schema handed to Ollama for decoding guidance — the
+    real ``Brief.model_validate()`` in ``_finalize_brief`` still validates
+    against the actual (untightened) application schema, so this can never
+    make validation MORE permissive, only guide generation to commit to
+    values within the schema's existing constraints.
+    """
+    schema = Brief.model_json_schema()
+    takeaway = schema["$defs"]["Takeaway"]
+    takeaway["properties"]["tone"].pop("default", None)
+    takeaway["properties"]["metric"] = {
+        "$ref": "#/$defs/TakeawayMetric",
+        "description": takeaway["properties"]["metric"].get("description", ""),
+    }
+    takeaway["required"] = ["headline", "summary", "tone", "metric", "details"]
+
+    schema["properties"].pop("takeaways")
+    schema["properties"]["workout_takeaway"] = {"$ref": "#/$defs/Takeaway"}
+    schema["properties"]["steps_takeaway"] = {"$ref": "#/$defs/Takeaway"}
+    schema["properties"]["other_takeaways"] = {
+        "type": "array",
+        "items": {"$ref": "#/$defs/Takeaway"},
+        "minItems": 1,
+        "maxItems": 3,
+    }
+    schema["required"] = [r for r in schema["required"] if r != "takeaways"] + [
+        "workout_takeaway", "steps_takeaway", "other_takeaways",
+    ]
+    return schema
+
+
+def _reshape_gemma4_slots(raw: str) -> str:
+    """Undo ``_gemma4_format_schema``'s explicit-slot shape back into Brief's
+    real ``takeaways`` list, so ``_finalize_brief``'s parse/validate path
+    stays identical for every model.
+
+    Deliberately does NOT go through ``_extract_json`` — that helper's
+    ``_salvage_takeaways`` step would find ``other_takeaways`` (a
+    list-of-dicts-with-``headline``) and salvage it AS the takeaways list,
+    silently discarding ``workout_takeaway``/``steps_takeaway`` before this
+    function ever sees them. Ollama's structured-output mode (``format=``)
+    returns strict, unfenced JSON, so a plain decode is sufficient here; a
+    genuinely malformed response falls through unchanged and gets the full
+    fence-stripping/salvage treatment from ``_extract_json`` inside
+    ``_finalize_brief``, reporting the real parse error instead of a
+    misleading one from a half-applied salvage.
+    """
+    try:
+        payload = _LOOSE_DECODER.decode(_strip_inline_control_chars(raw.strip()))
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    if "workout_takeaway" not in payload or "steps_takeaway" not in payload:
+        return raw
+    workout = payload.pop("workout_takeaway")
+    steps = payload.pop("steps_takeaway")
+    others = payload.pop("other_takeaways", None) or []
+    payload["takeaways"] = [workout, steps, *others]
+    return json.dumps(payload)
+
+
+def _format_race_goal_time(seconds: int | None) -> str | None:
+    """``6420`` -> ``"1:47:00"``; sub-hour goals drop the leading ``0:``."""
+    if seconds is None:
+        return None
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _gemma4_plan_prompt_facts(plan_today: dict) -> str:
+    """A pre-computed plan-facts block appended to gemma4's user prompt when
+    an active training plan is present.
+
+    Manual testing (2026-07-06) showed gemma4 fabricates these facts when
+    asked to derive them itself: it reported "14 days" to race when the real
+    value was 10, and reported adherence as "on track" when the last graded
+    session's verdict was actually "missed" — the OPPOSITE. Stating them
+    here reduces (doesn't guarantee — see ``_gemma4_plan_status_appendix``
+    for the guaranteed part) the chance the model's own prose contradicts
+    the facts. Gemma4-specific: Claude's live path already derives these
+    correctly, so this never touches the shared ``brief_v2_user_prompt``.
+    """
+    goal_type = plan_today.get("goal_type") or "race"
+    goal_time = _format_race_goal_time(plan_today.get("target_time_seconds"))
+    goal_desc = f"sub-{goal_time} {goal_type}" if goal_time else goal_type
+    days = plan_today.get("days_to_race")
+    countdown = f"{days} days out" if days is not None else "date not set"
+    last_graded = plan_today.get("last_graded")
+    adherence = (
+        "no session graded yet — do not invent a status" if last_graded is None
+        else f'last graded session ("{last_graded.get("description", "?")}") '
+             f'verdict: {last_graded.get("verdict", "unknown").upper()}')
+    today = plan_today.get("today")
+    prescription = (
+        "no session scheduled today on the plan" if today is None
+        else f'plan prescribes: "{today.get("description", "?")}"')
+    return (
+        "\n# Plan facts (pre-computed — CITE THESE VERBATIM, do not "
+        "recompute days-to-race or re-derive the adherence verdict)\n"
+        f"- Goal: {goal_desc}, {countdown}\n"
+        f"- Adherence: {adherence}\n"
+        f"- Today's prescription: {prescription}\n"
+        "Reconcile the prescription against today's recovery signals "
+        "(RHR/TSB/sleep) in your OWN words — but the three facts above are "
+        "ground truth; never contradict or restate a different number/"
+        "verdict.\n"
+    )
+
+
+def _gemma4_plan_status_appendix(plan_today: dict) -> str:
+    """A deterministic plan-status sentence appended to the workout
+    takeaway's ``details`` AFTER generation — not left to the model.
+
+    Where ``_gemma4_plan_prompt_facts`` only reduces the odds of
+    contradiction, this guarantees correctness: computed in Python from the
+    same ground-truth plan data Claude already reasons over correctly, so it
+    can never invent a countdown or invert a verdict. It also reliably
+    matches ``ab_brief._PLAN_KEYWORDS`` (the shadow-run parity gate's
+    plan-mention check) since the phrasing is fixed, unlike the model's own
+    free-text prose. The model's own headline/summary/details still carry
+    the actual coaching judgment (reconciling the prescription against
+    today's recovery signals) — only the fact-retrieval step is templated.
+    """
+    goal_type = plan_today.get("goal_type") or "race"
+    goal_time = _format_race_goal_time(plan_today.get("target_time_seconds"))
+    goal_desc = f"sub-{goal_time} {goal_type}" if goal_time else goal_type
+    days = plan_today.get("days_to_race")
+    countdown = (f"{days} days to race day" if days is not None
+                 else "race day date not yet set")
+    last_graded = plan_today.get("last_graded")
+    adherence = (
+        "no session graded yet on the plan" if last_graded is None
+        else f'adherence on the last graded session '
+             f'("{last_graded.get("description", "?")}") was '
+             f'{last_graded.get("verdict", "unknown").upper()}')
+    today = plan_today.get("today")
+    prescription = (
+        "the plan calls for no session today" if today is None
+        else f'the plan calls for: "{today.get("description", "?")}"')
+    return (
+        f"\n\n**Training plan status:** {goal_desc}, {countdown}. "
+        f"{adherence[0].upper()}{adherence[1:]}. "
+        f"Today's session — {prescription}."
+    )
+
+
+def _append_gemma4_plan_status(raw: str, plan_today: dict | None) -> str:
+    """Append ``_gemma4_plan_status_appendix`` to the workout takeaway's
+    ``details`` — always ``takeaways[0]`` post-``_reshape_gemma4_slots``.
+
+    A no-op when there's no active plan, or if ``raw`` doesn't parse or has
+    no takeaways — those fall through to the normal parse-failure path.
+    """
+    if plan_today is None:
+        return raw
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    takeaways = payload.get("takeaways")
+    if not isinstance(takeaways, list) or not takeaways:
+        return raw
+    workout = takeaways[0]
+    if not isinstance(workout, dict):
+        return raw
+    workout["details"] = (workout.get("details") or "") + _gemma4_plan_status_appendix(plan_today)
+    return json.dumps(payload)
+
+
+def _assert_fixture_only_data() -> None:
+    """Refuse to call a local model unless the DB *and* recent-briefs data are
+    fixture-only (both resolve under the system temp dir).
+
+    Local models run outside Claude's data-handling boundary, so this must be
+    an ALLOW-list check — it positively confirms fixture isolation rather than
+    merely failing to match one hardcoded "real" path. A deny-list check
+    against the dev-host default DB path would silently pass under a container
+    deployment (LOCAL_FITNESS_DATA_DIR=/data) where the real path differs from
+    that literal — see the design doc's round-2 findings.
+    """
+    tmp_root = Path(tempfile.gettempdir()).resolve()
+    for label, path in (
+        ("db.DEFAULT_DB_PATH", db.DEFAULT_DB_PATH),
+        ("briefs.DEFAULT_BRIEFINGS_DIR", briefs.DEFAULT_BRIEFINGS_DIR),
+    ):
+        resolved = Path(path).resolve()
+        if not resolved.is_relative_to(tmp_root):
+            raise RuntimeError(
+                f"refusing local-model call: {label}={resolved} is not under "
+                f"the system temp dir ({tmp_root}) — local models must only "
+                "ever see fixture data, never real personal data")
 
 
 # Back-compat re-exports: existing callers import these from `briefing`
@@ -152,6 +396,59 @@ def _iter_partial_takeaways(text: str, skip_count: int):
         pos = end
 
 
+async def _finalize_brief(raw: str, user_name: str, save: bool, brief_context):
+    """Shared tail: parse -> validate -> (optionally save) -> ground -> yield.
+
+    Used by both the Claude streaming path and the local-model (non-streaming)
+    path in ``generate_streaming`` so parsing/validation/grounding logic lives
+    in exactly one place — any quality difference between models is
+    attributable to the model, not to divergently-implemented post-processing.
+    """
+    try:
+        payload = _extract_json(raw)
+    except ValueError as e:
+        LOG.error("Brief JSON parse failed: %s", e)
+        yield {"type": "error", "message": f"Could not parse brief JSON: {e}"}
+        return
+    payload.setdefault("date", date.today().isoformat())
+    payload.setdefault("user_name", user_name)
+    payload["generated_at"] = datetime.now().isoformat()
+    # Repair collapsed markdown tables in the common path so BOTH the save path
+    # (save_brief repairs again — idempotent) and the eval/save=False path emit
+    # clean tables. See agent/render.fix_table_row_breaks.
+    for _tk in payload.get("takeaways", []) or []:
+        if isinstance(_tk, dict) and isinstance(_tk.get("details"), str):
+            _tk["details"] = fix_table_row_breaks(_tk["details"])
+
+    if save:
+        # Persist through the single write gate. `save_brief` re-stamps,
+        # validates ONCE, and returns the validated Brief — we emit THAT object
+        # so the on-disk and streamed briefs are identical (no parallel
+        # in-composer validate on the save path).
+        try:
+            result = save_brief(payload)
+        except ValidationError as e:
+            LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
+            yield {"type": "error", "message": f"Brief failed validation: {e}"}
+            return
+        if brief_context is not None:
+            grounding.log_grounding(result["brief"], brief_context)
+        yield {"type": "done", "brief": result["brief"].model_dump()}
+        return
+
+    # save=False (eval/scoring): validate locally to produce the done Brief
+    # without persisting.
+    try:
+        brief = Brief.model_validate(payload)
+    except ValidationError as e:
+        LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
+        yield {"type": "error", "message": f"Brief failed validation: {e}"}
+        return
+    if brief_context is not None:
+        grounding.log_grounding(brief, brief_context)
+    yield {"type": "done", "brief": brief.model_dump()}
+
+
 async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     """Run the briefing agent and yield NDJSON-shaped events as the model emits.
 
@@ -175,6 +472,52 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     # The V2 BriefContext, kept for the post-stream advisory grounding check.
     # None on the V1 path (no toolless context → nothing to ground against).
     brief_context = None
+
+    local_model_name = _local_model_name(model)
+    if local_model_name is not None:
+        # Shadow-run-only path (see docs/plans/2026-07-05-gemma4-shadow-run-
+        # design.md): local models are toolless-V2-only, never the tool-calling
+        # V1 monolith, so a local model can never be given MCP tool access.
+        if not _brief_v2_enabled():
+            raise ValueError(
+                'local models ("ollama:...") are only supported on the V2 '
+                "toolless path — refusing to give one MCP tool access")
+        brief_context = brief_planner.assemble_brief_context(today=date.today().isoformat())
+        # Round 2 finding (2026-07-05): a gemma4-specific prompt appendix
+        # (prompts.brief_v2_system_prompt_gemma4/user_prompt_gemma4) did NOT
+        # improve schema compliance, and structured output alone fixed
+        # compliance but revealed the model leaning on schema DEFAULTS
+        # (tone="neutral", metric=null) instead of actively choosing values —
+        # redundant prose instructions compete with content reasoning rather
+        # than helping it. So: base (shared, Claude-identical) prompt for
+        # narrative content, and for gemma4 specifically, a TIGHTENED format
+        # schema (no tone default, metric required-non-null) plus a higher
+        # temperature (fabrication was never the risk, so 0.4 was overly
+        # conservative) — this fixed the defaulting behavior empirically.
+        local_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
+        local_prompt_text = prompts.brief_v2_user_prompt(
+            brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
+        if local_model_name == "gemma4" and brief_context.plan_today is not None:
+            local_prompt_text += _gemma4_plan_prompt_facts(brief_context.plan_today)
+        _assert_fixture_only_data()
+        if local_model_name == "gemma4":
+            local_format = _gemma4_format_schema()
+            local_temperature = 0.8
+        else:
+            local_format = Brief.model_json_schema()
+            local_temperature = 0.4
+        raw = (await asyncio.to_thread(
+            local_model.generate_local_completion,
+            local_system_prompt, local_prompt_text, model=local_model_name,
+            format=local_format, temperature=local_temperature,
+        )).strip()
+        if local_model_name == "gemma4":
+            raw = _reshape_gemma4_slots(raw)
+            raw = _append_gemma4_plan_status(raw, brief_context.plan_today)
+        async for evt in _finalize_brief(raw, user_name, save, brief_context):
+            yield evt
+        return
+
     if _brief_v2_enabled():
         # V2 (agent/code separation): the deterministic planner gathers the data,
         # evaluates triggers, and ranks candidates; ONE toolless generator
@@ -389,49 +732,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     # surface the error event so the UI can show a clear message instead of
     # silently leaving the placeholder cards.
     raw = "\n".join(chunks).strip()
-    try:
-        payload = _extract_json(raw)
-    except ValueError as e:
-        LOG.error("Brief JSON parse failed: %s", e)
-        yield {"type": "error", "message": f"Could not parse brief JSON: {e}"}
-        return
-    payload.setdefault("date", date.today().isoformat())
-    payload.setdefault("user_name", user_name)
-    payload["generated_at"] = datetime.now().isoformat()
-    # Repair collapsed markdown tables in the common path so BOTH the save path
-    # (save_brief repairs again — idempotent) and the eval/save=False path emit
-    # clean tables. See agent/render.fix_table_row_breaks.
-    for _tk in payload.get("takeaways", []) or []:
-        if isinstance(_tk, dict) and isinstance(_tk.get("details"), str):
-            _tk["details"] = fix_table_row_breaks(_tk["details"])
-
-    if save:
-        # Persist through the single write gate. `save_brief` re-stamps,
-        # validates ONCE, and returns the validated Brief — we emit THAT object
-        # so the on-disk and streamed briefs are identical (no parallel
-        # in-composer validate on the save path).
-        try:
-            result = save_brief(payload)
-        except ValidationError as e:
-            LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
-            yield {"type": "error", "message": f"Brief failed validation: {e}"}
-            return
-        if brief_context is not None:
-            grounding.log_grounding(result["brief"], brief_context)
-        yield {"type": "done", "brief": result["brief"].model_dump()}
-        return
-
-    # save=False (eval/scoring): validate locally to produce the done Brief
-    # without persisting.
-    try:
-        brief = Brief.model_validate(payload)
-    except ValidationError as e:
-        LOG.error("Brief JSON failed validation: %s\n\nRaw: %s", e, raw[:1000])
-        yield {"type": "error", "message": f"Brief failed validation: {e}"}
-        return
-    if brief_context is not None:
-        grounding.log_grounding(brief, brief_context)
-    yield {"type": "done", "brief": brief.model_dump()}
+    async for evt in _finalize_brief(raw, user_name, save, brief_context):
+        yield evt
 
 
 async def _generate(model: str = DEFAULT_MODEL, save: bool = False) -> Brief:

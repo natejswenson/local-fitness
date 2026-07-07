@@ -747,6 +747,84 @@ Numbers are bare digits (no spaces). Omit `metric` if a takeaway is genuinely
 metric-free.{"" if persist_via_tool else " Return ONLY the JSON object — no fence, no preamble."}"""
 
 
+# --- gemma4-specific variants (2026-07-05 shadow-run round 1) --------------
+#
+# The first gemma4 shadow-run (docs/plans/2026-07-05-gemma4-shadow-run-
+# design.md) showed invention_rate=0.0 on every schema-valid generation —
+# gemma4 never fabricated a number — but it frequently violated the strict
+# JSON schema in ways Claude never does: capitalized tone values ("Positive"),
+# an invented tone not in the enum ("Informative"), `metric` sent as a bare
+# string ("Steps") instead of the required {"metric": ..., "days": ...}
+# object, missing required fields (no `headline`), and once a wholesale wrong
+# shape (`body`/`type` keys instead of `details`). These variants are
+# IDENTICAL in narrative content to the Claude prompts but append an explicit
+# section calling out exactly those observed failures by name — a smaller
+# instruction-following model benefits from redundant, concrete correction
+# far more than a restated abstract rule.
+#
+# This deliberately breaks prompt parity with Claude (the shadow-run design's
+# original invariant, chosen so any quality delta was attributable to the
+# model alone). That tradeoff is intentional here: round 1 already isolated
+# the failure to schema mechanics, not fabrication or voice — the next
+# question is "can a model-specific prompt fix gemma4's schema compliance,"
+# not "is Claude's exact prompt portable."
+
+_GEMMA4_SYSTEM_APPENDIX = """
+
+# Output format is a hard contract — read this twice
+You have a documented history of violating the brief's JSON schema even when
+narrating correctly. Before you answer, re-check every rule below:
+- `tone` is EXACTLY one of these four lowercase strings: positive, caution,
+  critical, neutral. Never capitalize it ("Positive" is WRONG). Never use any
+  other word ("Informative" is WRONG — it is not a valid tone).
+- `metric` (when present) is a JSON OBJECT with exactly two keys, `metric` and
+  `days` — e.g. {"metric": "steps", "days": 14}. It is NEVER a bare string
+  like "Steps" or "Recovery Score". Omit the field entirely if you have no
+  matching metric — do not invent a string value for it.
+- Every takeaway object has ALL FOUR required keys: `headline`, `summary`,
+  `tone`, `details`. Never omit `headline` or any other required key.
+- Never add extra top-level keys to a takeaway (no `type`, no `body` instead
+  of `details` — nothing outside `headline`/`summary`/`tone`/`metric`/`details`).
+- Output raw JSON only. No ```json fence, no prose before or after."""
+
+_GEMMA4_USER_APPENDIX = """
+
+# Before you output, verify against this checklist
+- [ ] Every takeaway has headline, summary, tone, details — all four, spelled
+      exactly that way.
+- [ ] Every `tone` value is lowercase and is one of: positive, caution,
+      critical, neutral.
+- [ ] Every `metric` (if present) is an object {"metric": "...", "days": N},
+      never a plain string.
+- [ ] No takeaway has any key other than headline/summary/tone/metric/details.
+- [ ] The response is raw JSON — no markdown fence, no leading/trailing text."""
+
+
+def brief_v2_system_prompt_gemma4(
+    user_name: str = DEFAULT_USER_NAME,
+    profile: coach.CoachProfile = ADAPTIVE,
+) -> str:
+    """gemma4-specific variant of ``brief_v2_system_prompt`` — see the module
+    comment above this function for why it diverges from the Claude prompt."""
+    return brief_v2_system_prompt(user_name, profile) + _GEMMA4_SYSTEM_APPENDIX
+
+
+def brief_v2_user_prompt_gemma4(
+    context,
+    user_name: str = DEFAULT_USER_NAME,
+    daily_step_goal: int = 10000,
+    recent_briefs_summary: str = "",
+    profile: coach.CoachProfile = ADAPTIVE,
+) -> str:
+    """gemma4-specific variant of ``brief_v2_user_prompt``. No
+    ``persist_via_tool`` param — local models never get tool access (see the
+    design doc's V1-refusal invariant), so only the toolless shape applies."""
+    return brief_v2_user_prompt(
+        context, user_name, daily_step_goal, recent_briefs_summary, profile,
+        persist_via_tool=False,
+    ) + _GEMMA4_USER_APPENDIX
+
+
 # Backwards-compat (tests still import these as constants)
 SYSTEM_PROMPT = system_prompt()
 BRIEFING_PROMPT = briefing_prompt()

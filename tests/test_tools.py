@@ -922,6 +922,96 @@ def test_brief_loop_excludes_write_tools():
         "log_manual_workout", "delete_manual_workout", "log_observation",
         "delete_observation", "save_user_note", "update_user_note",
         "delete_user_note", "daily_snapshot", "list_observations",
+        "sync_garmin_data",
     ):
         assert f"mcp__{tools.SERVER_NAME}__{w}" not in ro
     assert ro < set(tools.allowed_tool_names())
+
+
+# --- sync_garmin_data --------------------------------------------------------
+
+def test_sync_garmin_data_success_recomputes_baselines(monkeypatch):
+    calls = {}
+
+    def fake_pull(*, max_days):
+        calls["max_days"] = max_days
+        return {
+            "status": "success", "days_pulled": 2, "activities_loaded": 1,
+            "last_date": "2026-07-06", "error": None,
+        }
+
+    def fake_recompute(*, lookback_days):
+        calls["lookback_days"] = lookback_days
+        return 90
+
+    monkeypatch.setattr(tools.daily_ingest, "pull", fake_pull)
+    monkeypatch.setattr(tools.baselines_mod, "recompute", fake_recompute)
+
+    payload, err = call(tools.sync_garmin_data, {})
+    assert not err
+    assert payload["status"] == "success"
+    assert payload["days_pulled"] == 2
+    # Bite-sized cap wired through, and baselines only recomputed because new
+    # days actually landed.
+    assert calls["max_days"] == tools.SYNC_MAX_DAYS
+    assert calls["lookback_days"] == 90
+
+
+def test_sync_garmin_data_skipped_does_not_recompute(monkeypatch):
+    monkeypatch.setattr(
+        tools.daily_ingest, "pull",
+        lambda **_: {
+            "status": "skipped", "days_pulled": 0, "activities_loaded": 0,
+            "last_date": "2026-07-06", "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        tools.baselines_mod, "recompute",
+        lambda **_: pytest.fail("recompute should not run when no new days pulled"),
+    )
+    payload, err = call(tools.sync_garmin_data, {})
+    assert not err
+    assert payload["status"] == "skipped"
+    assert payload["days_pulled"] == 0
+
+
+def test_sync_garmin_data_partial_success_skips_recompute(monkeypatch):
+    # Mirrors _run_sync in web/server.py: only a clean "success" status
+    # triggers a baseline recompute, not "partial".
+    monkeypatch.setattr(
+        tools.daily_ingest, "pull",
+        lambda **_: {
+            "status": "partial", "days_pulled": 1, "activities_loaded": 0,
+            "last_date": "2026-07-05", "error": "1 day(s) still missing",
+        },
+    )
+    monkeypatch.setattr(
+        tools.baselines_mod, "recompute",
+        lambda **_: pytest.fail("recompute should not run on a partial pull"),
+    )
+    payload, err = call(tools.sync_garmin_data, {})
+    assert err
+    assert payload["status"] == "partial"
+    assert "still missing" in payload["error"]
+
+
+def test_sync_garmin_data_auth_failure_is_error(monkeypatch):
+    monkeypatch.setattr(
+        tools.daily_ingest, "pull",
+        lambda **_: {
+            "status": "auth_failure", "days_pulled": 0, "activities_loaded": 0,
+            "last_date": None, "error": "mfa_required: verification needed",
+        },
+    )
+    monkeypatch.setattr(
+        tools.baselines_mod, "recompute",
+        lambda **_: pytest.fail("recompute should not run on auth failure"),
+    )
+    payload, err = call(tools.sync_garmin_data, {})
+    assert err
+    assert payload["status"] == "auth_failure"
+    assert "mfa_required" in payload["error"]
+
+
+def test_sync_garmin_data_is_in_full_tool_set():
+    assert f"mcp__{tools.SERVER_NAME}__sync_garmin_data" in tools.allowed_tool_names()

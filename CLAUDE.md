@@ -270,6 +270,16 @@ These are settled — don't redesign without a reason.
   the seeding shell must share the same `HOME`.
 - **Path defaults**: `db.py`, `notes.py`, `briefing.py`, `web/server.py`
   all resolve to `_PROJECT_ROOT / ...` when env vars are unset.
+- **MCP tool surface can trigger a Garmin sync, not just read.** `agent/tools.py`'s
+  `sync_garmin_data` (in `ALL_TOOLS`, not in the brief loop's read-only
+  allow-list) wraps `ingest.daily.pull(max_days=SYNC_MAX_DAYS)` +
+  `ingest.baselines.recompute()` — the same bite-sized, gap-aware pull the web
+  UI's `/api/sync` uses, just without the UI's throttle/retry state machine.
+  Any MCP client wired to `fitness mcp-stdio` (Claude Desktop, opencode, etc.)
+  can call it directly; before this tool existed, MCP-only clients had read
+  access to the DB but no way to freshen it — only the CLI (`fitness pull`)
+  and the web UI could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
+  as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
 - **Auth middleware**: `LOCAL_FITNESS_API_TOKEN` env var; constant-time
   bearer check; `/health` and `/{full_path:path}` (SPA shell) are public.
 - **Rate limit**: in-memory token bucket on `RATE_LIMITED_PREFIXES`,

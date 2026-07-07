@@ -143,11 +143,21 @@ def _capture_v2(scenarios: list[str], model: str, runs: int) -> dict[str, dict]:
     import tempfile
 
     from local_fitness import db
-    from local_fitness.agent import brief_planner, briefing, grounding
+    from local_fitness.agent import brief_planner, briefing, briefs, grounding
 
+    # NOTE: LOCAL_FITNESS_BRIEFINGS_DIR is set below for completeness/back-compat,
+    # but it is NOT sufficient on its own — briefs.DEFAULT_BRIEFINGS_DIR is
+    # resolved ONCE at module-import time, and `briefing` (imported above) has
+    # already pulled `briefs` in by the time this function runs, so the env var
+    # override is a no-op. Without the direct attribute mutation below, every
+    # "fixture-only" shadow-run was silently folding real recent-brief content
+    # (real personal coaching history) into the prompt via
+    # briefing._recent_briefs_summary() -> briefs.DEFAULT_BRIEFINGS_DIR. Fixed
+    # the same way db.DEFAULT_DB_PATH is already handled two lines below.
     keys = (_V2_ENV, "LOCAL_FITNESS_NOTES_PATH", "LOCAL_FITNESS_BRIEFINGS_DIR")
     saved = {k: os.environ.get(k) for k in keys}
     orig_db = db.DEFAULT_DB_PATH
+    orig_briefings_dir = briefs.DEFAULT_BRIEFINGS_DIR
     out: dict[str, dict] = {}
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,6 +165,7 @@ def _capture_v2(scenarios: list[str], model: str, runs: int) -> dict[str, dict]:
             os.environ[_V2_ENV] = "1"
             os.environ["LOCAL_FITNESS_NOTES_PATH"] = str(root / "notes.md")
             os.environ["LOCAL_FITNESS_BRIEFINGS_DIR"] = str(root / "briefings")
+            briefs.DEFAULT_BRIEFINGS_DIR = root / "briefings"
             for scenario in scenarios:
                 fixture = eval_fixtures.build_fixture_db(scenario, root / scenario / "fitness.db")
                 db.DEFAULT_DB_PATH = fixture
@@ -179,6 +190,7 @@ def _capture_v2(scenarios: list[str], model: str, runs: int) -> dict[str, dict]:
                       f"consistent={rec['consistency']['consistent']}")
     finally:
         db.DEFAULT_DB_PATH = orig_db
+        briefs.DEFAULT_BRIEFINGS_DIR = orig_briefings_dir
         _restore_env(saved)
     return out
 
@@ -237,12 +249,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report["overall_parity"] else 1
 
     est = cb.estimate(scenarios, args.runs)
+    is_local_model = args.model.startswith("ollama:")
     if not args.run:
         print(f"Shadow-run plan: scenarios={scenarios} runs={args.runs} (V2 flag forced ON)")
         print(f"  -> {est['generations']} generations (hard cap {cb.MAX_GENERATIONS})")
-        print(f"  -> est ~{est['est_seconds']}s wall, ~{est['est_output_tokens']:,} output tokens")
+        if is_local_model:
+            print("  -> cost: $0 (local via Ollama). Wall-clock: unmeasured for this "
+                  "model — the estimate below is Claude-derived and does not apply; "
+                  "the first run calibrates it.")
+        else:
+            print(f"  -> est ~{est['est_seconds']}s wall, ~{est['est_output_tokens']:,} output tokens")
         print(f"  Compares V2 fingerprints against {baseline_path}.")
-        print("  Uses the Claude Max subscription (CLAUDE_CODE_OAUTH_TOKEN) — no per-token billing.")
+        if is_local_model:
+            print("  Runs locally via Ollama — no subscription/API cost.")
+        else:
+            print("  Uses the Claude Max subscription (CLAUDE_CODE_OAUTH_TOKEN) — no per-token billing.")
         print("  Re-run with --run to execute, or --mock <file> for a cost-free check.")
         return 0
 

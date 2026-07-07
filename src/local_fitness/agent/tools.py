@@ -18,12 +18,19 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from pydantic import ValidationError
 
 from .. import config, db, notes, plans
+from ..ingest import baselines as baselines_mod
+from ..ingest import daily as daily_ingest
 from . import briefs, charts, units
 
 
 SERVER_NAME = "fitness"
 
 BASELINE_METRICS = {"rhr", "sleep_seconds"}
+
+# Mirrors web/server.py's SYNC_MAX_DAYS — keeps a chat-triggered sync as
+# bite-sized as the UI's auto-sync so a long absence doesn't turn one tool
+# call into a multi-minute Garmin backfill.
+SYNC_MAX_DAYS = 30
 
 # The single source of truth for observation-type validation. Numeric types
 # (weight/rpe/soreness/energy/mood) store into value_num via `value`; free-text
@@ -527,6 +534,30 @@ async def find_anomalies(args: dict) -> dict:
         "sd_threshold": threshold,
         "anomalies": [dict(r) for r in rows],
     })
+
+
+@tool(
+    "sync_garmin_data",
+    "Pull the latest data from Garmin Connect into the database (gap-aware: "
+    "fills missing days, always refreshes the last few days so day-end totals "
+    "overwrite partial values) and recompute baselines/training-load if new "
+    "data landed. Every other tool only reads what's already in the DB — call "
+    "this first when the user asks to sync/refresh/pull/update their data, or "
+    "when today's data looks stale or missing.",
+    {},
+)
+async def sync_garmin_data(_args: dict) -> dict:
+    result = await asyncio.to_thread(daily_ingest.pull, max_days=SYNC_MAX_DAYS)
+    if result.get("status") == "success" and result.get("days_pulled", 0) > 0:
+        await asyncio.to_thread(baselines_mod.recompute, lookback_days=90)
+    if result.get("error"):
+        return _err(
+            result["error"],
+            status=result.get("status"),
+            days_pulled=result.get("days_pulled", 0),
+            last_date=result.get("last_date"),
+        )
+    return _text(result)
 
 
 @tool(
@@ -1483,6 +1514,7 @@ ALL_TOOLS = [
     get_workout_detail,
     compare_periods,
     find_anomalies,
+    sync_garmin_data,
     training_load_status,
     correlate,
     recovery_pattern,

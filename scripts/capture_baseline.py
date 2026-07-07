@@ -136,10 +136,12 @@ def _capture_live(scenarios: list[str], model: str, runs: int) -> dict[str, dict
     """Run the live composer against each fixture and aggregate. Mutates the
     process DB pointer + isolation env per scenario; restores them after."""
     from local_fitness import db
+    from local_fitness.agent import briefs
 
     orig_db = db.DEFAULT_DB_PATH
     orig_notes = os.environ.get("LOCAL_FITNESS_NOTES_PATH")
     orig_briefs = os.environ.get("LOCAL_FITNESS_BRIEFINGS_DIR")
+    orig_briefings_dir_attr = briefs.DEFAULT_BRIEFINGS_DIR
     out: dict[str, dict] = {}
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,6 +150,12 @@ def _capture_live(scenarios: list[str], model: str, runs: int) -> dict[str, dict
             # briefs can't leak into the fixture's brief (controlled continuity).
             os.environ["LOCAL_FITNESS_NOTES_PATH"] = str(tmp_root / "user_notes.md")
             os.environ["LOCAL_FITNESS_BRIEFINGS_DIR"] = str(tmp_root / "briefings")
+            # The env var alone is NOT sufficient: briefs.DEFAULT_BRIEFINGS_DIR is
+            # resolved once at import time, and `local_fitness.agent.briefing`
+            # (imported inside _generate_one, called below) has already imported
+            # `briefs` by then, so the override above is a no-op without this
+            # direct attribute mutation. Same fix as shadow_run.py.
+            briefs.DEFAULT_BRIEFINGS_DIR = tmp_root / "briefings"
             for scenario in scenarios:
                 fixture = eval_fixtures.build_fixture_db(
                     scenario, tmp_root / scenario / "fitness.db"
@@ -165,6 +173,7 @@ def _capture_live(scenarios: list[str], model: str, runs: int) -> dict[str, dict
                 )
     finally:
         db.DEFAULT_DB_PATH = orig_db
+        briefs.DEFAULT_BRIEFINGS_DIR = orig_briefings_dir_attr
         _restore_env("LOCAL_FITNESS_NOTES_PATH", orig_notes)
         _restore_env("LOCAL_FITNESS_BRIEFINGS_DIR", orig_briefs)
     return out

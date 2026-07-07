@@ -37,6 +37,9 @@ from claude_agent_sdk import (
 from local_fitness import db
 from local_fitness.agent import briefing
 from local_fitness.agent import briefs
+from local_fitness.agent import coach
+from local_fitness.agent import prompts
+from local_fitness.agent.schemas import Brief, BriefContext
 
 
 # --- _iter_partial_takeaways: the streaming partial-JSON parser ------------
@@ -607,3 +610,388 @@ def test_v1_path_does_not_run_grounding(stream_env, monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="local_fitness.agent.grounding"):
         _drain(save=True)
     assert not any("brief_grounding" in r.message for r in caplog.records)
+
+
+# --- gemma4/Ollama shadow-run dispatch --------------------------------------
+# See docs/plans/2026-07-05-gemma4-shadow-run-design.md. These test the new
+# "ollama:"-prefixed model dispatch in isolation from any real network call:
+# briefing.local_model.generate_local_completion is monkeypatched to a plain
+# (sync) fake, matching how asyncio.to_thread calls it in production.
+
+def _drain_model(model: str, save: bool = False) -> list[dict]:
+    async def go():
+        return [evt async for evt in briefing.generate_streaming(model=model, save=save)]
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("ollama:gemma4", "gemma4"),
+    ("ollama:llama3.1:8b", "llama3.1:8b"),
+    ("claude-sonnet-4-6", None),
+    ("gemma4", None),  # no prefix -> not treated as local, even if the name matches
+])
+def test_local_model_name_prefix_parsing(model, expected):
+    assert briefing._local_model_name(model) == expected
+
+
+def test_assert_fixture_only_data_passes_under_tmp_path(stream_env):
+    # stream_env's fixture already points db.DEFAULT_DB_PATH and
+    # briefs.DEFAULT_BRIEFINGS_DIR at pytest's tmp_path, which is guaranteed
+    # to live under the system temp root.
+    briefing._assert_fixture_only_data()  # must not raise
+
+
+def test_assert_fixture_only_data_raises_for_real_db_path(monkeypatch, stream_env):
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", db._PROJECT_ROOT / "data" / "fitness.db")
+    with pytest.raises(RuntimeError, match="db.DEFAULT_DB_PATH"):
+        briefing._assert_fixture_only_data()
+
+
+def test_assert_fixture_only_data_raises_for_real_briefings_dir(monkeypatch, stream_env):
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", db._PROJECT_ROOT / "briefings")
+    with pytest.raises(RuntimeError, match="briefs.DEFAULT_BRIEFINGS_DIR"):
+        briefing._assert_fixture_only_data()
+
+
+def test_local_model_refused_under_v1(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
+    with pytest.raises(ValueError, match="toolless path"):
+        _drain_model("ollama:gemma4", save=False)
+
+
+def _gemma4_slot_json(workout: dict, steps: dict, others: list[dict]) -> str:
+    """A gemma4 response in the explicit-slot shape _gemma4_format_schema
+    asks for (see briefing._reshape_gemma4_slots)."""
+    return json.dumps({
+        "workout_takeaway": workout, "steps_takeaway": steps,
+        "other_takeaways": others,
+    })
+
+
+def test_local_model_routes_to_local_client_and_saves(stream_env, monkeypatch):
+    """V2 + an 'ollama:' model calls local_model.generate_local_completion
+    (not claude_agent_sdk.query) and flows through the same parse/validate/
+    save/grounding tail as the Claude path. gemma4's response uses the
+    explicit-slot shape (see _gemma4_format_schema) which gets flattened back
+    into the real 'takeaways' list before that shared tail ever sees it."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    calls: list[dict] = []
+
+    def fake_local_completion(system_prompt, user_prompt, *, model, format=None,  # noqa: A002
+                              temperature=None, **kw):
+        calls.append({"system": system_prompt, "user": user_prompt, "model": model,
+                      "format": format, "temperature": temperature})
+        return _gemma4_slot_json(
+            _takeaway(headline="Today's workout"),
+            _takeaway(headline="Steps check-in"),
+            [_takeaway(headline="Conditioning note")],
+        )
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        fake_local_completion)
+    events = _drain_model("ollama:gemma4", save=True)
+
+    assert len(calls) == 1 and calls[0]["model"] == "gemma4"
+    # Same prompt-construction call the Claude V2 path uses — parity by
+    # construction, not by discipline.
+    assert "cite ONLY these numbers" in calls[0]["user"]
+    # Structured-output constraint, tightened for gemma4 specifically (see
+    # _gemma4_format_schema) — forces schema-conformant, non-defaulted JSON
+    # via grammar-constrained decoding rather than relying on instructions.
+    assert calls[0]["format"] == briefing._gemma4_format_schema()
+    assert calls[0]["temperature"] == 0.8
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1 and not [e for e in events if e["type"] == "error"]
+    on_disk = json.loads((stream_env / f"{date_today()}.json").read_text())
+    # Reshaped: workout first, steps second, then the rest — see
+    # _reshape_gemma4_slots.
+    assert [tk["headline"] for tk in on_disk["takeaways"]] == [
+        "Today's workout", "Steps check-in", "Conditioning note"]
+
+
+def test_local_model_parse_failure_surfaces_error_and_does_not_save(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        lambda *a, **kw: "not json at all")
+    events = _drain_model("ollama:gemma4", save=True)
+    assert [e for e in events if e["type"] == "error"]
+    assert list(stream_env.glob("*.json")) == []
+
+
+def test_local_model_all_models_get_the_same_base_prompt(stream_env, monkeypatch):
+    """Every local model gets the shared (Claude-identical) V2 prompt —
+    round 2 (2026-07-05) found a gemma4-specific prompt appendix did NOT
+    improve compliance, so gemma4-specific tuning now happens at the format-
+    schema layer (_gemma4_format_schema), not via divergent prompt wording."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    calls: list[dict] = []
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        lambda sp, up, **kw: calls.append({"system": sp, "user": up})
+                        or _brief_json([_takeaway()]))
+    expected_system_prompt = prompts.brief_v2_system_prompt(
+        db.get_setting("user_name", prompts.DEFAULT_USER_NAME),
+        coach.resolve_coach_profile())
+    for model in ("ollama:gemma4", "ollama:llama3.1:8b"):
+        calls.clear()
+        _drain_model(model, save=False)
+        assert calls[0]["system"] == expected_system_prompt
+
+
+def test_local_model_gemma4_gets_tightened_schema_and_higher_temperature(stream_env, monkeypatch):
+    """gemma4 specifically gets the tightened format schema + temperature=0.8
+    (fixed the tone/metric defaulting behavior — see _gemma4_format_schema).
+    A different local model gets the plain schema + the conservative default
+    temperature, since that tuning was never validated for it."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        briefing.local_model, "generate_local_completion",
+        lambda sp, up, *, format=None, temperature=None, **kw: (  # noqa: A002
+            calls.append({"format": format, "temperature": temperature})
+            or _brief_json([_takeaway()])))
+
+    calls.clear()
+    _drain_model("ollama:gemma4", save=False)
+    assert calls[0]["format"] == briefing._gemma4_format_schema()
+    assert calls[0]["temperature"] == 0.8
+
+    calls.clear()
+    _drain_model("ollama:llama3.1:8b", save=False)
+    assert calls[0]["format"] == Brief.model_json_schema()
+    assert calls[0]["temperature"] == 0.4
+
+
+def test_gemma4_format_schema_tightens_tone_and_metric():
+    schema = briefing._gemma4_format_schema()
+    takeaway = schema["$defs"]["Takeaway"]
+    assert "default" not in takeaway["properties"]["tone"]
+    assert takeaway["properties"]["metric"] == {
+        "$ref": "#/$defs/TakeawayMetric",
+        "description": "What metric to chart inline",
+    }
+    assert set(takeaway["required"]) == {
+        "headline", "summary", "tone", "metric", "details"}
+
+
+def test_gemma4_format_schema_expresses_category_mandate_as_required_slots():
+    """The prompt mandates exactly one workout + one steps takeaway in every
+    brief. A single `contains` constraint reliably forced one mandated
+    category in testing, but `allOf`-combined `contains` (forcing both) was
+    NOT reliably honored by Ollama's grammar-constrained decoder (verified
+    2026-07-06 — one fixture produced zero of either mandated category across
+    3 runs despite the constraint, and still validated). Required object keys
+    have been reliable throughout, so the mandate is two required slots
+    instead — verified 9/9 across 3 fixtures before being wired in here."""
+    schema = briefing._gemma4_format_schema()
+    assert "takeaways" not in schema["properties"]
+    assert schema["properties"]["workout_takeaway"] == {"$ref": "#/$defs/Takeaway"}
+    assert schema["properties"]["steps_takeaway"] == {"$ref": "#/$defs/Takeaway"}
+    assert schema["properties"]["other_takeaways"] == {
+        "type": "array", "items": {"$ref": "#/$defs/Takeaway"},
+        "minItems": 1, "maxItems": 3,
+    }
+    assert set(schema["required"]) >= {
+        "workout_takeaway", "steps_takeaway", "other_takeaways"}
+    assert "takeaways" not in schema["required"]
+
+
+def test_gemma4_format_schema_does_not_mutate_the_real_schema():
+    """Calling _gemma4_format_schema() must not leak mutations back into
+    Brief.model_json_schema()'s cached/shared $defs — each call builds a
+    fresh copy."""
+    before = Brief.model_json_schema()
+    briefing._gemma4_format_schema()
+    after = Brief.model_json_schema()
+    assert before == after
+    assert "default" in after["$defs"]["Takeaway"]["properties"]["tone"]
+    assert "takeaways" in after["properties"]
+
+
+def test_reshape_gemma4_slots_flattens_into_takeaways_list():
+    raw = _gemma4_slot_json(
+        _takeaway(headline="Workout"), _takeaway(headline="Steps"),
+        [_takeaway(headline="Conditioning"), _takeaway(headline="HR recovery")],
+    )
+    reshaped = json.loads(briefing._reshape_gemma4_slots(raw))
+    assert "workout_takeaway" not in reshaped
+    assert "steps_takeaway" not in reshaped
+    assert "other_takeaways" not in reshaped
+    assert [tk["headline"] for tk in reshaped["takeaways"]] == [
+        "Workout", "Steps", "Conditioning", "HR recovery"]
+
+
+def test_reshape_gemma4_slots_handles_missing_other_takeaways():
+    raw = json.dumps({
+        "workout_takeaway": _takeaway(headline="Workout"),
+        "steps_takeaway": _takeaway(headline="Steps"),
+    })
+    reshaped = json.loads(briefing._reshape_gemma4_slots(raw))
+    assert [tk["headline"] for tk in reshaped["takeaways"]] == ["Workout", "Steps"]
+
+
+def test_reshape_gemma4_slots_returns_raw_unchanged_when_slots_absent():
+    """A response already in the plain 'takeaways' shape (e.g. a non-gemma4
+    local model, or a malformed response) passes through untouched so the
+    normal parse/validation path reports the real outcome."""
+    raw = _brief_json([_takeaway()])
+    assert briefing._reshape_gemma4_slots(raw) == raw
+    assert briefing._reshape_gemma4_slots("not json at all") == "not json at all"
+
+
+def test_local_model_client_failure_propagates(stream_env, monkeypatch):
+    """A generate_local_completion failure (e.g. Ollama unreachable) is not
+    swallowed here — it propagates so callers (shadow_run.py's per-run
+    try/except) record it as a flake rather than a silent empty result."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+
+    def boom(*a, **kw):
+        raise RuntimeError("ollama call failed (connection): refused")
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion", boom)
+    with pytest.raises(RuntimeError, match="ollama call failed"):
+        _drain_model("ollama:gemma4", save=False)
+
+
+# --- Plan-fold gap: gemma4 fabricates plan facts when asked to derive them
+# itself (2026-07-06 manual testing: invented a wrong days-to-race count and
+# inverted a "missed" verdict to "on track"). Fixed by pre-computing the
+# facts in Python instead of asking the model to re-derive them. ----------
+
+_PLAN_TODAY = {
+    "goal_type": "half",
+    "target_time_seconds": 6420,  # 1:47:00
+    "days_to_race": 10,
+    "last_graded": {"description": "20min tempo at half-marathon effort", "verdict": "missed"},
+    "today": {"description": "Easy 5k, conversational pace"},
+}
+
+
+def test_format_race_goal_time():
+    assert briefing._format_race_goal_time(6420) == "1:47:00"
+    assert briefing._format_race_goal_time(154) == "2:34"
+    assert briefing._format_race_goal_time(None) is None
+
+
+def test_gemma4_plan_prompt_facts_cites_precomputed_values():
+    text = briefing._gemma4_plan_prompt_facts(_PLAN_TODAY)
+    assert "CITE THESE VERBATIM" in text
+    assert "sub-1:47:00 half" in text
+    assert "10 days out" in text
+    assert "MISSED" in text
+    assert "Easy 5k, conversational pace" in text
+
+
+def test_gemma4_plan_prompt_facts_handles_no_graded_session_or_no_session_today():
+    text = briefing._gemma4_plan_prompt_facts({
+        "goal_type": "marathon", "target_time_seconds": None, "days_to_race": None,
+        "last_graded": None, "today": None,
+    })
+    assert "do not invent a status" in text
+    assert "no session scheduled today" in text
+
+
+def test_gemma4_plan_status_appendix_is_correct_and_keyword_bearing():
+    """The appendix must be both factually correct (computed, not generated)
+    and hit ab_brief._PLAN_KEYWORDS reliably, since gemma4's own free-text
+    phrasing was shown not to (2026-07-06 shadow-run: 0/4 runs matched)."""
+    text = briefing._gemma4_plan_status_appendix(_PLAN_TODAY)
+    assert "sub-1:47:00 half" in text
+    assert "10 days to race day" in text
+    assert "MISSED" in text
+    assert 'the plan calls for: "Easy 5k, conversational pace"' in text
+    # Matches ab_brief._PLAN_KEYWORDS's exact substrings.
+    lowered = text.lower()
+    for keyword in ("training plan", "race day", "adherence", "plan calls for"):
+        assert keyword in lowered, keyword
+
+
+def test_gemma4_plan_status_appendix_handles_no_active_plan_data():
+    text = briefing._gemma4_plan_status_appendix({
+        "goal_type": "marathon", "target_time_seconds": None, "days_to_race": None,
+        "last_graded": None, "today": None,
+    })
+    assert "race day date not yet set" in text
+    assert "session graded yet on the plan" in text
+    assert "the plan calls for no session today" in text
+
+
+def test_append_gemma4_plan_status_appends_to_workout_takeaway_details():
+    raw = _brief_json([_takeaway(headline="Workout"), _takeaway(headline="Steps")])
+    result = json.loads(briefing._append_gemma4_plan_status(raw, _PLAN_TODAY))
+    assert "Training plan status" in result["takeaways"][0]["details"]
+    assert "MISSED" in result["takeaways"][0]["details"]
+    # Only the workout slot (index 0) is touched.
+    assert "Training plan status" not in result["takeaways"][1]["details"]
+
+
+def test_append_gemma4_plan_status_noop_when_no_active_plan():
+    raw = _brief_json([_takeaway()])
+    assert briefing._append_gemma4_plan_status(raw, None) == raw
+
+
+def test_append_gemma4_plan_status_noop_on_malformed_or_empty_takeaways():
+    assert briefing._append_gemma4_plan_status("not json", _PLAN_TODAY) == "not json"
+    raw = json.dumps({"takeaways": []})
+    assert briefing._append_gemma4_plan_status(raw, _PLAN_TODAY) == raw
+
+
+def _fake_plan_context(plan_today: dict) -> BriefContext:
+    return BriefContext(date=date_today(), user_name="Nate", candidates=[], plan_today=plan_today)
+
+
+def test_local_model_gemma4_folds_plan_status_into_workout_takeaway(stream_env, monkeypatch):
+    """End-to-end: an active plan flows through the gemma4 dispatch branch —
+    the prompt gets the pre-computed facts block, and the final saved brief's
+    workout takeaway carries the deterministic, correct plan-status
+    appendix regardless of what the (here, faked) model returned."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.brief_planner, "assemble_brief_context",
+                        lambda **kw: _fake_plan_context(_PLAN_TODAY))
+    calls: list[str] = []
+
+    def fake_local_completion(system_prompt, user_prompt, **kw):
+        calls.append(user_prompt)
+        return _gemma4_slot_json(
+            _takeaway(headline="Workout"), _takeaway(headline="Steps"), [])
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        fake_local_completion)
+    events = _drain_model("ollama:gemma4", save=True)
+
+    assert "CITE THESE VERBATIM" in calls[0]
+    assert "10 days out" in calls[0]
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1
+    details = done[0]["brief"]["takeaways"][0]["details"]
+    assert "Training plan status" in details
+    assert "MISSED" in details
+
+
+def test_local_model_gemma4_skips_plan_facts_when_no_active_plan(stream_env, monkeypatch):
+    """No active plan → no prompt facts block, no appendix — the plan-fold
+    machinery is a no-op path, not always-on."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.brief_planner, "assemble_brief_context",
+                        lambda **kw: _fake_plan_context(None))
+    calls: list[str] = []
+
+    def fake_local_completion(system_prompt, user_prompt, **kw):
+        calls.append(user_prompt)
+        return _gemma4_slot_json(
+            _takeaway(headline="Workout"), _takeaway(headline="Steps"), [])
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        fake_local_completion)
+    events = _drain_model("ollama:gemma4", save=True)
+
+    assert "CITE THESE VERBATIM" not in calls[0]
+    done = [e for e in events if e["type"] == "done"]
+    assert "Training plan status" not in done[0]["brief"]["takeaways"][0]["details"]
