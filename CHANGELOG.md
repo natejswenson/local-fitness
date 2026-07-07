@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-07
+
+### Added
+- **New MCP tool: `sync_garmin_data`.** MCP-only clients (opencode, Claude
+  Desktop, etc.) previously had read access to the fitness DB but no way to
+  refresh it — only the CLI (`fitness pull`) and the web UI's `/api/sync`
+  could trigger a live Garmin pull. The new tool wraps the same bite-sized,
+  gap-aware `ingest.daily.pull()` + baseline recompute the web UI uses, so an
+  MCP-connected agent can sync on request instead of only ever answering from
+  stale data. Deliberately excluded from the brief loop's read-only tool
+  allow-list — brief generation stays side-effect-free.
+
 ## [0.15.2] - 2026-07-01
 
 ### Fixed
