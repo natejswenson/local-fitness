@@ -39,6 +39,14 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load `.env` from the project root so LOCAL_FITNESS_OPENCODE_AGENT (and any
+# other .env-driven config) actually takes effect here — this script is one
+# level shallower than src/local_fitness/cli.py, so parents[1] (not cli.py's
+# parents[2]) reaches the repo root from this file's location.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 import capture_baseline as cb
 import eval_fixtures
 
@@ -180,6 +188,11 @@ def _capture_v2(scenarios: list[str], model: str, runs: int) -> dict[str, dict]:
                         results.append(brief.model_dump())
                         rates.append(grounding.invention_rate(brief, context))
                     except Exception as e:  # noqa: BLE001 — one bad gen ≠ abort
+                        # Alt-model failures (e.g. a misconfigured opencode
+                        # agent) propagate with NO log emitted anywhere else
+                        # in that path — this print is the only place the
+                        # actionable remediation text ever reaches the user.
+                        print(f"  FAILED: {str(e).splitlines()[0]}")
                         results.append({"error": str(e)})
                 rec = cb.aggregate_scenario(
                     results, plan_active=scenario in cb._PLAN_ACTIVE_SCENARIOS)
@@ -249,19 +262,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report["overall_parity"] else 1
 
     est = cb.estimate(scenarios, args.runs)
-    is_local_model = args.model.startswith("ollama:")
+    from local_fitness.agent.briefing import _ALT_MODEL_PREFIX
+
+    is_alt_model = args.model.startswith(_ALT_MODEL_PREFIX)
+    provider = (
+        args.model[len(_ALT_MODEL_PREFIX):].partition("/")[0] if is_alt_model else None
+    )
     if not args.run:
         print(f"Shadow-run plan: scenarios={scenarios} runs={args.runs} (V2 flag forced ON)")
         print(f"  -> {est['generations']} generations (hard cap {cb.MAX_GENERATIONS})")
-        if is_local_model:
+        if provider == "ollama":
             print("  -> cost: $0 (local via Ollama). Wall-clock: unmeasured for this "
                   "model — the estimate below is Claude-derived and does not apply; "
                   "the first run calibrates it.")
+        elif is_alt_model:
+            print(f"  -> cost: network call via opencode gateway ({args.model[len(_ALT_MODEL_PREFIX):]}) "
+                  "— cost depends on the model, not necessarily free. Wall-clock: "
+                  "unmeasured for this model — the estimate below is Claude-derived "
+                  "and does not apply; the first run calibrates it.")
         else:
             print(f"  -> est ~{est['est_seconds']}s wall, ~{est['est_output_tokens']:,} output tokens")
         print(f"  Compares V2 fingerprints against {baseline_path}.")
-        if is_local_model:
+        if provider == "ollama":
             print("  Runs locally via Ollama — no subscription/API cost.")
+        elif is_alt_model:
+            print("  Not local — leaves the machine via opencode's hosted gateway.")
         else:
             print("  Uses the Claude Max subscription (CLAUDE_CODE_OAUTH_TOKEN) — no per-token billing.")
         print("  Re-run with --run to execute, or --mock <file> for a cost-free check.")
