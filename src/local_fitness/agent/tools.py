@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import re
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 from pydantic import ValidationError
@@ -21,6 +26,9 @@ from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
 from . import briefs, charts, units
+from .schemas import Brief
+
+LOG = logging.getLogger(__name__)
 
 
 SERVER_NAME = "fitness"
@@ -318,18 +326,18 @@ def _chart_value_fmt(metric: str):
     return lambda v: f"{int(round(v))}"
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
-async def chart(args: dict) -> dict:
-    metric = args["metric"]
+def _fetch_metric_series(metric: str, days: int) -> tuple[list[str], list[float]]:
+    """Shared whitelisted fetch for chart()/generate_chart() — dates + values
+    for `metric` over the last `days` days.
+
+    Validates `metric` against `_CHART_METRICS` before building any SQL —
+    the check lives inside this helper, not left to each caller to remember;
+    both `chart()` and `generate_chart()` inherit it from here. Raises
+    ValueError on an unwhitelisted metric so callers translate it into their
+    own `_err()` response.
+    """
     if metric not in _CHART_METRICS:
-        return _err(f"unknown metric '{metric}'", allowed=sorted(_CHART_METRICS))
-    err = _validate_days(args["days"])
-    if err:
-        return _err(err)
-    style = args.get("style") or "calendar"
-    if style not in _CHART_STYLES:
-        return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
-    days = args["days"]
+        raise ValueError(f"unknown metric '{metric}'")
     cutoff = (date.today() - timedelta(days=days)).isoformat()
 
     # metric is whitelisted above; the column name interpolated here can only be
@@ -347,12 +355,28 @@ async def chart(args: dict) -> dict:
 
     with db.connect() as conn:
         rows = conn.execute(sql, (cutoff,)).fetchall()
-    if not rows:
+    dates = [r["date"] for r in rows]       # ISO YYYY-MM-DD
+    values = [float(r["v"]) for r in rows]
+    return dates, values
+
+
+@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
+async def chart(args: dict) -> dict:
+    metric = args["metric"]
+    if metric not in _CHART_METRICS:
+        return _err(f"unknown metric '{metric}'", allowed=sorted(_CHART_METRICS))
+    err = _validate_days(args["days"])
+    if err:
+        return _err(err)
+    style = args.get("style") or "calendar"
+    if style not in _CHART_STYLES:
+        return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
+    days = args["days"]
+    dates, values = _fetch_metric_series(metric, days)
+    if not values:
         return _err("no data in window", metric=metric, days=days)
 
-    dates = [r["date"] for r in rows]       # ISO YYYY-MM-DD
     labels = [d[5:] for d in dates]         # MM-DD
-    values = [float(r["v"]) for r in rows]
     fmt = _chart_value_fmt(metric)
     title = f"{metric} · last {days}d · n={len(values)}"
 
@@ -1504,6 +1528,189 @@ async def get_brief_context(_args: dict) -> dict:
     return _text(brief_planner.assemble_brief_context().model_dump())
 
 
+# --- LOCAL_ONLY_TOOLS: generate_brief_report / generate_chart -------------
+# Beautiful PDF/chart rendering tools. Reachable ONLY via run_stdio() (see
+# web/mcp_server.py) — never merged into ALL_TOOLS, never served over the
+# streamable-HTTP /mcp/ transport. A phone-triggered call over that network
+# transport would get back a container-internal path with no way to
+# retrieve the file; this boundary is structural, not just documented (see
+# docs/plans/2026-07-07-pdf-chart-reports-design.md).
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _default_reports_dir() -> Path:
+    """Resolve the reports directory. Honor LOCAL_FITNESS_REPORTS_DIR for a
+    host override; default to a project-relative `./reports/` directory
+    when unset. Deliberately NOT wired to a Dockerfile pre-creation step or
+    a compose bind-mount — the container's only process can never reach
+    these tools (see design doc), so `reports/` is created on demand by
+    each tool's own mkdir call, only on the host run_stdio() path."""
+    override = os.environ.get("LOCAL_FITNESS_REPORTS_DIR")
+    if override:
+        return Path(override)
+    return _PROJECT_ROOT / "reports"
+
+
+REPORTS_DIR = _default_reports_dir()
+
+
+def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
+    """Write `data` to `reports_dir/final_name` via a per-call-unique .tmp
+    sibling + os.replace() — the atomic-write shape agent/briefs.py's
+    save_brief() already uses, refined with a uuid4-suffixed temp name (not
+    save_brief()'s fixed one) so two concurrent processes/threads racing an
+    identical call never share a temp inode before either reaches replace().
+    Confirms the resolved final path is contained under reports_dir before
+    writing anything, mirroring web/server.py's SPA-fallback containment
+    check."""
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    final_path = reports_dir / final_name
+    final_path.resolve().relative_to(reports_dir.resolve())
+    tmp_path = reports_dir / f".{final_name}.{uuid4().hex[:8]}.tmp"
+    tmp_path.write_bytes(data)
+    os.replace(tmp_path, final_path)
+    return final_path
+
+
+@tool(
+    "generate_brief_report",
+    "Render a saved daily brief into a polished, beautiful PDF report "
+    "(visually comparable to the sibling budget project's monthly reports). "
+    "Local-only: reachable via stdio MCP clients (Claude Code/Claude Desktop "
+    "on this same machine), never over the network. Returns a local file "
+    "path the user can open directly.",
+    {"date": str},
+)
+async def generate_brief_report(args: dict) -> dict:
+    target_date = args["date"]
+    if not _DATE_RE.match(target_date):
+        return _err(f"malformed date '{target_date}', expected YYYY-MM-DD")
+
+    brief_path = briefs.DEFAULT_BRIEFINGS_DIR / f"{target_date}.json"
+    if not brief_path.exists():
+        return _err(f"no saved brief for {target_date}")
+    try:
+        brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
+    except ValidationError as e:
+        return _err(f"brief failed schema validation: {e}")
+
+    from . import visuals  # lazy: defers matplotlib/weasyprint import cost
+
+    charts_by_index: dict[str, bytes] = {}
+    for index, takeaway in enumerate(brief.takeaways):
+        if takeaway.metric is None:
+            continue
+        try:
+            m_dates, m_values = _fetch_metric_series(takeaway.metric.metric, takeaway.metric.days)
+            if not m_values:
+                continue
+            fmt = _chart_value_fmt(takeaway.metric.metric)
+            async with visuals.RENDER_LOCK:
+                png_bytes = await asyncio.to_thread(
+                    visuals.render_chart_png, list(zip(m_dates, m_values)), "line", fmt
+                )
+            charts_by_index[str(index)] = png_bytes
+        except Exception:
+            # A per-takeaway fetch/render problem (transient DB lock,
+            # degenerate single-point/all-identical-value series, etc.)
+            # must never fail the whole report — that takeaway simply
+            # renders without a chart image.
+            LOG.warning(
+                "chart render skipped for takeaway %d in brief %s",
+                index, target_date, exc_info=True,
+            )
+            continue
+
+    try:
+        async with visuals.RENDER_LOCK:
+            pdf_bytes = await asyncio.to_thread(visuals.render_brief_pdf, brief, charts_by_index)
+    except Exception as e:
+        return _err(f"PDF render failed: {e}")
+
+    try:
+        final_path = _write_atomic(REPORTS_DIR, f"brief-{target_date}.pdf", pdf_bytes)
+    except ValueError:
+        return _err("resolved path escaped reports directory")
+    return _text({"path": str(final_path)})
+
+
+_GENERATE_CHART_TYPES = frozenset({"line", "bar", "combo"})
+
+_GENERATE_CHART_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metric": {
+            "type": "string",
+            "description": "Any daily metric, training-load series (ctl/atl/tsb), or intensity_minutes_weighted — same whitelist as the chart tool.",
+        },
+        "days": {"type": "integer", "description": "Look back this many days"},
+        "chart_type": {
+            "type": "string",
+            "enum": sorted(_GENERATE_CHART_TYPES),
+            "description": (
+                "line = axis chart with gridlines; bar = vertical bars; "
+                "combo = bars + a least-squares trend line of the same "
+                "metric (matches the ASCII chart tool's combo style, one "
+                "metric, one axis — not a two-metric dual-axis chart)."
+            ),
+        },
+    },
+    "required": ["metric", "days", "chart_type"],
+}
+
+
+@tool(
+    "generate_chart",
+    "Render a beautiful standalone PNG chart (line/bar/combo) of a metric "
+    "over the last N days, for any ad-hoc trend question. Local-only: "
+    "reachable via stdio MCP clients (Claude Code/Claude Desktop on this "
+    "same machine), never over the network. Returns a local file path.",
+    _GENERATE_CHART_SCHEMA,
+)
+async def generate_chart(args: dict) -> dict:
+    metric = args["metric"]
+    days = args["days"]
+    chart_type = args["chart_type"]
+    if chart_type not in _GENERATE_CHART_TYPES:
+        return _err(f"unknown chart_type '{chart_type}'", allowed=sorted(_GENERATE_CHART_TYPES))
+    err = _validate_days(days)
+    if err:
+        return _err(err)
+    try:
+        dates, values = _fetch_metric_series(metric, days)
+    except ValueError as e:
+        return _err(str(e), allowed=sorted(_CHART_METRICS))
+    if not values:
+        return _err("no data in window", metric=metric, days=days)
+
+    from . import visuals  # lazy: defers matplotlib/weasyprint import cost
+
+    fmt = _chart_value_fmt(metric)
+    try:
+        async with visuals.RENDER_LOCK:
+            png_bytes = await asyncio.to_thread(
+                visuals.render_chart_png, list(zip(dates, values)), chart_type, fmt
+            )
+    except Exception as e:
+        return _err(f"chart render failed: {e}")
+
+    # {today} is computed here, not a tool argument — it exists in the
+    # filename only to distinguish chart runs across days. The idempotent-
+    # overwrite guarantee (identical metric/chart_type/days -> identical
+    # file) therefore holds only within a single calendar day.
+    today = date.today().isoformat()
+    try:
+        final_path = _write_atomic(
+            REPORTS_DIR, f"chart-{metric}-{chart_type}-{days}d-{today}.png", png_bytes
+        )
+    except ValueError:
+        return _err("resolved path escaped reports directory")
+    return _text({"path": str(final_path)})
+
+
 ALL_TOOLS = [
     get_today_status,
     get_brief_context,
@@ -1537,9 +1744,21 @@ ALL_TOOLS = [
     save_brief,
 ]
 
+# Registered ONLY here, never merged into ALL_TOOLS — wired into run_stdio()
+# alone (see web/mcp_server.py's build_server(extra_tools=...)), never into
+# build_session_manager()'s HTTP /mcp/ transport. A plain module-level list
+# literal referencing two already-defined function objects, symmetric with
+# and as trivially greppable as ALL_TOOLS — costs nothing to construct at
+# module scope. Only the heavy `import matplotlib`/`import weasyprint`
+# statements (inside the two functions' bodies and visuals.py's own module
+# body) are deferred, not this list.
+LOCAL_ONLY_TOOLS = [generate_brief_report, generate_chart]
 
-def make_server():
-    return create_sdk_mcp_server(name=SERVER_NAME, version="0.6.0", tools=ALL_TOOLS)
+
+def make_server(extra_tools: list | None = None):
+    return create_sdk_mcp_server(
+        name=SERVER_NAME, version="0.6.0", tools=ALL_TOOLS + (extra_tools or [])
+    )
 
 
 def allowed_tool_names() -> list[str]:

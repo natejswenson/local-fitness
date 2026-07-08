@@ -112,15 +112,15 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   builds from the `../local-fitness` working tree, so the checked-out branch is
   what ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
-  (85% coverage gate), `ruff`, the prompt scorer, and `pnpm build`
-  (`tsc -b && vite build`) for the frontend. It does **NOT** run
-  `docker build`. So a green CI proves the Python suite + the frontend
-  build/type-check pass — but a `node`/base-image bump or `Dockerfile`
-  change can still pass CI and break `docker compose up --build` (this bit
-  us once: `node:26` dropped bundled `corepack`). Always rebuild the
-  container yourself after touching the `Dockerfile`, base images, or web
-  deps. There are no frontend unit tests yet — CI type-checks and builds
-  the SPA but does not test it.
+  (85% coverage gate), `ruff`, the prompt scorer, `pnpm build` (`tsc -b &&
+  vite build`), and `pnpm test` (vitest) for the frontend. A separate
+  `docker-build` job compiles the full multi-stage image (no push) so a
+  `node`/base-image bump or `Dockerfile` change can't silently break
+  `docker compose up --build` while CI stays green (this bit us once:
+  `node:26` dropped bundled `corepack`) — but a green `docker-build` only
+  proves the image *compiles*, not that the running container behaves
+  correctly, so still rebuild and smoke-test locally after touching the
+  `Dockerfile`, base images, or web deps.
 - **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
   manual prefix today, `/devlog` skill (auto from git commits) going
   forward.
@@ -280,6 +280,21 @@ These are settled — don't redesign without a reason.
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
   and the web UI could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
+- **`generate_brief_report`/`generate_chart` are stdio-only, never `ALL_TOOLS`.**
+  These two MCP tools (`agent/tools.py`'s `LOCAL_ONLY_TOOLS`) render a saved
+  daily brief into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline,
+  reusing the `budget` project's validated color theme) and render a
+  standalone matplotlib PNG chart on demand, both to local files under
+  `LOCAL_FITNESS_REPORTS_DIR` (default `./reports/`, gitignored, ephemeral —
+  never bind-mounted). They're registered ONLY via `run_stdio()`'s
+  `build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)` call — structurally,
+  not just by convention, unreachable over the authenticated streamable-HTTP
+  `/mcp/` transport (`build_session_manager()` calls `build_server()`
+  argument-free), since a phone-triggered call over that transport would get
+  back a container-internal path with no way to retrieve the file. WeasyPrint
+  needs native Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS
+  Homebrew's install isn't on the default dylib search path and needs
+  `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
 - **Auth middleware**: `LOCAL_FITNESS_API_TOKEN` env var; constant-time
   bearer check; `/health` and `/{full_path:path}` (SPA shell) are public.
 - **Rate limit**: in-memory token bucket on `RATE_LIMITED_PREFIXES`,

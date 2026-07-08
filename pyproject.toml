@@ -1,6 +1,6 @@
 [project]
 name = "local-fitness"
-version = "0.16.0"
+version = "0.17.0"
 description = "Local Garmin-data agent: hands-off ingest + Claude-powered daily briefings"
 readme = "README.md"
 authors = [
@@ -14,9 +14,12 @@ dependencies = [
     "fitparse>=1.2.0",
     "garminconnect>=0.3.3",
     "keyring>=25.7.0",
+    "markdown>=3.10.2",
+    "matplotlib>=3.11.0",
     "python-dotenv>=1.0.1",
     "rich>=15.0.0",
     "uvicorn[standard]>=0.46.0",
+    "weasyprint>=69.0",
 ]
 
 [project.scripts]
@@ -30,6 +33,7 @@ build-backend = "uv_build"
 dev = [
     "anthropic>=0.97.0",
     "coverage>=7",
+    "pdfplumber>=0.11.10",
     "pytest>=8.0",
     "pytest-cov>=5",
     "ruff>=0.6",

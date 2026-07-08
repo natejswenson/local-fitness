@@ -354,6 +354,49 @@ def test_bad_host_is_rejected():
         assert r.status_code == 421  # DNS-rebinding guard fires on disallowed Host
 
 
+# --- LOCAL_ONLY_TOOLS: structural HTTP/stdio transport split (INV-T9/T10) --
+
+def _notif_initialized_body() -> str:
+    return json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+
+def _tools_list_body() -> str:
+    return json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+
+
+def test_mcp_http_transport_excludes_local_only_tools():
+    # INV-T9: an authed tools/list call over the real /mcp/ HTTP transport
+    # must never include generate_brief_report/generate_chart — a
+    # phone-triggered call over this transport would get back a
+    # container-internal path with no way to retrieve the file.
+    from starlette.testclient import TestClient
+    app = _make_app(token="secret", hosts=["fitness.home.local", "testserver"])
+    auth = {**_HDRS, "Authorization": "Bearer secret"}
+    with TestClient(app) as client:
+        init = client.post("/mcp/", content=_init_body(), headers=auth)
+        assert init.status_code == 200, init.text
+        client.post("/mcp/", content=_notif_initialized_body(), headers=auth)
+        r = client.post("/mcp/", content=_tools_list_body(), headers=auth)
+        assert r.status_code == 200, r.text
+        payload = json.loads(r.text)
+        names = {t["name"] for t in payload["result"]["tools"]}
+        assert names == {t.name for t in agent_tools.ALL_TOOLS}
+        assert "generate_brief_report" not in names
+        assert "generate_chart" not in names
+
+
+def test_build_server_with_local_only_tools_serves_both():
+    # INV-T10: the exact call run_stdio() makes — build_server(extra_tools=
+    # agent_tools.LOCAL_ONLY_TOOLS) — serves both local-only tool names.
+    server = mcp_server.build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
+    handler = server.request_handlers[types.ListToolsRequest]
+    res = asyncio.run(handler(types.ListToolsRequest(method="tools/list")))
+    served = {t.name for t in res.root.tools}
+    assert served == {t.name for t in agent_tools.ALL_TOOLS} | {
+        "generate_brief_report", "generate_chart",
+    }
+
+
 def test_spa_catchall_does_not_shadow_mcp():
     # F3: the /mcp Mount MUST be registered BEFORE the SPA catch-all
     # GET /{full_path:path}, or the catch-all wins for GET /mcp/ and returns
