@@ -8,8 +8,15 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
+import shutil
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pdfplumber
 import pytest
@@ -1061,18 +1068,172 @@ def test_write_atomic_writes_final_bytes_and_no_tmp_left_behind(tmp_path):
     assert list(reports_dir.glob("*.tmp")) == []
 
 
+@pytest.fixture(autouse=True)
+def no_real_open(monkeypatch):
+    """Stub subprocess.run and asyncio.sleep so generate_brief_report/
+    generate_chart's auto-open never pops a real Preview window or incurs
+    the real 1.5s grace-period sleep during tests. subprocess.run is a
+    fresh Mock() per test -- tests that care about its call args just
+    inspect tools.subprocess.run directly, no re-patching needed."""
+    monkeypatch.setattr(tools.subprocess, "run", Mock())
+    monkeypatch.setattr(tools.asyncio, "sleep", AsyncMock())
+
+
+@pytest.fixture(autouse=True)
+def _reset_ephemeral_dir():
+    """Guarantee a clean _EPHEMERAL_DIR slate before and after every test --
+    several tests below assert on first-call-vs-memoized behavior, which is
+    only meaningful if no prior test left a real ephemeral dir cached."""
+    tools._EPHEMERAL_DIR = None
+    yield
+    if tools._EPHEMERAL_DIR is not None:
+        shutil.rmtree(tools._EPHEMERAL_DIR, ignore_errors=True)
+    tools._EPHEMERAL_DIR = None
+
+
+@pytest.fixture
+def fake_tempdir(tmp_path, monkeypatch):
+    """Redirect tempfile.gettempdir() to a throwaway directory under
+    tmp_path, so tests exercising the real _default_reports_dir() path
+    never touch the actual OS temp dir or interact with real concurrent
+    fitness-mcp-stdio sessions on this machine."""
+    fake_root = tmp_path / "faketmp"
+    fake_root.mkdir()
+    monkeypatch.setattr(tools.tempfile, "gettempdir", lambda: str(fake_root))
+    return fake_root
+
+
 @pytest.fixture
 def reports_tmp(tmp_path, monkeypatch):
-    """Point REPORTS_DIR and DEFAULT_BRIEFINGS_DIR at tmp dirs so
+    """Point _default_reports_dir and DEFAULT_BRIEFINGS_DIR at tmp dirs so
     generate_brief_report/generate_chart tests never touch the real
     reports/ or briefings/ directories."""
     from local_fitness.agent import briefs as briefs_mod
 
     reports_dir = tmp_path / "reports"
-    monkeypatch.setattr(tools, "REPORTS_DIR", reports_dir)
+    monkeypatch.setattr(tools, "_default_reports_dir", lambda: reports_dir)
     briefs_dir = tmp_path / "briefings"
     monkeypatch.setattr(briefs_mod, "DEFAULT_BRIEFINGS_DIR", briefs_dir)
     return reports_dir, briefs_dir
+
+
+def test_default_reports_dir_ephemeral_when_env_unset(monkeypatch, fake_tempdir):
+    monkeypatch.delenv("LOCAL_FITNESS_REPORTS_DIR", raising=False)
+    register_calls = []
+    monkeypatch.setattr(
+        tools.atexit, "register", lambda fn, arg: register_calls.append((fn, arg))
+    )
+    result = tools._default_reports_dir()
+    assert result.exists()
+    assert result.is_dir()
+    assert result.parent == fake_tempdir
+    assert register_calls == [(tools._rmtree_ignore_errors, result)]
+
+
+def test_default_reports_dir_memoized(monkeypatch, fake_tempdir):
+    monkeypatch.delenv("LOCAL_FITNESS_REPORTS_DIR", raising=False)
+    mkdtemp_spy = Mock(side_effect=tempfile.mkdtemp)
+    monkeypatch.setattr(tools.tempfile, "mkdtemp", mkdtemp_spy)
+    first = tools._default_reports_dir()
+    second = tools._default_reports_dir()
+    assert first == second
+    assert mkdtemp_spy.call_count == 1
+
+
+def test_default_reports_dir_honors_env_override(monkeypatch, tmp_path):
+    override_dir = tmp_path / "persistent-reports"
+    monkeypatch.setenv("LOCAL_FITNESS_REPORTS_DIR", str(override_dir))
+    mkdtemp_spy = Mock()
+    monkeypatch.setattr(tools.tempfile, "mkdtemp", mkdtemp_spy)
+    register_spy = Mock()
+    monkeypatch.setattr(tools.atexit, "register", register_spy)
+    result = tools._default_reports_dir()
+    assert result == override_dir
+    mkdtemp_spy.assert_not_called()
+    register_spy.assert_not_called()
+
+
+def test_rmtree_ignore_errors_removes_dir(tmp_path):
+    d = tmp_path / "to_remove"
+    d.mkdir()
+    (d / "file.txt").write_text("x")
+    tools._rmtree_ignore_errors(d)
+    assert not d.exists()
+
+
+def test_rmtree_ignore_errors_missing_path_is_noop(tmp_path):
+    d = tmp_path / "does_not_exist"
+    tools._rmtree_ignore_errors(d)  # must not raise
+
+
+def _fake_pid_dir(fake_tempdir, pid, age_seconds=0):
+    d = fake_tempdir / f"local-fitness-reports-{pid}-abcd1234"
+    d.mkdir()
+    if age_seconds:
+        old_time = time.time() - age_seconds
+        os.utime(d, (old_time, old_time))
+    return d
+
+
+def test_sweep_removes_stale_and_dead_dir(monkeypatch, fake_tempdir):
+    stale = _fake_pid_dir(fake_tempdir, 99999, age_seconds=25 * 60 * 60)
+    monkeypatch.setattr(tools.os, "kill", Mock(side_effect=ProcessLookupError))
+    monkeypatch.delenv("LOCAL_FITNESS_REPORTS_DIR", raising=False)
+    tools._default_reports_dir()
+    assert not stale.exists()
+
+
+def test_sweep_leaves_fresh_dir_alone(monkeypatch, fake_tempdir):
+    fresh = _fake_pid_dir(fake_tempdir, 99999)  # recent mtime
+    monkeypatch.setattr(tools.os, "kill", Mock(side_effect=ProcessLookupError))
+    monkeypatch.delenv("LOCAL_FITNESS_REPORTS_DIR", raising=False)
+    tools._default_reports_dir()
+    assert fresh.exists()
+
+
+def test_sweep_leaves_alive_pid_dir_alone(monkeypatch, fake_tempdir):
+    alive = _fake_pid_dir(fake_tempdir, 12345, age_seconds=25 * 60 * 60)
+    monkeypatch.setattr(tools.os, "kill", Mock(return_value=None))  # simulates alive
+    monkeypatch.delenv("LOCAL_FITNESS_REPORTS_DIR", raising=False)
+    tools._default_reports_dir()
+    assert alive.exists()
+
+
+def test_sweep_leaves_unrelated_dir_alone(monkeypatch, fake_tempdir):
+    unrelated = fake_tempdir / "some-other-apps-tmpdir"
+    unrelated.mkdir()
+    old_time = time.time() - 25 * 60 * 60
+    os.utime(unrelated, (old_time, old_time))
+    monkeypatch.delenv("LOCAL_FITNESS_REPORTS_DIR", raising=False)
+    tools._default_reports_dir()
+    assert unrelated.exists()
+
+
+def test_reports_dir_constant_removed():
+    assert not hasattr(tools, "REPORTS_DIR")
+
+
+def test_default_reports_dir_concurrent_calls_create_only_one_dir(monkeypatch, fake_tempdir):
+    # Pins the threading.Lock's actual regression-prevention value: unlike
+    # sequential calls (test_default_reports_dir_memoized above), this uses
+    # genuinely concurrent threads racing the critical section -- it would
+    # fail if _EPHEMERAL_DIR_LOCK were removed or narrowed.
+    monkeypatch.delenv("LOCAL_FITNESS_REPORTS_DIR", raising=False)
+    mkdtemp_spy = Mock(side_effect=tempfile.mkdtemp)
+    monkeypatch.setattr(tools.tempfile, "mkdtemp", mkdtemp_spy)
+
+    n_workers = 4
+    barrier = threading.Barrier(n_workers)
+
+    def worker():
+        barrier.wait()
+        return tools._default_reports_dir()
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = [f.result() for f in [executor.submit(worker) for _ in range(n_workers)]]
+
+    assert len(set(results)) == 1
+    assert mkdtemp_spy.call_count == 1
 
 
 def _write_brief_json(briefs_dir, d, takeaways):
@@ -1098,6 +1259,7 @@ def test_generate_brief_report_malformed_date_no_file_io(monkeypatch):
         payload, err = call(tools.generate_brief_report, {"date": bad})
         assert err
         assert "malformed date" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_brief_report_missing_brief_is_error(reports_tmp):
@@ -1105,6 +1267,7 @@ def test_generate_brief_report_missing_brief_is_error(reports_tmp):
     payload, err = call(tools.generate_brief_report, {"date": "2026-07-08"})
     assert err
     assert "no saved brief" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_brief_report_invalid_brief_schema_is_error(reports_tmp):
@@ -1115,6 +1278,7 @@ def test_generate_brief_report_invalid_brief_schema_is_error(reports_tmp):
     payload, err = call(tools.generate_brief_report, {"date": d})
     assert err
     assert "schema validation" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_brief_report_chartless_takeaway_still_completes(seeded, reports_tmp):
@@ -1191,6 +1355,7 @@ def test_generate_chart_unknown_metric_no_sql(seeded, monkeypatch):
     )
     assert err
     assert "unknown metric" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_chart_unknown_chart_type(seeded):
@@ -1199,6 +1364,7 @@ def test_generate_chart_unknown_chart_type(seeded):
     )
     assert err
     assert "unknown chart_type" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_chart_rejects_huge_days(seeded):
@@ -1207,6 +1373,7 @@ def test_generate_chart_rejects_huge_days(seeded):
     )
     assert err
     assert "days must be between" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_chart_no_data_in_window(seeded):
@@ -1215,6 +1382,7 @@ def test_generate_chart_no_data_in_window(seeded):
     )
     assert err
     assert "no data in window" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_brief_report_pdf_render_failure_is_error(seeded, reports_tmp, monkeypatch):
@@ -1235,6 +1403,7 @@ def test_generate_brief_report_pdf_render_failure_is_error(seeded, reports_tmp, 
     payload, err = call(tools.generate_brief_report, {"date": d})
     assert err
     assert "PDF render failed" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_brief_report_path_escape_is_error(seeded, reports_tmp, monkeypatch):
@@ -1251,6 +1420,7 @@ def test_generate_brief_report_path_escape_is_error(seeded, reports_tmp, monkeyp
     payload, err = call(tools.generate_brief_report, {"date": d})
     assert err
     assert "escaped reports directory" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_chart_path_escape_is_error(seeded, reports_tmp, monkeypatch):
@@ -1263,6 +1433,7 @@ def test_generate_chart_path_escape_is_error(seeded, reports_tmp, monkeypatch):
     )
     assert err
     assert "escaped reports directory" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_chart_render_failure_is_error(seeded, monkeypatch):
@@ -1279,6 +1450,7 @@ def test_generate_chart_render_failure_is_error(seeded, monkeypatch):
     )
     assert err
     assert "chart render failed" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
@@ -1293,6 +1465,114 @@ def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
     assert path.name == f"chart-rhr-line-14d-{today}.png"
     assert path.parent == reports_dir
     assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def _spy_to_thread(monkeypatch, recorded):
+    real_to_thread = asyncio.to_thread
+
+    async def spy(func, *args, **kwargs):
+        recorded.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(tools.asyncio, "to_thread", spy)
+
+
+def test_generate_brief_report_auto_opens_and_dispatches_via_to_thread(
+    seeded, reports_tmp, monkeypatch
+):
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+    recorded = []
+    _spy_to_thread(monkeypatch, recorded)
+
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    final_path = Path(payload["path"])
+    tools.subprocess.run.assert_called_once_with(
+        ["open", str(final_path)],
+        check=False,
+        timeout=10,
+        stdout=tools.subprocess.DEVNULL,
+        stderr=tools.subprocess.DEVNULL,
+    )
+    assert tools._default_reports_dir in recorded
+
+
+def test_generate_chart_auto_opens_and_dispatches_via_to_thread(
+    seeded, reports_tmp, monkeypatch
+):
+    recorded = []
+    _spy_to_thread(monkeypatch, recorded)
+
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+    )
+    assert not err
+    final_path = Path(payload["path"])
+    tools.subprocess.run.assert_called_once_with(
+        ["open", str(final_path)],
+        check=False,
+        timeout=10,
+        stdout=tools.subprocess.DEVNULL,
+        stderr=tools.subprocess.DEVNULL,
+    )
+    assert tools._default_reports_dir in recorded
+
+
+def test_generate_brief_report_auto_open_failure_does_not_fail_tool(
+    seeded, reports_tmp, monkeypatch
+):
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+    monkeypatch.setattr(tools.subprocess, "run", Mock(side_effect=OSError("no open binary")))
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    assert Path(payload["path"]).exists()
+
+
+def test_generate_chart_auto_open_failure_does_not_fail_tool(seeded, reports_tmp, monkeypatch):
+    monkeypatch.setattr(tools.subprocess, "run", Mock(side_effect=OSError("no open binary")))
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+    )
+    assert not err
+    assert Path(payload["path"]).exists()
+
+
+def test_generate_brief_report_reports_dir_error_is_clean(seeded, reports_tmp, monkeypatch):
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    def boom():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tools, "_default_reports_dir", boom)
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert err
+    assert "could not prepare reports directory" in payload["error"]
+    assert not tools.subprocess.run.called
+
+
+def test_generate_chart_reports_dir_error_is_clean(seeded, monkeypatch):
+    def boom():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tools, "_default_reports_dir", boom)
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+    )
+    assert err
+    assert "could not prepare reports directory" in payload["error"]
+    assert not tools.subprocess.run.called
 
 
 def test_generate_brief_report_and_generate_chart_excluded_from_all_tools():

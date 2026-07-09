@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-09
+
+### Changed
+- **`generate_brief_report`/`generate_chart` now default to an ephemeral,
+  auto-opened output directory instead of persistent `./reports/`.** When
+  `LOCAL_FITNESS_REPORTS_DIR` is unset (the common case), output now goes
+  to a per-process `tempfile.mkdtemp()` directory — PID-embedded naming,
+  cleaned up via `atexit` when the `fitness mcp-stdio` process exits, with
+  a liveness-checked stale-directory sweep as a backstop for abrupt
+  (`SIGKILL`/`SIGTERM`) exits. After a successful write, the file is now
+  auto-opened via macOS `open` (best-effort, never fails the tool call).
+  Setting `LOCAL_FITNESS_REPORTS_DIR` still opts back into the old
+  persistent-directory behavior (still auto-opened, no auto-cleanup). This
+  closes the gap where getting the "pretty" PDF/PNG version of a report or
+  chart required a second explicit ask and left files to accumulate
+  unopened in `./reports/` forever.
+
 ## [0.18.0] - 2026-07-08
 
 ### Added

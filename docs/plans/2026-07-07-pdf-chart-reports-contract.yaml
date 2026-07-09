@@ -190,3 +190,22 @@ ambiguity_resolutions:
     alternatives: ["Investigate/confirm WeasyPrint's thread-safety under concurrent write_pdf() calls", "Leave unaddressed (accept the same uncertainty already flagged for matplotlib but not extended to WeasyPrint)"]
     reasoning: "No confirmed WeasyPrint threading bug exists either way; verifying internals is undocumented, implementation-dependent, and would need re-verification on every WeasyPrint upgrade. A lock is trivial to pay for a low-traffic, single-user tool and removes the open question entirely."
     reversibility: "high — a lock can be removed later if concurrency needs increase and thread-safety is separately confirmed"
+
+# --- Addendum (2026-07-09) ---------------------------------------------
+# A follow-up change makes several invariants above stale as literally
+# written -- see the matching addendum in the paired
+# 2026-07-07-pdf-chart-reports-design.md for the full explanation:
+#   - INV-2 ("Both tools write only under LOCAL_FITNESS_REPORTS_DIR") and
+#     INV-4 ("mkdir before the .tmp write"): substitute "the directory
+#     returned by _default_reports_dir()" for "LOCAL_FITNESS_REPORTS_DIR"
+#     -- that function now defaults to a per-process ephemeral
+#     tempfile.mkdtemp() directory (atexit-cleaned, PID-named, with a
+#     liveness-checked stale-dir sweep), with LOCAL_FITNESS_REPORTS_DIR
+#     as an explicit opt-out back to a persistent directory. The
+#     REPORTS_DIR module-level constant no longer exists.
+#   - INV-5 (path-containment check): unchanged in mechanism, still
+#     applies to whichever directory _default_reports_dir() resolves.
+#   - Both tools now also auto-open the generated file (macOS `open`,
+#     best-effort, never fails the tool call) after a successful write.
+#   - AMB-2's "reports/ is ephemeral by design" is now literally true,
+#     not just a Dockerfile/bind-mount argument.
