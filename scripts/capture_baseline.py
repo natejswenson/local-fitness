@@ -42,6 +42,14 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load `.env` from the project root so LOCAL_FITNESS_OPENCODE_AGENT (and any
+# other .env-driven config) actually takes effect here — this script is one
+# level shallower than src/local_fitness/cli.py, so parents[1] (not cli.py's
+# parents[2]) reaches the repo root from this file's location.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 import ab_brief  # scripts/ is on sys.path via tests/conftest.py and __main__ below
 import eval_fixtures
 
@@ -225,7 +233,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="actually call the model (default: dry-run plan + estimate)")
     ap.add_argument("--mock", help="JSON {scenario: [brief, ...]} — aggregate with no model calls")
     ap.add_argument("--out", default=str(_BASELINE_PATH),
-                    help="where to write the baseline JSON")
+                    help="where to write the baseline JSON — pass an explicit "
+                         "path when capturing against an alt (non-Claude) "
+                         "model, or this will OVERWRITE the committed "
+                         "Claude-V1 baseline at its default")
     args = ap.parse_args(argv)
     scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
     unknown = [s for s in scenarios if s not in eval_fixtures.SCENARIOS]

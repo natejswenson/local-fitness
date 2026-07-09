@@ -1,11 +1,17 @@
 """Thin client for calling a local model via Ollama's HTTP API.
 
-Used by the ``"ollama:"``-prefixed model dispatch in ``agent.briefing`` to run
-the V2 toolless brief generator against a local model (e.g. gemma4) instead of
-Claude, for shadow-run comparison. Stdlib-only (``urllib.request``) since
-neither ``httpx`` nor ``ollama`` is currently a project dependency and this is
-a diagnostic path, not (yet) a production one. See
-docs/plans/2026-07-05-gemma4-shadow-run-design.md.
+Used by ``agent.briefing``'s ``"opencode:"``-prefixed alt-model dispatch
+(``_alt_model_name()``) for the ``ollama`` provider specifically — every
+other provider routes through ``opencode_model.py``'s opencode-CLI transport
+instead, since this module talks directly to a local Ollama daemon
+(``http://localhost:11434``) and has no equivalent for off-machine models.
+Runs the V2 toolless brief generator against a local model (e.g. gemma4)
+instead of Claude, for shadow-run comparison. Stdlib-only
+(``urllib.request``) since neither ``httpx`` nor ``ollama`` is currently a
+project dependency and this is a diagnostic path, not (yet) a production
+one. See docs/plans/2026-07-08-model-agnostic-shadow-run-design.md
+(generalizes docs/plans/2026-07-05-gemma4-shadow-run-design.md's original
+gemma4/Ollama-only path).
 """
 from __future__ import annotations
 

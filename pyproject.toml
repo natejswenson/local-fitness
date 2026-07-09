@@ -1,6 +1,6 @@
 [project]
 name = "local-fitness"
-version = "0.17.0"
+version = "0.18.0"
 description = "Local Garmin-data agent: hands-off ingest + Claude-powered daily briefings"
 readme = "README.md"
 authors = [
@@ -64,3 +64,8 @@ exclude_lines = [
 # cli.py deliberately calls load_dotenv() before importing submodules that
 # read os.environ at import time — the imports can't move above it.
 "src/local_fitness/cli.py" = ["E402"]
+# Same pattern: LOCAL_FITNESS_OPENCODE_AGENT (read at call time inside
+# agent.briefing.generate_streaming) must be loaded from .env before these
+# scripts' own imports run, mirroring cli.py above.
+"scripts/shadow_run.py" = ["E402"]
+"scripts/capture_baseline.py" = ["E402"]

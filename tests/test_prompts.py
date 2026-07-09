@@ -186,32 +186,3 @@ def test_system_prompt_is_cache_stable(monkeypatch):
     assert prompts.system_prompt("Dana") == prompts.system_prompt("Dana")
 
 
-# --- gemma4-specific V2 prompt variants -------------------------------------
-# See docs/plans/2026-07-05-gemma4-shadow-run-design.md: round 1 showed
-# invention_rate=0.0 (no fabrication) but frequent schema violations. These
-# variants append explicit, example-driven correction rather than restating
-# an abstract rule — verify the appendix is present and names the exact
-# failures observed, and that the base narrative content is preserved.
-
-def test_gemma4_system_prompt_is_superset_of_base():
-    base = prompts.brief_v2_system_prompt("Nate", prompts.ADAPTIVE)
-    gemma = prompts.brief_v2_system_prompt_gemma4("Nate", prompts.ADAPTIVE)
-    assert gemma.startswith(base)
-    assert len(gemma) > len(base)
-
-
-def test_gemma4_system_prompt_names_observed_failures():
-    sp = " ".join(prompts.brief_v2_system_prompt_gemma4("Nate", prompts.ADAPTIVE).split())
-    assert "positive, caution, critical, neutral" in sp
-    assert '"Positive" is WRONG' in sp
-    assert '"Informative" is WRONG' in sp
-    assert "NEVER a bare string" in sp
-
-
-def test_gemma4_user_prompt_is_superset_of_base():
-    base = prompts.brief_v2_user_prompt(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
-    gemma = prompts.brief_v2_user_prompt_gemma4(_ctx(), "Nate", 10000, "", prompts.ADAPTIVE)
-    assert gemma.startswith(base)
-    assert "Before you output, verify against this checklist" in gemma
-    for field in ("headline", "summary", "tone", "metric", "details"):
-        assert field in gemma  # base schema still present, not replaced

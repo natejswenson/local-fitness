@@ -6,7 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.17.0] - 2026-07-08
+## [0.18.0] - 2026-07-08
 
 ### Added
 - **Two new local-only MCP tools: `generate_brief_report` and `generate_chart`.**
@@ -22,6 +22,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retrieve the file. Requires native Pango/HarfBuzz libraries (`apt-get` on
   Linux/CI; on macOS, `brew install pango` plus
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` — see `.env.example`).
+
+## [0.17.0] - 2026-07-08
+
+### Changed
+- **Alt-model shadow-run path is model-agnostic — any model the `opencode`
+  CLI can reach, not just gemma4/Ollama.** The dispatch key changes shape
+  from `"ollama:<model>"` to `"opencode:<provider>/<model>"` (e.g.
+  `"opencode:opencode/deepseek-v4-flash-free"`), a breaking rename with no
+  compatibility shim (internal shadow-run-only diagnostic tool, not a public
+  API). Dispatch is capability-aware, not uniform: `provider == "ollama"`
+  keeps the existing direct-HTTP, grammar-constrained-decoding path
+  (`local_model.py`, unchanged); every other provider routes through a new
+  `agent/opencode_model.py` subprocess transport that shells out to
+  `opencode run`. gemma4's tuning (tightened schema, temperature, plan-fact
+  injection) moves into a per-model profile registry
+  (`briefing._MODEL_PROFILES`) so a new model gets zero extra tuning by
+  default instead of requiring new `if model == ...` branches. Requires a
+  one-time, tool-free opencode agent (`LOCAL_FITNESS_OPENCODE_AGENT`, see
+  `.env.example`) — a fail-closed pre-check refuses to send a prompt if that
+  agent isn't configured, rather than risking opencode's undocumented
+  silent fallback to its tool-enabled default agent. The fixture-only
+  safety gate (`_assert_fixture_only_data`) now also checks the user-notes
+  path, closing a real gap where un-isolated callers could ship real
+  personal notes to a third-party model. Shadow-run-only — never the live
+  production 06:30 brief job. See
+  docs/plans/2026-07-08-model-agnostic-shadow-run-design.md.
 
 ## [0.16.0] - 2026-07-07
 

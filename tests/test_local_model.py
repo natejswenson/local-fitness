@@ -1,10 +1,10 @@
 """Tests for agent/local_model.py — the Ollama HTTP client.
 
 No real network calls: urllib.request.urlopen is mocked. Focus is the
-contract generate_streaming's "ollama:" dispatch branch depends on: a clean
-string return on success, and ALL failure modes (connection error, malformed
-body, unexpected response shape) normalized into one RuntimeError shape
-rather than three different low-level exception types.
+contract generate_streaming's "opencode:ollama/..." dispatch branch depends
+on: a clean string return on success, and ALL failure modes (connection
+error, malformed body, unexpected response shape) normalized into one
+RuntimeError shape rather than three different low-level exception types.
 """
 from __future__ import annotations
 

@@ -35,6 +35,7 @@ from claude_agent_sdk import (
 )
 
 from local_fitness import db
+from local_fitness import notes
 from local_fitness.agent import briefing
 from local_fitness.agent import briefs
 from local_fitness.agent import coach
@@ -612,11 +613,13 @@ def test_v1_path_does_not_run_grounding(stream_env, monkeypatch, caplog):
     assert not any("brief_grounding" in r.message for r in caplog.records)
 
 
-# --- gemma4/Ollama shadow-run dispatch --------------------------------------
-# See docs/plans/2026-07-05-gemma4-shadow-run-design.md. These test the new
-# "ollama:"-prefixed model dispatch in isolation from any real network call:
-# briefing.local_model.generate_local_completion is monkeypatched to a plain
-# (sync) fake, matching how asyncio.to_thread calls it in production.
+# --- alt-model (gemma4/Ollama + opencode) shadow-run dispatch ---------------
+# See docs/plans/2026-07-08-model-agnostic-shadow-run-design.md (generalizes
+# docs/plans/2026-07-05-gemma4-shadow-run-design.md's original gemma4/Ollama-
+# only path). These test the "opencode:"-prefixed model dispatch in isolation
+# from any real network call: briefing.local_model.generate_local_completion
+# is monkeypatched to a plain (sync) fake, matching how asyncio.to_thread
+# calls it in production.
 
 def _drain_model(model: str, save: bool = False) -> list[dict]:
     async def go():
@@ -626,13 +629,14 @@ def _drain_model(model: str, save: bool = False) -> list[dict]:
 
 
 @pytest.mark.parametrize("model,expected", [
-    ("ollama:gemma4", "gemma4"),
-    ("ollama:llama3.1:8b", "llama3.1:8b"),
+    ("opencode:ollama/gemma4", "ollama/gemma4"),
+    ("opencode:ollama/llama3.1:8b", "ollama/llama3.1:8b"),
+    ("opencode:opencode/deepseek-v4-flash-free", "opencode/deepseek-v4-flash-free"),
     ("claude-sonnet-4-6", None),
-    ("gemma4", None),  # no prefix -> not treated as local, even if the name matches
+    ("gemma4", None),  # no prefix -> not treated as alt-model, even if the name matches
 ])
-def test_local_model_name_prefix_parsing(model, expected):
-    assert briefing._local_model_name(model) == expected
+def test_alt_model_name_prefix_parsing(model, expected):
+    assert briefing._alt_model_name(model) == expected
 
 
 def test_assert_fixture_only_data_passes_under_tmp_path(stream_env):
@@ -654,10 +658,17 @@ def test_assert_fixture_only_data_raises_for_real_briefings_dir(monkeypatch, str
         briefing._assert_fixture_only_data()
 
 
+def test_assert_fixture_only_data_raises_for_real_notes_path(monkeypatch, stream_env):
+    monkeypatch.setattr(notes, "_default_notes_path",
+                        lambda: db._PROJECT_ROOT / "data" / "user_notes.md")
+    with pytest.raises(RuntimeError, match=r"notes\._default_notes_path\(\)"):
+        briefing._assert_fixture_only_data()
+
+
 def test_local_model_refused_under_v1(stream_env, monkeypatch):
     monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
     with pytest.raises(ValueError, match="toolless path"):
-        _drain_model("ollama:gemma4", save=False)
+        _drain_model("opencode:ollama/gemma4", save=False)
 
 
 def _gemma4_slot_json(workout: dict, steps: dict, others: list[dict]) -> str:
@@ -670,7 +681,7 @@ def _gemma4_slot_json(workout: dict, steps: dict, others: list[dict]) -> str:
 
 
 def test_local_model_routes_to_local_client_and_saves(stream_env, monkeypatch):
-    """V2 + an 'ollama:' model calls local_model.generate_local_completion
+    """V2 + an 'opencode:ollama/...' model calls local_model.generate_local_completion
     (not claude_agent_sdk.query) and flows through the same parse/validate/
     save/grounding tail as the Claude path. gemma4's response uses the
     explicit-slot shape (see _gemma4_format_schema) which gets flattened back
@@ -691,7 +702,7 @@ def test_local_model_routes_to_local_client_and_saves(stream_env, monkeypatch):
 
     monkeypatch.setattr(briefing.local_model, "generate_local_completion",
                         fake_local_completion)
-    events = _drain_model("ollama:gemma4", save=True)
+    events = _drain_model("opencode:ollama/gemma4", save=True)
 
     assert len(calls) == 1 and calls[0]["model"] == "gemma4"
     # Same prompt-construction call the Claude V2 path uses — parity by
@@ -716,7 +727,7 @@ def test_local_model_parse_failure_surfaces_error_and_does_not_save(stream_env, 
     monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
     monkeypatch.setattr(briefing.local_model, "generate_local_completion",
                         lambda *a, **kw: "not json at all")
-    events = _drain_model("ollama:gemma4", save=True)
+    events = _drain_model("opencode:ollama/gemma4", save=True)
     assert [e for e in events if e["type"] == "error"]
     assert list(stream_env.glob("*.json")) == []
 
@@ -735,7 +746,7 @@ def test_local_model_all_models_get_the_same_base_prompt(stream_env, monkeypatch
     expected_system_prompt = prompts.brief_v2_system_prompt(
         db.get_setting("user_name", prompts.DEFAULT_USER_NAME),
         coach.resolve_coach_profile())
-    for model in ("ollama:gemma4", "ollama:llama3.1:8b"):
+    for model in ("opencode:ollama/gemma4", "opencode:ollama/llama3.1:8b"):
         calls.clear()
         _drain_model(model, save=False)
         assert calls[0]["system"] == expected_system_prompt
@@ -756,12 +767,12 @@ def test_local_model_gemma4_gets_tightened_schema_and_higher_temperature(stream_
             or _brief_json([_takeaway()])))
 
     calls.clear()
-    _drain_model("ollama:gemma4", save=False)
+    _drain_model("opencode:ollama/gemma4", save=False)
     assert calls[0]["format"] == briefing._gemma4_format_schema()
     assert calls[0]["temperature"] == 0.8
 
     calls.clear()
-    _drain_model("ollama:llama3.1:8b", save=False)
+    _drain_model("opencode:ollama/llama3.1:8b", save=False)
     assert calls[0]["format"] == Brief.model_json_schema()
     assert calls[0]["temperature"] == 0.4
 
@@ -855,7 +866,135 @@ def test_local_model_client_failure_propagates(stream_env, monkeypatch):
 
     monkeypatch.setattr(briefing.local_model, "generate_local_completion", boom)
     with pytest.raises(RuntimeError, match="ollama call failed"):
-        _drain_model("ollama:gemma4", save=False)
+        _drain_model("opencode:ollama/gemma4", save=False)
+
+
+def test_malformed_alt_model_string_raises_value_error(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    with pytest.raises(ValueError, match="malformed alt-model string"):
+        _drain_model("opencode:gemma4", save=False)  # no "/" -> no provider/model split
+
+
+def test_unlisted_model_uses_default_profile():
+    """A model with no _MODEL_PROFILES entry gets the safe generic path:
+    plain schema, conservative temperature, no plan-facts, no reshape."""
+    profile = briefing._MODEL_PROFILES.get(
+        "opencode/deepseek-v4-flash-free", briefing._DEFAULT_PROFILE)
+    assert profile is briefing._DEFAULT_PROFILE
+    assert profile.temperature == 0.4
+    assert profile.ollama_format_schema is None
+    assert profile.plan_prompt_facts is None
+    assert profile.plan_status_appendix is None
+    assert profile.reshape is None
+
+
+def test_gemma4_key_resolves_to_its_tuned_profile():
+    profile = briefing._MODEL_PROFILES.get("ollama/gemma4", briefing._DEFAULT_PROFILE)
+    assert profile.temperature == 0.8
+    assert profile.ollama_format_schema is briefing._gemma4_format_schema
+    assert profile.plan_prompt_facts is briefing._gemma4_plan_prompt_facts
+    assert profile.plan_status_appendix is briefing._append_gemma4_plan_status
+    assert profile.reshape is briefing._reshape_gemma4_slots
+
+
+def test_non_ollama_dispatch_never_touches_local_model(stream_env, monkeypatch):
+    """A non-'ollama' provider routes through opencode_model exclusively —
+    local_model.generate_local_completion must never be called."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+
+    def boom(*a, **kw):
+        raise AssertionError("local_model.generate_local_completion must not be called")
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion", boom)
+    monkeypatch.setattr(
+        briefing.opencode_model, "generate_opencode_completion",
+        lambda *a, **kw: _brief_json([_takeaway()]))
+    events = _drain_model("opencode:opencode/deepseek-v4-flash-free", save=False)
+    assert [e for e in events if e["type"] == "done"]
+
+
+def test_non_ollama_dispatch_passes_full_provider_model_string(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    calls: list[dict] = []
+
+    def fake_opencode_completion(system_prompt, user_prompt, *, model, agent, **kw):
+        calls.append({"model": model, "agent": agent})
+        return _brief_json([_takeaway()])
+
+    monkeypatch.setattr(briefing.opencode_model, "generate_opencode_completion",
+                        fake_opencode_completion)
+    _drain_model("opencode:opencode/deepseek-v4-flash-free", save=False)
+    assert calls[0]["model"] == "opencode/deepseek-v4-flash-free"
+    assert calls[0]["agent"] == "fitness-brief"
+
+
+def test_opencode_agent_env_var_flows_into_dispatch(stream_env, monkeypatch):
+    """Setting LOCAL_FITNESS_OPENCODE_AGENT to a distinct value must reach
+    generate_opencode_completion's agent= argument — not the hardcoded
+    default — proving the env var actually flows through, not just gets
+    read and silently ignored."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setenv("LOCAL_FITNESS_OPENCODE_AGENT", "my-custom-agent")
+    calls: list[dict] = []
+
+    def fake_opencode_completion(system_prompt, user_prompt, *, model, agent, **kw):
+        calls.append({"model": model, "agent": agent})
+        return _brief_json([_takeaway()])
+
+    monkeypatch.setattr(briefing.opencode_model, "generate_opencode_completion",
+                        fake_opencode_completion)
+    _drain_model("opencode:opencode/deepseek-v4-flash-free", save=False)
+    assert calls[0]["agent"] == "my-custom-agent"
+
+
+def test_profile_driven_plan_status_appendix_is_dispatched(stream_env, monkeypatch):
+    """The profile-registry's plan_status_appendix callable is what's
+    invoked — not a hardcoded call to _append_gemma4_plan_status — proven by
+    swapping the registry entry for a stub and confirming the stub fires."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.brief_planner, "assemble_brief_context",
+                        lambda **kw: _fake_plan_context(_PLAN_TODAY))
+    stub_calls: list[tuple] = []
+
+    def stub_appendix(raw, plan_today):
+        stub_calls.append((raw, plan_today))
+        return raw
+
+    stub_profile = briefing._ModelProfile(
+        ollama_format_schema=briefing._gemma4_format_schema,
+        plan_status_appendix=stub_appendix,
+    )
+    monkeypatch.setitem(briefing._MODEL_PROFILES, "ollama/gemma4", stub_profile)
+
+    def fake_local_completion(system_prompt, user_prompt, **kw):
+        return _gemma4_slot_json(
+            _takeaway(headline="Workout"), _takeaway(headline="Steps"), [])
+
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        fake_local_completion)
+    _drain_model("opencode:ollama/gemma4", save=False)
+    assert len(stub_calls) == 1
+    assert stub_calls[0][1] == _PLAN_TODAY
+
+
+def test_off_machine_warning_log_does_not_fire_for_ollama_dispatch(stream_env, monkeypatch, caplog):
+    """generate_opencode_completion is structurally unreachable for
+    provider=='ollama' models — so its off-machine warning log can never
+    fire on that path. Asserted here (not in test_opencode_model.py, where
+    it would be vacuous since that module's function is never called for
+    Ollama models at all)."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(stream_env.parent / "notes.md"))
+    monkeypatch.setattr(briefing.local_model, "generate_local_completion",
+                        lambda *a, **kw: _brief_json([_takeaway()]))
+    with caplog.at_level(logging.WARNING, logger="local_fitness.agent.opencode_model"):
+        _drain_model("opencode:ollama/gemma4", save=False)
+    assert not any("off-machine" in r.message for r in caplog.records)
 
 
 # --- Plan-fold gap: gemma4 fabricates plan facts when asked to derive them
@@ -963,7 +1102,7 @@ def test_local_model_gemma4_folds_plan_status_into_workout_takeaway(stream_env, 
 
     monkeypatch.setattr(briefing.local_model, "generate_local_completion",
                         fake_local_completion)
-    events = _drain_model("ollama:gemma4", save=True)
+    events = _drain_model("opencode:ollama/gemma4", save=True)
 
     assert "CITE THESE VERBATIM" in calls[0]
     assert "10 days out" in calls[0]
@@ -990,7 +1129,7 @@ def test_local_model_gemma4_skips_plan_facts_when_no_active_plan(stream_env, mon
 
     monkeypatch.setattr(briefing.local_model, "generate_local_completion",
                         fake_local_completion)
-    events = _drain_model("ollama:gemma4", save=True)
+    events = _drain_model("opencode:ollama/gemma4", save=True)
 
     assert "CITE THESE VERBATIM" not in calls[0]
     done = [e for e in events if e["type"] == "done"]

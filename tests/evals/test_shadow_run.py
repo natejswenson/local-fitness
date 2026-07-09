@@ -146,6 +146,34 @@ def test_dry_run_returns_zero_and_quotes_spend(tmp_path, capsys):
     assert "generations" in out and "V2 flag forced ON" in out
 
 
+def test_dry_run_ollama_provider_prints_local_free_message(tmp_path, capsys):
+    """provider=='ollama' still gets the local/free messaging — this is the
+    only alt-model transport that's genuinely free and never leaves the
+    machine."""
+    base = _write_baseline(tmp_path)
+    rc = sr.main(["--baseline", str(base), "--model", "opencode:ollama/gemma4"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cost: $0 (local via Ollama)" in out
+    assert "Runs locally via Ollama" in out
+
+
+def test_dry_run_opencode_provider_prints_network_cost_message(tmp_path, capsys):
+    """A non-'ollama' alt-model provider must NOT get the local/free message
+    — it's a network call to a third-party gateway whose cost depends on
+    the model (regression check for the previously-fixed cost-messaging
+    bug)."""
+    base = _write_baseline(tmp_path)
+    rc = sr.main(["--baseline", str(base), "--model",
+                 "opencode:opencode/deepseek-v4-flash-free"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cost: $0 (local via Ollama)" not in out
+    assert "network call via opencode gateway" in out
+    assert "deepseek-v4-flash-free" in out
+    assert "Not local" in out
+
+
 def test_run_refused_over_cap(tmp_path, capsys):
     base = _write_baseline(tmp_path)
     rc = sr.main(["--run", "--runs", "5", "--baseline", str(base)])
