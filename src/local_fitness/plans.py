@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 from dataclasses import dataclass
 from datetime import date as _date
 from pathlib import Path
@@ -36,15 +37,21 @@ class GradingConfig:
     count_walks_mileage: bool = False
 
 
-def resolve_grading_config(db_path=None) -> GradingConfig:
+def resolve_grading_config(
+    db_path=None, conn: sqlite3.Connection | None = None
+) -> GradingConfig:
     """Read the grading knobs (DB > env > default), validate, and build a
     ``GradingConfig``. Does I/O (one batched settings read); callers resolve it
     once per request and thread the result into the pure grading functions.
 
     The fraction pair must satisfy ``0 <= partial <= done <= 1``; on any
     violation BOTH revert to their defaults so the grade bands can never invert
-    (a ``partial > done`` would make ``partial`` unreachable)."""
-    settings = db.all_settings(db_path=db_path)
+    (a ``partial > done`` would make ``partial`` unreachable).
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
+    settings = db.all_settings(db_path=db_path, conn=conn)
     done = config._resolve_from(
         settings, "grade_done_fraction", "LOCAL_FITNESS_GRADE_DONE_FRACTION",
         DONE_FRACTION, float)
@@ -625,8 +632,13 @@ def get_plan(plan_id: int, db_path: Path | None = None) -> dict | None:
         return plan
 
 
-def _get_by_status(status: str, db_path: Path | None) -> dict | None:
-    with db.connect(db_path) as conn:
+def _get_by_status(
+    status: str, db_path: Path | None, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    """Accepts an already-open ``conn`` to let hot-path callers (e.g.
+    ``get_active_plan``) share one connection instead of opening a fresh one
+    per lookup; behavior is unchanged when omitted."""
+    if conn is not None:
         row = conn.execute(
             "SELECT * FROM training_plans WHERE status=? ORDER BY plan_id DESC LIMIT 1",
             (status,),
@@ -636,39 +648,81 @@ def _get_by_status(status: str, db_path: Path | None) -> dict | None:
         plan = _row_to_plan(row)
         plan["workouts"] = _load_workouts(conn, plan["plan_id"])
         return plan
+    with db.connect(db_path) as c:
+        row = c.execute(
+            "SELECT * FROM training_plans WHERE status=? ORDER BY plan_id DESC LIMIT 1",
+            (status,),
+        ).fetchone()
+        if row is None:
+            return None
+        plan = _row_to_plan(row)
+        plan["workouts"] = _load_workouts(c, plan["plan_id"])
+        return plan
 
 
-def get_active_plan(db_path: Path | None = None) -> dict | None:
-    return _get_by_status("active", db_path)
+def get_active_plan(
+    db_path: Path | None = None, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    """Accepts an already-open ``conn`` (threaded through to ``_get_by_status``,
+    the function that actually reads the DB) to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
+    return _get_by_status("active", db_path, conn=conn)
 
 
 def load_activities_by_date(
-    start: str, end: str, db_path: Path | None = None
+    start: str, end: str, db_path: Path | None = None, conn: sqlite3.Connection | None = None
 ) -> dict[str, list[dict]]:
-    """Activities in [start, end] grouped by date — input to adherence grading."""
+    """Activities in [start, end] grouped by date — input to adherence grading.
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
     out: dict[str, list[dict]] = {}
-    with db.connect(db_path) as conn:
+    if conn is not None:
         rows = conn.execute(
             "SELECT date, activity_type, distance_meters, duration_seconds "
             "FROM activities WHERE date >= ? AND date <= ? ORDER BY date",
             (start, end),
         ).fetchall()
+    else:
+        with db.connect(db_path) as c:
+            rows = c.execute(
+                "SELECT date, activity_type, distance_meters, duration_seconds "
+                "FROM activities WHERE date >= ? AND date <= ? ORDER BY date",
+                (start, end),
+            ).fetchall()
     for r in rows:
         out.setdefault(r["date"], []).append(dict(r))
     return out
 
 
 def best_recent_effort(
-    cutoff: str, db_path: Path | None = None, min_distance_m: float = 2000.0
+    cutoff: str,
+    db_path: Path | None = None,
+    min_distance_m: float = 2000.0,
+    conn: sqlite3.Connection | None = None,
 ) -> dict | None:
-    """Fastest recent running effort since `cutoff` as {distance_m, time_s} for Riegel."""
-    with db.connect(db_path) as conn:
+    """Fastest recent running effort since `cutoff` as {distance_m, time_s} for Riegel.
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
+    if conn is not None:
         rows = conn.execute(
             "SELECT activity_type, distance_meters, duration_seconds, avg_pace_sec_per_km "
             "FROM activities WHERE date >= ? AND distance_meters >= ? "
             "AND avg_pace_sec_per_km IS NOT NULL",
             (cutoff, min_distance_m),
         ).fetchall()
+    else:
+        with db.connect(db_path) as c:
+            rows = c.execute(
+                "SELECT activity_type, distance_meters, duration_seconds, avg_pace_sec_per_km "
+                "FROM activities WHERE date >= ? AND distance_meters >= ? "
+                "AND avg_pace_sec_per_km IS NOT NULL",
+                (cutoff, min_distance_m),
+            ).fetchall()
     best = None
     best_pace = None
     for r in rows:

@@ -250,7 +250,9 @@ def init_schema(db_path: Path | None = None) -> None:
             conn.execute("ALTER TABLE activities ADD COLUMN source TEXT DEFAULT 'garmin'")
 
 
-def last_known_daily_date(db_path: Path | None = None) -> str | None:
+def last_known_daily_date(
+    db_path: Path | None = None, conn: sqlite3.Connection | None = None
+) -> str | None:
     """Most recent date with any wellness row in `daily_metrics`.
 
     Used as the resume point for live pulls — honest about what data we
@@ -258,9 +260,16 @@ def last_known_daily_date(db_path: Path | None = None) -> str | None:
     daily pull. The previous query (status='success' AND source='daily')
     was blind to backfill rows, causing the first live pull after a
     backfill to re-fetch 5 years.
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted.
     """
-    with connect(db_path) as conn:
+    if conn is not None:
         row = conn.execute("SELECT MAX(date) AS d FROM daily_metrics").fetchone()
+        return row["d"] if row and row["d"] else None
+    with connect(db_path) as c:
+        row = c.execute("SELECT MAX(date) AS d FROM daily_metrics").fetchone()
     return row["d"] if row and row["d"] else None
 
 
@@ -301,10 +310,23 @@ def mark_orphaned_runs(db_path: Path | None = None) -> int:
         return cur.rowcount
 
 
-def get_setting(key: str, default: str | None = None, db_path: Path | None = None) -> str | None:
-    """Fetch a single user setting (e.g., 'user_name'). Returns default if unset."""
-    with connect(db_path) as conn:
+def get_setting(
+    key: str,
+    default: str | None = None,
+    db_path: Path | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> str | None:
+    """Fetch a single user setting (e.g., 'user_name'). Returns default if unset.
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted.
+    """
+    if conn is not None:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+    with connect(db_path) as c:
+        row = c.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
 
 
@@ -317,7 +339,15 @@ def set_setting(key: str, value: str, db_path: Path | None = None) -> None:
         )
 
 
-def all_settings(db_path: Path | None = None) -> dict[str, str]:
-    with connect(db_path) as conn:
+def all_settings(
+    db_path: Path | None = None, conn: sqlite3.Connection | None = None
+) -> dict[str, str]:
+    """Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
+    if conn is not None:
         rows = conn.execute("SELECT key, value FROM settings ORDER BY key").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+    with connect(db_path) as c:
+        rows = c.execute("SELECT key, value FROM settings ORDER BY key").fetchall()
     return {r["key"]: r["value"] for r in rows}

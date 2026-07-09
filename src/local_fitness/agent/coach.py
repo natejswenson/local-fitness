@@ -18,6 +18,7 @@ which builds module constants at import) never raises.
 """
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -154,13 +155,19 @@ def load_profile(name: str) -> CoachProfile:
     )
 
 
-def resolve_coach_profile(db_path=None) -> CoachProfile:
+def resolve_coach_profile(
+    db_path=None, conn: sqlite3.Connection | None = None
+) -> CoachProfile:
     """Resolve the active profile: pick by ``coach_profile`` (DB>env>default),
     apply per-dial config overrides (default = the profile's own value). An
-    out-of-range or unparseable override falls back to the profile's value."""
-    name = config.coach_profile(db_path=db_path)
+    out-of-range or unparseable override falls back to the profile's value.
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
+    name = config.coach_profile(db_path=db_path, conn=conn)
     base = load_profile(name)
-    settings = db.all_settings(db_path=db_path)
+    settings = db.all_settings(db_path=db_path, conn=conn)
 
     def _dial(key, default):
         v = config._resolve_from(settings, f"coach_{key}", f"LOCAL_FITNESS_COACH_{key.upper()}", default, int)

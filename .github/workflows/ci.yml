@@ -48,6 +48,19 @@ jobs:
       - name: Run tests with coverage gate
         run: uv run pytest --cov-report=xml
 
+      # Separate axis from the coverage gate above: latency + db.connect()
+      # open-count regression, gated against the committed baseline captured
+      # by capture-perf-baseline.yml on this same runner type (machine-id
+      # matched — see docs/plans/2026-07-09-mcp-speed-and-ui-retirement-design.md
+      # "Eval-proof methodology"). --no-cov is load-bearing: the global
+      # --cov-fail-under=85 addopts would otherwise fail this narrow slice
+      # on coverage alone, independent of whether the benchmarks pass.
+      - name: Perf-benchmark regression gate
+        run: |
+          uv run pytest tests/test_perf_benchmarks.py --benchmark-only \
+            --benchmark-storage=file://./.benchmarks \
+            --benchmark-compare=0001 --benchmark-compare-fail=min:15% --no-cov
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:

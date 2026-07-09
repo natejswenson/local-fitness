@@ -14,6 +14,7 @@ functions in ``plans.py`` never call it — they receive a resolved
 from __future__ import annotations
 
 import os
+import sqlite3
 
 from . import db
 
@@ -59,9 +60,15 @@ def _coerce(db_raw, env_raw, default, cast):
         return default
 
 
-def _resolve(key, env, default, cast, db_path=None):
-    """Resolve a single knob (own DB read). For standalone single-knob use."""
-    return _coerce(db.get_setting(key, db_path=db_path), os.environ.get(env), default, cast)
+def _resolve(key, env, default, cast, db_path=None, conn: sqlite3.Connection | None = None):
+    """Resolve a single knob (own DB read). For standalone single-knob use.
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
+    return _coerce(
+        db.get_setting(key, db_path=db_path, conn=conn), os.environ.get(env), default, cast
+    )
 
 
 def _resolve_from(settings: dict, key, env, default, cast):
@@ -79,16 +86,26 @@ def _as_profile_name(s) -> str:
     return str(s).strip().lower()
 
 
-def coach_profile(db_path=None) -> str:
+def coach_profile(db_path=None, conn: sqlite3.Connection | None = None) -> str:
     """Selected coach tone profile name (DB > env > default 'adaptive'). The
-    returned name is whitelisted downstream by coach.load_profile."""
+    returned name is whitelisted downstream by coach.load_profile.
+
+    Accepts an already-open ``conn`` (threaded through to ``_resolve``, the
+    function that actually reads the DB) to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
     return _resolve("coach_profile", "LOCAL_FITNESS_COACH_PROFILE",
-                    "adaptive", _as_profile_name, db_path)
+                    "adaptive", _as_profile_name, db_path, conn=conn)
 
 
-def riegel_lookback_days(db_path=None) -> int:
+def riegel_lookback_days(db_path=None, conn: sqlite3.Connection | None = None) -> int:
     """Lookback window (days) for the projected-finish best effort. Clamps a
-    nonsense value (< 1 or > ~10 years) to the default."""
+    nonsense value (< 1 or > ~10 years) to the default.
+
+    Accepts an already-open ``conn`` (threaded through to ``_resolve``, the
+    function that actually reads the DB) to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
     n = _resolve("riegel_lookback_days", "LOCAL_FITNESS_RIEGEL_LOOKBACK_DAYS",
-                 DEFAULT_RIEGEL_LOOKBACK_DAYS, int, db_path)
+                 DEFAULT_RIEGEL_LOOKBACK_DAYS, int, db_path, conn=conn)
     return n if 1 <= n <= _RIEGEL_LOOKBACK_MAX_DAYS else DEFAULT_RIEGEL_LOOKBACK_DAYS

@@ -112,7 +112,8 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   builds from the `../local-fitness` working tree, so the checked-out branch is
   what ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
-  (85% coverage gate), `ruff`, the prompt scorer, `pnpm build` (`tsc -b &&
+  (85% coverage gate), a separate perf-benchmark regression gate (see
+  below), `ruff`, the prompt scorer, `pnpm build` (`tsc -b &&
   vite build`), and `pnpm test` (vitest) for the frontend. A separate
   `docker-build` job compiles the full multi-stage image (no push) so a
   `node`/base-image bump or `Dockerfile` change can't silently break
@@ -121,6 +122,25 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   proves the image *compiles*, not that the running container behaves
   correctly, so still rebuild and smoke-test locally after touching the
   `Dockerfile`, base images, or web deps.
+- **Perf-benchmark regression gate (`tests/test_perf_benchmarks.py`).**
+  `pytest-benchmark`-based, separate axis from the coverage gate: latency
+  AND `db.connect()`-open-count for the brief/plan hot paths
+  (`assemble_brief_context`, `get_training_plan_progress`,
+  `get_training_plan_status`, `_build_plan_section`, `daily_snapshot`),
+  run against a synthetic multi-year fixture (`scripts/perf_fixture.py` —
+  fabricated, never derived from real data). Skipped on every ordinary
+  `pytest` run (`--benchmark-skip` in `pyproject.toml`'s `addopts`); the
+  `validate` job's "Perf-benchmark regression gate" step explicitly opts
+  back in with `--benchmark-only --no-cov`, comparing against the
+  committed `.benchmarks/Linux-CPython-3.12-64bit/0001_*.json` baseline
+  (`--benchmark-compare-fail=min:15%`). **Machine-id matched, non-negotiable**:
+  pytest-benchmark nests saves under `platform.system()-implementation-
+  pyver-arch`, so the baseline MUST be (re)captured via the
+  `capture-perf-baseline.yml` `workflow_dispatch` job on `ubuntu-latest` —
+  never locally on Nate's Mac (`Darwin-CPython-3.12-64bit` would never
+  match, turning every subsequent `validate` run into a hard failure).
+  Rebaseline only when intentionally resetting the comparison floor after
+  a further perf improvement, not routinely.
 - **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
   manual prefix today, `/devlog` skill (auto from git commits) going
   forward.

@@ -1415,16 +1415,17 @@ async def update_plan_workout(args: dict) -> dict:
     {},
 )
 async def get_training_plan_status(_args: dict) -> dict:
-    active = plans.get_active_plan()
-    if active is None:
-        return _text({"active": False})
-    frontier = db.last_known_daily_date()
-    today = date.today().isoformat()
-    dates = [w["date"] for w in active["workouts"]] or [today]
-    start = min(dates)
-    end = max([today, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end)
-    cfg = plans.resolve_grading_config()
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+        if active is None:
+            return _text({"active": False})
+        frontier = db.last_known_daily_date(conn=conn)
+        today = date.today().isoformat()
+        dates = [w["date"] for w in active["workouts"]] or [today]
+        start = min(dates)
+        end = max([today, *dates] + ([frontier] if frontier else []))
+        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        cfg = plans.resolve_grading_config(conn=conn)
     return _text(plans.build_plan_status(active, frontier, activities_by_date, today, cfg))
 
 
@@ -1440,20 +1441,22 @@ async def get_training_plan_status(_args: dict) -> dict:
     {},
 )
 async def get_training_plan_progress(_args: dict) -> dict:
-    active = plans.get_active_plan()
-    if active is None:  # build_plan_detail has no None guard — guard here first.
-        return _text({"active": False})
-    frontier = db.last_known_daily_date()
-    today = date.today().isoformat()
-    # Mirror get_training_plan_status's frontier-INCLUSIVE end (parity: both plan
-    # tools compute identical grading windows), not the web tab's exclusive form.
-    dates = [w["date"] for w in active["workouts"]] or [today]
-    start = min(dates)
-    end = max([today, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end)
-    cutoff = (date.today() - timedelta(days=config.riegel_lookback_days())).isoformat()
-    best_effort = plans.best_recent_effort(cutoff)
-    cfg = plans.resolve_grading_config()
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+        if active is None:  # build_plan_detail has no None guard — guard here first.
+            return _text({"active": False})
+        frontier = db.last_known_daily_date(conn=conn)
+        today = date.today().isoformat()
+        # Mirror get_training_plan_status's frontier-INCLUSIVE end (parity: both plan
+        # tools compute identical grading windows), not the web tab's exclusive form.
+        dates = [w["date"] for w in active["workouts"]] or [today]
+        start = min(dates)
+        end = max([today, *dates] + ([frontier] if frontier else []))
+        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        cutoff = (date.today() - timedelta(
+            days=config.riegel_lookback_days(conn=conn))).isoformat()
+        best_effort = plans.best_recent_effort(cutoff, conn=conn)
+        cfg = plans.resolve_grading_config(conn=conn)
     detail = plans.build_plan_detail(active, frontier, activities_by_date, best_effort, cfg)
 
     # days_to_race is produced only by build_plan_status, not build_plan_detail —
@@ -1690,16 +1693,17 @@ def _build_plan_section(target_date: str) -> dict | None:
     old brief's PDF shows that day's plan state, not today's. Mirrors
     get_training_plan_progress's plan-loading pattern, anchored to
     target_date instead of the real wall-clock date."""
-    active = plans.get_active_plan()
-    if active is None:
-        return None
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+        if active is None:
+            return None
 
-    frontier = db.last_known_daily_date()
-    dates = [w["date"] for w in active["workouts"]] or [target_date]
-    start = min(dates)
-    end = max([target_date, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end)
-    cfg = plans.resolve_grading_config()
+        frontier = db.last_known_daily_date(conn=conn)
+        dates = [w["date"] for w in active["workouts"]] or [target_date]
+        start = min(dates)
+        end = max([target_date, *dates] + ([frontier] if frontier else []))
+        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        cfg = plans.resolve_grading_config(conn=conn)
     # build_plan_detail has no "as of" date concept — grade_workout's pending
     # holdout compares each workout's OWN date against the real data frontier,
     # not against target_date, so every workout's verdict is a settled fact
