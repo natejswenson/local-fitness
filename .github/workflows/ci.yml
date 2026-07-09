@@ -71,6 +71,7 @@ jobs:
           name: perf-benchmark-run-${{ github.run_id }}
           path: .benchmarks/
           retention-days: 14
+          include-hidden-files: true
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

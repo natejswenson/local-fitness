@@ -67,3 +67,4 @@ jobs:
           name: perf-baseline
           path: .benchmarks/
           retention-days: 14
+          include-hidden-files: true
