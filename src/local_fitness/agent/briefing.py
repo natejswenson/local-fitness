@@ -13,6 +13,8 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -28,11 +30,13 @@ from claude_agent_sdk import (
 from pydantic import ValidationError
 
 from .. import db
+from .. import notes
 from . import brief_planner
 from . import briefs
 from . import coach
 from . import grounding
 from . import local_model
+from . import opencode_model
 from . import prompts
 from . import tools as agent_tools
 from .briefs import (
@@ -94,18 +98,26 @@ def _brief_v2_enabled() -> bool:
     return os.environ.get(_BRIEF_V2_ENV, "").strip().lower() not in _FALSY
 
 
-# Local-model (Ollama) shadow-run support. See
-# docs/plans/2026-07-05-gemma4-shadow-run-design.md. A "model" string prefixed
-# "ollama:" is dispatched to local_model.generate_local_completion() instead
-# of claude_agent_sdk.query() — shadow-run comparison only, never the live
-# production path unless a future, separate decision promotes it.
-_LOCAL_MODEL_PREFIX = "ollama:"
+# Alt-model (non-Claude) shadow-run support. See
+# docs/plans/2026-07-08-model-agnostic-shadow-run-design.md (generalizes
+# docs/plans/2026-07-05-gemma4-shadow-run-design.md's original gemma4/Ollama-
+# only path). A "model" string prefixed "opencode:" names a "provider/model"
+# pair (e.g. "opencode:ollama/gemma4", "opencode:opencode/deepseek-v4-flash-
+# free") dispatched to either local_model.generate_local_completion() (the
+# "ollama" provider — direct HTTP, grammar-constrained decoding preserved) or
+# opencode_model.generate_opencode_completion() (every other provider, via
+# the opencode CLI) instead of claude_agent_sdk.query() — shadow-run
+# comparison only, never the live production path unless a future, separate
+# decision promotes it.
+_ALT_MODEL_PREFIX = "opencode:"
 
 
-def _local_model_name(model: str) -> str | None:
-    """The Ollama model name if ``model`` is a local-model request, else None."""
-    if model.startswith(_LOCAL_MODEL_PREFIX):
-        return model[len(_LOCAL_MODEL_PREFIX):]
+def _alt_model_name(model: str) -> str | None:
+    """The full "provider/model" string (e.g. "ollama/gemma4",
+    "opencode/deepseek-v4-flash-free") if ``model`` is an alt-model request,
+    else None."""
+    if model.startswith(_ALT_MODEL_PREFIX):
+        return model[len(_ALT_MODEL_PREFIX):]
     return None
 
 
@@ -311,27 +323,71 @@ def _append_gemma4_plan_status(raw: str, plan_today: dict | None) -> str:
     return json.dumps(payload)
 
 
-def _assert_fixture_only_data() -> None:
-    """Refuse to call a local model unless the DB *and* recent-briefs data are
-    fixture-only (both resolve under the system temp dir).
+@dataclass(frozen=True)
+class _ModelProfile:
+    """Per-model tuning, replacing the old ``if model == "gemma4"`` branches.
 
-    Local models run outside Claude's data-handling boundary, so this must be
-    an ALLOW-list check — it positively confirms fixture isolation rather than
-    merely failing to match one hardcoded "real" path. A deny-list check
-    against the dev-host default DB path would silently pass under a container
-    deployment (LOCAL_FITNESS_DATA_DIR=/data) where the real path differs from
-    that literal — see the design doc's round-2 findings.
+    Keyed by exact "provider/model" string in ``_MODEL_PROFILES`` below —
+    only models with real, empirically-validated tuning get an entry; every
+    other model (including any new opencode-reachable one) falls through to
+    ``_DEFAULT_PROFILE`` with zero extra tuning until a real observed failure
+    justifies adding one, mirroring how gemma4's own tuning arose.
+    """
+
+    temperature: float = 0.4
+    # ollama-provider only: consumed by generate_local_completion's
+    # temperature= kwarg. generate_opencode_completion has no temperature
+    # parameter (opencode run has no CLI-level temperature flag) — this
+    # field is a silent no-op on the opencode transport, by design.
+    ollama_format_schema: Callable[[], dict] | None = None  # ollama provider only
+    plan_prompt_facts: Callable[[dict], str] | None = None
+    plan_status_appendix: Callable[[str, dict | None], str] | None = None
+    reshape: Callable[[str], str] | None = None
+
+
+_DEFAULT_PROFILE = _ModelProfile()
+_MODEL_PROFILES: dict[str, _ModelProfile] = {
+    "ollama/gemma4": _ModelProfile(
+        temperature=0.8,
+        ollama_format_schema=_gemma4_format_schema,
+        plan_prompt_facts=_gemma4_plan_prompt_facts,
+        plan_status_appendix=_append_gemma4_plan_status,
+        reshape=_reshape_gemma4_slots,
+    ),
+}
+
+
+def _assert_fixture_only_data() -> None:
+    """Refuse to call an alt model unless the DB, recent-briefs, AND
+    user-notes data are all fixture-only (resolve under the system temp dir).
+
+    Alt models run outside Claude's data-handling boundary — for the
+    opencode-CLI transport specifically, this is the ONLY thing standing
+    between real personal health/coaching data and an off-machine LLM
+    provider — so this must be an ALLOW-list check — it positively confirms
+    fixture isolation rather than merely failing to match one hardcoded
+    "real" path. A deny-list check against the dev-host default DB path would
+    silently pass under a container deployment (LOCAL_FITNESS_DATA_DIR=/data)
+    where the real path differs from that literal — see the design doc's
+    round-2 findings.
+
+    Checks THREE paths, not two: the alt-model system prompt is built via
+    prompts.brief_v2_system_prompt(...), which injects user notes via
+    notes.render_for_prompt() — so notes._default_notes_path() must be
+    checked too, or a real user_notes.md could reach a third-party
+    opencode-hosted model while this gate reported "safe".
     """
     tmp_root = Path(tempfile.gettempdir()).resolve()
     for label, path in (
         ("db.DEFAULT_DB_PATH", db.DEFAULT_DB_PATH),
         ("briefs.DEFAULT_BRIEFINGS_DIR", briefs.DEFAULT_BRIEFINGS_DIR),
+        ("notes._default_notes_path()", notes._default_notes_path()),
     ):
         resolved = Path(path).resolve()
         if not resolved.is_relative_to(tmp_root):
             raise RuntimeError(
-                f"refusing local-model call: {label}={resolved} is not under "
-                f"the system temp dir ({tmp_root}) — local models must only "
+                f"refusing alt-model call: {label}={resolved} is not under "
+                f"the system temp dir ({tmp_root}) — alt models must only "
                 "ever see fixture data, never real personal data")
 
 
@@ -473,47 +529,64 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     # None on the V1 path (no toolless context → nothing to ground against).
     brief_context = None
 
-    local_model_name = _local_model_name(model)
-    if local_model_name is not None:
-        # Shadow-run-only path (see docs/plans/2026-07-05-gemma4-shadow-run-
-        # design.md): local models are toolless-V2-only, never the tool-calling
-        # V1 monolith, so a local model can never be given MCP tool access.
+    # Alt-model branch: reached by every shadow-run entry point (scripts/
+    # shadow_run.py, ab_brief.py, capture_baseline.py — all via `_generate`),
+    # never by production (`generate_and_save` always passes DEFAULT_MODEL, a
+    # Claude model, so `_alt_model_name()` returns None for it and this
+    # branch is never executed there — see docs/plans/2026-07-08-model-
+    # agnostic-shadow-run-design.md).
+    alt_model_name = _alt_model_name(model)
+    if alt_model_name is not None:
+        # Shadow-run-only path: alt models are toolless-V2-only, never the
+        # tool-calling V1 monolith, so an alt model can never be given MCP
+        # tool access.
         if not _brief_v2_enabled():
             raise ValueError(
-                'local models ("ollama:...") are only supported on the V2 '
-                "toolless path — refusing to give one MCP tool access")
+                'alt models ("opencode:provider/model") are only supported '
+                "on the V2 toolless path — refusing to give one MCP tool access")
         brief_context = brief_planner.assemble_brief_context(today=date.today().isoformat())
-        # Round 2 finding (2026-07-05): a gemma4-specific prompt appendix
-        # (prompts.brief_v2_system_prompt_gemma4/user_prompt_gemma4) did NOT
-        # improve schema compliance, and structured output alone fixed
-        # compliance but revealed the model leaning on schema DEFAULTS
-        # (tone="neutral", metric=null) instead of actively choosing values —
-        # redundant prose instructions compete with content reasoning rather
-        # than helping it. So: base (shared, Claude-identical) prompt for
-        # narrative content, and for gemma4 specifically, a TIGHTENED format
-        # schema (no tone default, metric required-non-null) plus a higher
-        # temperature (fabrication was never the risk, so 0.4 was overly
-        # conservative) — this fixed the defaulting behavior empirically.
-        local_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
-        local_prompt_text = prompts.brief_v2_user_prompt(
+        provider, _, bare_model = alt_model_name.partition("/")
+        if not provider or not bare_model:
+            raise ValueError(
+                f"malformed alt-model string {model!r}: expected "
+                f"'opencode:<provider>/<model>' (e.g. 'opencode:ollama/gemma4')")
+        profile = _MODEL_PROFILES.get(alt_model_name, _DEFAULT_PROFILE)
+
+        alt_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
+        alt_prompt_text = prompts.brief_v2_user_prompt(
             brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
-        if local_model_name == "gemma4" and brief_context.plan_today is not None:
-            local_prompt_text += _gemma4_plan_prompt_facts(brief_context.plan_today)
+        if profile.plan_prompt_facts and brief_context.plan_today is not None:
+            alt_prompt_text += profile.plan_prompt_facts(brief_context.plan_today)
+
         _assert_fixture_only_data()
-        if local_model_name == "gemma4":
-            local_format = _gemma4_format_schema()
-            local_temperature = 0.8
+
+        if provider == "ollama":
+            # Direct-HTTP transport, grammar-constrained decoding preserved —
+            # see the design doc's "capability-aware dispatch" rationale for
+            # why this stays on the old path instead of routing through
+            # opencode (Ollama has no CLI passthrough for structured output).
+            alt_format = (profile.ollama_format_schema() if profile.ollama_format_schema
+                          else Brief.model_json_schema())
+            raw = (await asyncio.to_thread(
+                local_model.generate_local_completion,
+                alt_system_prompt, alt_prompt_text, model=bare_model,
+                format=alt_format, temperature=profile.temperature,
+            )).strip()
         else:
-            local_format = Brief.model_json_schema()
-            local_temperature = 0.4
-        raw = (await asyncio.to_thread(
-            local_model.generate_local_completion,
-            local_system_prompt, local_prompt_text, model=local_model_name,
-            format=local_format, temperature=local_temperature,
-        )).strip()
-        if local_model_name == "gemma4":
-            raw = _reshape_gemma4_slots(raw)
-            raw = _append_gemma4_plan_status(raw, brief_context.plan_today)
+            # opencode-CLI transport — every other provider (e.g. opencode's
+            # own hosted gateway models like opencode/deepseek-v4-flash-free).
+            agent = os.environ.get("LOCAL_FITNESS_OPENCODE_AGENT", "fitness-brief")
+            raw = (await asyncio.to_thread(
+                opencode_model.generate_opencode_completion,
+                alt_system_prompt, alt_prompt_text,
+                model=alt_model_name, agent=agent,
+            )).strip()
+
+        if profile.reshape:
+            raw = profile.reshape(raw)
+        if profile.plan_status_appendix and brief_context.plan_today is not None:
+            raw = profile.plan_status_appendix(raw, brief_context.plan_today)
+
         async for evt in _finalize_brief(raw, user_name, save, brief_context):
             yield evt
         return
