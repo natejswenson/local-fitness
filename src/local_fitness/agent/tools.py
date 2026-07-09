@@ -8,11 +8,16 @@ column names — no user input ever interpolates into SQL except via params.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1540,21 +1545,122 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+_EPHEMERAL_DIR_PID_RE = re.compile(r"^local-fitness-reports-(\d+)-")
+_EPHEMERAL_DIR_MAX_AGE_SECONDS = 24 * 60 * 60  # longer than any plausible single session
+
+_EPHEMERAL_DIR: Path | None = None
+_EPHEMERAL_DIR_LOCK = threading.Lock()
+
+
+def _rmtree_ignore_errors(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _sweep_stale_ephemeral_dirs() -> None:
+    """Best-effort removal of `local-fitness-reports-<pid>-*` directories
+    left behind by processes that exited without running atexit handlers
+    (SIGKILL/SIGTERM). Only removes a candidate when its mtime is older
+    than 24h AND the PID embedded in its name is dead (os.kill(pid, 0)
+    raises ProcessLookupError) — a directory whose PID is still alive, or
+    whose name doesn't match the expected pattern, is left alone. Each
+    candidate is handled in its own try/except so one bad candidate never
+    aborts sweeping the rest."""
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob("local-fitness-reports-*"))
+    except OSError:
+        return
+    for candidate in candidates:
+        try:
+            match = _EPHEMERAL_DIR_PID_RE.match(candidate.name)
+            if not match:
+                continue
+            pid = int(match.group(1))
+            age_seconds = time.time() - candidate.stat().st_mtime
+            if age_seconds <= _EPHEMERAL_DIR_MAX_AGE_SECONDS:
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass  # PID is dead — safe to remove
+            else:
+                continue  # PID is alive (or we can't tell) — leave it alone
+            _rmtree_ignore_errors(candidate)
+        except Exception:
+            continue
+
 
 def _default_reports_dir() -> Path:
     """Resolve the reports directory. Honor LOCAL_FITNESS_REPORTS_DIR for a
-    host override; default to a project-relative `./reports/` directory
-    when unset. Deliberately NOT wired to a Dockerfile pre-creation step or
-    a compose bind-mount — the container's only process can never reach
-    these tools (see design doc), so `reports/` is created on demand by
-    each tool's own mkdir call, only on the host run_stdio() path."""
+    host override (persistent, no atexit cleanup — this branch never
+    touches _EPHEMERAL_DIR, so there's nothing to guard or clean up).
+
+    Otherwise, resolve to a per-process ephemeral tempfile.mkdtemp()
+    directory, memoized in the module-level _EPHEMERAL_DIR cache and
+    registered for atexit cleanup on first use. The directory name embeds
+    this process's PID (local-fitness-reports-<pid>-<random>) so a
+    best-effort stale-directory sweep (_sweep_stale_ephemeral_dirs) can
+    tell a genuinely dead session's leftover directory apart from a live
+    one's, and only removes the former.
+
+    _EPHEMERAL_DIR_LOCK guards the whole check-then-set-and-create sequence
+    below: both tools dispatch this function via asyncio.to_thread (to keep
+    its filesystem I/O off the event loop), so two concurrent tool calls
+    run this body on separate OS worker threads — without the lock, both
+    could observe _EPHEMERAL_DIR as None and each create their own
+    ephemeral directory.
+
+    Accepted residual risk: atexit doesn't fire on SIGKILL or (Python's
+    default disposition for) SIGTERM, so an abruptly-killed process's
+    directory can leak until the age+liveness sweep above claims it. That
+    sweep itself has a narrower residual gap: os.kill(pid, 0) reads a
+    zombie (exited but unreaped) child as still alive, and a reaped PID
+    can be reassigned to an unrelated process — both can extend leakage
+    beyond one stale session in rare cases. Building a real liveness
+    registry to close this isn't justified for a personal, single-user
+    tool."""
     override = os.environ.get("LOCAL_FITNESS_REPORTS_DIR")
     if override:
         return Path(override)
-    return _PROJECT_ROOT / "reports"
+
+    with _EPHEMERAL_DIR_LOCK:
+        global _EPHEMERAL_DIR
+        if _EPHEMERAL_DIR is not None:
+            return _EPHEMERAL_DIR
+        _sweep_stale_ephemeral_dirs()
+        new_dir = Path(tempfile.mkdtemp(prefix=f"local-fitness-reports-{os.getpid()}-"))
+        atexit.register(_rmtree_ignore_errors, new_dir)
+        _EPHEMERAL_DIR = new_dir
+        return new_dir
 
 
-REPORTS_DIR = _default_reports_dir()
+async def _auto_open(path: Path) -> None:
+    """Best-effort: open `path` in the OS default viewer (macOS `open`).
+    Never raises and never fails the tool call — the file was generated
+    successfully either way. `check=False` means a non-zero exit code
+    (e.g. "no GUI session") doesn't raise, so it's checked explicitly and
+    logged; a missing `open` binary or a timeout raise real exceptions,
+    caught below. stdout/stderr are redirected to DEVNULL rather than
+    inherited from the parent — this process's stdout is the live
+    JSON-RPC framing channel for the whole stdio MCP session, so anything
+    `open` ever wrote there would corrupt that transport. The sleep after
+    a successful open is a deliberate grace-period delay: even on a
+    completely normal process exit (no crash), atexit-triggered cleanup
+    could otherwise race the just-spawned viewer process while it's still
+    reading the file off disk."""
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["open", str(path)],
+            check=False,
+            timeout=10,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            LOG.warning("auto-open exited non-zero (%s) for %s", result.returncode, path)
+        await asyncio.sleep(1.5)
+    except Exception:
+        LOG.warning("auto-open failed for %s", path, exc_info=True)
 
 
 def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
@@ -1631,9 +1737,14 @@ async def generate_brief_report(args: dict) -> dict:
         return _err(f"PDF render failed: {e}")
 
     try:
-        final_path = _write_atomic(REPORTS_DIR, f"brief-{target_date}.pdf", pdf_bytes)
+        reports_dir = await asyncio.to_thread(_default_reports_dir)
+    except OSError as e:
+        return _err(f"could not prepare reports directory: {e}")
+    try:
+        final_path = _write_atomic(reports_dir, f"brief-{target_date}.pdf", pdf_bytes)
     except ValueError:
         return _err("resolved path escaped reports directory")
+    await _auto_open(final_path)
     return _text({"path": str(final_path)})
 
 
@@ -1703,11 +1814,16 @@ async def generate_chart(args: dict) -> dict:
     # file) therefore holds only within a single calendar day.
     today = date.today().isoformat()
     try:
+        reports_dir = await asyncio.to_thread(_default_reports_dir)
+    except OSError as e:
+        return _err(f"could not prepare reports directory: {e}")
+    try:
         final_path = _write_atomic(
-            REPORTS_DIR, f"chart-{metric}-{chart_type}-{days}d-{today}.png", png_bytes
+            reports_dir, f"chart-{metric}-{chart_type}-{days}d-{today}.png", png_bytes
         )
     except ValueError:
         return _err("resolved path escaped reports directory")
+    await _auto_open(final_path)
     return _text({"path": str(final_path)})
 
 

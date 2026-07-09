@@ -284,9 +284,23 @@ These are settled — don't redesign without a reason.
   These two MCP tools (`agent/tools.py`'s `LOCAL_ONLY_TOOLS`) render a saved
   daily brief into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline,
   reusing the `budget` project's validated color theme) and render a
-  standalone matplotlib PNG chart on demand, both to local files under
-  `LOCAL_FITNESS_REPORTS_DIR` (default `./reports/`, gitignored, ephemeral —
-  never bind-mounted). They're registered ONLY via `run_stdio()`'s
+  standalone matplotlib PNG chart on demand. Since the 2026-07-09 UX pass,
+  both write to and auto-open from an **ephemeral per-process tmp
+  directory by default** (`tempfile.mkdtemp`, PID-embedded naming, cleaned
+  up via `atexit` when the `fitness mcp-stdio` process exits — a fresh
+  subprocess per opencode/Claude session, so this is the natural
+  session-cleanup boundary) rather than the old persistent `./reports/`.
+  A best-effort liveness-checked sweep also reaps any prior session's
+  leaked directory (PID dead + >24h old) on each process's first call —
+  `atexit` doesn't fire on `SIGKILL`/`SIGTERM`, so an abrupt kill can still
+  leak until the sweep claims it; this is an accepted residual risk for a
+  personal, single-user tool, not something hardened further. After a
+  successful write, the file is auto-opened via macOS `open` (best-effort,
+  never fails the tool call; logs a warning and no-ops on other platforms).
+  Set `LOCAL_FITNESS_REPORTS_DIR` to opt back into a persistent directory
+  (still auto-opened, no auto-cleanup) — see `.env.example`. If you have an
+  existing populated `./reports/` from before this change, it's vestigial
+  now and safe to delete by hand. They're registered ONLY via `run_stdio()`'s
   `build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)` call — structurally,
   not just by convention, unreachable over the authenticated streamable-HTTP
   `/mcp/` transport (`build_session_manager()` calls `build_server()`

@@ -903,3 +903,36 @@ above for rationale).
   `weasyprint` doesn't break CI on bare `ubuntu-latest`. These packages
   are deliberately CI-only; the `Dockerfile` does not carry them (see
   Docs to update).
+
+## Addendum (2026-07-09): ephemeral-by-default output directory + auto-open
+
+A follow-up change (planned informally via a Claude Code plan-mode
+artifact, not a separate committed design doc) makes the invariants below
+describing `LOCAL_FITNESS_REPORTS_DIR` as the sole write root, and
+`reports/` as a persistent-but-regenerable directory, no longer hold as
+originally written:
+
+- **`REPORTS_DIR` (the module-level constant) is removed.** Both tools now
+  resolve their output directory per-call via `_default_reports_dir()`,
+  which returns a per-process **ephemeral** `tempfile.mkdtemp()` directory
+  by default — PID-embedded naming, cleaned up via `atexit` when the
+  `fitness mcp-stdio` process exits, with a liveness-checked stale-directory
+  sweep as a backstop for abrupt (`SIGKILL`/`SIGTERM`) exits.
+  `LOCAL_FITNESS_REPORTS_DIR` still works exactly as before (persistent,
+  no auto-cleanup) as an explicit opt-out.
+- **"Both tools write only under `LOCAL_FITNESS_REPORTS_DIR`"** (line 663)
+  and **"mkdir before the .tmp write"** (line 705) are still true in spirit
+  — substitute "the directory returned by `_default_reports_dir()`" for
+  "`LOCAL_FITNESS_REPORTS_DIR`" throughout; the path-containment check
+  (line 744) is unchanged and still applies to whichever directory is
+  resolved.
+- **Both tools now auto-open the generated file** (macOS `open`,
+  best-effort, never fails the tool call) after a successful write — a UX
+  addition, not part of the original scope above.
+- **AMB-2's "reports/ is ephemeral by design" reasoning (contract yaml)
+  is now literally true**, not just a Dockerfile/bind-mount argument — the
+  directory itself is now a real OS tmp dir, not a persistent
+  project-relative folder.
+
+See `CLAUDE.md`'s "What's already wired" entry for these two tools for the
+current, authoritative summary of this behavior.
