@@ -15,6 +15,20 @@ name: Capture perf-benchmark baseline
 #
 # Re-run only to intentionally rebaseline (e.g. after a further perf
 # improvement that should reset the comparison floor) — not routinely.
+#
+# Bootstrapping note: `workflow_dispatch` workflows are only dispatchable via
+# the API/`gh workflow run` once the workflow FILE exists on the repo's
+# DEFAULT branch (`main` here — see CLAUDE.md's Branching & release
+# strategy). Since `main` only receives deliberate `dev -> main` promotions,
+# this workflow can't be dispatched from a feature branch pre-merge. The
+# 0001 baseline committed alongside this file's initial landing was instead
+# captured via a local `docker run --platform=linux/amd64 python:3.12-slim`
+# container: pytest-benchmark's machine-id
+# (`platform.system()-implementation-pyver-arch`) depends only on OS/arch
+# bitness, not on being a real GitHub-hosted runner, so a matching Linux
+# container produces an identical, valid `Linux-CPython-3.12-64bit` save.
+# Once this workflow has landed on `main` at least once, prefer dispatching
+# it for real over the Docker workaround.
 on:
   workflow_dispatch: {}
 
