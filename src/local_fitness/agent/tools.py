@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
-from . import briefs, charts, units
+from . import briefs, charts, coach, plan_coach, units
 from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
@@ -1681,6 +1681,104 @@ def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
     return final_path
 
 
+def _build_plan_section(target_date: str) -> dict | None:
+    """Training Plan section payload for generate_brief_report's PDF, or
+    None when there's nothing to show (no active plan, or an active plan
+    with no workout data at all in the trailing-7-day window ending on
+    target_date). Computed fresh from plans.py, keyed to target_date (the
+    brief's own date) as "today" — not date.today() — so regenerating an
+    old brief's PDF shows that day's plan state, not today's. Mirrors
+    get_training_plan_progress's plan-loading pattern, anchored to
+    target_date instead of the real wall-clock date."""
+    active = plans.get_active_plan()
+    if active is None:
+        return None
+
+    frontier = db.last_known_daily_date()
+    dates = [w["date"] for w in active["workouts"]] or [target_date]
+    start = min(dates)
+    end = max([target_date, *dates] + ([frontier] if frontier else []))
+    activities_by_date = plans.load_activities_by_date(start, end)
+    cfg = plans.resolve_grading_config()
+    # build_plan_detail has no "as of" date concept — grade_workout's pending
+    # holdout compares each workout's OWN date against the real data frontier,
+    # not against target_date, so every workout's verdict is a settled fact
+    # once the frontier has passed it (regenerating an old brief's PDF still
+    # shows accurate historical grading). target_date only selects which
+    # graded workout is "today" and which trailing window to show below —
+    # it is never passed to build_plan_detail itself (its 4th positional
+    # param is best_effort, a Riegel-projection dict, not a date).
+    detail = plans.build_plan_detail(active, frontier, activities_by_date, cfg=cfg)
+
+    window_start = (date.fromisoformat(target_date) - timedelta(days=6)).isoformat()
+    week_workouts = sorted(
+        (w for w in detail["workouts"] if window_start <= w["date"] <= target_date),
+        key=lambda w: w["date"],
+        reverse=True,
+    )
+
+    last_7_days: list[dict] = []
+    for w in week_workouts:
+        target_m = w.get("target_distance_m")
+        planned_mi = units.to_miles(target_m) if target_m else None
+        if w["verdict"] in ("pending", "compliant"):
+            actual_mi = None
+        else:
+            actual_m = w.get("actual_distance_m")
+            actual_mi = units.to_miles(actual_m) if actual_m is not None else None
+        last_7_days.append({
+            "date": w["date"],
+            "type": w["type"],
+            "planned_mi": planned_mi,
+            "actual_mi": actual_mi,
+            "verdict": w["verdict"],
+        })
+
+    if not last_7_days:
+        return None
+
+    week_planned_mi = sum(d["planned_mi"] or 0 for d in last_7_days)
+    week_actual_mi = sum(d["actual_mi"] or 0 for d in last_7_days)
+    slips = sum(1 for d in last_7_days if d["verdict"] in ("partial", "missed"))
+    adherence_pct = detail.get("adherence_pct")
+    if adherence_pct is None:
+        adherence_pct = 0
+
+    today_entry = next((w for w in detail["workouts"] if w["date"] == target_date), None)
+    today_payload = None
+    if today_entry is not None:
+        target_m = today_entry.get("target_distance_m")
+        today_payload = {
+            "type": today_entry["type"],
+            "distance_mi": units.to_miles(target_m) if target_m else None,
+            "pace_min_per_mi": units.format_pace_min_per_mi(today_entry.get("target_pace_sec_per_km")),
+            "description": today_entry.get("description") or "",
+        }
+
+    # build_plan_detail has no days_to_race field at all (unlike goal_type/
+    # race_date, it's never a stored plan column) -- build_plan_status
+    # computes it the same way, on the fly, from race_date and its own
+    # "today" parameter. Anchored to target_date here (not build_plan_detail,
+    # which has no date concept) since "days from the brief's date to the
+    # race" is inherently relative to whichever date this report is for.
+    race = detail.get("race_date")
+    days_to_race = (
+        (date.fromisoformat(race) - date.fromisoformat(target_date)).days
+        if race else None
+    )
+
+    return {
+        "adherence_pct": adherence_pct,
+        "goal_type": detail.get("goal_type") or "goal",
+        "days_to_race": days_to_race,
+        "week_planned_mi": round(week_planned_mi, 1),
+        "week_actual_mi": round(week_actual_mi, 1),
+        "slips": slips,
+        "today": today_payload,
+        "last_7_days": last_7_days,
+    }
+
+
 @tool(
     "generate_brief_report",
     "Render a saved daily brief into a polished, beautiful PDF report "
@@ -1730,9 +1828,45 @@ async def generate_brief_report(args: dict) -> dict:
             )
             continue
 
+    plan_section: dict | None = None
+    try:
+        plan_section = _build_plan_section(target_date)
+    except Exception:
+        # Malformed/partial plan data must never fail the whole report —
+        # same "one section's problem never sinks the report" precedent
+        # as the chart-rendering loop above.
+        LOG.warning("plan section build failed for brief %s", target_date, exc_info=True)
+        plan_section = None
+
+    if plan_section is not None and plan_section["today"] is not None:
+        profile = coach.resolve_coach_profile()
+        try:
+            coaching_line = await plan_coach.generate_coaching_line(
+                profile,
+                plan_section["today"],
+                plan_section["last_7_days"],
+                plan_section["adherence_pct"],
+                plan_section["days_to_race"],
+                plan_section["goal_type"],
+            )
+        except Exception:
+            LOG.warning(
+                "plan coaching-line generation failed for brief %s, using fallback",
+                target_date, exc_info=True,
+            )
+            coaching_line = plan_coach.fallback_coaching_line(
+                plan_section["today"],
+                plan_section["last_7_days"],
+                plan_section["days_to_race"],
+                plan_section["goal_type"],
+            )
+        plan_section["today"]["coaching_line"] = coaching_line
+
     try:
         async with visuals.RENDER_LOCK:
-            pdf_bytes = await asyncio.to_thread(visuals.render_brief_pdf, brief, charts_by_index)
+            pdf_bytes = await asyncio.to_thread(
+                visuals.render_brief_pdf, brief, charts_by_index, plan_section
+            )
     except Exception as e:
         return _err(f"PDF render failed: {e}")
 
