@@ -6,9 +6,12 @@ We call them directly against a seeded tmp DB (no SDK runtime, no network).
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from datetime import date, timedelta
+from pathlib import Path
 
+import pdfplumber
 import pytest
 
 from local_fitness import db
@@ -1015,3 +1018,288 @@ def test_sync_garmin_data_auth_failure_is_error(monkeypatch):
 
 def test_sync_garmin_data_is_in_full_tool_set():
     assert f"mcp__{tools.SERVER_NAME}__sync_garmin_data" in tools.allowed_tool_names()
+
+
+# --- LOCAL_ONLY_TOOLS: generate_brief_report / generate_chart --------------
+
+
+def test_fetch_metric_series_matches_chart_tool_output(seeded):
+    # Regression guard for the chart()/generate_chart() extraction: the shared
+    # helper's fetched values must be the exact same numbers chart()'s ASCII
+    # rendering displays for the same (metric, days) window.
+    dates, values = tools._fetch_metric_series("rhr", 14)
+    assert len(dates) == len(values) > 0
+    assert dates == sorted(dates)  # ascending, matching the ORDER BY date SQL
+
+    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "spark"})
+    assert not err
+    fmt = tools._chart_value_fmt("rhr")
+    assert fmt(min(values)) in text
+    assert fmt(max(values)) in text
+
+
+def test_fetch_metric_series_unknown_metric_raises(seeded):
+    with pytest.raises(ValueError, match="unknown metric"):
+        tools._fetch_metric_series("bogus", 14)
+
+
+def test_write_atomic_rejects_escaping_final_name(tmp_path):
+    # INV-T4: containment check mirrors web/server.py's SPA-fallback route —
+    # a final_name that resolves outside reports_dir must raise before write.
+    reports_dir = tmp_path / "reports"
+    with pytest.raises(ValueError):
+        tools._write_atomic(reports_dir, "../escaped.pdf", b"data")
+    # Nothing escaped: the parent of reports_dir has no new file.
+    assert not (tmp_path / "escaped.pdf").exists()
+
+
+def test_write_atomic_writes_final_bytes_and_no_tmp_left_behind(tmp_path):
+    reports_dir = tmp_path / "reports"
+    path = tools._write_atomic(reports_dir, "out.png", b"hello")
+    assert path == reports_dir / "out.png"
+    assert path.read_bytes() == b"hello"
+    assert list(reports_dir.glob("*.tmp")) == []
+
+
+@pytest.fixture
+def reports_tmp(tmp_path, monkeypatch):
+    """Point REPORTS_DIR and DEFAULT_BRIEFINGS_DIR at tmp dirs so
+    generate_brief_report/generate_chart tests never touch the real
+    reports/ or briefings/ directories."""
+    from local_fitness.agent import briefs as briefs_mod
+
+    reports_dir = tmp_path / "reports"
+    monkeypatch.setattr(tools, "REPORTS_DIR", reports_dir)
+    briefs_dir = tmp_path / "briefings"
+    monkeypatch.setattr(briefs_mod, "DEFAULT_BRIEFINGS_DIR", briefs_dir)
+    return reports_dir, briefs_dir
+
+
+def _write_brief_json(briefs_dir, d, takeaways):
+    briefs_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"date": d, "user_name": "Nate", "takeaways": takeaways}
+    (briefs_dir / f"{d}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+class _NoTouch:
+    """Sentinel standing in for DEFAULT_BRIEFINGS_DIR: raises if ANY path is
+    built from it, proving a malformed date is rejected before file I/O."""
+
+    def __truediv__(self, other):
+        raise AssertionError("must not touch briefings dir on malformed date")
+
+
+def test_generate_brief_report_malformed_date_no_file_io(monkeypatch):
+    # INV-T2: malformed date rejected before any file I/O is attempted.
+    from local_fitness.agent import briefs as briefs_mod
+
+    monkeypatch.setattr(briefs_mod, "DEFAULT_BRIEFINGS_DIR", _NoTouch())
+    for bad in ("2026/07/08", "../../../etc/passwd", "20260708", "2026-7-8", ""):
+        payload, err = call(tools.generate_brief_report, {"date": bad})
+        assert err
+        assert "malformed date" in payload["error"]
+
+
+def test_generate_brief_report_missing_brief_is_error(reports_tmp):
+    # INV-T1: well-formed date, but no saved brief for it -> clean error.
+    payload, err = call(tools.generate_brief_report, {"date": "2026-07-08"})
+    assert err
+    assert "no saved brief" in payload["error"]
+
+
+def test_generate_brief_report_invalid_brief_schema_is_error(reports_tmp):
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    briefs_dir.mkdir(parents=True, exist_ok=True)
+    (briefs_dir / f"{d}.json").write_text(json.dumps({"date": d}), encoding="utf-8")
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert err
+    assert "schema validation" in payload["error"]
+
+
+def test_generate_brief_report_chartless_takeaway_still_completes(seeded, reports_tmp):
+    # INV-T11: a takeaway with no metric renders a complete PDF (no image).
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    path = Path(payload["path"])
+    assert path.parent == reports_dir
+    assert path.read_bytes()[:5] == b"%PDF-"
+
+
+def test_generate_brief_report_per_takeaway_render_failure_degrades_gracefully(
+    seeded, reports_tmp, monkeypatch
+):
+    # INV-T12: a per-takeaway fetch/render exception is caught and logged;
+    # that takeaway's chart is omitted but the whole report still completes.
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {
+            "headline": "h", "summary": "s", "tone": "neutral", "details": "d",
+            "metric": {"metric": "rhr", "days": 14},
+        },
+    ])
+
+    def boom(*_a, **_k):
+        raise RuntimeError("degenerate series")
+
+    monkeypatch.setattr(tools, "_fetch_metric_series", boom)
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    path = Path(payload["path"])
+    pdf_bytes = path.read_bytes()
+    assert pdf_bytes[:5] == b"%PDF-"
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        total_images = sum(len(p.images) for p in doc.pages)
+    assert total_images == 0  # the failed takeaway's chart was skipped
+
+
+def test_generate_brief_report_happy_path_embeds_chart(seeded, reports_tmp):
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {
+            "headline": "Easy day", "summary": "RHR steady", "tone": "positive",
+            "details": "Deep dive.", "metric": {"metric": "rhr", "days": 14},
+        },
+    ])
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    path = Path(payload["path"])
+    assert path.name == f"brief-{d}.pdf"
+    assert path.parent == reports_dir
+    pdf_bytes = path.read_bytes()
+    assert pdf_bytes[:5] == b"%PDF-"
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        total_images = sum(len(p.images) for p in doc.pages)
+    assert total_images == 1
+
+
+def test_generate_chart_unknown_metric_no_sql(seeded, monkeypatch):
+    # INV-T3: an unwhitelisted metric is rejected before any SQL executes.
+    def boom(*_a, **_k):
+        raise AssertionError("must not query DB for an unwhitelisted metric")
+
+    monkeypatch.setattr(db, "connect", boom)
+    payload, err = call(
+        tools.generate_chart, {"metric": "bogus", "days": 14, "chart_type": "line"}
+    )
+    assert err
+    assert "unknown metric" in payload["error"]
+
+
+def test_generate_chart_unknown_chart_type(seeded):
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "pie"}
+    )
+    assert err
+    assert "unknown chart_type" in payload["error"]
+
+
+def test_generate_chart_rejects_huge_days(seeded):
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": _BIG, "chart_type": "line"}
+    )
+    assert err
+    assert "days must be between" in payload["error"]
+
+
+def test_generate_chart_no_data_in_window(seeded):
+    payload, err = call(
+        tools.generate_chart, {"metric": "vo2_max", "days": 14, "chart_type": "line"}
+    )
+    assert err
+    assert "no data in window" in payload["error"]
+
+
+def test_generate_brief_report_pdf_render_failure_is_error(seeded, reports_tmp, monkeypatch):
+    # A whole-PDF render failure (distinct from a per-takeaway degradation)
+    # is a hard error -- there's no partial PDF to fall back to.
+    from local_fitness.agent import visuals
+
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    def boom(*_a, **_k):
+        raise RuntimeError("weasyprint exploded")
+
+    monkeypatch.setattr(visuals, "render_brief_pdf", boom)
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert err
+    assert "PDF render failed" in payload["error"]
+
+
+def test_generate_brief_report_path_escape_is_error(seeded, reports_tmp, monkeypatch):
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    def boom(*_a, **_k):
+        raise ValueError("escaped")
+
+    monkeypatch.setattr(tools, "_write_atomic", boom)
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert err
+    assert "escaped reports directory" in payload["error"]
+
+
+def test_generate_chart_path_escape_is_error(seeded, reports_tmp, monkeypatch):
+    def boom(*_a, **_k):
+        raise ValueError("escaped")
+
+    monkeypatch.setattr(tools, "_write_atomic", boom)
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+    )
+    assert err
+    assert "escaped reports directory" in payload["error"]
+
+
+def test_generate_chart_render_failure_is_error(seeded, monkeypatch):
+    # Unlike generate_brief_report, generate_chart has no takeaway to fall
+    # back to -- a render failure is a hard error, not a graceful skip.
+    from local_fitness.agent import visuals
+
+    def boom(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(visuals, "render_chart_png", boom)
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+    )
+    assert err
+    assert "chart render failed" in payload["error"]
+
+
+def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
+    # INV-T8 + INV-9: valid PNG at the filename format metric-chart_type-Nd-date.
+    reports_dir, _briefs_dir = reports_tmp
+    payload, err = call(
+        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+    )
+    assert not err
+    path = Path(payload["path"])
+    today = date.today().isoformat()
+    assert path.name == f"chart-rhr-line-14d-{today}.png"
+    assert path.parent == reports_dir
+    assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_generate_brief_report_and_generate_chart_excluded_from_all_tools():
+    # INV-4: the two local-only tools are never registered in ALL_TOOLS —
+    # only in LOCAL_ONLY_TOOLS.
+    all_names = {t.name for t in tools.ALL_TOOLS}
+    assert "generate_brief_report" not in all_names
+    assert "generate_chart" not in all_names
+    local_only_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
+    assert local_only_names == {"generate_brief_report", "generate_chart"}

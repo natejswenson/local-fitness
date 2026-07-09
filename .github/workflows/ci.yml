@@ -32,6 +32,16 @@ jobs:
       - name: Sync dependencies (incl. dev group)
         run: uv sync --dev
 
+      # WeasyPrint (generate_brief_report's PDF renderer) needs Pango/HarfBuzz
+      # natively — pulled in here so pytest can import it. Ubuntu's apt puts
+      # these on the normal dynamic-linker search path, so (unlike macOS) no
+      # DYLD_LIBRARY_PATH-equivalent env var is needed after this step.
+      - name: Install WeasyPrint native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangoft2-1.0-0 fonts-dejavu-core
+
       - name: Lint
         run: uv run ruff check .
 

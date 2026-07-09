@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-08
+
+### Added
+- **Two new local-only MCP tools: `generate_brief_report` and `generate_chart`.**
+  `generate_brief_report` renders a saved daily brief into a polished PDF
+  (WeasyPrint, reusing the sibling `budget` project's validated color theme);
+  `generate_chart` renders a standalone matplotlib PNG for any ad-hoc
+  trend/metric question. Both write to local files under
+  `LOCAL_FITNESS_REPORTS_DIR` (default `./reports/`, gitignored). Reachable
+  ONLY via the stdio MCP transport (`fitness mcp-stdio`) — structurally
+  excluded from the authenticated streamable-HTTP `/mcp/` transport via
+  `agent/tools.py`'s `LOCAL_ONLY_TOOLS`, since a phone-triggered call over
+  that transport would get back a container-internal path with no way to
+  retrieve the file. Requires native Pango/HarfBuzz libraries (`apt-get` on
+  Linux/CI; on macOS, `brew install pango` plus
+  `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` — see `.env.example`).
+
 ## [0.17.0] - 2026-07-08
 
 ### Changed
