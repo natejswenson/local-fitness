@@ -112,15 +112,15 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   builds from the `../local-fitness` working tree, so the checked-out branch is
   what ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
-  (85% coverage gate), `ruff`, the prompt scorer, and `pnpm build`
-  (`tsc -b && vite build`) for the frontend. It does **NOT** run
-  `docker build`. So a green CI proves the Python suite + the frontend
-  build/type-check pass — but a `node`/base-image bump or `Dockerfile`
-  change can still pass CI and break `docker compose up --build` (this bit
-  us once: `node:26` dropped bundled `corepack`). Always rebuild the
-  container yourself after touching the `Dockerfile`, base images, or web
-  deps. There are no frontend unit tests yet — CI type-checks and builds
-  the SPA but does not test it.
+  (85% coverage gate), `ruff`, the prompt scorer, `pnpm build` (`tsc -b &&
+  vite build`), and `pnpm test` (vitest) for the frontend. A separate
+  `docker-build` job compiles the full multi-stage image (no push) so a
+  `node`/base-image bump or `Dockerfile` change can't silently break
+  `docker compose up --build` while CI stays green (this bit us once:
+  `node:26` dropped bundled `corepack`) — but a green `docker-build` only
+  proves the image *compiles*, not that the running container behaves
+  correctly, so still rebuild and smoke-test locally after touching the
+  `Dockerfile`, base images, or web deps.
 - **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
   manual prefix today, `/devlog` skill (auto from git commits) going
   forward.
@@ -280,6 +280,64 @@ These are settled — don't redesign without a reason.
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
   and the web UI could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
+- **`generate_brief_report`/`generate_chart` are stdio-only, never `ALL_TOOLS`.**
+  These two MCP tools (`agent/tools.py`'s `LOCAL_ONLY_TOOLS`) render a saved
+  daily brief into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline,
+  reusing the `budget` project's validated color theme) and render a
+  standalone matplotlib PNG chart on demand. Since the 2026-07-09 UX pass,
+  both write to and auto-open from an **ephemeral per-process tmp
+  directory by default** (`tempfile.mkdtemp`, PID-embedded naming, cleaned
+  up via `atexit` when the `fitness mcp-stdio` process exits — a fresh
+  subprocess per opencode/Claude session, so this is the natural
+  session-cleanup boundary) rather than the old persistent `./reports/`.
+  A best-effort liveness-checked sweep also reaps any prior session's
+  leaked directory (PID dead + >24h old) on each process's first call —
+  `atexit` doesn't fire on `SIGKILL`/`SIGTERM`, so an abrupt kill can still
+  leak until the sweep claims it; this is an accepted residual risk for a
+  personal, single-user tool, not something hardened further. After a
+  successful write, the file is auto-opened via macOS `open` (best-effort,
+  never fails the tool call; logs a warning and no-ops on other platforms).
+  Set `LOCAL_FITNESS_REPORTS_DIR` to opt back into a persistent directory
+  (still auto-opened, no auto-cleanup) — see `.env.example`. If you have an
+  existing populated `./reports/` from before this change, it's vestigial
+  now and safe to delete by hand. They're registered ONLY via `run_stdio()`'s
+  `build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)` call — structurally,
+  not just by convention, unreachable over the authenticated streamable-HTTP
+  `/mcp/` transport (`build_session_manager()` calls `build_server()`
+  argument-free), since a phone-triggered call over that transport would get
+  back a container-internal path with no way to retrieve the file. WeasyPrint
+  needs native Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS
+  Homebrew's install isn't on the default dylib search path and needs
+  `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
+- **The brief PDF (`generate_brief_report`) has a 2-column signal-card grid
+  and a Training Plan section** (2026-07-09 redesign). `visuals.py`'s
+  signal cards (formerly one stacked column) reflow into a flexbox grid
+  robust to any takeaway count — an odd-count last card spans the full
+  width (`.span-full`) rather than leaving a gap; never assume exactly 4.
+  Below that, a Training Plan section (adherence %, days-to-race, this
+  week's planned/actual mileage, a slip count, today's prescribed workout,
+  and a last-7-days table graded done/partial/missed/rest/scheduled) is
+  computed **live from `plans.py` at render time** — `tools.py`'s
+  `_build_plan_section()` — keyed to the brief's own date, not
+  `date.today()`; the `Brief`/`Takeaway` schema carries zero plan fields
+  and never will. Note `plans.build_plan_detail()` has no "as of" date
+  parameter at all — its verdicts are always graded against the real data
+  frontier, never a hypothetical past perspective — so `target_date` is
+  only used to pick which graded workout is "today" and slice the
+  trailing window, never passed into `build_plan_detail` itself (a real
+  bug caught during this build: its 4th positional arg is `best_effort`, a
+  Riegel-projection dict, not a date). The section is omitted entirely
+  (not shown empty) when there's no active plan or no plan data in the
+  window. Today's coaching line comes from a **new `agent/plan_coach.py`
+  module** — a Claude Agent SDK call (toolless, single-shot, same
+  `briefing.DEFAULT_MODEL` the real daily brief uses) called fresh on
+  every render, with a deterministic template fallback
+  (`fallback_coaching_line`) if that call fails for any reason (missing
+  credential, network, timeout) — the PDF still generates either way.
+  `plan_coach.py` imports `briefing` lazily, inside the function body,
+  not at module scope: `briefing.py` already imports `tools.py` at module
+  scope (as `agent_tools`), and `tools.py` imports `plan_coach.py` — a
+  module-scope import there would close a real circular import.
 - **Auth middleware**: `LOCAL_FITNESS_API_TOKEN` env var; constant-time
   bearer check; `/health` and `/{full_path:path}` (SPA shell) are public.
 - **Rate limit**: in-memory token bucket on `RATE_LIMITED_PREFIXES`,

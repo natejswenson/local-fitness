@@ -372,14 +372,22 @@ def _install_coach_persona(instance: Server) -> None:
     instance.create_initialization_options = _with_coach_persona
 
 
-def build_server() -> Server:
+def build_server(extra_tools: list | None = None) -> Server:
     """The reused, fully-wired low-level MCP Server (one source of truth).
 
     The SDK's ``create_sdk_mcp_server`` only wires the TOOL handlers; we register
     the coach PROMPT and the schema/brief RESOURCES on the same instance here so
     both transports (stdio + streamable-HTTP) advertise all three primitives, and
-    install the live coach-persona ``instructions`` wrap."""
-    instance = agent_tools.make_server()["instance"]
+    install the live coach-persona ``instructions`` wrap.
+
+    ``extra_tools`` is forwarded to ``agent_tools.make_server()`` — ONLY
+    ``run_stdio()`` passes ``LOCAL_ONLY_TOOLS`` here. ``build_session_manager()``
+    below calls this argument-free, which is the load-bearing line that keeps
+    the local-only tools (generate_brief_report, generate_chart) off the
+    streamable-HTTP /mcp/ transport. If a future edit ever passes
+    ``LOCAL_ONLY_TOOLS`` there too "for consistency", the HTTP transport
+    silently regains tools this whole boundary exists to keep off it."""
+    instance = agent_tools.make_server(extra_tools=extra_tools)["instance"]
     _register_prompts_and_resources(instance)
     _install_coach_persona(instance)
     return instance
@@ -414,10 +422,14 @@ def build_session_manager(
 
 
 async def run_stdio() -> None:
-    """Serve the same tools over stdio (local, auth-free). No HTTP, so the
-    Host/Origin and trailing-slash gotchas of the HTTP path do not apply."""
+    """Serve the same tools over stdio (local, auth-free), PLUS the
+    local-only PDF/chart tools (generate_brief_report, generate_chart) —
+    reachable here and ONLY here, never over the streamable-HTTP /mcp/
+    transport (see build_server's extra_tools note and the design doc).
+    No HTTP, so the Host/Origin and trailing-slash gotchas of the HTTP path
+    do not apply."""
     from mcp.server.stdio import stdio_server
 
-    server = build_server()
+    server = build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())

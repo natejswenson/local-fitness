@@ -6,6 +6,83 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-09
+
+### Changed
+- **`generate_brief_report`'s PDF redesigned: signal cards now render in a
+  2-column layout, and a new Training Plan section is added below them.**
+  The existing takeaway cards reflow into a flexbox grid (robust to any
+  takeaway count — an odd-count last card spans the full width rather than
+  leaving a gap). The new section shows adherence %, days-to-race, this
+  week's planned/actual mileage, a slip count, today's prescribed workout
+  with a Claude-generated coaching line (same model as the real daily
+  brief, called fresh on every render, with a deterministic fallback if
+  the call fails), and a table of the last 7 days graded against
+  prescription (done/partial/missed/rest/scheduled). Computed live from
+  `plans.py` at render time, keyed to the brief's own date — no changes to
+  the `Brief` schema or the daily brief generation pipeline. Whole section
+  is omitted when there's no active plan or no plan data for the window.
+
+## [0.19.0] - 2026-07-09
+
+### Changed
+- **`generate_brief_report`/`generate_chart` now default to an ephemeral,
+  auto-opened output directory instead of persistent `./reports/`.** When
+  `LOCAL_FITNESS_REPORTS_DIR` is unset (the common case), output now goes
+  to a per-process `tempfile.mkdtemp()` directory — PID-embedded naming,
+  cleaned up via `atexit` when the `fitness mcp-stdio` process exits, with
+  a liveness-checked stale-directory sweep as a backstop for abrupt
+  (`SIGKILL`/`SIGTERM`) exits. After a successful write, the file is now
+  auto-opened via macOS `open` (best-effort, never fails the tool call).
+  Setting `LOCAL_FITNESS_REPORTS_DIR` still opts back into the old
+  persistent-directory behavior (still auto-opened, no auto-cleanup). This
+  closes the gap where getting the "pretty" PDF/PNG version of a report or
+  chart required a second explicit ask and left files to accumulate
+  unopened in `./reports/` forever.
+
+## [0.18.0] - 2026-07-08
+
+### Added
+- **Two new local-only MCP tools: `generate_brief_report` and `generate_chart`.**
+  `generate_brief_report` renders a saved daily brief into a polished PDF
+  (WeasyPrint, reusing the sibling `budget` project's validated color theme);
+  `generate_chart` renders a standalone matplotlib PNG for any ad-hoc
+  trend/metric question. Both write to local files under
+  `LOCAL_FITNESS_REPORTS_DIR` (default `./reports/`, gitignored). Reachable
+  ONLY via the stdio MCP transport (`fitness mcp-stdio`) — structurally
+  excluded from the authenticated streamable-HTTP `/mcp/` transport via
+  `agent/tools.py`'s `LOCAL_ONLY_TOOLS`, since a phone-triggered call over
+  that transport would get back a container-internal path with no way to
+  retrieve the file. Requires native Pango/HarfBuzz libraries (`apt-get` on
+  Linux/CI; on macOS, `brew install pango` plus
+  `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` — see `.env.example`).
+
+## [0.17.0] - 2026-07-08
+
+### Changed
+- **Alt-model shadow-run path is model-agnostic — any model the `opencode`
+  CLI can reach, not just gemma4/Ollama.** The dispatch key changes shape
+  from `"ollama:<model>"` to `"opencode:<provider>/<model>"` (e.g.
+  `"opencode:opencode/deepseek-v4-flash-free"`), a breaking rename with no
+  compatibility shim (internal shadow-run-only diagnostic tool, not a public
+  API). Dispatch is capability-aware, not uniform: `provider == "ollama"`
+  keeps the existing direct-HTTP, grammar-constrained-decoding path
+  (`local_model.py`, unchanged); every other provider routes through a new
+  `agent/opencode_model.py` subprocess transport that shells out to
+  `opencode run`. gemma4's tuning (tightened schema, temperature, plan-fact
+  injection) moves into a per-model profile registry
+  (`briefing._MODEL_PROFILES`) so a new model gets zero extra tuning by
+  default instead of requiring new `if model == ...` branches. Requires a
+  one-time, tool-free opencode agent (`LOCAL_FITNESS_OPENCODE_AGENT`, see
+  `.env.example`) — a fail-closed pre-check refuses to send a prompt if that
+  agent isn't configured, rather than risking opencode's undocumented
+  silent fallback to its tool-enabled default agent. The fixture-only
+  safety gate (`_assert_fixture_only_data`) now also checks the user-notes
+  path, closing a real gap where un-isolated callers could ship real
+  personal notes to a third-party model. Shadow-run-only — never the live
+  production 06:30 brief job. See
+  docs/plans/2026-07-08-model-agnostic-shadow-run-design.md.
+
 ## [0.16.0] - 2026-07-07
 
 ### Added

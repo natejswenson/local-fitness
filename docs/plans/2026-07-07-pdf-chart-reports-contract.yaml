@@ -1,0 +1,211 @@
+version: "1.0"
+ticket: "#TBD"
+epic: "#TBD"
+title: "Beautiful PDF brief reports + on-demand trend charts"
+date: "2026-07-07"
+
+api_surface:
+  - name: "generate_brief_report"
+    type: "function"
+    signature: "generate_brief_report(date: str) -> {\"path\": str}"
+    params:
+      - name: "date"
+        type: "str"
+        required: true
+    returns: "{\"path\": str} | error"
+    description: >-
+      MCP tool (LOCAL_ONLY_TOOLS, stdio-only). Renders a saved daily brief
+      (briefings/{date}.json) into a polished PDF report at
+      reports/brief-{date}.pdf.
+  - name: "generate_chart"
+    type: "function"
+    signature: "generate_chart(metric: str, days: int, chart_type: \"line\" | \"bar\" | \"combo\") -> {\"path\": str}"
+    params:
+      - name: "metric"
+        type: "str"
+        required: true
+      - name: "days"
+        type: "int"
+        required: true
+      - name: "chart_type"
+        type: "\"line\" | \"bar\" | \"combo\""
+        required: true
+    returns: "{\"path\": str} | error"
+    description: >-
+      MCP tool (LOCAL_ONLY_TOOLS, stdio-only). Renders an ad-hoc trend/metric
+      question into a standalone chart PNG at
+      reports/chart-{metric}-{chart_type}-{days}d-{date}.png.
+
+invariants:
+  checkable:
+    - id: "INV-1"
+      description: "Neither tool performs its own aggregation/rollup — all numeric values are pass-through from already-tested data functions (_fetch_metric_series)."
+      verification: "render_chart_png/render_brief_pdf contain no SQL or aggregation logic of their own"
+      check_method: "code-inspection"
+    - id: "INV-2"
+      description: "Both tools write only under LOCAL_FITNESS_REPORTS_DIR — no other write path."
+      verification: "grep for open()/Path.write/os.replace calls in the two tool functions; all target paths resolve under LOCAL_FITNESS_REPORTS_DIR"
+      check_method: "grep"
+    - id: "INV-3"
+      description: "Palette hex values (#2a78d6, #0ca30c, #fab219, #d03b3b, #e1e0d9) match the budget project's theme exactly, defined once in visuals.py, not duplicated per chart type."
+      verification: "single source-of-truth constants module, no inline hex literals elsewhere in visuals.py"
+      check_method: "grep"
+    - id: "INV-4"
+      description: "The two tools are registered only in LOCAL_ONLY_TOOLS, never in ALL_TOOLS; build_server() in web/mcp_server.py is only ever called with extra_tools=LOCAL_ONLY_TOOLS from run_stdio(), never from build_session_manager()."
+      verification: "grep confirms tool names absent from ALL_TOOLS; code-inspection confirms build_session_manager()'s build_server() call site is argument-free"
+      check_method: "code-inspection"
+    - id: "INV-5"
+      description: "date (in generate_brief_report) is validated against ^\\d{4}-\\d{2}-\\d{2}$ before it is used to build either the read path or the write path."
+      verification: "validation call precedes any Path construction using date"
+      check_method: "code-inspection"
+    - id: "INV-6"
+      description: "reports/ is gitignored."
+      verification: ".gitignore contains a reports/ entry"
+      check_method: "file-structure"
+    - id: "INV-7"
+      description: "Both tools write via a .tmp sibling suffixed with a per-call unique token (uuid4().hex[:8]) + os.replace(), never a direct write to the final path — not save_brief()'s fixed .tmp name."
+      verification: "temp filename construction includes uuid4().hex[:8]; final write is via os.replace()"
+      check_method: "code-inspection"
+    - id: "INV-8"
+      description: "Both tools call LOCAL_FITNESS_REPORTS_DIR.mkdir(parents=True, exist_ok=True) before the .tmp write."
+      verification: "mkdir call present in both tool functions before any file write"
+      check_method: "grep"
+    - id: "INV-9"
+      description: "generate_chart's filename is fully determined by (metric, chart_type, days) plus {date}, where {date} is date.today().isoformat() computed at render time, not a tool argument."
+      verification: "generate_chart's parameter list has no date parameter; date used in filename is computed internally"
+      check_method: "code-inspection"
+    - id: "INV-10"
+      description: "LOCAL_ONLY_TOOLS is a module-level constant symmetric with ALL_TOOLS; the import matplotlib/import weasyprint statements are deferred into the two tools' function bodies (and visuals.py's own module body), never executed at tools.py module scope."
+      verification: "no top-level `import matplotlib` or `import weasyprint` in tools.py; LOCAL_ONLY_TOOLS is a plain list literal at module scope"
+      check_method: "grep"
+    - id: "INV-11"
+      description: "Both generate_brief_report and generate_chart acquire the same single module-level asyncio.Lock() in visuals.py before entering their asyncio.to_thread render call, and release it once the render completes."
+      verification: "single Lock instance defined once in visuals.py, acquired in both tool functions around the render call"
+      check_method: "code-inspection"
+  testable:
+    - id: "INV-T1"
+      description: "generate_brief_report on a missing date returns an error, never a crash or a blank PDF."
+      verification: "call with a date that has no saved brief; assert a clean _err response"
+      test_tag: "contract:correctness:inv-t1"
+    - id: "INV-T2"
+      description: "generate_brief_report on a malformed date (e.g. containing / or ..) returns an error before any file I/O is attempted — never a path-traversal read/write."
+      verification: "call with malformed date strings; assert error returned and no file system access occurred"
+      test_tag: "contract:security:inv-t2"
+    - id: "INV-T3"
+      description: "generate_chart called with an unwhitelisted metric returns an error before any SQL is executed."
+      verification: "call with a metric not in _CHART_METRICS; assert error and no SQL execution (e.g. via mock/spy on the DB connection)"
+      test_tag: "contract:security:inv-t3"
+    - id: "INV-T4"
+      description: "The resolved output path for both tools, checked via .resolve().relative_to(LOCAL_FITNESS_REPORTS_DIR.resolve()), rejects any input that would otherwise escape reports/."
+      verification: "containment check test mirroring web/server.py's SPA-fallback route test"
+      test_tag: "contract:security:inv-t4"
+    - id: "INV-T5"
+      description: "Generated PDF text contains the exact headline/summary/metric display values from the source Brief verbatim; for details (markdown-rendered), it contains the markdown-rendered form, not the raw markdown source."
+      verification: "pdfplumber text extraction assertions against a fixture Brief"
+      test_tag: "contract:correctness:inv-t5"
+    - id: "INV-T6"
+      description: "A sentinel headline/summary containing <, >, and & renders in the output HTML as &lt;, &gt;, &amp; respectively — never as the raw character."
+      verification: "fixture Brief with HTML-special characters in headline; assert escaped output"
+      test_tag: "contract:security:inv-t6"
+    - id: "INV-T7"
+      description: "A fixture Brief whose details field embeds a raw <img src=\"http://example.com/x.png\"> (or an external <link>/@import) renders to PDF with that external resource neither fetched nor present — no network call made."
+      verification: "mock/spy the url_fetcher or disable network access in the test; assert render succeeds with no external reference in output"
+      test_tag: "contract:security:inv-t7"
+    - id: "INV-T8"
+      description: "Generated chart PNG is non-empty, valid, and dimensioned as configured."
+      verification: "PNG magic bytes + dimension assertions"
+      test_tag: "contract:correctness:inv-t8"
+    - id: "INV-T9"
+      description: "An authed tools/list call over the /mcp/ HTTP transport does not include generate_brief_report or generate_chart."
+      verification: "httpx.ASGITransport test against the real app with a valid bearer token, asserting tool names absent"
+      test_tag: "contract:security:inv-t9"
+    - id: "INV-T10"
+      description: "mcp_server.build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS) — the actual call run_stdio() makes — serves both generate_brief_report and generate_chart in its tool names."
+      verification: "call build_server with extra_tools=LOCAL_ONLY_TOOLS directly; assert both tool names present"
+      test_tag: "contract:correctness:inv-t10"
+    - id: "INV-T11"
+      description: "A takeaway with no chartable data (no metric, or an empty _fetch_metric_series result) still produces a complete PDF — that takeaway renders without a chart image rather than failing the whole call."
+      verification: "fixture Brief with a chartless takeaway; assert PDF generation succeeds"
+      test_tag: "contract:correctness:inv-t11"
+    - id: "INV-T12"
+      description: "A takeaway whose render_chart_png (or _fetch_metric_series) call raises on degenerate-but-real data is caught and logged, that takeaway's chart is omitted, and generate_brief_report still returns a complete PDF."
+      verification: "fixture with a single-point or all-identical-value series that triggers a render exception; assert graceful degradation"
+      test_tag: "contract:correctness:inv-t12"
+    - id: "INV-T13"
+      description: "A details field containing a markdown table renders to a real <table>/<td> HTML structure, never raw |-delimited pipe characters."
+      verification: "fixture Brief with a markdown table in details; assert real table markup in rendered HTML"
+      test_tag: "contract:correctness:inv-t13"
+    - id: "INV-T14"
+      description: "In a Brief with 2+ takeaways each given a distinct chart PNG in charts at known indices — including a chartless takeaway positioned between two charted ones — each takeaway's rendered PDF section contains its own chart image, never another takeaway's."
+      verification: "fixture with charts = {\"0\": png_a, \"2\": png_b} (index 1 chartless); assert correct per-index chart placement"
+      test_tag: "contract:correctness:inv-t14"
+
+integration_points: []
+
+security_review:
+  status: "required"
+  signals_detected:
+    - category: "auth"
+      evidence: "The design's core mechanism is a structural boundary preventing generate_brief_report/generate_chart from being reachable over the authenticated streamable-HTTP /mcp/ transport — a tool-registry visibility boundary, not a traditional endpoint auth check, but auth-relevant per CLAUDE.md's own rule (\"add a case to tests/test_security.py for any new auth-relevant code path\")."
+    - category: "external_input"
+      evidence: "date, metric, and chart_type are model-suppliable values interpolated into file paths (date) and used to gate a metric whitelist before SQL construction (metric) — both require validation before use per CLAUDE.md's non-negotiable path-containment and whitelisting rules."
+    - category: "network"
+      evidence: "WeasyPrint's default HTML renderer performs live network fetches for embedded <img>/<link>/@import references; the design requires a custom url_fetcher restricting requests to the data: scheme only, since brief content can be influenced by free-text user notes."
+  deployment_context: "hybrid"
+
+ambiguity_resolutions:
+  - id: "AMB-1"
+    decision: "WeasyPrint (HTML/CSS -> PDF) chosen over ReportLab and Playwright+Chromium for PDF layout."
+    confidence: "high"
+    alternatives: ["ReportLab (pure-Python, zero native deps)", "Playwright+Chromium (best visual fidelity)"]
+    reasoning: "ReportLab risks reading as a generic invoice PDF (no gradients/flexbox, core-font-only unless a licensed TTF is embedded); Playwright costs 400-700MB image size and non-root sandbox complexity. This repo's CI already runs a docker-build job that would catch a native-dependency regression, making WeasyPrint's modest apt-get cost an acceptable trade for real CSS fidelity."
+    reversibility: "medium — would require re-implementing render_brief_pdf's HTML/CSS assembly against a different rendering API, not a config flag"
+  - id: "AMB-2"
+    decision: "reports/ is ephemeral by design — not bind-mounted, not pre-created in the Dockerfile."
+    confidence: "high"
+    alternatives: ["Bind-mount reports/ like briefings/ for durability across container rebuilds"]
+    reasoning: "Generated PDFs/PNGs are trivially regenerable on demand, unlike briefings/ which is a system of record. The container's only process (fitness serve) can never reach LOCAL_ONLY_TOOLS anyway, so Dockerfile pre-creation would be dead weight regardless."
+    reversibility: "high — adding a bind mount later is a one-line compose change"
+  - id: "AMB-3"
+    decision: "Two separate MCP tools (generate_brief_report, generate_chart) rather than one unified tool with a mode switch."
+    confidence: "high"
+    alternatives: ["One tool, e.g. generate_visual(mode: \"report\"|\"chart\", ...)"]
+    reasoning: "Narrower, self-documenting per-tool schemas match the existing one-tool-one-purpose convention (e.g. the existing chart tool); a unified tool's schema would become a bag of mostly-optional params. User-confirmed during design."
+    reversibility: "medium — would require collapsing two MCP tool schemas into one"
+  - id: "AMB-4"
+    decision: "LOCAL_ONLY_TOOLS is a module-level constant in agent/tools.py, symmetric with ALL_TOOLS — not constructed fresh inside run_stdio()."
+    confidence: "high"
+    alternatives: ["Assemble the list inside web/mcp_server.py's run_stdio() at call time"]
+    reasoning: "The list only references already-defined function objects, so it costs nothing to construct at module scope; keeping it symmetric with ALL_TOOLS keeps it trivially greppable for the tripwire tests. Only the heavy matplotlib/weasyprint imports are deferred, not the list literal."
+    reversibility: "high — purely an internal code-organization choice"
+  - id: "AMB-5"
+    decision: "generate_chart's v1 chart_type enum is scoped to line/bar/combo only; calendar and spark are deferred out of scope."
+    confidence: "high"
+    alternatives: ["Mirror the full 5-style ASCII chart() enum (calendar, line, bar, combo, spark)"]
+    reasoning: "calendar (week-stacked heat-grid) and spark (axis-less sparkline) are ASCII/terminal-native concepts that don't obviously earn standalone-PNG-artifact status the way line/bar do; deferring avoids wasted implementation effort on a low-value chart form."
+    reversibility: "high — additive; can be added in a later version without breaking the existing enum"
+  - id: "AMB-6"
+    decision: "Serialize renders behind a single asyncio.Lock() rather than audit WeasyPrint's internal thread-safety."
+    confidence: "medium"
+    alternatives: ["Investigate/confirm WeasyPrint's thread-safety under concurrent write_pdf() calls", "Leave unaddressed (accept the same uncertainty already flagged for matplotlib but not extended to WeasyPrint)"]
+    reasoning: "No confirmed WeasyPrint threading bug exists either way; verifying internals is undocumented, implementation-dependent, and would need re-verification on every WeasyPrint upgrade. A lock is trivial to pay for a low-traffic, single-user tool and removes the open question entirely."
+    reversibility: "high — a lock can be removed later if concurrency needs increase and thread-safety is separately confirmed"
+
+# --- Addendum (2026-07-09) ---------------------------------------------
+# A follow-up change makes several invariants above stale as literally
+# written -- see the matching addendum in the paired
+# 2026-07-07-pdf-chart-reports-design.md for the full explanation:
+#   - INV-2 ("Both tools write only under LOCAL_FITNESS_REPORTS_DIR") and
+#     INV-4 ("mkdir before the .tmp write"): substitute "the directory
+#     returned by _default_reports_dir()" for "LOCAL_FITNESS_REPORTS_DIR"
+#     -- that function now defaults to a per-process ephemeral
+#     tempfile.mkdtemp() directory (atexit-cleaned, PID-named, with a
+#     liveness-checked stale-dir sweep), with LOCAL_FITNESS_REPORTS_DIR
+#     as an explicit opt-out back to a persistent directory. The
+#     REPORTS_DIR module-level constant no longer exists.
+#   - INV-5 (path-containment check): unchanged in mechanism, still
+#     applies to whichever directory _default_reports_dir() resolves.
+#   - Both tools now also auto-open the generated file (macOS `open`,
+#     best-effort, never fails the tool call) after a successful write.
+#   - AMB-2's "reports/ is ephemeral by design" is now literally true,
+#     not just a Dockerfile/bind-mount argument.

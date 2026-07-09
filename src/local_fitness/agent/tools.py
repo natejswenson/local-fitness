@@ -8,11 +8,21 @@ column names — no user input ever interpolates into SQL except via params.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
+import logging
+import os
+import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
+import threading
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 from pydantic import ValidationError
@@ -20,7 +30,10 @@ from pydantic import ValidationError
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
-from . import briefs, charts, units
+from . import briefs, charts, coach, plan_coach, units
+from .schemas import Brief
+
+LOG = logging.getLogger(__name__)
 
 
 SERVER_NAME = "fitness"
@@ -318,18 +331,18 @@ def _chart_value_fmt(metric: str):
     return lambda v: f"{int(round(v))}"
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
-async def chart(args: dict) -> dict:
-    metric = args["metric"]
+def _fetch_metric_series(metric: str, days: int) -> tuple[list[str], list[float]]:
+    """Shared whitelisted fetch for chart()/generate_chart() — dates + values
+    for `metric` over the last `days` days.
+
+    Validates `metric` against `_CHART_METRICS` before building any SQL —
+    the check lives inside this helper, not left to each caller to remember;
+    both `chart()` and `generate_chart()` inherit it from here. Raises
+    ValueError on an unwhitelisted metric so callers translate it into their
+    own `_err()` response.
+    """
     if metric not in _CHART_METRICS:
-        return _err(f"unknown metric '{metric}'", allowed=sorted(_CHART_METRICS))
-    err = _validate_days(args["days"])
-    if err:
-        return _err(err)
-    style = args.get("style") or "calendar"
-    if style not in _CHART_STYLES:
-        return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
-    days = args["days"]
+        raise ValueError(f"unknown metric '{metric}'")
     cutoff = (date.today() - timedelta(days=days)).isoformat()
 
     # metric is whitelisted above; the column name interpolated here can only be
@@ -347,12 +360,28 @@ async def chart(args: dict) -> dict:
 
     with db.connect() as conn:
         rows = conn.execute(sql, (cutoff,)).fetchall()
-    if not rows:
+    dates = [r["date"] for r in rows]       # ISO YYYY-MM-DD
+    values = [float(r["v"]) for r in rows]
+    return dates, values
+
+
+@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
+async def chart(args: dict) -> dict:
+    metric = args["metric"]
+    if metric not in _CHART_METRICS:
+        return _err(f"unknown metric '{metric}'", allowed=sorted(_CHART_METRICS))
+    err = _validate_days(args["days"])
+    if err:
+        return _err(err)
+    style = args.get("style") or "calendar"
+    if style not in _CHART_STYLES:
+        return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
+    days = args["days"]
+    dates, values = _fetch_metric_series(metric, days)
+    if not values:
         return _err("no data in window", metric=metric, days=days)
 
-    dates = [r["date"] for r in rows]       # ISO YYYY-MM-DD
     labels = [d[5:] for d in dates]         # MM-DD
-    values = [float(r["v"]) for r in rows]
     fmt = _chart_value_fmt(metric)
     title = f"{metric} · last {days}d · n={len(values)}"
 
@@ -1504,6 +1533,434 @@ async def get_brief_context(_args: dict) -> dict:
     return _text(brief_planner.assemble_brief_context().model_dump())
 
 
+# --- LOCAL_ONLY_TOOLS: generate_brief_report / generate_chart -------------
+# Beautiful PDF/chart rendering tools. Reachable ONLY via run_stdio() (see
+# web/mcp_server.py) — never merged into ALL_TOOLS, never served over the
+# streamable-HTTP /mcp/ transport. A phone-triggered call over that network
+# transport would get back a container-internal path with no way to
+# retrieve the file; this boundary is structural, not just documented (see
+# docs/plans/2026-07-07-pdf-chart-reports-design.md).
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_EPHEMERAL_DIR_PID_RE = re.compile(r"^local-fitness-reports-(\d+)-")
+_EPHEMERAL_DIR_MAX_AGE_SECONDS = 24 * 60 * 60  # longer than any plausible single session
+
+_EPHEMERAL_DIR: Path | None = None
+_EPHEMERAL_DIR_LOCK = threading.Lock()
+
+
+def _rmtree_ignore_errors(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _sweep_stale_ephemeral_dirs() -> None:
+    """Best-effort removal of `local-fitness-reports-<pid>-*` directories
+    left behind by processes that exited without running atexit handlers
+    (SIGKILL/SIGTERM). Only removes a candidate when its mtime is older
+    than 24h AND the PID embedded in its name is dead (os.kill(pid, 0)
+    raises ProcessLookupError) — a directory whose PID is still alive, or
+    whose name doesn't match the expected pattern, is left alone. Each
+    candidate is handled in its own try/except so one bad candidate never
+    aborts sweeping the rest."""
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob("local-fitness-reports-*"))
+    except OSError:
+        return
+    for candidate in candidates:
+        try:
+            match = _EPHEMERAL_DIR_PID_RE.match(candidate.name)
+            if not match:
+                continue
+            pid = int(match.group(1))
+            age_seconds = time.time() - candidate.stat().st_mtime
+            if age_seconds <= _EPHEMERAL_DIR_MAX_AGE_SECONDS:
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass  # PID is dead — safe to remove
+            else:
+                continue  # PID is alive (or we can't tell) — leave it alone
+            _rmtree_ignore_errors(candidate)
+        except Exception:
+            continue
+
+
+def _default_reports_dir() -> Path:
+    """Resolve the reports directory. Honor LOCAL_FITNESS_REPORTS_DIR for a
+    host override (persistent, no atexit cleanup — this branch never
+    touches _EPHEMERAL_DIR, so there's nothing to guard or clean up).
+
+    Otherwise, resolve to a per-process ephemeral tempfile.mkdtemp()
+    directory, memoized in the module-level _EPHEMERAL_DIR cache and
+    registered for atexit cleanup on first use. The directory name embeds
+    this process's PID (local-fitness-reports-<pid>-<random>) so a
+    best-effort stale-directory sweep (_sweep_stale_ephemeral_dirs) can
+    tell a genuinely dead session's leftover directory apart from a live
+    one's, and only removes the former.
+
+    _EPHEMERAL_DIR_LOCK guards the whole check-then-set-and-create sequence
+    below: both tools dispatch this function via asyncio.to_thread (to keep
+    its filesystem I/O off the event loop), so two concurrent tool calls
+    run this body on separate OS worker threads — without the lock, both
+    could observe _EPHEMERAL_DIR as None and each create their own
+    ephemeral directory.
+
+    Accepted residual risk: atexit doesn't fire on SIGKILL or (Python's
+    default disposition for) SIGTERM, so an abruptly-killed process's
+    directory can leak until the age+liveness sweep above claims it. That
+    sweep itself has a narrower residual gap: os.kill(pid, 0) reads a
+    zombie (exited but unreaped) child as still alive, and a reaped PID
+    can be reassigned to an unrelated process — both can extend leakage
+    beyond one stale session in rare cases. Building a real liveness
+    registry to close this isn't justified for a personal, single-user
+    tool."""
+    override = os.environ.get("LOCAL_FITNESS_REPORTS_DIR")
+    if override:
+        return Path(override)
+
+    with _EPHEMERAL_DIR_LOCK:
+        global _EPHEMERAL_DIR
+        if _EPHEMERAL_DIR is not None:
+            return _EPHEMERAL_DIR
+        _sweep_stale_ephemeral_dirs()
+        new_dir = Path(tempfile.mkdtemp(prefix=f"local-fitness-reports-{os.getpid()}-"))
+        atexit.register(_rmtree_ignore_errors, new_dir)
+        _EPHEMERAL_DIR = new_dir
+        return new_dir
+
+
+async def _auto_open(path: Path) -> None:
+    """Best-effort: open `path` in the OS default viewer (macOS `open`).
+    Never raises and never fails the tool call — the file was generated
+    successfully either way. `check=False` means a non-zero exit code
+    (e.g. "no GUI session") doesn't raise, so it's checked explicitly and
+    logged; a missing `open` binary or a timeout raise real exceptions,
+    caught below. stdout/stderr are redirected to DEVNULL rather than
+    inherited from the parent — this process's stdout is the live
+    JSON-RPC framing channel for the whole stdio MCP session, so anything
+    `open` ever wrote there would corrupt that transport. The sleep after
+    a successful open is a deliberate grace-period delay: even on a
+    completely normal process exit (no crash), atexit-triggered cleanup
+    could otherwise race the just-spawned viewer process while it's still
+    reading the file off disk."""
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["open", str(path)],
+            check=False,
+            timeout=10,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            LOG.warning("auto-open exited non-zero (%s) for %s", result.returncode, path)
+        await asyncio.sleep(1.5)
+    except Exception:
+        LOG.warning("auto-open failed for %s", path, exc_info=True)
+
+
+def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
+    """Write `data` to `reports_dir/final_name` via a per-call-unique .tmp
+    sibling + os.replace() — the atomic-write shape agent/briefs.py's
+    save_brief() already uses, refined with a uuid4-suffixed temp name (not
+    save_brief()'s fixed one) so two concurrent processes/threads racing an
+    identical call never share a temp inode before either reaches replace().
+    Confirms the resolved final path is contained under reports_dir before
+    writing anything, mirroring web/server.py's SPA-fallback containment
+    check."""
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    final_path = reports_dir / final_name
+    final_path.resolve().relative_to(reports_dir.resolve())
+    tmp_path = reports_dir / f".{final_name}.{uuid4().hex[:8]}.tmp"
+    tmp_path.write_bytes(data)
+    os.replace(tmp_path, final_path)
+    return final_path
+
+
+def _build_plan_section(target_date: str) -> dict | None:
+    """Training Plan section payload for generate_brief_report's PDF, or
+    None when there's nothing to show (no active plan, or an active plan
+    with no workout data at all in the trailing-7-day window ending on
+    target_date). Computed fresh from plans.py, keyed to target_date (the
+    brief's own date) as "today" — not date.today() — so regenerating an
+    old brief's PDF shows that day's plan state, not today's. Mirrors
+    get_training_plan_progress's plan-loading pattern, anchored to
+    target_date instead of the real wall-clock date."""
+    active = plans.get_active_plan()
+    if active is None:
+        return None
+
+    frontier = db.last_known_daily_date()
+    dates = [w["date"] for w in active["workouts"]] or [target_date]
+    start = min(dates)
+    end = max([target_date, *dates] + ([frontier] if frontier else []))
+    activities_by_date = plans.load_activities_by_date(start, end)
+    cfg = plans.resolve_grading_config()
+    # build_plan_detail has no "as of" date concept — grade_workout's pending
+    # holdout compares each workout's OWN date against the real data frontier,
+    # not against target_date, so every workout's verdict is a settled fact
+    # once the frontier has passed it (regenerating an old brief's PDF still
+    # shows accurate historical grading). target_date only selects which
+    # graded workout is "today" and which trailing window to show below —
+    # it is never passed to build_plan_detail itself (its 4th positional
+    # param is best_effort, a Riegel-projection dict, not a date).
+    detail = plans.build_plan_detail(active, frontier, activities_by_date, cfg=cfg)
+
+    window_start = (date.fromisoformat(target_date) - timedelta(days=6)).isoformat()
+    week_workouts = sorted(
+        (w for w in detail["workouts"] if window_start <= w["date"] <= target_date),
+        key=lambda w: w["date"],
+        reverse=True,
+    )
+
+    last_7_days: list[dict] = []
+    for w in week_workouts:
+        target_m = w.get("target_distance_m")
+        planned_mi = units.to_miles(target_m) if target_m else None
+        if w["verdict"] in ("pending", "compliant"):
+            actual_mi = None
+        else:
+            actual_m = w.get("actual_distance_m")
+            actual_mi = units.to_miles(actual_m) if actual_m is not None else None
+        last_7_days.append({
+            "date": w["date"],
+            "type": w["type"],
+            "planned_mi": planned_mi,
+            "actual_mi": actual_mi,
+            "verdict": w["verdict"],
+        })
+
+    if not last_7_days:
+        return None
+
+    week_planned_mi = sum(d["planned_mi"] or 0 for d in last_7_days)
+    week_actual_mi = sum(d["actual_mi"] or 0 for d in last_7_days)
+    slips = sum(1 for d in last_7_days if d["verdict"] in ("partial", "missed"))
+    adherence_pct = detail.get("adherence_pct")
+    if adherence_pct is None:
+        adherence_pct = 0
+
+    today_entry = next((w for w in detail["workouts"] if w["date"] == target_date), None)
+    today_payload = None
+    if today_entry is not None:
+        target_m = today_entry.get("target_distance_m")
+        today_payload = {
+            "type": today_entry["type"],
+            "distance_mi": units.to_miles(target_m) if target_m else None,
+            "pace_min_per_mi": units.format_pace_min_per_mi(today_entry.get("target_pace_sec_per_km")),
+            "description": today_entry.get("description") or "",
+        }
+
+    # build_plan_detail has no days_to_race field at all (unlike goal_type/
+    # race_date, it's never a stored plan column) -- build_plan_status
+    # computes it the same way, on the fly, from race_date and its own
+    # "today" parameter. Anchored to target_date here (not build_plan_detail,
+    # which has no date concept) since "days from the brief's date to the
+    # race" is inherently relative to whichever date this report is for.
+    race = detail.get("race_date")
+    days_to_race = (
+        (date.fromisoformat(race) - date.fromisoformat(target_date)).days
+        if race else None
+    )
+
+    return {
+        "adherence_pct": adherence_pct,
+        "goal_type": detail.get("goal_type") or "goal",
+        "days_to_race": days_to_race,
+        "week_planned_mi": round(week_planned_mi, 1),
+        "week_actual_mi": round(week_actual_mi, 1),
+        "slips": slips,
+        "today": today_payload,
+        "last_7_days": last_7_days,
+    }
+
+
+@tool(
+    "generate_brief_report",
+    "Render a saved daily brief into a polished, beautiful PDF report "
+    "(visually comparable to the sibling budget project's monthly reports). "
+    "Local-only: reachable via stdio MCP clients (Claude Code/Claude Desktop "
+    "on this same machine), never over the network. Returns a local file "
+    "path the user can open directly.",
+    {"date": str},
+)
+async def generate_brief_report(args: dict) -> dict:
+    target_date = args["date"]
+    if not _DATE_RE.match(target_date):
+        return _err(f"malformed date '{target_date}', expected YYYY-MM-DD")
+
+    brief_path = briefs.DEFAULT_BRIEFINGS_DIR / f"{target_date}.json"
+    if not brief_path.exists():
+        return _err(f"no saved brief for {target_date}")
+    try:
+        brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
+    except ValidationError as e:
+        return _err(f"brief failed schema validation: {e}")
+
+    from . import visuals  # lazy: defers matplotlib/weasyprint import cost
+
+    charts_by_index: dict[str, bytes] = {}
+    for index, takeaway in enumerate(brief.takeaways):
+        if takeaway.metric is None:
+            continue
+        try:
+            m_dates, m_values = _fetch_metric_series(takeaway.metric.metric, takeaway.metric.days)
+            if not m_values:
+                continue
+            fmt = _chart_value_fmt(takeaway.metric.metric)
+            async with visuals.RENDER_LOCK:
+                png_bytes = await asyncio.to_thread(
+                    visuals.render_chart_png, list(zip(m_dates, m_values)), "line", fmt
+                )
+            charts_by_index[str(index)] = png_bytes
+        except Exception:
+            # A per-takeaway fetch/render problem (transient DB lock,
+            # degenerate single-point/all-identical-value series, etc.)
+            # must never fail the whole report — that takeaway simply
+            # renders without a chart image.
+            LOG.warning(
+                "chart render skipped for takeaway %d in brief %s",
+                index, target_date, exc_info=True,
+            )
+            continue
+
+    plan_section: dict | None = None
+    try:
+        plan_section = _build_plan_section(target_date)
+    except Exception:
+        # Malformed/partial plan data must never fail the whole report —
+        # same "one section's problem never sinks the report" precedent
+        # as the chart-rendering loop above.
+        LOG.warning("plan section build failed for brief %s", target_date, exc_info=True)
+        plan_section = None
+
+    if plan_section is not None and plan_section["today"] is not None:
+        profile = coach.resolve_coach_profile()
+        try:
+            coaching_line = await plan_coach.generate_coaching_line(
+                profile,
+                plan_section["today"],
+                plan_section["last_7_days"],
+                plan_section["adherence_pct"],
+                plan_section["days_to_race"],
+                plan_section["goal_type"],
+            )
+        except Exception:
+            LOG.warning(
+                "plan coaching-line generation failed for brief %s, using fallback",
+                target_date, exc_info=True,
+            )
+            coaching_line = plan_coach.fallback_coaching_line(
+                plan_section["today"],
+                plan_section["last_7_days"],
+                plan_section["days_to_race"],
+                plan_section["goal_type"],
+            )
+        plan_section["today"]["coaching_line"] = coaching_line
+
+    try:
+        async with visuals.RENDER_LOCK:
+            pdf_bytes = await asyncio.to_thread(
+                visuals.render_brief_pdf, brief, charts_by_index, plan_section
+            )
+    except Exception as e:
+        return _err(f"PDF render failed: {e}")
+
+    try:
+        reports_dir = await asyncio.to_thread(_default_reports_dir)
+    except OSError as e:
+        return _err(f"could not prepare reports directory: {e}")
+    try:
+        final_path = _write_atomic(reports_dir, f"brief-{target_date}.pdf", pdf_bytes)
+    except ValueError:
+        return _err("resolved path escaped reports directory")
+    await _auto_open(final_path)
+    return _text({"path": str(final_path)})
+
+
+_GENERATE_CHART_TYPES = frozenset({"line", "bar", "combo"})
+
+_GENERATE_CHART_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metric": {
+            "type": "string",
+            "description": "Any daily metric, training-load series (ctl/atl/tsb), or intensity_minutes_weighted — same whitelist as the chart tool.",
+        },
+        "days": {"type": "integer", "description": "Look back this many days"},
+        "chart_type": {
+            "type": "string",
+            "enum": sorted(_GENERATE_CHART_TYPES),
+            "description": (
+                "line = axis chart with gridlines; bar = vertical bars; "
+                "combo = bars + a least-squares trend line of the same "
+                "metric (matches the ASCII chart tool's combo style, one "
+                "metric, one axis — not a two-metric dual-axis chart)."
+            ),
+        },
+    },
+    "required": ["metric", "days", "chart_type"],
+}
+
+
+@tool(
+    "generate_chart",
+    "Render a beautiful standalone PNG chart (line/bar/combo) of a metric "
+    "over the last N days, for any ad-hoc trend question. Local-only: "
+    "reachable via stdio MCP clients (Claude Code/Claude Desktop on this "
+    "same machine), never over the network. Returns a local file path.",
+    _GENERATE_CHART_SCHEMA,
+)
+async def generate_chart(args: dict) -> dict:
+    metric = args["metric"]
+    days = args["days"]
+    chart_type = args["chart_type"]
+    if chart_type not in _GENERATE_CHART_TYPES:
+        return _err(f"unknown chart_type '{chart_type}'", allowed=sorted(_GENERATE_CHART_TYPES))
+    err = _validate_days(days)
+    if err:
+        return _err(err)
+    try:
+        dates, values = _fetch_metric_series(metric, days)
+    except ValueError as e:
+        return _err(str(e), allowed=sorted(_CHART_METRICS))
+    if not values:
+        return _err("no data in window", metric=metric, days=days)
+
+    from . import visuals  # lazy: defers matplotlib/weasyprint import cost
+
+    fmt = _chart_value_fmt(metric)
+    try:
+        async with visuals.RENDER_LOCK:
+            png_bytes = await asyncio.to_thread(
+                visuals.render_chart_png, list(zip(dates, values)), chart_type, fmt
+            )
+    except Exception as e:
+        return _err(f"chart render failed: {e}")
+
+    # {today} is computed here, not a tool argument — it exists in the
+    # filename only to distinguish chart runs across days. The idempotent-
+    # overwrite guarantee (identical metric/chart_type/days -> identical
+    # file) therefore holds only within a single calendar day.
+    today = date.today().isoformat()
+    try:
+        reports_dir = await asyncio.to_thread(_default_reports_dir)
+    except OSError as e:
+        return _err(f"could not prepare reports directory: {e}")
+    try:
+        final_path = _write_atomic(
+            reports_dir, f"chart-{metric}-{chart_type}-{days}d-{today}.png", png_bytes
+        )
+    except ValueError:
+        return _err("resolved path escaped reports directory")
+    await _auto_open(final_path)
+    return _text({"path": str(final_path)})
+
+
 ALL_TOOLS = [
     get_today_status,
     get_brief_context,
@@ -1537,9 +1994,21 @@ ALL_TOOLS = [
     save_brief,
 ]
 
+# Registered ONLY here, never merged into ALL_TOOLS — wired into run_stdio()
+# alone (see web/mcp_server.py's build_server(extra_tools=...)), never into
+# build_session_manager()'s HTTP /mcp/ transport. A plain module-level list
+# literal referencing two already-defined function objects, symmetric with
+# and as trivially greppable as ALL_TOOLS — costs nothing to construct at
+# module scope. Only the heavy `import matplotlib`/`import weasyprint`
+# statements (inside the two functions' bodies and visuals.py's own module
+# body) are deferred, not this list.
+LOCAL_ONLY_TOOLS = [generate_brief_report, generate_chart]
 
-def make_server():
-    return create_sdk_mcp_server(name=SERVER_NAME, version="0.6.0", tools=ALL_TOOLS)
+
+def make_server(extra_tools: list | None = None):
+    return create_sdk_mcp_server(
+        name=SERVER_NAME, version="0.6.0", tools=ALL_TOOLS + (extra_tools or [])
+    )
 
 
 def allowed_tool_names() -> list[str]:
