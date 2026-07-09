@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-09
+
+### Changed
+- **`generate_brief_report`'s PDF redesigned: signal cards now render in a
+  2-column layout, and a new Training Plan section is added below them.**
+  The existing takeaway cards reflow into a flexbox grid (robust to any
+  takeaway count — an odd-count last card spans the full width rather than
+  leaving a gap). The new section shows adherence %, days-to-race, this
+  week's planned/actual mileage, a slip count, today's prescribed workout
+  with a Claude-generated coaching line (same model as the real daily
+  brief, called fresh on every render, with a deterministic fallback if
+  the call fails), and a table of the last 7 days graded against
+  prescription (done/partial/missed/rest/scheduled). Computed live from
+  `plans.py` at render time, keyed to the brief's own date — no changes to
+  the `Brief` schema or the daily brief generation pipeline. Whole section
+  is omitted when there's no active plan or no plan data for the window.
+
 ## [0.19.0] - 2026-07-09
 
 ### Changed

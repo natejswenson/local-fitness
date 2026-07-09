@@ -45,13 +45,23 @@ work.
   the `Brief` schema.** `Brief`/`Takeaway` (schemas.py) carry zero
   plan-specific fields today, and stay that way — `generate_brief_report`
   calls `plans.get_active_plan()` + `plans.build_plan_detail(plan, frontier,
-  activities_by_date, today=target_date, cfg)` fresh, the same functions
-  `get_training_plan_progress` already uses, just anchored to the **brief's
-  date** (`target_date`) as `today` instead of `date.today()` — so
-  regenerating an old brief's PDF shows that day's plan state, not today's.
-  This keeps the change fully additive to the PDF-only code path: zero risk
-  to the V2 brief generation pipeline, zero eval-fixture/schema-version
-  impact.
+  activities_by_date, cfg=cfg)` fresh, the same function
+  `get_training_plan_progress` already uses. Implementation correction from
+  the first draft of this doc: `build_plan_detail` has **no** "as of a
+  given date" parameter at all — its 4th positional argument is
+  `best_effort` (a Riegel-projection dict), not `today`; passing
+  `target_date` there (as first drafted) would raise `AttributeError` the
+  moment a plan is active. This isn't actually a gap: `grade_workout`'s
+  pending-holdout compares each workout's **own** date against the real
+  data frontier, never against an external "as of" date, so every
+  workout's verdict is a settled historical fact once the frontier has
+  passed it — regenerating an old brief's PDF still shows accurate
+  grading for that window. `target_date` is used only to pick which graded
+  workout counts as "today" and which trailing 7-day window to slice out
+  of `detail["workouts"]` afterward, both done in Python, not inside
+  `build_plan_detail` itself. This keeps the change fully additive to the
+  PDF-only code path: zero risk to the V2 brief generation pipeline, zero
+  eval-fixture/schema-version impact.
 - **The coaching line is Claude-generated, using the same model as the real
   daily brief, called fresh on every render — with a deterministic
   fallback on failure.** Confirmed with Nate: not a canned template as the
@@ -161,11 +171,22 @@ async def generate_coaching_line(
     days_to_race: int | None,
     goal_type: str,
     *,
-    model: str = briefing.DEFAULT_MODEL,
-    timeout: float = 30.0,
-) -> str:
+    model: str | None = None,       # None -> resolves to briefing.DEFAULT_MODEL,
+    timeout: float = 30.0,          # imported lazily inside the function body --
+) -> str:                            # see "circular import" note below.
     """Raises RuntimeError/TimeoutError/anything the Agent SDK raises on
-    failure — caller (tools.py) is responsible for the fallback."""
+    failure — caller (tools.py) is responsible for the fallback.
+
+    Implementation note (deviation from the first draft of this doc): the
+    model default can't literally be `briefing.DEFAULT_MODEL` in the
+    function *signature*, because that would require a module-scope
+    `from . import briefing` in plan_coach.py — and briefing.py already
+    imports tools.py at module scope (as `agent_tools`), while tools.py
+    imports plan_coach.py. That closes a real circular import
+    (tools -> plan_coach -> briefing -> tools). Resolving `model is None ->
+    briefing.DEFAULT_MODEL` inside the function body, with the import
+    deferred to call time, sidesteps it — same effective default, no cycle.
+    """
     ...
 
 def fallback_coaching_line(
@@ -219,10 +240,15 @@ def render_brief_pdf(
 **Testable:**
 - 2-column layout: N=1,2,3,4,5 takeaways each produce the correct
   `.span-full` placement (only ever the *last* card, only when N is odd).
-- N=0 takeaways renders the signals section as empty (no crash) — real
-  edge case, however rare.
-- `plan_section=None` → rendered HTML contains no "Training Plan" heading
-  string at all.
+  (N=0 is not a real edge case: `Brief.takeaways` has a pydantic
+  min-length-1 constraint, confirmed during implementation — a zero-
+  takeaway `Brief` cannot be constructed at all, so there's nothing to
+  test there.)
+- `plan_section=None` → rendered HTML contains no *rendered* Training Plan
+  heading element. (A loose substring search for the phrase isn't
+  sufficient — this file's own CSS carries an explanatory comment that
+  also contains the words "Training Plan", always present regardless of
+  plan_section; the test matches the exact heading markup instead.)
 - Adherence/mileage/slips numbers match hand-computed values against a
   seeded plan+activities fixture (pin exact values, not just "a number").
 - Verdict → badge class/label mapping is exhaustive over

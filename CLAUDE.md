@@ -309,6 +309,35 @@ These are settled — don't redesign without a reason.
   needs native Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS
   Homebrew's install isn't on the default dylib search path and needs
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
+- **The brief PDF (`generate_brief_report`) has a 2-column signal-card grid
+  and a Training Plan section** (2026-07-09 redesign). `visuals.py`'s
+  signal cards (formerly one stacked column) reflow into a flexbox grid
+  robust to any takeaway count — an odd-count last card spans the full
+  width (`.span-full`) rather than leaving a gap; never assume exactly 4.
+  Below that, a Training Plan section (adherence %, days-to-race, this
+  week's planned/actual mileage, a slip count, today's prescribed workout,
+  and a last-7-days table graded done/partial/missed/rest/scheduled) is
+  computed **live from `plans.py` at render time** — `tools.py`'s
+  `_build_plan_section()` — keyed to the brief's own date, not
+  `date.today()`; the `Brief`/`Takeaway` schema carries zero plan fields
+  and never will. Note `plans.build_plan_detail()` has no "as of" date
+  parameter at all — its verdicts are always graded against the real data
+  frontier, never a hypothetical past perspective — so `target_date` is
+  only used to pick which graded workout is "today" and slice the
+  trailing window, never passed into `build_plan_detail` itself (a real
+  bug caught during this build: its 4th positional arg is `best_effort`, a
+  Riegel-projection dict, not a date). The section is omitted entirely
+  (not shown empty) when there's no active plan or no plan data in the
+  window. Today's coaching line comes from a **new `agent/plan_coach.py`
+  module** — a Claude Agent SDK call (toolless, single-shot, same
+  `briefing.DEFAULT_MODEL` the real daily brief uses) called fresh on
+  every render, with a deterministic template fallback
+  (`fallback_coaching_line`) if that call fails for any reason (missing
+  credential, network, timeout) — the PDF still generates either way.
+  `plan_coach.py` imports `briefing` lazily, inside the function body,
+  not at module scope: `briefing.py` already imports `tools.py` at module
+  scope (as `agent_tools`), and `tools.py` imports `plan_coach.py` — a
+  module-scope import there would close a real circular import.
 - **Auth middleware**: `LOCAL_FITNESS_API_TOKEN` env var; constant-time
   bearer check; `/health` and `/{full_path:path}` (SPA shell) are public.
 - **Rate limit**: in-memory token bucket on `RATE_LIMITED_PREFIXES`,

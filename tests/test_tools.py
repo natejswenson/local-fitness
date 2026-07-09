@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, Mock
 import pdfplumber
 import pytest
 
-from local_fitness import db
+from local_fitness import db, plans
 from local_fitness.agent import tools
 
 
@@ -1597,3 +1597,188 @@ def test_generate_brief_report_and_generate_chart_excluded_from_all_tools():
     assert "generate_chart" not in all_names
     local_only_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
     assert local_only_names == {"generate_brief_report", "generate_chart"}
+
+
+# --- 2026-07-09: Training Plan section (_build_plan_section + wiring) ------
+
+@pytest.fixture
+def plan_seeded(tmp_path, monkeypatch):
+    """A DB with an ACTIVE training plan spanning the trailing 7 days
+    through today, with real activities producing a deliberate mix of
+    verdicts (done/partial/missed/compliant/pending).
+
+    Independent of the `seeded` fixture, which pre-seeds an unrelated 10km
+    activity on today's date — that would collide with this fixture's
+    intentionally-empty (pending) workout for today."""
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+
+    def d(offset):
+        return (today - timedelta(days=offset)).isoformat()
+
+    with db.connect(p) as conn:
+        for i in range(7):
+            conn.execute("INSERT INTO daily_metrics (date, rhr) VALUES (?, 50)", (d(i),))
+
+    workouts = [
+        {"date": d(6), "seq": 1, "week_index": 1, "type": "long",
+         "target_distance_m": 6000.0, "description": ""},
+        {"date": d(5), "seq": 1, "week_index": 1, "type": "rest",
+         "target_distance_m": None, "description": ""},
+        {"date": d(4), "seq": 1, "week_index": 1, "type": "easy",
+         "target_distance_m": 5000.0, "description": ""},
+        {"date": d(3), "seq": 1, "week_index": 1, "type": "tempo",
+         "target_distance_m": 3000.0, "description": ""},
+        {"date": d(2), "seq": 1, "week_index": 1, "type": "rest",
+         "target_distance_m": None, "description": ""},
+        {"date": d(1), "seq": 1, "week_index": 2, "type": "easy",
+         "target_distance_m": 4000.0, "target_pace_sec_per_km": 350.0,
+         "description": "keep HR under 140"},
+        {"date": d(0), "seq": 1, "week_index": 2, "type": "easy",
+         "target_distance_m": 4000.0, "target_pace_sec_per_km": 350.0,
+         "description": "keep HR under 140"},
+    ]
+    plan_id = plans.insert_draft(
+        {
+            "goal_type": "10k",
+            "race_date": (today + timedelta(days=71)).isoformat(),
+            "target_time_seconds": 3000,
+            "created_at": today.isoformat(),
+        },
+        workouts,
+        db_path=p,
+    )
+    plans.commit_plan(plan_id, now="t", db_path=p)
+
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters, duration_seconds) "
+            "VALUES (1, ?, 'running', 5100.0, 1800)", (d(4),),  # done: easy 5000m
+        )
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters, duration_seconds) "
+            "VALUES (2, ?, 'running', 3050.0, 900)", (d(3),),  # done: tempo 3000m
+        )
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters, duration_seconds) "
+            "VALUES (3, ?, 'running', 2960.0, 1080)", (d(1),),  # partial: easy 4000m
+        )
+        # d(6) long 6000m: no activity -> missed. d(0) today easy 4000m: no
+        # activity -> pending (date >= frontier and raw classify is missed).
+    return p
+
+
+def test_build_plan_section_no_active_plan_is_none(seeded):
+    assert tools._build_plan_section(date.today().isoformat()) is None
+
+
+def test_build_plan_section_active_plan_full_values(plan_seeded):
+    today = date.today()
+    section = tools._build_plan_section(today.isoformat())
+    assert section is not None
+    assert section["adherence_pct"] == 75  # 4.5/6 non-pending graded workouts
+    assert section["goal_type"] == "10k"
+    assert section["days_to_race"] == 71
+    assert section["week_planned_mi"] == 13.7
+    assert section["week_actual_mi"] == 6.9
+    assert section["slips"] == 2  # d(6) missed + d(1) partial
+
+    assert section["today"] == {
+        "type": "easy",
+        "distance_mi": 2.49,
+        "pace_min_per_mi": "9:23",
+        "description": "keep HR under 140",
+    }
+
+    dates = [w["date"] for w in section["last_7_days"]]
+    assert dates == sorted(dates, reverse=True)  # most recent first
+    by_date = {w["date"]: w for w in section["last_7_days"]}
+    assert by_date[today.isoformat()]["verdict"] == "pending"
+    assert by_date[today.isoformat()]["actual_mi"] is None
+    assert by_date[(today - timedelta(days=1)).isoformat()]["verdict"] == "partial"
+    assert by_date[(today - timedelta(days=1)).isoformat()]["actual_mi"] == 1.84
+    assert by_date[(today - timedelta(days=2)).isoformat()]["verdict"] == "compliant"
+    assert by_date[(today - timedelta(days=2)).isoformat()]["planned_mi"] is None
+    assert by_date[(today - timedelta(days=3)).isoformat()]["verdict"] == "done"
+    assert by_date[(today - timedelta(days=4)).isoformat()]["verdict"] == "done"
+    assert by_date[(today - timedelta(days=5)).isoformat()]["verdict"] == "compliant"
+    assert by_date[(today - timedelta(days=6)).isoformat()]["verdict"] == "missed"
+    assert by_date[(today - timedelta(days=6)).isoformat()]["actual_mi"] == 0.0
+
+
+def test_build_plan_section_no_workouts_in_window_is_none(plan_seeded):
+    # Plan's workouts only span today-6..today; a target_date far outside
+    # that range has nothing in its trailing-7-day window.
+    far_future = (date.today() + timedelta(days=100)).isoformat()
+    assert tools._build_plan_section(far_future) is None
+
+
+def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
+    plan_seeded, reports_tmp, monkeypatch
+):
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    calls = []
+
+    async def fake_generate(profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type):
+        calls.append((today_workout, adherence_pct, days_to_race, goal_type))
+        return "Go hit today's easy 4 clean."
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    pdf_bytes = Path(payload["path"]).read_bytes()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    assert "TRAINING PLAN" in text
+    assert "Go hit today's easy 4 clean." in text
+    assert len(calls) == 1
+    assert calls[0][1] == 75  # adherence_pct threaded through correctly
+    assert calls[0][2] == 71  # days_to_race
+    assert calls[0][3] == "10k"
+
+
+def test_generate_brief_report_coaching_line_failure_falls_back(
+    plan_seeded, reports_tmp, monkeypatch
+):
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("no credential")
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", boom)
+
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err  # a coaching-line failure must never fail the whole report
+    pdf_bytes = Path(payload["path"]).read_bytes()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    assert "TRAINING PLAN" in text
+    # fallback_coaching_line's deterministic phrasing for a partial prior day.
+    assert "Today: easy 2.49 mi @ 9:23/mi." in text
+
+
+def test_generate_brief_report_no_active_plan_has_no_plan_section(seeded, reports_tmp):
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    pdf_bytes = Path(payload["path"]).read_bytes()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    assert "TRAINING PLAN" not in text

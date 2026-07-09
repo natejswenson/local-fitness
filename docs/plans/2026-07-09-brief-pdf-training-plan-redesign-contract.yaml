@@ -49,10 +49,10 @@ api_surface:
     description: "agent/plan_coach.py. Pure prompt assembly, no I/O."
   - name: "generate_coaching_line"
     type: "function"
-    signature: "async generate_coaching_line(profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type, *, model: str = briefing.DEFAULT_MODEL, timeout: float = 30.0) -> str"
+    signature: "async generate_coaching_line(profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type, *, model: str | None = None, timeout: float = 30.0) -> str"
     params:
       - name: "model"
-        type: "str"
+        type: "str | None"
         required: false
       - name: "timeout"
         type: "float"
@@ -60,10 +60,12 @@ api_surface:
     returns: "str, or raises on any failure"
     description: >-
       agent/plan_coach.py. Claude Agent SDK call (toolless, max_turns=1),
-      Agent SDK imported inside the function body. model defaults to
-      briefing.DEFAULT_MODEL — the same constant the real daily brief
-      generator always uses — never a duplicated literal. Raises on any
-      failure; caller is responsible for the fallback.
+      Agent SDK imported inside the function body. model=None resolves to
+      briefing.DEFAULT_MODEL, imported lazily inside the function body (not
+      as a signature default) to avoid a circular import: briefing.py
+      imports tools.py at module scope, and tools.py imports plan_coach.py.
+      Never a duplicated literal. Raises on any failure; caller is
+      responsible for the fallback.
   - name: "fallback_coaching_line"
     type: "function"
     signature: "fallback_coaching_line(today_workout: dict, last_7_days: list[dict], days_to_race: int | None, goal_type: str) -> str"
@@ -81,8 +83,8 @@ invariants:
       verification: "code-inspection: no db.* calls, no requests/urllib calls in visuals.py"
       check_method: "code-inspection"
     - id: "INV-3"
-      description: "generate_coaching_line's model default is the attribute reference briefing.DEFAULT_MODEL, not a duplicated literal string."
-      verification: "grep the function signature for `briefing.DEFAULT_MODEL`, absence of a hardcoded model literal as the default"
+      description: "generate_coaching_line's model resolves from the attribute reference briefing.DEFAULT_MODEL when the caller passes None, never a duplicated literal string. Resolved inside the function body (not as a signature default) because briefing.py imports tools.py at module scope, and tools.py imports plan_coach.py -- a module-scope `from . import briefing` in plan_coach.py would close that into a real circular import."
+      verification: "grep plan_coach.py for `briefing.DEFAULT_MODEL` inside generate_coaching_line's body, absence of a hardcoded model literal, and absence of a module-scope `from . import briefing` / `import briefing` in plan_coach.py"
       check_method: "grep"
     - id: "INV-4"
       description: "The 2-column signals layout is CSS flexbox (flex-wrap: wrap), not CSS Grid."
@@ -98,8 +100,8 @@ invariants:
       verification: "parametrized test over N=1..5 fixture takeaways; assert span-full placement"
       test_tag: "contract:correctness:inv-t1"
     - id: "INV-T2"
-      description: "N=0 takeaways renders without raising and produces an empty signals section."
-      verification: "fixture Brief with takeaways=[]; assert render_brief_pdf succeeds"
+      description: "N=0 takeaways is not a reachable state: Brief.takeaways carries a pydantic min-length-1 constraint, confirmed during implementation, so a zero-takeaway Brief cannot be constructed at all. No test targets this (would be testing an impossible state)."
+      verification: "n/a -- superseded during implementation"
       test_tag: "contract:correctness:inv-t2"
     - id: "INV-T3"
       description: "plan_section=None produces rendered output with no Training Plan section heading string present, byte-identical in structure to the pre-this-change render for the same brief/charts."
