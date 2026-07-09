@@ -21,14 +21,21 @@ name: Capture perf-benchmark baseline
 # DEFAULT branch (`main` here — see CLAUDE.md's Branching & release
 # strategy). Since `main` only receives deliberate `dev -> main` promotions,
 # this workflow can't be dispatched from a feature branch pre-merge. The
-# 0001 baseline committed alongside this file's initial landing was instead
-# captured via a local `docker run --platform=linux/amd64 python:3.12-slim`
-# container: pytest-benchmark's machine-id
-# (`platform.system()-implementation-pyver-arch`) depends only on OS/arch
-# bitness, not on being a real GitHub-hosted runner, so a matching Linux
-# container produces an identical, valid `Linux-CPython-3.12-64bit` save.
-# Once this workflow has landed on `main` at least once, prefer dispatching
-# it for real over the Docker workaround.
+# 0001 baseline actually committed at this file's initial landing was
+# captured via ci.yml's "Perf-benchmark regression gate" step (which
+# --benchmark-autosave's every run) on a real PR build against
+# ubuntu-latest, downloaded from that run's "perf-benchmark-run-<id>"
+# artifact, and hand-promoted to 0001 — a genuine same-hardware capture
+# without needing this workflow to be dispatchable yet. (An earlier attempt
+# used a local `docker run --platform=linux/amd64 python:3.12-slim`
+# container — matches the Linux-CPython-3.12-64bit machine-id STRING, but
+# Docker Desktop's emulated-Apple-Silicon-as-amd64 CPU is far slower than
+# real Azure/GitHub metal, which blew the 15% regression gate on pure
+# hardware noise. Machine-id string equality is necessary but not
+# sufficient for a valid comparison baseline — use this workflow or a real
+# CI run, not an emulated container.) Once this workflow has landed on
+# `main` at least once, prefer dispatching it for real over either
+# workaround.
 on:
   workflow_dispatch: {}
 
