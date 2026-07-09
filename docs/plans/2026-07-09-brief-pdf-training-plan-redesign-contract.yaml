@@ -1,0 +1,172 @@
+version: "1.0"
+ticket: "#TBD"
+epic: "#TBD"
+title: "Brief PDF redesign: 2-column signals + new Training Plan section"
+date: "2026-07-09"
+
+api_surface:
+  - name: "render_brief_pdf"
+    type: "function"
+    signature: "render_brief_pdf(brief: Brief, charts: dict[str, bytes], plan_section: dict | None = None) -> bytes"
+    params:
+      - name: "brief"
+        type: "Brief"
+        required: true
+      - name: "charts"
+        type: "dict[str, bytes]"
+        required: true
+      - name: "plan_section"
+        type: "dict | None"
+        required: false
+    returns: "bytes (PDF)"
+    description: >-
+      agent/visuals.py. Pure formatting, no DB/network access. New optional
+      plan_section param renders the Training Plan section; None (default)
+      omits it entirely and preserves the exact prior output shape.
+  - name: "build_prompt"
+    type: "function"
+    signature: "build_prompt(profile: CoachProfile, today_workout: dict, last_7_days: list[dict], adherence_pct: int, days_to_race: int | None, goal_type: str) -> tuple[str, str]"
+    params:
+      - name: "profile"
+        type: "CoachProfile"
+        required: true
+      - name: "today_workout"
+        type: "dict"
+        required: true
+      - name: "last_7_days"
+        type: "list[dict]"
+        required: true
+      - name: "adherence_pct"
+        type: "int"
+        required: true
+      - name: "days_to_race"
+        type: "int | None"
+        required: true
+      - name: "goal_type"
+        type: "str"
+        required: true
+    returns: "(system_prompt: str, user_prompt: str)"
+    description: "agent/plan_coach.py. Pure prompt assembly, no I/O."
+  - name: "generate_coaching_line"
+    type: "function"
+    signature: "async generate_coaching_line(profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type, *, model: str = briefing.DEFAULT_MODEL, timeout: float = 30.0) -> str"
+    params:
+      - name: "model"
+        type: "str"
+        required: false
+      - name: "timeout"
+        type: "float"
+        required: false
+    returns: "str, or raises on any failure"
+    description: >-
+      agent/plan_coach.py. Claude Agent SDK call (toolless, max_turns=1),
+      Agent SDK imported inside the function body. model defaults to
+      briefing.DEFAULT_MODEL — the same constant the real daily brief
+      generator always uses — never a duplicated literal. Raises on any
+      failure; caller is responsible for the fallback.
+  - name: "fallback_coaching_line"
+    type: "function"
+    signature: "fallback_coaching_line(today_workout: dict, last_7_days: list[dict], days_to_race: int | None, goal_type: str) -> str"
+    returns: "str"
+    description: "agent/plan_coach.py. Pure, deterministic, never raises."
+
+invariants:
+  checkable:
+    - id: "INV-1"
+      description: "plan_coach.py has no top-level `import claude_agent_sdk` — deferred inside generate_coaching_line's function body only, mirroring visuals.py's matplotlib/weasyprint deferral (tools.py, which imports plan_coach, is imported by the always-running web server)."
+      verification: "grep confirms no module-scope claude_agent_sdk import in plan_coach.py"
+      check_method: "grep"
+    - id: "INV-2"
+      description: "render_brief_pdf performs no DB access and no network access — pure formatting of its three parameters, unchanged from the existing contract."
+      verification: "code-inspection: no db.* calls, no requests/urllib calls in visuals.py"
+      check_method: "code-inspection"
+    - id: "INV-3"
+      description: "generate_coaching_line's model default is the attribute reference briefing.DEFAULT_MODEL, not a duplicated literal string."
+      verification: "grep the function signature for `briefing.DEFAULT_MODEL`, absence of a hardcoded model literal as the default"
+      check_method: "grep"
+    - id: "INV-4"
+      description: "The 2-column signals layout is CSS flexbox (flex-wrap: wrap), not CSS Grid."
+      verification: "grep _CSS in visuals.py for `display: flex` on .signals, absence of `display: grid` for that selector"
+      check_method: "grep"
+    - id: "INV-5"
+      description: "No new color literals are introduced — all new CSS rules (.stat-strip, .today-callout, .verdict.*, table.week-table) reference only the existing PRIMARY/GOOD/WARNING/CRITICAL/NEUTRAL constants."
+      verification: "grep for hex literals (#[0-9a-fA-F]{3,6}) in the new CSS blocks; only the existing five constant definitions contain raw hex"
+      check_method: "grep"
+  testable:
+    - id: "INV-T1"
+      description: "Signal cards render in a 2-column layout for any N in {1,2,3,4,5}; the .span-full class is applied to exactly one card (the last) when and only when N is odd."
+      verification: "parametrized test over N=1..5 fixture takeaways; assert span-full placement"
+      test_tag: "contract:correctness:inv-t1"
+    - id: "INV-T2"
+      description: "N=0 takeaways renders without raising and produces an empty signals section."
+      verification: "fixture Brief with takeaways=[]; assert render_brief_pdf succeeds"
+      test_tag: "contract:correctness:inv-t2"
+    - id: "INV-T3"
+      description: "plan_section=None produces rendered output with no Training Plan section heading string present, byte-identical in structure to the pre-this-change render for the same brief/charts."
+      verification: "render with plan_section omitted; assert absence of the section heading text"
+      test_tag: "contract:correctness:inv-t3"
+    - id: "INV-T4"
+      description: "Adherence %, week planned/actual mileage, and slips count in a rendered plan_section match hand-computed values from a fixed seeded plan+activities fixture."
+      verification: "pdfplumber text extraction; assert exact pinned numeric strings, not just presence of a number"
+      test_tag: "contract:correctness:inv-t4"
+    - id: "INV-T5"
+      description: "Every value in {done, partial, missed, compliant, pending} maps to its own distinct verdict badge CSS class and label text; no verdict falls through to a default/unstyled state."
+      verification: "parametrized test over all five verdict values"
+      test_tag: "contract:correctness:inv-t5"
+    - id: "INV-T6"
+      description: "generate_coaching_line raising any exception is caught by generate_brief_report, which falls back to fallback_coaching_line's output and still returns a success payload — never a raised exception or a failed tool call."
+      verification: "mock generate_coaching_line to raise; assert generate_brief_report succeeds and the PDF text contains the fallback line's distinguishing content"
+      test_tag: "contract:correctness:inv-t6"
+    - id: "INV-T7"
+      description: "fallback_coaching_line is pure: identical inputs across two calls produce byte-identical output."
+      verification: "call twice with the same fixture inputs; assert equality"
+      test_tag: "contract:correctness:inv-t7"
+    - id: "INV-T8"
+      description: "No active plan (get_active_plan() returns None) results in plan_section=None reaching render_brief_pdf, end to end through generate_brief_report."
+      verification: "seeded DB with no active plan row; assert rendered PDF has no Training Plan section"
+      test_tag: "contract:correctness:inv-t8"
+    - id: "INV-T9"
+      description: "generate_coaching_line's dispatch (model, timeout, and prompt content derived from build_prompt) is asserted against a mocked Agent SDK call's actual call arguments, not merely that some call happened."
+      verification: "mock the Agent SDK boundary; assert call kwargs include model=briefing.DEFAULT_MODEL and the expected prompt substrings"
+      test_tag: "contract:correctness:inv-t9"
+
+integration_points: []
+
+security_review:
+  status: "not_required"
+  signals_detected: []
+  deployment_context: "hybrid"
+  note: >-
+    No new external input surface, no new write path, no new auth-relevant
+    code path — plan_section is built entirely from already-trusted DB-
+    derived data (plans.py) and rendered through the existing html.escape()
+    discipline in render_brief_pdf. The one new network call
+    (generate_coaching_line's Claude API call) is outbound-only, uses the
+    same credential/transport pattern already reviewed for the production
+    brief job, and fails closed to a local deterministic fallback.
+
+ambiguity_resolutions:
+  - id: "AMB-1"
+    decision: "Flexbox over CSS Grid for the 2-column signals layout."
+    confidence: "high"
+    alternatives: ["CSS Grid with grid-template-columns + grid-column span"]
+    reasoning: "Flexbox is the longer-established, more reliably-supported layout model in WeasyPrint; this isn't a place to discover Grid-support gaps in a personal report a user opens daily."
+    reversibility: "high — a CSS-only change if Grid support is later confirmed solid"
+  - id: "AMB-2"
+    decision: "Coaching line calls Claude fresh on every render (no caching), following briefing.DEFAULT_MODEL, with a deterministic fallback on failure."
+    confidence: "high"
+    alternatives: ["Cache once per day in a sidecar file", "Deterministic template as the primary path"]
+    reasoning: "User-confirmed twice, explicitly, after tradeoffs (repeat-open cost/latency, non-determinism) were raised. Fallback-on-failure (not fallback-as-primary) satisfies this repo's 'one render failure must never fail the whole report' precedent without contradicting the user's explicit choice."
+    reversibility: "high — caching or a template-primary path can be added later without changing the public function signatures"
+  - id: "AMB-3"
+    decision: "Training Plan data computed live from plans.py at PDF-render time, keyed to the brief's own date — no new fields on the Brief/Takeaway schema."
+    confidence: "high"
+    alternatives: ["Persist plan snapshot fields onto the Brief schema at brief-generation time"]
+    reasoning: "Brief is eval'd against baseline.json/fixtures as part of the V2 architecture; adding fields would touch that surface for no benefit, since plans.py's data is already queryable fresh and independent of brief generation."
+    reversibility: "high — purely additive; a future snapshot field could still be added without conflicting with this design"
+  - id: "AMB-4"
+    decision: "\"Last week\" = trailing 7 calendar days ending on the brief's date, not the plan's week-index boundaries."
+    confidence: "high"
+    alternatives: ["Use plans.py's existing week_index-based weekly_mileage entries"]
+    reasoning: "Avoids a partial-week-at-the-seam confusion when regenerating a brief mid-plan-week, and keeps the stat-strip mileage tile and the last-7-days table sourced from the exact same data slice so they can't disagree."
+    reversibility: "high — an internal windowing choice, no external contract impact"
