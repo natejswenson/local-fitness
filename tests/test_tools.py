@@ -10,9 +10,11 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
@@ -1074,8 +1076,20 @@ def no_real_open(monkeypatch):
     generate_chart's auto-open never pops a real Preview window or incurs
     the real 1.5s grace-period sleep during tests. subprocess.run is a
     fresh Mock() per test -- tests that care about its call args just
-    inspect tools.subprocess.run directly, no re-patching needed."""
-    monkeypatch.setattr(tools.subprocess, "run", Mock())
+    inspect tools.subprocess.run directly, no re-patching needed.
+
+    Rebinds tools.subprocess to a stand-in module rather than mutating the
+    real subprocess module's .run in place -- tools.subprocess IS the real
+    stdlib subprocess module object (a plain `import subprocess`), so
+    patching .run on it directly leaked into every other subprocess.run
+    caller in the same test process, including matplotlib's font_manager
+    (subprocess.check_output delegates to subprocess.run internally),
+    which broke real chart-rendering happy-path tests on a fresh CI
+    runner with no cached font list."""
+    fake_subprocess = types.ModuleType("subprocess")
+    fake_subprocess.__dict__.update(subprocess.__dict__)
+    fake_subprocess.run = Mock()
+    monkeypatch.setattr(tools, "subprocess", fake_subprocess)
     monkeypatch.setattr(tools.asyncio, "sleep", AsyncMock())
 
 
