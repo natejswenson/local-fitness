@@ -58,8 +58,19 @@ jobs:
       - name: Perf-benchmark regression gate
         run: |
           uv run pytest tests/test_perf_benchmarks.py --benchmark-only \
-            --benchmark-storage=file://./.benchmarks \
+            --benchmark-storage=file://./.benchmarks --benchmark-autosave \
             --benchmark-compare=0001 --benchmark-compare-fail=min:15% --no-cov
+
+      # Always runs (even when the gate above fails) so a genuine ubuntu-latest
+      # capture is downloadable without needing a dispatched capture-perf-
+      # baseline.yml run — see that workflow's bootstrapping note.
+      - name: Upload this run's benchmark save
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-benchmark-run-${{ github.run_id }}
+          path: .benchmarks/
+          retention-days: 14
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
