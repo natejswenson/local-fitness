@@ -173,27 +173,16 @@ def _takeaways(n: int) -> list[Takeaway]:
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 5])
-def test_build_html_colspan_count_matches_parity(n):
+def test_build_html_cards_stack_single_column_not_paired(n):
+    # 2026-07-09 layout: cards no longer pair 2-up into table rows — the
+    # 2-column split moved to the whole-page level (signals rail vs. plan
+    # rail), so every card renders as its own top-level <section>, and
+    # there is no per-pair <tr>/colspan wrapping at all regardless of N.
     brief = _brief(_takeaways(n))
     html_out = visuals._build_html(brief, {}, None)
-    # An odd count gets exactly one trailing full-width (colspan="2") row;
-    # an even count pairs every card into a two-<td> row with none. Match
-    # the actual rendered <td> attribute, not a bare "colspan=\"2\"" —
-    # that substring also appears in this file's own CSS comment, which is
-    # present in every render regardless of takeaway count.
-    colspan_count = html_out.count('class="cell-full" colspan="2"')
-    assert colspan_count == (1 if n % 2 == 1 else 0)
-
-
-def test_build_html_colspan_is_on_the_last_card_specifically():
-    brief = _brief(_takeaways(3))
-    html_out = visuals._build_html(brief, {}, None)
-    # Split into per-row chunks on <tr> and confirm only the last row (the
-    # 3rd, last, 0-indexed card, alone after pairing 0+1) is full-width.
-    rows = html_out.split("<tr>")[1:]
-    assert len(rows) == 2
-    assert 'colspan="2"' not in rows[0]
-    assert 'colspan="2"' in rows[1]
+    assert html_out.count('class="signal-card') == n
+    assert "<tr>" not in html_out
+    assert "colspan" not in html_out
 
 
 def _heading_positions(pdf_bytes: bytes, words: list[str]) -> dict[str, tuple[float, float]]:
@@ -210,10 +199,9 @@ def _heading_positions(pdf_bytes: bytes, words: list[str]) -> dict[str, tuple[fl
     return {w: found[w] for w in words}
 
 
-def test_render_brief_pdf_paired_cards_render_in_two_distinct_columns():
-    # Single-token, non-wrapping headlines so each word's position
-    # unambiguously identifies its card.
-    words = ["Alphahead", "Betahead", "Gammahead", "Deltahead"]
+def test_render_brief_pdf_cards_stack_in_a_single_column():
+    # No plan section → signal cards run the full page width, one per row.
+    words = ["Alphahead", "Betahead", "Gammahead"]
     brief = _brief([
         Takeaway(headline=w, summary=f"s{i}", tone="neutral", details=f"d{i}")
         for i, w in enumerate(words)
@@ -221,52 +209,26 @@ def test_render_brief_pdf_paired_cards_render_in_two_distinct_columns():
     pdf = visuals.render_brief_pdf(brief, {})
     pos = _heading_positions(pdf, words)
 
-    # Row 1 (Alphahead, Betahead): same top (same row), distinct x0 (columns).
-    assert pos["Alphahead"][1] == pos["Betahead"][1]
-    assert pos["Alphahead"][0] != pos["Betahead"][0]
-    # Row 2 (Gammahead, Deltahead): same pairing, and strictly below row 1.
-    assert pos["Gammahead"][1] == pos["Deltahead"][1]
-    assert pos["Gammahead"][0] != pos["Deltahead"][0]
-    assert pos["Gammahead"][1] > pos["Alphahead"][1]
-    # The two columns line up: left members share an x0, right members share one.
-    left_x, right_x = sorted([pos["Alphahead"][0], pos["Betahead"][0]])
-    assert {pos["Gammahead"][0], pos["Deltahead"][0]} == {left_x, right_x}
+    x0s = {pos[w][0] for w in words}
+    assert len(x0s) == 1, f"expected one shared column x0, got {x0s}"
+    tops = [pos[w][1] for w in words]
+    assert tops == sorted(tops) and len(set(tops)) == len(tops)
 
 
-def test_render_brief_pdf_odd_trailing_card_spans_full_row_width():
-    words = ["Alphahead", "Betahead", "Gammahead"]
-    # The odd card's summary is one long unbroken-enough line — in a
-    # half-width column it wraps well before reaching the second column's
-    # x-position; at full (colspan="2") width it doesn't have to.
-    long_summary = "one two three four five six seven eight nine ten eleven twelve"
-    brief = _brief([
-        Takeaway(headline=w, summary=(long_summary if w == "Gammahead" else f"s{i}"),
-                  tone="neutral", details=f"d{i}")
-        for i, w in enumerate(words)
-    ])
-    pdf = visuals.render_brief_pdf(brief, {})
-    pos = _heading_positions(pdf, words)
-
-    left_x = min(pos["Alphahead"][0], pos["Betahead"][0])
-    right_x = max(pos["Alphahead"][0], pos["Betahead"][0])
-    # The odd trailing card starts at the left column, not the right one —
-    # colspan="2" widens its cell rather than shifting it into column 2.
-    # Sub-point tolerance: the colspan cell's padding differs slightly from
-    # a single-column cell's, which shifts its left edge by a fraction of a
-    # point — not the multi-point difference a real column jump would cause.
-    assert abs(pos["Gammahead"][0] - left_x) < 2
-    assert pos["Gammahead"][1] > pos["Alphahead"][1]
-
-    # And its row is genuinely full-width: the long summary's first line
-    # must run at least past the right column's start x-position, which a
-    # half-width cell (the pre-fix, single-column-only behavior) could not.
+def test_render_brief_pdf_signals_and_plan_render_as_two_page_columns():
+    # With a plan section present, the WHOLE PAGE is 2 columns: the signal
+    # cards rail (left) and the Training Plan rail (right) run in parallel
+    # rather than stacking sequentially — this is what actually buys back
+    # the vertical room to fit a full brief on one page.
+    brief = _brief([Takeaway(headline="Alphahead", summary="s", tone="neutral", details="d")])
+    pdf = visuals.render_brief_pdf(brief, {}, plan_section=_PLAN_SECTION)
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
-        summary_words = [w for w in doc.pages[0].extract_words() if w["text"] == "one"]
-    assert summary_words, "summary text 'one' not found in rendered PDF"
-    summary_top = summary_words[0]["top"]
-    with pdfplumber.open(io.BytesIO(pdf)) as doc:
-        same_line = [w for w in doc.pages[0].extract_words() if w["top"] == summary_top]
-    assert max(w["x1"] for w in same_line) > right_x
+        words = {w["text"]: (w["x0"], w["top"]) for w in doc.pages[0].extract_words()}
+    assert "Alphahead" in words
+    assert "TRAINING" in words  # "TRAINING PLAN" heading, uppercased via CSS but literal in text
+    # The plan rail sits well to the right of the signals rail — not merely
+    # a few points over the way sub-pixel padding differences would.
+    assert words["TRAINING"][0] - words["Alphahead"][0] > 100
 
 
 def test_render_plan_section_html_none_is_empty_string():

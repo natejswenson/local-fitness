@@ -20,6 +20,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`tests/test_visuals.py`) that assert actual rendered x/y positions
   instead of just HTML structure.
 
+### Changed
+- **The brief PDF is redesigned to fit one page and look more polished.**
+  The whole-page layout is now 2 columns — the signal-card rail (left)
+  runs in parallel with the Training Plan section (right) instead of
+  stacking sequentially — which buys back the vertical room a 3-5
+  takeaway brief plus a full plan section needs to fit on one A4 page.
+  Built as an HTML `<table>` (the one layout primitive WeasyPrint 69.0
+  reliably supports for real multi-column placement — flex/grid were
+  both tried and both silently collapse to one column for this content
+  shape). Signal cards get a tone-tinted background wash and rounded
+  left-accent border instead of a plain ruled list; the header gains a
+  colored rule and a pill-styled date badge; the plan rail's stat strip
+  becomes a 2x2 tile grid (the narrower rail can't fit 4 tiles across).
+  Verified 1-page fit via `pdfplumber` page-count checks against the
+  documented 3-5 takeaway maximum, not by eyeballing a render.
+
 ## [0.21.0] - 2026-07-09
 
 ### Removed

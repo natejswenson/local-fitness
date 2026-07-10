@@ -1766,9 +1766,24 @@ def test_generate_brief_report_coaching_line_failure_falls_back(
     pdf_bytes = Path(payload["path"]).read_bytes()
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
+        # The 2026-07-09 layout puts signal cards and the Training Plan
+        # side by side as two real page columns — plain extract_text()
+        # reads left-to-right across the FULL page width per visual row,
+        # interleaving words from both columns and breaking up a phrase
+        # that lives entirely in the (right) plan column. Crop to the
+        # right half before extracting to read that phrase intact.
+        plan_text = "\n".join(
+            p.crop((p.width * 0.45, 0, p.width, p.height)).extract_text() or ""
+            for p in doc.pages
+        )
     assert "TRAINING PLAN" in text
+    # The narrow right rail can word-wrap mid phrase (e.g. "9:23/" then
+    # "mi." on the next PDF line, with no real space between them) — strip
+    # ALL whitespace from both sides so a wrap-induced newline can't be
+    # mistaken for (or masked by) a real space.
+    squashed = "".join(plan_text.split())
     # fallback_coaching_line's deterministic phrasing for a partial prior day.
-    assert "Today: easy 2.49 mi @ 9:23/mi." in text
+    assert "".join("Today: easy 2.49 mi @ 9:23/mi.".split()) in squashed
 
 
 def test_generate_brief_report_no_active_plan_has_no_plan_section(seeded, reports_tmp):
