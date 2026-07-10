@@ -74,7 +74,7 @@ jobs:
           include-hidden-files: true
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
           fail_ci_if_error: false  # badge/upload is informational; the gate lives in pytest
