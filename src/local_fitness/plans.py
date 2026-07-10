@@ -591,6 +591,49 @@ def delete_plan(plan_id: int, db_path: Path | None = None) -> None:
             raise PlanNotFoundError(f"no plan {plan_id}")
 
 
+def discard_draft(plan_id: int, db_path: Path | None = None) -> None:
+    """Archive a DRAFT plan without activating it.
+
+    Unlike commit_plan's check-then-write (SELECT status, then an
+    unconditional UPDATE), discard_draft folds the status guard into the
+    UPDATE's WHERE clause itself, closing the TOCTOU at the SQL layer
+    instead of via a separate SELECT. If rowcount == 0, the row either
+    doesn't exist or isn't currently a draft; a follow-up existence check
+    (same connection, not a fresh one) disambiguates PlanNotFoundError from
+    NotDraftError. Refuses active/archived targets so a call can never
+    archive the live plan by mistake."""
+    with db.connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE training_plans SET status='archived' "
+            "WHERE plan_id=? AND status='draft'", (plan_id,),
+        )
+        if cur.rowcount == 0:
+            found = conn.execute(
+                "SELECT status FROM training_plans WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+            if found is None:
+                raise PlanNotFoundError(f"no plan {plan_id}")
+            raise NotDraftError(f"plan {plan_id} is '{found['status']}', not draft")
+
+
+def abandon_active_plan(db_path: Path | None = None) -> int:
+    """Archive the currently active plan, leaving no active plan.
+
+    Returns the archived plan's plan_id. Raises NoActivePlanError if none
+    exists. The RETURNING clause is itself the atomic check — no separate
+    SELECT-then-write, so there's no window for a concurrent writer to race
+    this call."""
+    with db.connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE training_plans SET status='archived' "
+            "WHERE status='active' RETURNING plan_id"
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise NoActivePlanError("no active plan")
+        return row["plan_id"]
+
+
 def _dump_snapshot(snapshot) -> str | None:
     if snapshot is None:
         return None
