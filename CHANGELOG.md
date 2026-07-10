@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-09
+
 ### Removed
 - **The web UI is retired.** The entire `web/` directory (React/Vite SPA,
   ~3,800 LOC), every UI-only REST route (`/api/today`, `/api/metric/{name}`,
