@@ -1,6 +1,7 @@
 name: CodeQL
 
-# Static security analysis over the Python backend.
+# Static security analysis over the Python backend, plus GitHub Actions
+# workflow scanning (supply-chain / injection issues in .github/workflows/*.yml).
 # Free for public repos; surfaces injection / auth / path issues on the same
 # code paths the security contract in CLAUDE.md protects.
 on:
@@ -24,15 +25,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [python]
+        include:
+          - language: python
+            queries: security-and-quality
+          # Scans .github/workflows/*.yml for supply-chain / injection issues
+          # (untrusted-input-in-run-step, etc). Not a JS/TS stand-in — CodeQL
+          # 2.23.5+ correctly errors if `javascript`/`javascript-typescript`
+          # is used to scan workflow YAML with no real JS/TS source behind
+          # it (this repo has none since the web UI's retirement); `actions`
+          # is the real, dedicated language for this.
+          - language: actions
+            queries: ""
     steps:
       - uses: actions/checkout@v7
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          language: ${{ matrix.language }}
-          queries: security-and-quality
+          languages: ${{ matrix.language }}
+          queries: ${{ matrix.queries }}
 
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
