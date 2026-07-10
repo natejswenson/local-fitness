@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **The brief PDF's 2-column signal-card grid never actually rendered as
+  2 columns.** Shipped in the 0.20.0 redesign, the `display: flex;
+  flex-wrap: wrap` (and a subsequently-tried `display: grid;
+  grid-template-columns: 1fr 1fr`) CSS both looked correct as source but
+  WeasyPrint 69.0 rendered every card on its own row regardless — a gap
+  only caught by objectively measuring rendered word positions with
+  `pdfplumber`, not by eyeballing a thumbnail or checking HTML class
+  names. Replaced with an HTML `<table>` (the one layout primitive
+  WeasyPrint reliably supports for this), verified correct against real,
+  wrapping takeaway content, with new geometry-based regression tests
+  (`tests/test_visuals.py`) that assert actual rendered x/y positions
+  instead of just HTML structure.
+
 ## [0.21.0] - 2026-07-09
 
 ### Removed

@@ -179,25 +179,40 @@ h1 {{ font-size: 1.4em; margin-bottom: 0.2em; }}
 h1 .date {{ color: {INK_FAINT}; font-weight: normal; font-size: 0.7em; }}
 
 /* Section 1: signal cards (formerly one stacked column of takeaways),
-   now a 2-column flex grid — robust to any takeaway count, not a fixed
-   2x2 (brief_planner triggers a variable N per day). Flexbox, not CSS
-   Grid: the longer-established, more reliably-supported layout model in
-   WeasyPrint. An odd-count last card spans the full width (.span-full,
-   computed in Python) rather than leaving a dangling gap. */
-div.signals {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1em;
+   now paired 2-up into an HTML table — robust to any takeaway count, not
+   a fixed 2x2 (brief_planner triggers a variable N per day). An odd-count
+   last card gets `colspan="2"` (computed in Python) rather than leaving
+   a dangling gap or a half-empty row.
+
+   Table, NOT flexbox or CSS Grid: both were tried and both are broken in
+   WeasyPrint 69.0 for this content shape — `display: flex; flex-wrap:
+   wrap` never actually wraps items onto the same row (every item lands
+   on its own row regardless of flex-basis, content length, or which
+   other rules are in the sheet), and `display: grid;
+   grid-template-columns: 1fr 1fr` mis-places items into extra implicit
+   narrow columns once row count / odd-card colspan get involved. Table
+   layout is one of the oldest, most reliable parts of any CSS engine
+   (this file already leans on it for div.details/week-table) and is
+   confirmed correct here via pdfplumber word bounding boxes (two
+   distinct x0 values per row, colspan row spans both) against real,
+   wrapping takeaway content — not just short placeholder text, which is
+   what made the flex/grid failures easy to miss originally. */
+table.signals {{
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0 1em;
+  table-layout: fixed;
   margin: 1em 0;
 }}
+table.signals td {{ vertical-align: top; }}
+table.signals td.cell-left {{ padding-right: 0.5em; }}
+table.signals td.cell-right {{ padding-left: 0.5em; }}
+table.signals td.cell-full {{ padding: 0; }}
 section.signal-card {{
-  flex: 1 1 calc(50% - 0.5em);
-  min-width: 0;
   border-left: 4px solid {PRIMARY};
   padding: 0.6em 1em;
   page-break-inside: avoid;
 }}
-section.signal-card.span-full {{ flex-basis: 100%; }}
 section.tone-positive {{ border-left-color: {GOOD}; }}
 section.tone-caution {{ border-left-color: {WARNING}; }}
 section.tone-critical {{ border-left-color: {CRITICAL}; }}
@@ -395,13 +410,12 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
 
 def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | None) -> str:
     """Assemble the full report HTML string. Separated from `render_brief_pdf`
-    so layout/structure (e.g. which signal card gets `.span-full`) is
-    testable via plain string assertions, without needing to introspect
-    WeasyPrint's PDF layout output."""
+    so layout/structure (e.g. which row gets `colspan="2"`) is testable via
+    plain string assertions, without needing to introspect WeasyPrint's PDF
+    layout output."""
     import markdown as md_lib
 
-    n = len(brief.takeaways)
-    sections: list[str] = []
+    cards: list[str] = []
     for index, takeaway in enumerate(brief.takeaways):
         headline = html.escape(takeaway.headline)
         summary = html.escape(takeaway.summary)
@@ -412,9 +426,8 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
         details_html = md_lib.markdown(takeaway.details, extensions=["tables"])
         png_bytes = charts.get(str(index))
         chart_img = f'<img class="chart" src="{_data_uri(png_bytes)}" alt="chart">' if png_bytes else ""
-        span_full = " span-full" if (n % 2 == 1 and index == n - 1) else ""
-        sections.append(f"""
-        <section class="signal-card tone-{html.escape(takeaway.tone)}{span_full}">
+        cards.append(f"""
+        <section class="signal-card tone-{html.escape(takeaway.tone)}">
           <h2>{headline}</h2>
           <p class="summary">{summary}</p>
           {chart_img}
@@ -422,7 +435,21 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
         </section>
         """)
 
-    signals_html = f'<div class="signals">{"".join(sections)}</div>' if sections else ""
+    # Pair cards 2-up into table rows (see the `table.signals` CSS comment
+    # for why a table, not flex/grid). An odd trailing card gets its own
+    # full-width row via colspan="2".
+    rows: list[str] = []
+    i = 0
+    while i < len(cards):
+        if i + 1 < len(cards):
+            rows.append(f'<tr><td class="cell-left">{cards[i]}</td>'
+                        f'<td class="cell-right">{cards[i + 1]}</td></tr>')
+            i += 2
+        else:
+            rows.append(f'<tr><td class="cell-full" colspan="2">{cards[i]}</td></tr>')
+            i += 1
+
+    signals_html = f'<table class="signals"><colgroup><col><col></colgroup>{"".join(rows)}</table>' if rows else ""
     plan_html = _render_plan_section_html(plan_section)
 
     return f"""<!doctype html>

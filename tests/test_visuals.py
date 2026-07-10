@@ -173,28 +173,100 @@ def _takeaways(n: int) -> list[Takeaway]:
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 5])
-def test_build_html_span_full_count_matches_parity(n):
+def test_build_html_colspan_count_matches_parity(n):
     brief = _brief(_takeaways(n))
     html_out = visuals._build_html(brief, {}, None)
-    # ' span-full"' (leading space, trailing quote) matches only the actual
-    # rendered class attribute (`class="signal-card tone-x span-full"`) —
-    # a bare "span-full" substring also matches this file's own CSS rule
-    # and its explanatory comment, which are present in every render
-    # regardless of takeaway count.
-    span_full_count = html_out.count(' span-full"')
-    assert span_full_count == (1 if n % 2 == 1 else 0)
+    # An odd count gets exactly one trailing full-width (colspan="2") row;
+    # an even count pairs every card into a two-<td> row with none. Match
+    # the actual rendered <td> attribute, not a bare "colspan=\"2\"" —
+    # that substring also appears in this file's own CSS comment, which is
+    # present in every render regardless of takeaway count.
+    colspan_count = html_out.count('class="cell-full" colspan="2"')
+    assert colspan_count == (1 if n % 2 == 1 else 0)
 
 
-def test_build_html_span_full_is_on_the_last_card_specifically():
+def test_build_html_colspan_is_on_the_last_card_specifically():
     brief = _brief(_takeaways(3))
     html_out = visuals._build_html(brief, {}, None)
-    # Split into per-card chunks on the signal-card class and confirm only
-    # the chunk containing "h2" (the 3rd, last, 0-indexed card) has span-full.
-    cards = html_out.split('class="signal-card')[1:]
-    assert len(cards) == 3
-    assert ' span-full"' not in cards[0]
-    assert ' span-full"' not in cards[1]
-    assert ' span-full"' in cards[2]
+    # Split into per-row chunks on <tr> and confirm only the last row (the
+    # 3rd, last, 0-indexed card, alone after pairing 0+1) is full-width.
+    rows = html_out.split("<tr>")[1:]
+    assert len(rows) == 2
+    assert 'colspan="2"' not in rows[0]
+    assert 'colspan="2"' in rows[1]
+
+
+def _heading_positions(pdf_bytes: bytes, words: list[str]) -> dict[str, tuple[float, float]]:
+    """Map each single-token headline word to its (x0, top) position on the
+    first PDF page. Used to assert genuine rendered column placement — HTML
+    string assertions alone can't catch a layout engine silently collapsing
+    a 2-column design to one column (which is exactly what happened here:
+    the flex/grid-based CSS looked correct as a string but WeasyPrint 69.0
+    rendered every card on its own row regardless)."""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        found = {w["text"]: (w["x0"], w["top"]) for w in doc.pages[0].extract_words()}
+    missing = [w for w in words if w not in found]
+    assert not missing, f"expected headline tokens not found in rendered PDF: {missing}"
+    return {w: found[w] for w in words}
+
+
+def test_render_brief_pdf_paired_cards_render_in_two_distinct_columns():
+    # Single-token, non-wrapping headlines so each word's position
+    # unambiguously identifies its card.
+    words = ["Alphahead", "Betahead", "Gammahead", "Deltahead"]
+    brief = _brief([
+        Takeaway(headline=w, summary=f"s{i}", tone="neutral", details=f"d{i}")
+        for i, w in enumerate(words)
+    ])
+    pdf = visuals.render_brief_pdf(brief, {})
+    pos = _heading_positions(pdf, words)
+
+    # Row 1 (Alphahead, Betahead): same top (same row), distinct x0 (columns).
+    assert pos["Alphahead"][1] == pos["Betahead"][1]
+    assert pos["Alphahead"][0] != pos["Betahead"][0]
+    # Row 2 (Gammahead, Deltahead): same pairing, and strictly below row 1.
+    assert pos["Gammahead"][1] == pos["Deltahead"][1]
+    assert pos["Gammahead"][0] != pos["Deltahead"][0]
+    assert pos["Gammahead"][1] > pos["Alphahead"][1]
+    # The two columns line up: left members share an x0, right members share one.
+    left_x, right_x = sorted([pos["Alphahead"][0], pos["Betahead"][0]])
+    assert {pos["Gammahead"][0], pos["Deltahead"][0]} == {left_x, right_x}
+
+
+def test_render_brief_pdf_odd_trailing_card_spans_full_row_width():
+    words = ["Alphahead", "Betahead", "Gammahead"]
+    # The odd card's summary is one long unbroken-enough line — in a
+    # half-width column it wraps well before reaching the second column's
+    # x-position; at full (colspan="2") width it doesn't have to.
+    long_summary = "one two three four five six seven eight nine ten eleven twelve"
+    brief = _brief([
+        Takeaway(headline=w, summary=(long_summary if w == "Gammahead" else f"s{i}"),
+                  tone="neutral", details=f"d{i}")
+        for i, w in enumerate(words)
+    ])
+    pdf = visuals.render_brief_pdf(brief, {})
+    pos = _heading_positions(pdf, words)
+
+    left_x = min(pos["Alphahead"][0], pos["Betahead"][0])
+    right_x = max(pos["Alphahead"][0], pos["Betahead"][0])
+    # The odd trailing card starts at the left column, not the right one —
+    # colspan="2" widens its cell rather than shifting it into column 2.
+    # Sub-point tolerance: the colspan cell's padding differs slightly from
+    # a single-column cell's, which shifts its left edge by a fraction of a
+    # point — not the multi-point difference a real column jump would cause.
+    assert abs(pos["Gammahead"][0] - left_x) < 2
+    assert pos["Gammahead"][1] > pos["Alphahead"][1]
+
+    # And its row is genuinely full-width: the long summary's first line
+    # must run at least past the right column's start x-position, which a
+    # half-width cell (the pre-fix, single-column-only behavior) could not.
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        summary_words = [w for w in doc.pages[0].extract_words() if w["text"] == "one"]
+    assert summary_words, "summary text 'one' not found in rendered PDF"
+    summary_top = summary_words[0]["top"]
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        same_line = [w for w in doc.pages[0].extract_words() if w["top"] == summary_top]
+    assert max(w["x1"] for w in same_line) > right_x
 
 
 def test_render_plan_section_html_none_is_empty_string():
