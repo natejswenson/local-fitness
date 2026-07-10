@@ -45,7 +45,8 @@ services:
       # Long-lived Claude Code subscription token (so the Agent SDK
       # subprocess can authenticate without per-request API billing)
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
-      # Bearer token gating /api/* AND /mcp/ — REQUIRED when binding 0.0.0.0
+      # Bearer token gating /mcp/ (and every other non-public path) —
+      # REQUIRED when binding 0.0.0.0
       - LOCAL_FITNESS_API_TOKEN=${LOCAL_FITNESS_API_TOKEN}
       # MCP server host allowlist — MUST include the served host or every
       # /mcp/ request 421s (DNS-rebinding guard). Default includes
@@ -80,12 +81,11 @@ docker compose up -d --build local-fitness
 
 ### Per-device login
 
-The web UI checks `/api/auth/verify` on first paint. With auth on, the
-unauthenticated probe returns 401 and the `AuthGate` component shows
-a single-input login form. Paste the value of
-`LOCAL_FITNESS_API_TOKEN` once per device — it persists in the
-browser's `localStorage` and the user never sees the screen again
-unless the server token rotates.
+There is no browser session — every client is an MCP client (Claude
+Code/Desktop/Mobile, opencode) authenticating directly via the
+`Authorization: Bearer <token>` header on the `/mcp/` transport. Configure
+the token once in each client's MCP server config; a request with no or
+the wrong header gets a 401 from the bearer middleware.
 
 ### Rotating the token
 
@@ -93,8 +93,9 @@ unless the server token rotates.
 2. Update the compose-side `.env`.
 3. `docker compose up -d local-fitness` (no rebuild needed; env-only
    change recreates the container).
-4. Every previously-logged-in device's next request returns 401, the
-   `AuthGate` re-prompts mid-session, user pastes new token, done.
+4. Every previously-configured client's next `/mcp/` request now 401s —
+   update the token in that client's MCP server config (wherever the
+   `Authorization: Bearer` header is set) and it resumes.
 
 ## Host CLI / dev mode
 

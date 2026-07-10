@@ -61,81 +61,18 @@ def app_no_token(monkeypatch, hermetic_db):
     return srv
 
 
-@pytest.mark.anyio
-async def test_spa_fallback_blocks_path_traversal(app_no_token, monkeypatch):
-    """Confirmed exploit from the 2026-05-04 audit: GET /../../pyproject.toml
-    used to return 200 with the file. The fix resolves the candidate path
-    and rejects any escape from WEB_DIST. We probe via raw ASGI with `..`
-    segments preserved (httpx's outer client normalizes; the ASGI scope
-    skips that and reaches the route handler with the raw path).
-    """
-    if not app_no_token.WEB_DIST.exists():
-        pytest.skip("web/dist not built — run `cd web && pnpm build` first")
+# test_spa_fallback_blocks_path_traversal (deleted): exercised the SPA
+# catch-all's WEB_DIST containment check. Part B removes that entire route
+# (no file-serving route left in the app) along with web/, so the concern
+# is moot, not merely untested — see docs/plans/2026-07-09-mcp-speed-and-
+# ui-retirement-design.md.
 
-    async def asgi_get(path: str) -> tuple[int, bytes]:
-        body_chunks: list[bytes] = []
-        status_code = {"v": 0}
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(msg):
-            if msg["type"] == "http.response.start":
-                status_code["v"] = msg["status"]
-            elif msg["type"] == "http.response.body":
-                body_chunks.append(msg.get("body", b""))
-
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.3"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": path,
-            "raw_path": path.encode("utf-8"),
-            "query_string": b"",
-            "root_path": "",
-            "headers": [],
-            "client": ("127.0.0.1", 12345),
-            "server": ("testserver", 80),
-        }
-        await app_no_token.app(scope, receive, send)
-        return status_code["v"], b"".join(body_chunks)
-
-    # Each of these would have served arbitrary disk content pre-fix.
-    for traversal in [
-        "/../../pyproject.toml",
-        "/../../../README.md",
-        "/foo/../../../README.md",
-        "/../../data/fitness.db",
-        "/../../.env",
-    ]:
-        status, body = await asgi_get(traversal)
-        # The handler now returns the SPA index.html (HTML) on traversal
-        # rather than the requested file. Confirm: 200, but body is the
-        # SPA shell (small) rather than e.g. pyproject.toml (~700 bytes
-        # of TOML) or README.md (~6 KB of markdown starting with `#`).
-        assert status == 200, f"{traversal} returned {status}"
-        assert b"[project]" not in body, f"{traversal} leaked pyproject.toml"
-        assert b"# local-fitness" not in body, f"{traversal} leaked README.md"
-        assert body.lstrip().startswith(b"<!"), (
-            f"{traversal} returned non-HTML body — possible regression"
-        )
-
-
-@pytest.mark.anyio
-async def test_api_requires_bearer_when_token_set(app_with_token):
-    transport = httpx.ASGITransport(app=app_with_token.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        # No token → 401 on /api/* (except /health and /api/auth/verify)
-        r = await c.get("/api/today")
-        assert r.status_code == 401
-        # Wrong token → 401
-        r = await c.get("/api/today", headers={"Authorization": "Bearer wrong"})
-        assert r.status_code == 401
-        # Correct token → not 401 (may be 500 on empty DB but auth passed)
-        r = await c.get("/api/status", headers={"Authorization": "Bearer test-token-fixed"})
-        assert r.status_code != 401, f"correct token still got {r.status_code}: {r.text}"
+# test_api_requires_bearer_when_token_set (deleted): asserted 401/!=401
+# against /api/today and /api/status, both removed by Part B. Superseded by
+# test_mcp_endpoint_requires_bearer above plus the /mcp/-targeted
+# test_auth_rejects_without_bearer / test_auth_rejects_wrong_token /
+# test_auth_accepts_valid_token below, which pin the same rejection- and
+# acceptance-side behavior against the route that actually survives.
 
 
 @pytest.mark.anyio
@@ -189,43 +126,99 @@ async def test_health_is_public(app_with_token):
         assert r.json() == {"status": "ok"}
 
 
-@pytest.mark.anyio
-async def test_auth_verify_path_is_public(app_with_token):
-    """The login screen needs to probe with whatever token the user typed,
-    so the verify endpoint must reach the auth middleware as a normal
-    request (it returns 401 on bad tokens, 200 on good ones)."""
-    transport = httpx.ASGITransport(app=app_with_token.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        r = await c.get("/api/auth/verify")
+# test_auth_verify_path_is_public (deleted): asserted 401/200 + a specific
+# JSON body against /api/auth/verify, removed by Part B (no login screen
+# left to probe a freshly-pasted token). See the /mcp/-targeted tests below
+# for the surviving middleware behavior this test was really pinning.
+
+# test_dashboards_require_auth (deleted): asserted 401 unauthed / 200 +
+# "values" authed against /api/activity-heatmap, /api/strength-volume,
+# /api/pace-efficiency — all three removed by Part B, no replacement (no
+# rebuild of the retired dashboard-specific visualizations planned).
+
+
+# --- /mcp/ auth-middleware behavior (salvaged + rewritten from the deleted
+# tests/test_web_api.py, which pinned the same behavior against /api/* routes
+# Part B removes) — /mcp/ is the only generic authed endpoint that survives,
+# so these target it directly via a TestClient context manager (drives the
+# ASGI lifespan, unlike the bare ASGITransport fixtures above, which are
+# sufficient for a 401-only check but not for a call that actually reaches
+# the mount) -----------------------------------------------------------------
+
+def _mcp_init_body() -> dict:
+    return {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "1"}},
+    }
+
+
+_MCP_HDRS = {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+
+
+def test_auth_rejects_without_bearer(app_with_token):
+    """No token configured → request proceeds unauthenticated" is the OTHER
+    fixture below; this pins the rejection side: a token IS configured and
+    no Authorization header is sent → 401."""
+    from starlette.testclient import TestClient
+
+    with TestClient(app_with_token.app, base_url="http://localhost") as c:
+        r = c.post("/mcp/", json=_mcp_init_body(), headers=_MCP_HDRS)
         assert r.status_code == 401
-        r = await c.get(
-            "/api/auth/verify",
-            headers={"Authorization": "Bearer test-token-fixed"},
-        )
-        assert r.status_code == 200
-        assert r.json() == {"ok": True, "auth_required": True}
+
+
+def test_auth_rejects_wrong_token(app_with_token):
+    from starlette.testclient import TestClient
+
+    with TestClient(app_with_token.app, base_url="http://localhost") as c:
+        r = c.post("/mcp/", json=_mcp_init_body(),
+                   headers={**_MCP_HDRS, "Authorization": "Bearer wrong"})
+        assert r.status_code == 401
+
+
+def test_auth_accepts_valid_token(app_with_token):
+    """Valid bearer token → request is accepted (reaches the MCP mount and
+    initializes, not just "not 401")."""
+    from starlette.testclient import TestClient
+
+    with TestClient(app_with_token.app, base_url="http://localhost") as c:
+        r = c.post("/mcp/", json=_mcp_init_body(),
+                   headers={**_MCP_HDRS, "Authorization": "Bearer test-token-fixed"})
+        assert r.status_code == 200, r.text
+
+
+def test_auth_verify_open_when_no_token(app_no_token):
+    """No token configured → request proceeds unauthenticated (host-CLI dev
+    convenience on loopback)."""
+    from starlette.testclient import TestClient
+
+    with TestClient(app_no_token.app, base_url="http://localhost") as c:
+        r = c.post("/mcp/", json=_mcp_init_body(), headers=_MCP_HDRS)
+        assert r.status_code == 200, r.text
 
 
 @pytest.mark.anyio
-async def test_dashboards_require_auth(app_with_token):
-    """All three dashboard endpoints land under /api/, so the bearer
-    middleware should gate them automatically. Pinning the contract so
-    a future endpoint move can't quietly drop auth."""
+async def test_root_public(app_no_token):
+    """No token configured, and GET / has no route left (SPA retired) —
+    falls straight through to FastAPI's 404, not the auth gate."""
+    transport = httpx.ASGITransport(app=app_no_token.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.get("/")
+        assert r.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_root_public_even_with_token(app_with_token):
+    """Token configured, no Authorization header sent, GET / — deny-by-
+    default means `/` is no longer in _is_public_path's whitelist, so the
+    bearer check now runs and rejects the missing header BEFORE routing
+    ever gets a chance to 404 on the (also-deleted) route."""
     transport = httpx.ASGITransport(app=app_with_token.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        for path in (
-            "/api/activity-heatmap",
-            "/api/strength-volume",
-            "/api/pace-efficiency",
-        ):
-            r = await c.get(path)
-            assert r.status_code == 401, f"{path} returned {r.status_code}"
-            r = await c.get(
-                path, headers={"Authorization": "Bearer test-token-fixed"}
-            )
-            assert r.status_code == 200, f"{path} with token returned {r.status_code}: {r.text}"
-            body = r.json()
-            assert "values" in body, f"{path} response missing `values`: {body}"
+        r = await c.get("/")
+        assert r.status_code == 401
+
 
 
 @pytest.mark.anyio
@@ -253,35 +246,16 @@ async def test_csp_blocks_inline_scripts(app_no_token):
         assert "'unsafe-inline'" not in csp.split("style-src")[0]  # not on script-src
 
 
-@pytest.mark.anyio
-async def test_plan_endpoints_require_auth(app_with_token):
-    """GET/commit/delete on /api/plan must be bearer-gated by the middleware,
-    and the int path param must reject non-int (no injection surface)."""
-    transport = httpx.ASGITransport(app=app_with_token.app)
-    tok = {"Authorization": "Bearer test-token-fixed"}
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        # GET
-        assert (await c.get("/api/plan")).status_code == 401
-        assert (await c.get("/api/plan", headers=tok)).status_code == 200
-        # commit
-        assert (await c.post("/api/plan/1/commit")).status_code == 401
-        # with token: 404 (no such plan) — auth passed, not 401
-        assert (await c.post("/api/plan/1/commit", headers=tok)).status_code == 404
-        # delete
-        assert (await c.delete("/api/plan/1")).status_code == 401
-        # non-int path param rejected (422) once authed
-        assert (await c.post("/api/plan/abc/commit", headers=tok)).status_code == 422
+# test_plan_endpoints_require_auth (deleted): asserted 401/200/404/422
+# against /api/plan* routes, all removed by Part B — plan reads/writes now
+# happen exclusively through the authenticated MCP tool surface (same trust
+# boundary as every other plan-write tool), not a separate REST path.
 
-
-def test_plan_components_have_no_raw_html_sink():
-    """AI-authored plan strings (title/description/ability_snapshot) must never
-    reach dangerouslySetInnerHTML — escaped JSX text only (design H1)."""
-    from pathlib import Path
-
-    web_src = Path(__file__).resolve().parent.parent / "web" / "src"
-    plan_file = web_src / "components" / "TrainingPlan.tsx"
-    assert plan_file.exists(), "TrainingPlan.tsx not found"
-    assert "dangerouslySetInnerHTML" not in plan_file.read_text()
+# test_plan_components_have_no_raw_html_sink (deleted): asserted
+# web/src/components/TrainingPlan.tsx exists and has no
+# dangerouslySetInnerHTML sink. Part B deletes web/ entirely, so the file
+# under test no longer exists — the XSS/stored-injection concern this test
+# guarded is moot once there's no JSX rendering AI-authored plan strings.
 
 
 def test_serve_refuses_non_loopback_without_token(monkeypatch):
@@ -389,15 +363,24 @@ async def test_run_sql_bounds_long_query_by_deadline(run_sql_db, monkeypatch):
 
 
 def test_is_public_path_uppercase_api_not_public():
-    """Case-insensitivity regression: GET /API/TODAY matches no real API route
-    and would fall to the SPA catch-all — but the auth gate must still treat it
-    as NON-public so router and gate agree on case."""
+    """Case-sensitivity is moot post-deny-by-default (every path denies
+    unless it's the literal "/health" whitelist entry), but this keeps the
+    historical regression pinned: an uppercase /API/* path was never
+    treated as the public /api/ prefix, and still isn't."""
     from local_fitness.web import server as srv
 
     assert srv._is_public_path("/API/TODAY") is False
     assert srv._is_public_path("/Api/Plan") is False
     assert srv._is_public_path("/MCP/") is False
-    # Legitimate public paths still public.
     assert srv._is_public_path("/health") is True
-    assert srv._is_public_path("/") is True
-    assert srv._is_public_path("/assets/index.js") is True
+
+
+def test_is_public_path_deny_by_default():
+    """No SPA shell to serve unauthenticated means an arbitrary unknown path
+    denies by default now, where it used to fall through to public — see
+    CLAUDE.md's "whitelist explicitly" security convention."""
+    from local_fitness.web import server as srv
+
+    assert srv._is_public_path("/foo") is False
+    assert srv._is_public_path("/") is False
+    assert srv._is_public_path("/assets/index.js") is False

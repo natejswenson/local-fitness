@@ -1053,8 +1053,9 @@ def test_fetch_metric_series_unknown_metric_raises(seeded):
 
 
 def test_write_atomic_rejects_escaping_final_name(tmp_path):
-    # INV-T4: containment check mirrors web/server.py's SPA-fallback route —
-    # a final_name that resolves outside reports_dir must raise before write.
+    # INV-T4: the CLAUDE.md-mandated .resolve().relative_to() containment
+    # pattern — a final_name that resolves outside reports_dir must raise
+    # before write.
     reports_dir = tmp_path / "reports"
     with pytest.raises(ValueError):
         tools._write_atomic(reports_dir, "../escaped.pdf", b"data")

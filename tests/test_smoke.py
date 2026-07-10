@@ -39,7 +39,9 @@ def test_baselines_empty_db(tmp_path: Path, monkeypatch):
 
 def test_tool_schemas_well_formed():
     """Every tool has a name + description + handler."""
-    assert len(agent_tools.ALL_TOOLS) == 30  # +sync_garmin_data (MCP-triggered Garmin sync)
+    # +commit_training_plan/discard_training_plan_draft/abandon_active_plan
+    # (agent owns the full plan lifecycle post-UI-retirement)
+    assert len(agent_tools.ALL_TOOLS) == 33
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

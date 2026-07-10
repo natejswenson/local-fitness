@@ -8,10 +8,6 @@ __pycache__
 .pytest_cache
 .ruff_cache
 
-# Frontend build artifacts — rebuilt inside the container
-web/node_modules
-web/dist
-
 # Local data that should never bake into the image
 data
 briefings

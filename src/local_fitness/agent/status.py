@@ -96,12 +96,23 @@ def _tsb_interpretation(tsb: float | None) -> str:
 
 def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Build the per-metric rows: baseline_delta for the five baselined
-    metrics, trend_arrow for the trend set, raw for everything else."""
-    # Today's daily_metrics row (may be absent on an empty/new DB).
-    today_row_raw = conn.execute(
-        "SELECT * FROM daily_metrics WHERE date = ?", (today,)
-    ).fetchone()
-    today_row = dict(today_row_raw) if today_row_raw else {}
+    metrics, trend_arrow for the trend set, raw for everything else.
+
+    One query fetches the trailing trend window (which always includes
+    ``today``, its last day) up front; today's row and each trend metric's
+    series are then sliced out of that single result set in Python, with
+    per-column null-filtering standing in for the old per-metric ``WHERE
+    <metric> IS NOT NULL`` clause."""
+    # Window is relative to the passed `today`, NOT wall-clock — so an
+    # injected `today` (fixtures / brief_planner) is reproducible.
+    cutoff = (date.fromisoformat(today) - timedelta(days=_TREND_WINDOW_DAYS)).isoformat()
+    window_rows = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM daily_metrics WHERE date >= ? AND date <= ? ORDER BY date",
+            (cutoff, today),
+        ).fetchall()
+    ]
+    today_row = next((r for r in window_rows if r["date"] == today), {})
 
     rows: list[dict[str, Any]] = []
     for metric in sorted(DAILY_NUMERIC_METRICS):
@@ -126,16 +137,7 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
             continue
 
         if metric in _TREND_METRICS:
-            # Window is relative to the passed `today`, NOT wall-clock — so an
-            # injected `today` (fixtures / brief_planner) is reproducible.
-            cutoff = (date.fromisoformat(today) - timedelta(days=_TREND_WINDOW_DAYS)).isoformat()
-            series = [
-                r["v"] for r in conn.execute(
-                    f"SELECT {metric} AS v FROM daily_metrics "
-                    f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date",
-                    (cutoff,),
-                ).fetchall()
-            ]
+            series = [r[metric] for r in window_rows if r.get(metric) is not None]
             rows.append({
                 "metric": metric,
                 "value": value,
