@@ -6,6 +6,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+- **The web UI is retired.** The entire `web/` directory (React/Vite SPA,
+  ~3,800 LOC), every UI-only REST route (`/api/today`, `/api/metric/{name}`,
+  `/api/training-load`, `/api/workouts`, `/api/workout/{id}`, `/api/brief`,
+  `/api/sync`, `/api/sync/status`, `/api/plan*`, `/api/activity-heatmap`,
+  `/api/strength-volume`, `/api/pace-efficiency`, `/api/status`,
+  `/api/config`, `/api/auth/verify`, `/api/notes*`), the
+  background-sync-orchestration subsystem, and SPA static-file serving are
+  gone. Docker's `web-builder` stage, CI's frontend build/test steps,
+  `.github/dependabot.yml`'s npm entry, and `codeql.yml`'s
+  javascript-typescript matrix leg are removed alongside it. `fitness
+  serve`'s `--open` flag (opened a browser to the now-nonexistent SPA) is
+  also gone.
+
+### Added
+- **Three new MCP tools cover the plan-lifecycle actions the UI's
+  commit/delete buttons used to be the only path for**: `commit_training_plan`
+  (activate a draft), `discard_training_plan_draft` (drop a draft without
+  activating it), and `abandon_active_plan` (archive the active plan with
+  nothing queued to replace it — no undo). The agent now owns the entire
+  training-plan lifecycle.
+
+### Changed
+- **`_is_public_path` now denies by default.** Only `/health` is explicitly
+  whitelisted; every other path (including `/mcp/`) requires the bearer
+  token whenever one is configured. The old blanket-public fallthrough for
+  non-`/api/` paths existed only to let an unauthenticated browser tab load
+  the SPA shell — with no SPA left, deny-by-default is the correct posture
+  per this repo's own security convention (whitelist explicitly, don't rely
+  on a permissive default).
+- **MCP tool speed: the brief/plan read paths now share ONE SQLite
+  connection per call instead of opening a fresh connection per lookup.**
+  `assemble_brief_context` (brief_planner.py) went from 9 `db.connect()`
+  opens to 1 when a training plan is active; `get_training_plan_progress`
+  went from 6 to 1; `get_training_plan_status` and `_build_plan_section`
+  each went from 4 to 1 (measured on a synthetic multi-year fixture — see
+  `tests/test_perf_benchmarks.py`). `db.py`, `config.py`, `plans.py`, and
+  `agent/coach.py` gained an optional `conn: sqlite3.Connection | None`
+  parameter on every function in these call chains — additive, no
+  behavior change for existing callers that omit it.
+- **`agent/status.py`'s `_metric_rows` collapsed from up to 4 queries to
+  1.** The per-trend-metric `WHERE <metric> IS NOT NULL` query is replaced
+  by a single trailing-window `SELECT *` with per-column null-filtering
+  done in Python.
+- **`agent/brief_planner.py`'s `_compute_signals` no longer scans the
+  entire `activities` table.** The run-history query is now bounded to a
+  35-day lookback (`_ACTIVITY_LOOKBACK_DAYS`) instead of unbounded back to
+  account creation. Accepted tradeoff: `days_since_last_run`/`recent_te`
+  read `None`/fewer-than-5 instead of the true (larger) value when a
+  runner's last run predates the 35-day window — covered by a regression
+  test.
+- **New `pytest-benchmark`-based perf-eval harness** (`tests/test_perf_benchmarks.py`,
+  `scripts/perf_fixture.py`, `.github/workflows/capture-perf-baseline.yml`),
+  proving the above with before/after connection counts and a CI-gated
+  latency comparison (`--benchmark-compare-fail=min:15%`) against a
+  committed `ubuntu-latest`-captured baseline — not eyeballed. Skipped on
+  every ordinary `pytest` run (`--benchmark-skip` in `pyproject.toml`);
+  only an explicit `--benchmark-only` invocation runs it.
+
 ## [0.20.0] - 2026-07-09
 
 ### Changed

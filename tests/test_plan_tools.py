@@ -84,6 +84,82 @@ def test_revise_refuses_committed_plan(seeded):
     assert plans.get_plan(pid, db_path=seeded)["title"] == "Sub-50" or True  # unchanged title
 
 
+# --- commit_training_plan / discard_training_plan_draft / abandon_active_plan
+
+def test_commit_activates_draft(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    body, err = call(tools.commit_training_plan, {"plan_id": pid})
+    assert not err and body == {"plan_id": pid, "status": "active"}
+    assert plans.get_plan(pid, db_path=seeded)["status"] == "active"
+
+
+def test_commit_rejects_wrong_type_plan_id(seeded):
+    body, err = call(tools.commit_training_plan, {"plan_id": "abc"})
+    assert err and "plan_id" in body["error"]
+
+
+def test_commit_rejects_missing_plan(seeded):
+    body, err = call(tools.commit_training_plan, {"plan_id": 9999})
+    assert err and "error" in body
+
+
+def test_commit_rejects_already_active_plan(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.commit_training_plan, {"plan_id": pid})
+    assert err and "error" in body
+
+
+def test_discard_draft_archives_without_activating(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    body, err = call(tools.discard_training_plan_draft, {"plan_id": pid})
+    assert not err and body == {"plan_id": pid, "status": "archived"}
+    assert plans.get_plan(pid, db_path=seeded)["status"] == "archived"
+    assert plans.get_active_plan(db_path=seeded) is None
+
+
+def test_discard_draft_rejects_wrong_type_plan_id(seeded):
+    body, err = call(tools.discard_training_plan_draft, {"plan_id": "abc"})
+    assert err and "plan_id" in body["error"]
+
+
+def test_discard_draft_rejects_missing_plan(seeded):
+    body, err = call(tools.discard_training_plan_draft, {"plan_id": 9999})
+    assert err and "error" in body
+
+
+def test_discard_draft_refuses_active_plan(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.discard_training_plan_draft, {"plan_id": pid})
+    assert err and "error" in body
+    assert plans.get_plan(pid, db_path=seeded)["status"] == "active"  # untouched
+
+
+def test_abandon_active_plan_archives(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.abandon_active_plan, {})
+    assert not err and body == {"plan_id": pid, "status": "archived"}
+    assert plans.get_active_plan(db_path=seeded) is None
+
+
+def test_abandon_active_plan_no_active_errors(seeded):
+    body, err = call(tools.abandon_active_plan, {})
+    assert err and "error" in body
+
+
+def test_new_plan_lifecycle_tools_registered():
+    names = {t.name for t in tools.ALL_TOOLS}
+    assert {"commit_training_plan", "discard_training_plan_draft", "abandon_active_plan"} <= names
+
+
+def test_new_plan_lifecycle_tools_not_read_only():
+    ro = set(tools.read_only_tool_names())
+    for name in ("commit_training_plan", "discard_training_plan_draft", "abandon_active_plan"):
+        assert f"mcp__fitness__{name}" not in ro
+
+
 def test_status_inactive(seeded):
     body, _ = call(tools.get_training_plan_status, {})
     assert body == {"active": False}

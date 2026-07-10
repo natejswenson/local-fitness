@@ -110,6 +110,40 @@ def test_delete_missing_raises(dbp):
         plans.delete_plan(9999, db_path=dbp)
 
 
+def test_discard_draft_archives(dbp):
+    pid = plans.insert_draft(_plan(), [_wk()], db_path=dbp)
+    plans.discard_draft(pid, db_path=dbp)
+    assert plans.get_plan(pid, db_path=dbp)["status"] == "archived"
+
+
+def test_discard_draft_missing_raises(dbp):
+    with pytest.raises(plans.PlanNotFoundError):
+        plans.discard_draft(9999, db_path=dbp)
+
+
+def test_discard_draft_refuses_active(dbp):
+    pid = plans.insert_draft(_plan(), [_wk()], db_path=dbp)
+    plans.commit_plan(pid, now="t", db_path=dbp)
+    with pytest.raises(plans.NotDraftError):
+        plans.discard_draft(pid, db_path=dbp)
+    assert plans.get_plan(pid, db_path=dbp)["status"] == "active"  # untouched
+
+
+def test_abandon_active_plan_archives_and_returns_id(dbp):
+    pid = plans.insert_draft(_plan(), [_wk()], db_path=dbp)
+    plans.commit_plan(pid, now="t", db_path=dbp)
+    archived_id = plans.abandon_active_plan(db_path=dbp)
+    assert archived_id == pid
+    assert plans.get_plan(pid, db_path=dbp)["status"] == "archived"
+    assert plans.get_active_plan(db_path=dbp) is None
+
+
+def test_abandon_active_plan_no_active_raises(dbp):
+    plans.insert_draft(_plan(), [_wk()], db_path=dbp)  # a draft, never committed
+    with pytest.raises(plans.NoActivePlanError):
+        plans.abandon_active_plan(db_path=dbp)
+
+
 def test_cannot_force_second_active_plan(dbp):
     """The partial unique index is the race backstop: even a direct UPDATE
     that would create a second active plan must fail loudly (design H5)."""

@@ -40,9 +40,8 @@ SERVER_NAME = "fitness"
 
 BASELINE_METRICS = {"rhr", "sleep_seconds"}
 
-# Mirrors web/server.py's SYNC_MAX_DAYS — keeps a chat-triggered sync as
-# bite-sized as the UI's auto-sync so a long absence doesn't turn one tool
-# call into a multi-minute Garmin backfill.
+# Caps a chat-triggered sync's lookback so a long absence doesn't turn one
+# tool call into a multi-minute Garmin backfill.
 SYNC_MAX_DAYS = 30
 
 # The single source of truth for observation-type validation. Numeric types
@@ -1222,15 +1221,16 @@ async def delete_manual_workout(args: dict) -> dict:
     })
 
 
-# --- Training plans (the first agent->SQLite write path; DRAFT-ONLY) -------
+# --- Training plans (the agent owns the entire plan lifecycle) -------------
 #
-# Plan STRUCTURE stays draft-gated: propose/revise only touch drafts, `status`
-# is never an input, and activation/deletion is a human action via REST. But the
-# agent is the plan write path for per-day prescriptions: `update_plan_workout`
-# re-prescribes a single day on the ACTIVE plan (the web UI is view-only). It
-# edits prescription columns only — it can move a long run or swap a session, but
-# it cannot re-key, re-status, or restructure the plan. See plans.py for the
-# enforced write boundary.
+# The agent is the sole plan write path: propose/revise create and edit DRAFT
+# structure (`status` is never a caller input), `update_plan_workout`
+# re-prescribes a single day on the ACTIVE plan (prescription columns only —
+# it can move a long run or swap a session, but it cannot re-key, re-status,
+# or restructure the plan), and commit_training_plan/discard_training_plan_draft/
+# abandon_active_plan cover the rest of the lifecycle (activate a draft, drop a
+# draft, or abandon the active plan outright). See plans.py for the enforced
+# write boundary.
 
 _PROPOSE_PLAN_SCHEMA = {
     "type": "object",
@@ -1272,7 +1272,9 @@ _EDITABLE_TOOL_FIELDS = ("goal_type", "race_date", "target_time_seconds", "goal_
     "Create a DRAFT training plan from a goal + a full workout schedule you "
     "generated. Ground it first: call training_load_status, get_today_status, "
     "and query_workouts to read the athlete's real fitness before proposing. "
-    "Archives any prior draft. Does NOT activate the plan — the user commits it.",
+    "Archives any prior draft. Does NOT activate the plan — call "
+    "commit_training_plan to activate it, or discard_training_plan_draft to "
+    "drop it.",
     _PROPOSE_PLAN_SCHEMA,
 )
 async def propose_training_plan(args: dict) -> dict:
@@ -1308,7 +1310,8 @@ async def propose_training_plan(args: dict) -> dict:
     "revise_training_plan",
     "Revise the DRAFT plan during a riff: update goal fields and/or replace the "
     "workout set wholesale. Only works on a draft (refuses active/archived "
-    "plans). Cannot change a plan's status — the user commits via the UI.",
+    "plans). Cannot change a plan's status — call commit_training_plan to "
+    "activate it, or discard_training_plan_draft to drop it.",
     _REVISE_PLAN_SCHEMA,
 )
 async def revise_training_plan(args: dict) -> dict:
@@ -1355,11 +1358,10 @@ _UPDATE_WORKOUT_SCHEMA = {
 
 @tool(
     "update_plan_workout",
-    "Re-prescribe ONE day on the ACTIVE training plan (the agent is the plan "
-    "write path; the web UI is view-only). Pass the date plus any of "
-    "type/distance_mi/pace_min_per_mi/description — use it to move a long run, "
-    "swap days, or adjust a session. type='rest' clears distance & pace. Edits "
-    "the prescription only; it cannot re-key or restructure the plan.",
+    "Re-prescribe ONE day on the ACTIVE training plan. Pass the date plus any "
+    "of type/distance_mi/pace_min_per_mi/description — use it to move a long "
+    "run, swap days, or adjust a session. type='rest' clears distance & pace. "
+    "Edits the prescription only; it cannot re-key or restructure the plan.",
     _UPDATE_WORKOUT_SCHEMA,
 )
 async def update_plan_workout(args: dict) -> dict:
@@ -1407,6 +1409,62 @@ async def update_plan_workout(args: dict) -> dict:
 
 
 @tool(
+    "commit_training_plan",
+    "Activate a DRAFT training plan, archiving any prior active plan. Only "
+    "works on a draft (refuses to touch an already-active or archived plan). "
+    "Call after propose_training_plan/revise_training_plan once the athlete "
+    "has agreed to the plan.",
+    {"type": "object", "properties": {"plan_id": {"type": "integer"}}, "required": ["plan_id"]},
+)
+async def commit_training_plan(args: dict) -> dict:
+    plan_id = args.get("plan_id")
+    if not isinstance(plan_id, int):
+        return _err("plan_id (int) is required")
+    try:
+        plans.commit_plan(plan_id, now=datetime.now().isoformat(timespec="seconds"))
+    except (plans.PlanNotFoundError, plans.NotDraftError) as e:
+        return _err(str(e))
+    return _text({"plan_id": plan_id, "status": "active"})
+
+
+@tool(
+    "discard_training_plan_draft",
+    "Discard (archive) the DRAFT training plan without activating it. Only "
+    "works on a draft — refuses to touch the active plan (call "
+    "commit_training_plan on a new draft to replace it instead). Only call "
+    "when the user explicitly asks to drop or reject a draft.",
+    {"type": "object", "properties": {"plan_id": {"type": "integer"}}, "required": ["plan_id"]},
+)
+async def discard_training_plan_draft(args: dict) -> dict:
+    plan_id = args.get("plan_id")
+    if not isinstance(plan_id, int):
+        return _err("plan_id (int) is required")
+    try:
+        plans.discard_draft(plan_id)
+    except (plans.PlanNotFoundError, plans.NotDraftError) as e:
+        return _err(str(e))
+    return _text({"plan_id": plan_id, "status": "archived"})
+
+
+@tool(
+    "abandon_active_plan",
+    "Archive the currently active training plan with nothing queued to "
+    "replace it. Only call when the user explicitly asks to stop "
+    "following their plan entirely — never proactively, and never as "
+    "part of activating a new plan (commit_training_plan already "
+    "archives the prior active plan atomically as part of that swap). "
+    "No undo tool exists for this.",
+    {"type": "object", "properties": {}},
+)
+async def abandon_active_plan(_args: dict) -> dict:
+    try:
+        plan_id = plans.abandon_active_plan()
+    except plans.NoActivePlanError as e:
+        return _err(str(e))
+    return _text({"plan_id": plan_id, "status": "archived"})
+
+
+@tool(
     "get_training_plan_status",
     "Status of the ACTIVE training plan: goal, days to race, the most recent "
     "graded day's prescription + verdict, today's prescribed session, and "
@@ -1415,16 +1473,17 @@ async def update_plan_workout(args: dict) -> dict:
     {},
 )
 async def get_training_plan_status(_args: dict) -> dict:
-    active = plans.get_active_plan()
-    if active is None:
-        return _text({"active": False})
-    frontier = db.last_known_daily_date()
-    today = date.today().isoformat()
-    dates = [w["date"] for w in active["workouts"]] or [today]
-    start = min(dates)
-    end = max([today, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end)
-    cfg = plans.resolve_grading_config()
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+        if active is None:
+            return _text({"active": False})
+        frontier = db.last_known_daily_date(conn=conn)
+        today = date.today().isoformat()
+        dates = [w["date"] for w in active["workouts"]] or [today]
+        start = min(dates)
+        end = max([today, *dates] + ([frontier] if frontier else []))
+        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        cfg = plans.resolve_grading_config(conn=conn)
     return _text(plans.build_plan_status(active, frontier, activities_by_date, today, cfg))
 
 
@@ -1440,20 +1499,22 @@ async def get_training_plan_status(_args: dict) -> dict:
     {},
 )
 async def get_training_plan_progress(_args: dict) -> dict:
-    active = plans.get_active_plan()
-    if active is None:  # build_plan_detail has no None guard — guard here first.
-        return _text({"active": False})
-    frontier = db.last_known_daily_date()
-    today = date.today().isoformat()
-    # Mirror get_training_plan_status's frontier-INCLUSIVE end (parity: both plan
-    # tools compute identical grading windows), not the web tab's exclusive form.
-    dates = [w["date"] for w in active["workouts"]] or [today]
-    start = min(dates)
-    end = max([today, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end)
-    cutoff = (date.today() - timedelta(days=config.riegel_lookback_days())).isoformat()
-    best_effort = plans.best_recent_effort(cutoff)
-    cfg = plans.resolve_grading_config()
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+        if active is None:  # build_plan_detail has no None guard — guard here first.
+            return _text({"active": False})
+        frontier = db.last_known_daily_date(conn=conn)
+        today = date.today().isoformat()
+        # Mirror get_training_plan_status's frontier-INCLUSIVE end (parity: both plan
+        # tools compute identical grading windows), not the web tab's exclusive form.
+        dates = [w["date"] for w in active["workouts"]] or [today]
+        start = min(dates)
+        end = max([today, *dates] + ([frontier] if frontier else []))
+        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        cutoff = (date.today() - timedelta(
+            days=config.riegel_lookback_days(conn=conn))).isoformat()
+        best_effort = plans.best_recent_effort(cutoff, conn=conn)
+        cfg = plans.resolve_grading_config(conn=conn)
     detail = plans.build_plan_detail(active, frontier, activities_by_date, best_effort, cfg)
 
     # days_to_race is produced only by build_plan_status, not build_plan_detail —
@@ -1670,8 +1731,9 @@ def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
     save_brief()'s fixed one) so two concurrent processes/threads racing an
     identical call never share a temp inode before either reaches replace().
     Confirms the resolved final path is contained under reports_dir before
-    writing anything, mirroring web/server.py's SPA-fallback containment
-    check."""
+    writing anything — the same `.resolve().relative_to()` containment
+    pattern CLAUDE.md's security section mandates for path joins with user
+    input."""
     reports_dir.mkdir(parents=True, exist_ok=True)
     final_path = reports_dir / final_name
     final_path.resolve().relative_to(reports_dir.resolve())
@@ -1690,16 +1752,17 @@ def _build_plan_section(target_date: str) -> dict | None:
     old brief's PDF shows that day's plan state, not today's. Mirrors
     get_training_plan_progress's plan-loading pattern, anchored to
     target_date instead of the real wall-clock date."""
-    active = plans.get_active_plan()
-    if active is None:
-        return None
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+        if active is None:
+            return None
 
-    frontier = db.last_known_daily_date()
-    dates = [w["date"] for w in active["workouts"]] or [target_date]
-    start = min(dates)
-    end = max([target_date, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end)
-    cfg = plans.resolve_grading_config()
+        frontier = db.last_known_daily_date(conn=conn)
+        dates = [w["date"] for w in active["workouts"]] or [target_date]
+        start = min(dates)
+        end = max([target_date, *dates] + ([frontier] if frontier else []))
+        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        cfg = plans.resolve_grading_config(conn=conn)
     # build_plan_detail has no "as of" date concept — grade_workout's pending
     # holdout compares each workout's OWN date against the real data frontier,
     # not against target_date, so every workout's verdict is a settled fact
@@ -1989,6 +2052,9 @@ ALL_TOOLS = [
     propose_training_plan,
     revise_training_plan,
     update_plan_workout,
+    commit_training_plan,
+    discard_training_plan_draft,
+    abandon_active_plan,
     get_training_plan_status,
     get_training_plan_progress,
     save_brief,

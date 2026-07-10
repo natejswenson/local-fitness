@@ -54,6 +54,14 @@ _PRIORITY = {"workout": 0, "steps": 1, "conditioning": 2, "recovery": 3, "wildca
 _LOOKBACK_DAYS = 14
 _RUNNING_TYPES = ("running", "trail_running", "treadmill_running", "track_running")
 
+# Activities lookback for _compute_signals's run-history query: covers the
+# 28-day (2 * _LOOKBACK_DAYS) prior-window comparison plus slack, bounding a
+# scan that previously grew unbounded with account age. Accepted tradeoff:
+# days_since_last_run/recent_te read None/fewer-than-5 when the runner's last
+# run predates this window, instead of the true (larger) count — see the
+# design doc's Fix #3.
+_ACTIVITY_LOOKBACK_DAYS = 35
+
 
 # --- signals: everything the predicates + tone resolvers read --------------
 @dataclass(frozen=True)
@@ -499,10 +507,11 @@ def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | N
     if ctl_now is not None and ctl_then and ctl_then["ctl"]:
         ctl_pct = round((ctl_now - ctl_then["ctl"]) / ctl_then["ctl"] * 100, 1)
 
-    # Run history.
+    # Run history. Bounded — see _ACTIVITY_LOOKBACK_DAYS.
+    activity_floor = (today_d - timedelta(days=_ACTIVITY_LOOKBACK_DAYS)).isoformat()
     acts = [dict(r) for r in conn.execute(
         "SELECT date, activity_type, aerobic_te FROM activities "
-        "WHERE date <= ? ORDER BY date DESC", (today,),
+        "WHERE date <= ? AND date >= ? ORDER BY date DESC", (today, activity_floor),
     ).fetchall()]
     runs = [a for a in acts if _running(a["activity_type"])]
     days_since = None
@@ -561,19 +570,23 @@ def _rhr_anomalies(rows: dict, today_d: date, baseline: dict | None) -> list[dic
     return out
 
 
-def _plan_today(db_path: Path | None, today: str) -> dict:
-    """Mirror tools.get_training_plan_status with an injected `today`/db_path."""
+def _plan_today(db_path: Path | None, today: str, conn=None) -> dict:
+    """Mirror tools.get_training_plan_status with an injected `today`/db_path.
+
+    Accepts an already-open ``conn`` to let hot-path callers share one
+    connection instead of opening a fresh one per lookup; behavior is
+    unchanged when omitted."""
     from .. import plans
 
-    active = plans.get_active_plan(db_path)
+    active = plans.get_active_plan(db_path, conn=conn)
     if active is None:
         return {"active": False}
-    frontier = db.last_known_daily_date(db_path)
+    frontier = db.last_known_daily_date(db_path, conn=conn)
     dates = [w["date"] for w in active["workouts"]] or [today]
     start = min(dates)
     end = max([today, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end, db_path)
-    cfg = plans.resolve_grading_config(db_path)
+    activities_by_date = plans.load_activities_by_date(start, end, db_path, conn=conn)
+    cfg = plans.resolve_grading_config(db_path, conn=conn)
     return plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
 
 
@@ -648,18 +661,19 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
     injected ``today``. Pure read; never raises on an empty DB. Through Phase 2
     nothing consumes this in production — the prompt is still authoritative."""
     today = today or date.today().isoformat()
-    user_name = db.get_setting("user_name", "Nate", db_path=db_path) or "Nate"
-    try:
-        step_goal = int(db.get_setting("daily_step_goal", "10000", db_path=db_path) or "10000")
-    except ValueError:
-        step_goal = 10000
-    profile = resolve_coach_profile(db_path=db_path)
-
-    plan = _plan_today(db_path, today)
-    plan_today = plan if plan.get("active") else None
-    days_to_race = plan.get("days_to_race") if plan_today else None
-
     with db.connect(db_path) as conn:
+        user_name = db.get_setting("user_name", "Nate", db_path=db_path, conn=conn) or "Nate"
+        try:
+            step_goal = int(db.get_setting(
+                "daily_step_goal", "10000", db_path=db_path, conn=conn) or "10000")
+        except ValueError:
+            step_goal = 10000
+        profile = resolve_coach_profile(db_path=db_path, conn=conn)
+
+        plan = _plan_today(db_path, today, conn=conn)
+        plan_today = plan if plan.get("active") else None
+        days_to_race = plan.get("days_to_race") if plan_today else None
+
         baseline = status_mod._baseline_row(conn, today)
         metric_rows = status_mod._metric_rows(conn, today, baseline)
         training_load = status_mod._training_load(baseline)
