@@ -56,11 +56,11 @@ When you add a new env var:
 
 After the 2026-05-04 audit, these are guardrails. Don't regress them.
 
-- **Every new `/api/*` endpoint is auth-gated by default.** The bearer
-  middleware in `web/server.py` covers anything under `/api/`. If you
-  add a new endpoint that genuinely should be public (like `/health`),
-  whitelist it explicitly in `_is_public_path()`, not by sneaking it
-  outside the prefix.
+- **Every new server endpoint is auth-gated by default.** `_is_public_path()`
+  in `web/server.py` denies by default — the bearer middleware covers
+  everything except what's explicitly whitelisted there. If you add a new
+  endpoint that genuinely should be public (like `/health`), whitelist it
+  explicitly, not by relaxing the fallthrough.
 - **Every new endpoint that calls Claude is rate-limited.** The
   middleware matches by prefix in `RATE_LIMITED_PREFIXES`. Add new
   Claude-cost paths to that tuple — don't just hope they stay cheap.
@@ -94,10 +94,8 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   is **85%** (`--cov-fail-under=85`); a PR that drops coverage or adds untested
   code is incomplete. Stop short of testing pure I/O glue (network/LLM/uvicorn)
   only where a test would merely assert a mock — and say so explicitly.
-- **Test before claiming done.** `uv run pytest -x` for Python, `pnpm
-  build` + `pnpm tsc --noEmit` for the frontend, `docker compose up
-  -d --build local-fitness` for the container path. For UI, take a
-  screenshot — never claim something looks better without the PNG.
+- **Test before claiming done.** `uv run pytest -x` for Python, `docker
+  compose up -d --build local-fitness` for the container path.
 - **The live deployment tracks `dev`, not `main`.** Nate's daily-use app at
   `https://fitness.home.local` (and the host `uv run fitness ...`) runs from the
   `dev` working branch — that's where all tested work lands. `main` is the
@@ -106,22 +104,18 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   checkout** so the live app is current. Do **not** promote to `main` or cut a
   release as part of normal work — that happens only when Nate explicitly asks.
 - **Rebuild the container after every change.** Stale containers serve stale
-  code. This is durable: rebuild even when you "only" changed the frontend (the
-  SPA gets baked into stage 1). Check out `dev` first, then `docker compose up
-  -d --build local-fitness` from `/Users/natejswenson/localrepo/traefik` (compose
-  builds from the `../local-fitness` working tree, so the checked-out branch is
-  what ships to the container).
+  code. Check out `dev` first, then `docker compose up -d --build
+  local-fitness` from `/Users/natejswenson/localrepo/traefik` (compose builds
+  from the `../local-fitness` working tree, so the checked-out branch is what
+  ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
   (85% coverage gate), a separate perf-benchmark regression gate (see
-  below), `ruff`, the prompt scorer, `pnpm build` (`tsc -b &&
-  vite build`), and `pnpm test` (vitest) for the frontend. A separate
-  `docker-build` job compiles the full multi-stage image (no push) so a
-  `node`/base-image bump or `Dockerfile` change can't silently break
-  `docker compose up --build` while CI stays green (this bit us once:
-  `node:26` dropped bundled `corepack`) — but a green `docker-build` only
-  proves the image *compiles*, not that the running container behaves
-  correctly, so still rebuild and smoke-test locally after touching the
-  `Dockerfile`, base images, or web deps.
+  below), and `ruff`, the prompt scorer. A separate `docker-build` job
+  compiles the full image (no push) so a base-image bump or `Dockerfile`
+  change can't silently break `docker compose up --build` while CI stays
+  green — but a green `docker-build` only proves the image *compiles*, not
+  that the running container behaves correctly, so still rebuild and
+  smoke-test locally after touching the `Dockerfile` or base images.
 - **Perf-benchmark regression gate (`tests/test_perf_benchmarks.py`).**
   `pytest-benchmark`-based, separate axis from the coverage gate: latency
   AND `db.connect()`-open-count for the brief/plan hot paths
@@ -214,16 +208,18 @@ today", "how's my training load", "what did I run last week"):
   no structured tool fits. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
-- **The agent owns plan writes; the web UI is view-only.** When the user wants
-  to change their plan (move a long run, swap days, adjust a session), edit it
-  with `update_plan_workout(date, type/distance_mi/pace_min_per_mi/description)`
+- **The agent owns the entire plan lifecycle — there is no UI.** When the user
+  wants to change their plan (move a long run, swap days, adjust a session),
+  edit it with `update_plan_workout(date, type/distance_mi/pace_min_per_mi/description)`
   — it re-prescribes one day on the *active* plan (`type='rest'` clears
-  distance/pace). Do **not** route them through the draft→commit-in-UI flow; the
-  UI is for visual display. Structure changes (whole new plan) still go through
-  `propose_training_plan`/`revise_training_plan` (drafts). The write boundary is
-  enforced in `plans.py` (`update_active_workout` whitelists prescription columns
-  only — it can't re-key/re-status/restructure). Don't hand-write `UPDATE` SQL —
-  the tool exists.
+  distance/pace). Structure changes (whole new plan) go through
+  `propose_training_plan`/`revise_training_plan` (drafts), and the rest of the
+  lifecycle — activating a draft, dropping a draft, or abandoning the active
+  plan outright — is `commit_training_plan`/`discard_training_plan_draft`/
+  `abandon_active_plan` (2026-07-09, UI-retirement design). The write boundary
+  is enforced in `plans.py` (`update_active_workout` whitelists prescription
+  columns only — it can't re-key/re-status/restructure). Don't hand-write
+  `UPDATE` SQL — the tool exists.
 - **Don't narrate the lookup.** The user wants the answer, not the mechanics.
   Lead with a one-line answer, then a clean table (at most ~4 columns, one-word
   headers, never a sentence in a cell) plus short coach text. Per-item detail
@@ -244,6 +240,20 @@ today", "how's my training load", "what did I run last week"):
 
 These are settled — don't redesign without a reason.
 
+- **The web UI is retired (2026-07-09) — MCP is the only client surface.**
+  The entire `web/` directory (React/Vite SPA), every UI-only REST route
+  (`/api/*`), the background-sync-orchestration subsystem, and the SPA
+  static-file serving are gone. `src/local_fitness/web/server.py` (note:
+  a *different* `web/` — the Python package, not the deleted frontend
+  directory) still exists and still hosts the authenticated MCP
+  streamable-HTTP transport at `/mcp/` plus `/health` — "keep and improve
+  the API" was the explicit design goal, not remove the server. The three
+  plan-lifecycle MCP tools (`commit_training_plan`/
+  `discard_training_plan_draft`/`abandon_active_plan`) exist specifically
+  because the UI's commit/delete buttons were the only prior path for
+  those actions — see *Answering fitness questions*'s plan-ownership
+  bullet. See `docs/plans/2026-07-09-mcp-speed-and-ui-retirement-design.md`
+  for the full rationale (also covers Part A: MCP tool speed/efficiency).
 - **Brief composer = V2 (agent/code separation), default ON** since the
   2026-06-27 cutover. The pipeline is deterministic `brief_planner` (triggers,
   fixed priority, advisory tone → typed `BriefContext`) → ONE **toolless**
@@ -270,9 +280,11 @@ These are settled — don't redesign without a reason.
   **Failure signature** when the token is missing/expired: pull succeeds
   (`Pull: success` in `logs/brief.launchd.out.log`) but generation returns
   empty (`chars=0 takeaways_yielded=0`, "no JSON found in agent response"
-  in `logs/brief.launchd.err.log`), so **no brief saves and the UI's "new
-  data available" banner sticks** (orphaned sync — pull ran, brief didn't).
-  Fix = put/refresh the token in `.env` (gitignored); re-mint on expiry.
+  in `logs/brief.launchd.err.log`), so **no brief saves** (orphaned sync —
+  pull ran, brief didn't) — surfaces as `get_brief_context`'s
+  `data_through_date` outrunning the brief's own `date` on the next MCP
+  query. Fix = put/refresh the token in `.env` (gitignored); re-mint on
+  expiry.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a
@@ -288,17 +300,17 @@ These are settled — don't redesign without a reason.
   re-seed with an interactive `uv run fitness pull`. `~/.garminconnect` is
   outside the repo; `Path.home()` resolves from `HOME`, so the launchd job and
   the seeding shell must share the same `HOME`.
-- **Path defaults**: `db.py`, `notes.py`, `briefing.py`, `web/server.py`
-  all resolve to `_PROJECT_ROOT / ...` when env vars are unset.
+- **Path defaults**: `db.py`, `notes.py`, `briefing.py` all resolve to
+  `_PROJECT_ROOT / ...` when env vars are unset.
 - **MCP tool surface can trigger a Garmin sync, not just read.** `agent/tools.py`'s
   `sync_garmin_data` (in `ALL_TOOLS`, not in the brief loop's read-only
   allow-list) wraps `ingest.daily.pull(max_days=SYNC_MAX_DAYS)` +
-  `ingest.baselines.recompute()` — the same bite-sized, gap-aware pull the web
-  UI's `/api/sync` uses, just without the UI's throttle/retry state machine.
+  `ingest.baselines.recompute()` — a bite-sized, gap-aware pull, capped so a
+  long absence doesn't turn one tool call into a multi-minute Garmin backfill.
   Any MCP client wired to `fitness mcp-stdio` (Claude Desktop, opencode, etc.)
   can call it directly; before this tool existed, MCP-only clients had read
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
-  and the web UI could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
+  could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
 - **`generate_brief_report`/`generate_chart` are stdio-only, never `ALL_TOOLS`.**
   These two MCP tools (`agent/tools.py`'s `LOCAL_ONLY_TOOLS`) render a saved
@@ -359,13 +371,14 @@ These are settled — don't redesign without a reason.
   scope (as `agent_tools`), and `tools.py` imports `plan_coach.py` — a
   module-scope import there would close a real circular import.
 - **Auth middleware**: `LOCAL_FITNESS_API_TOKEN` env var; constant-time
-  bearer check; `/health` and `/{full_path:path}` (SPA shell) are public.
+  bearer check; `_is_public_path` denies by default — only `/health` is
+  explicitly whitelisted (2026-07-09 UI-retirement design; no SPA shell
+  left that needs unauthenticated loading, so there's no reason for a
+  blanket-public fallthrough). `/mcp/` and every other path require the
+  bearer token whenever one is configured.
 - **Rate limit**: in-memory token bucket on `RATE_LIMITED_PREFIXES`,
   loopback IPs exempt.
-- **Frontend auth**: `web/src/lib/api.ts` `authedFetch` adds Bearer
-  from `localStorage`; `AuthGate` wraps the route tree and re-prompts
-  on 401 mid-session.
-- **CI dep scanning**: `.github/dependabot.yml` (pip / npm / docker /
+- **CI dep scanning**: `.github/dependabot.yml` (pip / docker /
   github-actions, weekly), `target-branch: dev` so bumps flow through the
   promotion path.
 - **Branch protection**: `main` + `dev` both gated on the CI `validate`
@@ -379,9 +392,9 @@ These are settled — don't redesign without a reason.
   generator, chat loop.
 - `src/local_fitness/ingest/` — Garmin auth, daily pull, ZIP backfill,
   baselines / CTL-ATL-TSB.
-- `src/local_fitness/web/server.py` — FastAPI app + middleware stack.
+- `src/local_fitness/web/server.py` — FastAPI app + middleware stack
+  (MCP transport host + `/health`; no UI to serve).
 - `src/local_fitness/db.py` — SQLite schema + connection helpers.
-- `web/src/` — Vite + React + TS + Tailwind frontend.
 - `tests/` — pytest. `test_security.py` is the audit-regression file.
 - `docs/deployment.md` — what the deploying side wires into compose.
 - `devlog/` — running notes per change.

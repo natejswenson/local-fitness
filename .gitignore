@@ -26,12 +26,6 @@ reports/
 .env
 .env.local
 
-# Frontend (web/)
-web/node_modules/
-web/dist/
-web/.vite/
-web/*.tsbuildinfo
-
 # OS / editor cruft
 .DS_Store
 .idea/
@@ -40,6 +34,3 @@ web/*.tsbuildinfo
 
 # Claude Code local runtime state
 .claude/
-
-# uxpolish-generated variant files (one-shot, not committed)
-web/src/components/*.v[0-9].tsx

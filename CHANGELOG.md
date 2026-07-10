@@ -6,7 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+- **The web UI is retired.** The entire `web/` directory (React/Vite SPA,
+  ~3,800 LOC), every UI-only REST route (`/api/today`, `/api/metric/{name}`,
+  `/api/training-load`, `/api/workouts`, `/api/workout/{id}`, `/api/brief`,
+  `/api/sync`, `/api/sync/status`, `/api/plan*`, `/api/activity-heatmap`,
+  `/api/strength-volume`, `/api/pace-efficiency`, `/api/status`,
+  `/api/config`, `/api/auth/verify`, `/api/notes*`), the
+  background-sync-orchestration subsystem, and SPA static-file serving are
+  gone. Docker's `web-builder` stage, CI's frontend build/test steps,
+  `.github/dependabot.yml`'s npm entry, and `codeql.yml`'s
+  javascript-typescript matrix leg are removed alongside it. `fitness
+  serve`'s `--open` flag (opened a browser to the now-nonexistent SPA) is
+  also gone.
+
+### Added
+- **Three new MCP tools cover the plan-lifecycle actions the UI's
+  commit/delete buttons used to be the only path for**: `commit_training_plan`
+  (activate a draft), `discard_training_plan_draft` (drop a draft without
+  activating it), and `abandon_active_plan` (archive the active plan with
+  nothing queued to replace it — no undo). The agent now owns the entire
+  training-plan lifecycle.
+
 ### Changed
+- **`_is_public_path` now denies by default.** Only `/health` is explicitly
+  whitelisted; every other path (including `/mcp/`) requires the bearer
+  token whenever one is configured. The old blanket-public fallthrough for
+  non-`/api/` paths existed only to let an unauthenticated browser tab load
+  the SPA shell — with no SPA left, deny-by-default is the correct posture
+  per this repo's own security convention (whitelist explicitly, don't rely
+  on a permissive default).
 - **MCP tool speed: the brief/plan read paths now share ONE SQLite
   connection per call instead of opening a fresh connection per lookup.**
   `assemble_brief_context` (brief_planner.py) went from 9 `db.connect()`

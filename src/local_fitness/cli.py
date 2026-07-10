@@ -208,18 +208,9 @@ def config_get(key: str | None):
          "Set LOCAL_FITNESS_HOST=0.0.0.0 in the container to expose on the Docker network.",
 )
 @click.option("--reload", is_flag=True, help="Reload on code changes (dev mode)")
-@click.option("--open", "open_browser", is_flag=True, help="Open browser on start")
-def serve(port: int, host: str, reload: bool, open_browser: bool):
-    """Start the web UI + API server."""
+def serve(port: int, host: str, reload: bool):
+    """Start the MCP server (streamable-HTTP transport at /mcp/)."""
     from .web.server import serve as serve_app
-    if open_browser:
-        import threading
-        import time
-        import webbrowser
-        def _open():
-            time.sleep(1)
-            webbrowser.open(f"http://{host}:{port}")
-        threading.Thread(target=_open, daemon=True).start()
     serve_app(host=host, port=port, reload=reload)
 
 

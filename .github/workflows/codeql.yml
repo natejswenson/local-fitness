@@ -1,6 +1,6 @@
 name: CodeQL
 
-# Static security analysis over the Python backend + the React/TS frontend.
+# Static security analysis over the Python backend.
 # Free for public repos; surfaces injection / auth / path issues on the same
 # code paths the security contract in CLAUDE.md protects.
 on:
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [python, javascript-typescript]
+        language: [python]
     steps:
       - uses: actions/checkout@v7
 

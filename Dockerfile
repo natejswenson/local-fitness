@@ -1,37 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-# ----- Stage 1: build the React SPA -------------------------------------
-# Debian (glibc), not Alpine (musl): Vite 8 bundles with rolldown, whose
-# native binding ships per-platform. The musl binding fails to resolve under
-# pnpm on alpine (MODULE_NOT_FOUND at `vite build`); the gnu binding on slim
-# is the supported, well-tested path.
-FROM node:26-bookworm-slim AS web-builder
-WORKDIR /web
-
-# Use pnpm via corepack (matches the host workflow). node:26 dropped the
-# bundled corepack shim, so install it explicitly before enabling — it then
-# honors the `packageManager: pnpm@x` pin in web/package.json.
-RUN npm install -g corepack@latest && corepack enable
-
-# Harden the registry fetch: rolldown's platform-specific native binding is
-# an OPTIONAL dependency, so a flaky download makes `pnpm install` succeed
-# with the .node binary missing — `vite build` then dies with MODULE_NOT_FOUND.
-# More retries / longer timeouts make the optional-binding fetch reliable.
-ENV npm_config_fetch_retries=5 \
-    npm_config_fetch_retry_mintimeout=10000 \
-    npm_config_fetch_retry_maxtimeout=120000 \
-    npm_config_fetch_timeout=300000
-
-# Cache deps layer when only source changes
-COPY web/package.json web/pnpm-lock.yaml* ./
-RUN pnpm install --frozen-lockfile
-
-# Copy the rest of the frontend and build
-COPY web/ ./
-RUN pnpm build
-
-
-# ----- Stage 2: runtime -------------------------------------------------
+# ----- Runtime ------------------------------------------------------------
+# The web UI (React/Vite SPA) was retired 2026-07-09 — MCP is the only
+# client surface now, so there's no frontend build stage left. See
+# docs/plans/2026-07-09-mcp-speed-and-ui-retirement-design.md.
 FROM python:3.12-slim AS runtime
 
 # System deps:
@@ -71,9 +43,6 @@ COPY --chown=app:app src/ ./src/
 ENV UV_HTTP_TIMEOUT=180 \
     UV_CONCURRENT_DOWNLOADS=4
 RUN chown app:app /app && su app -c "uv sync --frozen --no-dev"
-
-# Copy the built SPA from stage 1 so FastAPI's static-file mount finds it.
-COPY --from=web-builder --chown=app:app /web/dist ./web/dist
 
 # Container-only env. Host CLI keeps its existing defaults (Path.home()
 # for data/briefings, 127.0.0.1 for serve, Keychain for auth) — these

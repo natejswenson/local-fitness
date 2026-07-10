@@ -13,18 +13,6 @@ updates:
       - dependencies
       - python
 
-  # Frontend deps (pnpm via the npm ecosystem).
-  - package-ecosystem: npm
-    directory: /web
-    target-branch: dev
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
-    labels:
-      - dependencies
-      - frontend
-
   # Container base images.
   - package-ecosystem: docker
     directory: /

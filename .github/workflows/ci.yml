@@ -1,9 +1,9 @@
 name: CI
 
 # Treat the agent as code: lint it, test the deterministic core behind a
-# coverage gate, score the prompt, build the frontend, AND compile the Docker
-# image — so the documented container deploy can't silently break (a base-image
-# bump that passes the host build but breaks `docker compose up --build`).
+# coverage gate, score the prompt, AND compile the Docker image — so the
+# documented container deploy can't silently break (a base-image bump that
+# passes the host build but breaks `docker compose up --build`).
 on:
   push:
     branches: [main, dev]
@@ -82,43 +82,10 @@ jobs:
       - name: Score the agent prompt
         run: uv run python scripts/score_prompt.py
 
-      # Frontend: type-check + production build on the SAME Node major as the
-      # Docker web-builder stage (node:26), with corepack installed explicitly
-      # (node:26 dropped the bundled shim — this mirrors the Dockerfile exactly).
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 26
-
-      - name: Enable corepack (pnpm)
-        run: npm install -g corepack@latest && corepack enable
-
-      - name: Resolve pnpm store dir
-        id: pnpm-store
-        working-directory: web
-        run: echo "dir=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache pnpm store
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pnpm-store.outputs.dir }}
-          key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
-          restore-keys: pnpm-${{ runner.os }}-
-
-      - name: Build frontend (tsc -b && vite build)
-        working-directory: web
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
-
-      - name: Test frontend (vitest)
-        working-directory: web
-        run: pnpm test
-
   docker-build:
-    # Compile the multi-stage image (web-builder + python runtime) — the path CI
-    # otherwise never exercises. No push; GHA layer cache keeps it fast. Catches
-    # the node:26 / corepack regression class and any Dockerfile/base-image drift.
+    # Compile the image — the path CI otherwise never exercises. No push; GHA
+    # layer cache keeps it fast. Catches base-image drift the host build
+    # wouldn't (e.g. a `docker compose up --build` regression).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
