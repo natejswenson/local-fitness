@@ -86,6 +86,11 @@ classifiers delegate to it so brief and tools agree by construction:
 
 - `tsb_zone(tsb: float | None) -> str` — extracted from
   `status._tsb_interpretation` (status.py:84); `status.py` delegates.
+  On `None` the delegated classifier returns `_tsb_interpretation`'s
+  existing None-case string ("no training-load data yet" — a sentence,
+  not a zone label), deliberately kept for delegation consistency;
+  reachable on `training_load_status` since its SQL filters on `ctl`,
+  not `tsb`.
 - `pct_change(now: float | None, then: float | None) -> float | None` — the
   `ctl_pct_change_14d` arithmetic from `brief_planner._compute_signals`
   (brief_planner.py:500-508); brief_planner delegates. `then == 0` or
@@ -128,8 +133,13 @@ classifiers delegate to it so brief and tools agree by construction:
   cohens_d, magnitude: "negligible"|"small"|"moderate"|"large"} | None`
   (Cohen's conventional bands, **lower-bound inclusive**: `|d| >= 0.2`
   small, `>= 0.5` moderate, `>= 0.8` large, below 0.2 negligible; pooled
-  SD). Degradation is **per-field, not whole-function** (whole-`None` only
-  when ALL inputs are None): `delta_pct` needs only the two means — it is
+  SD). `delta_pct = (mean_a − mean_b) / mean_b × 100`, matching
+  `delta_mean_a_minus_b`'s a-minus-b direction (tools.py:516).
+  Degradation is **per-field, not whole-function** (whole-`None` only
+  when ALL inputs are None — a branch unreachable from `compare_periods`,
+  whose `_stats` always returns an int `n`, tools.py:507; kept as a
+  pure-function contract for direct callers/tests): `delta_pct` needs
+  only the two means — it is
   `None` only when `mean_b` is 0/None (division guard) or `mean_a` is
   None, and is otherwise computed even when the SDs/ns can't support a d;
   `cohens_d`/`magnitude` are `None` when either SD is 0/None or either
@@ -188,7 +198,14 @@ the extra query is allowed. The import direction already exists:
 tools` would cycle at module scope); `training_load_status` uses the same
 lazy-import pattern. Checkable invariant: the 14-day "then" lookup exists
 in exactly ONE place (`brief_planner`), consumed by both paths —
-agreement by construction, mirroring the `tsb_zone` treatment.
+agreement by construction, mirroring the `tsb_zone` treatment. One
+honesty note on that phrase: the shared helper covers the **"then"**
+term only — the "now" term still comes from each path's own latest-ctl
+read (brief via `status._baseline_row`, tool via its 30-day window).
+Divergence there is unreachable in practice: `baselines.recompute`
+writes NULL ctl only before the first activity, so the frontier row
+carries ctl whenever activities exist, and a >30-day-stale baselines
+table makes the tool error before it could disagree.
 
 **Float rounding at the payload boundary.** The analysis tools emit
 full-precision floats (`0.4285714285714286`). Round at the `_text({...})`
@@ -281,7 +298,9 @@ weekly_rollup(workouts: list[dict], target_date: str) -> dict
 `_build_plan_section` already windows via ISO-*string* comparison
 (`window_start <= w["date"] <= target_date`, tools.py:1776-1778), and
 string comparison of ISO dates is order-correct, so the shared function
-takes the string directly with no parse/round-trip.
+takes the string directly. To be precise: the *comparison* is
+string-based; computing `window_start` still parses once
+(`date.fromisoformat(target_date) − 6d`, as tools.py:1776 does today).
 
 taking already-graded workout dicts (no I/O, no connections — direct-import
 testable). The `days` list is the canonical per-day shape: the function owns
@@ -447,7 +466,10 @@ already carries `target_duration_sec` — pure formatting of data in hand).
 Top-level `predicted_finish_formatted` / `target_time_formatted` attach to
 `get_training_plan_progress`; `get_training_plan_status` gets
 `target_time_formatted` only (`target_time_seconds` IS in
-`build_plan_status`'s payload — pure formatting, no new data) and **not**
+`build_plan_status`'s payload — pure formatting, no new data; the
+formatting is a tools.py post-processing step on `build_plan_status`'s
+returned dict (tools.py:1487) — `plans.py` gains no `units` import,
+consistent with the existing invariant) and **not**
 `predicted_finish_formatted` (no projection on that path — see 2b). Raw
 seconds stay. A wrong hand-built h:mm:ss for a race-time answer is a
 plausible, embarrassing agent error.
@@ -478,7 +500,8 @@ period**. The SUM-branch payload shape is fixed here: each period carries
 `{n, total}` (no `mean`/`sd` — a period total has no per-observation
 stats) plus a per-period `total_mi` convenience via `units.to_miles` under
 the same `display_units()` gate as `_augment_workout`; the top level
-carries `delta` and `delta_pct` and **no** `cohens_d`/`magnitude` (no
+carries `delta` and `delta_pct` (following the same a-minus-b
+convention as `effect_size`'s `delta_pct`) and **no** `cohens_d`/`magnitude` (no
 per-observation SD to pool — `effect_size` fields are omitted for SUM
 metrics). Pace aggregation is deliberately excluded (duration-weighted
 mean is a real design problem — not this pass). Constraint tension,
@@ -601,7 +624,11 @@ output entering a user-facing artifact with zero numeric validation. Add
 list[GroundingFlag]` — pure, reusing `grounding`'s numeric-token parser and
 nearest-match bands over a pool built from the plan section
 (`adherence_pct`, `days_to_race`, today's `distance_mi`/pace,
-`week_planned_mi`/`week_actual_mi`). `generate_brief_report` logs the flags advisorily, exactly as V2
+`week_planned_mi`/`week_actual_mi`). It replicates `flag()`'s empty-pool
+guard explicitly (`if not pool: return []`, grounding.py:134-135), since
+`_nearest` documents a non-empty-pool precondition — in practice the
+pool is never empty (`adherence_pct` defaults to 0,
+tools.py:1807-1808). `generate_brief_report` logs the flags advisorily, exactly as V2
 does (`log_grounding` pattern) — never gates, never alters the PDF.
 `grounding`'s parser internals (`_parse`, `_nearest`) get public
 re-exports (or a small public wrapper) rather than plan_coach importing
@@ -692,7 +719,7 @@ New public function in `brief_planner` (takes a connection — not pure, but sin
 
 New pure functions in existing modules:
 - `tools.weekly_rollup(workouts: list[dict], target_date: str) -> dict` — `target_date` is an ISO date string (repo convention — callers window via ISO-string comparison, tools.py:1776-1778, which is order-correct); module-level in `agent/tools.py` (NOT `plans.py` — see 2a's relocation rationale); returns `{week_planned_mi, week_actual_mi, slips, days: list[dict]}` where each `days` entry is `{date, verdict, type, planned_mi, actual_mi}` — the canonical per-day shape, with the verdict-conditional `actual_mi` suppression (`verdict in ("pending", "compliant")` → `None`) applied inside the function and the totals summed from that same list; `days` is **reverse-chronological** (most recent first — the tests/test_tools.py:1697-1698 pin; see 2a for the downstream consumers that depend on it); rounding order: per-day `to_miles` 2 dp → sum → total 1 dp (see 2a). Empty window → `days: []` with zero totals; the empty→`None` short-circuit stays in `_build_plan_section` (see 2a). `_build_plan_section` consumes `days`; `get_training_plan_progress`'s `this_week` carries the three totals only.
-- `plans.goal_gap(predicted_finish_s: float | None, target_time_s: int | None) -> dict | None` (`predicted_finish_s` is float — `riegel_predict` returns `float`, plans.py:341). Returns `None` when `predicted_finish_s` is None or when `target_time_s` is None **or `<= 0`** — a zero goal time is storable (`validate_plan_input` rejects only negatives, plans.py:205-207) but has no defined gap % (see 2b).
+- `plans.goal_gap(predicted_finish_s: float | None, target_time_s: int | None) -> dict | None` (`predicted_finish_s` is float — `riegel_predict` returns `float`, plans.py:341). Returns `None` when `predicted_finish_s` is None or when `target_time_s` is None **or `<= 0`** — a zero goal time is storable (`validate_plan_input` rejects only negatives and non-finite values, plans.py:205-207) but has no defined gap % (see 2b).
 - `units.format_hm(seconds: float | int | None) -> str | None` — reproduces `_hm`'s output exactly: `f"{h}h {m:02d}m"` at/over an hour (zero-padded minutes — `27180 → "7h 33m"`, `25500 → "7h 05m"`), `f"{m}m"` sub-hour (`"45m"`), `None` → `None`; the sleep-rendering convention (callers feed floats — `sleep_seconds` values and 60-day means; `_hm` already does `int(round(...))`, brief_planner.py:442); `brief_planner._hm` delegates to it, keeping its own ""-on-None contract at its boundary (see 3c).
 - No `units.format_hms` — the existing `units.format_duration` already emits `H:MM:SS` at/over an hour (units.py:55-68); reused as-is for workout/target durations (see 2d). `format_hm` is not an `H:MM:SS` sibling — it is the hours-and-minutes sleep shape (3c), a different convention.
 - `plan_coach.ground_coaching_line(text: str, plan_section: dict) -> list[GroundingFlag]` — flags carry `takeaway_index=0` (see 4a).
@@ -937,7 +964,8 @@ Prompt/instruction changes:
   is None); two 1-day periods → `delta_pct` present, `cohens_d` None;
   `r` exactly on a band boundary → pinned by test.
 - Plan with no goal time, a **zero goal time** (storable —
-  `validate_plan_input` rejects only negatives, plans.py:205-207 — but
+  `validate_plan_input` rejects only negatives and non-finite values,
+  plans.py:205-207 — but
   meaningless, and a bare zero would divide by zero), or no best-effort
   projection → `goal_gap` None, formatted fields absent.
 - Windowing when the plan is entirely in the past (race done) or entirely

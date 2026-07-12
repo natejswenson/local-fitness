@@ -38,7 +38,12 @@ api_surface:
       'positive' via >=, consistent with sd_position; r None -> None,
       i.e. no strength/direction);
       effect_size(mean_a, mean_b, sd_a, sd_b, n_a, n_b) -> dict | None —
-      degrades PER-FIELD, never whole-None unless ALL inputs are None:
+      delta_pct = (mean_a - mean_b) / mean_b * 100, matching
+      delta_mean_a_minus_b's a-minus-b direction (tools.py:516);
+      degrades PER-FIELD, never whole-None unless ALL inputs are None
+      (a branch unreachable from compare_periods — _stats always returns
+      an int n, tools.py:507 — kept as a pure-function contract for
+      direct callers/tests):
       delta_pct needs only the two means (None only when mean_b is 0/None
       or mean_a is None, else computed even when SDs/ns can't support a
       d); cohens_d/magnitude are None when either SD is 0/None or either
@@ -103,7 +108,9 @@ api_surface:
       ISO date STRING, not a date object — the repo convention:
       _build_plan_section already windows via ISO-string comparison
       (tools.py:1776-1778), and string comparison of ISO dates is
-      order-correct, so no parse/round-trip. Lives in
+      order-correct — the comparison is string-based; computing
+      window_start still parses once (date.fromisoformat(target_date)
+      - 6d, as tools.py:1776 does today). Lives in
       agent/tools.py, NOT plans.py: it needs units.to_miles, and plans.py
       imports only config/db (plans.py:18) with a km-internal convention —
       a core->agent.units import is unsanctioned; both consumers
@@ -232,7 +239,8 @@ api_surface:
       carry delta_pct with cohens_d/magnitude None; floats rounded; (2g,
       designated cut) accepts distance_meters (activities, SUM semantics):
       per-period {n, total} (no mean/sd) + per-period total_mi convenience
-      (miles-gated); top-level delta + delta_pct; NO cohens_d/magnitude
+      (miles-gated); top-level delta + delta_pct (same a-minus-b
+      convention as effect_size's delta_pct); NO cohens_d/magnitude
       for SUM metrics (no per-observation SD to pool)
   - name: "get_metric_trend payload"
     type: "tool_payload"
@@ -265,7 +273,10 @@ api_surface:
     type: "tool_payload"
     signature: >-
       + target_time_formatted (target_time_seconds already in
-      build_plan_status's payload — pure formatting);
+      build_plan_status's payload — pure formatting, applied as a
+      tools.py post-processing step on build_plan_status's returned dict,
+      tools.py:1487 — plans.py gains no units import, consistent with
+      the existing invariant);
       target_duration_formatted + Fix C fields on today/last_graded. NO
       this_week / goal_gap / predicted_finish_formatted — goal gap and
       projection genuinely lack a data source there (no Riegel query on
