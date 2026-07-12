@@ -1,0 +1,144 @@
+version: "1.0"
+ticket: "N/A"
+epic: "N/A"
+title: "Deterministic intelligence, MCP payload quality, agent UX, layer-separation hardening"
+date: "2026-07-12"
+
+api_surface:
+  - name: "interpret module"
+    type: "module"
+    signature: "src/local_fitness/agent/interpret.py"
+    description: >-
+      New pure module, stdlib-only imports (no db, no SDK, no schemas).
+      Houses the shared classifiers: tsb_zone(tsb) -> str;
+      pct_change(now, then) -> float | None;
+      trend_direction(slope_per_day, *, flat_threshold) -> str;
+      baseline_position(sd_distance) -> str;
+      correlation_read(r) -> dict | None;
+      effect_size(mean_a, mean_b, sd_a, sd_b, n_a, n_b) -> dict | None;
+      sd_position(value, mean, sd) -> dict | None.
+      All handle None/zero/degenerate input without raising.
+  - name: "plans.weekly_rollup"
+    type: "function"
+    signature: "weekly_rollup(workouts: list[dict], target_date: date) -> dict"
+    returns: "{week_planned_mi, week_actual_mi, slips, week_adherence_pct}"
+    description: >-
+      Pure, I/O-free extraction of _build_plan_section's trailing-week
+      aggregation. Called by _build_plan_section (PDF),
+      get_training_plan_progress, and get_training_plan_status.
+  - name: "plans.goal_gap"
+    type: "function"
+    signature: "goal_gap(predicted_finish_s: int | None, target_time_s: int | None) -> dict | None"
+    returns: "{gap_seconds, gap_pct, on_pace: bool} | None"
+    description: "Pure. None when either input is None. Positive gap = slower than goal."
+  - name: "units.format_hms"
+    type: "function"
+    signature: "format_hms(seconds: int | None) -> str | None"
+    returns: "H:MM:SS string or None"
+    description: "Only added if format_duration doesn't already emit this shape."
+  - name: "plan_coach.build_prompt"
+    type: "function"
+    signature: "build_prompt(..., notes_text: str | None = None) -> tuple[str, str]"
+    description: >-
+      Signature extension, still pure/I-O-free. Appends notes section when
+      notes_text provided; always includes metric-translation block.
+  - name: "plan_coach.ground_coaching_line"
+    type: "function"
+    signature: "ground_coaching_line(text: str, plan_section: dict) -> list[GroundingFlag]"
+    description: >-
+      Pure, advisory-only grounding of the PDF coaching line against the
+      deterministic plan section. Never raises on arbitrary text. Logged by
+      generate_brief_report; never gates the PDF.
+  - name: "training_load_status payload"
+    type: "tool_payload"
+    signature: "+ tsb_zone, ctl_pct_change_14d, ctl_direction; floats rounded"
+  - name: "correlate payload"
+    type: "tool_payload"
+    signature: "+ strength, direction; static legend string REMOVED; pearson_r 3dp"
+  - name: "find_anomalies payload"
+    type: "tool_payload"
+    signature: "per-row + sd_distance, direction"
+  - name: "compare_periods payload"
+    type: "tool_payload"
+    signature: >-
+      + delta_pct, cohens_d, magnitude; floats rounded; accepts
+      distance_meters (activities, SUM semantics, + sum_mi miles-gated;
+      no effect_size fields for SUM metrics)
+  - name: "get_metric_trend payload"
+    type: "tool_payload"
+    signature: "+ slope_direction, vs_baseline; floats rounded"
+  - name: "get_training_plan_progress payload"
+    type: "tool_payload"
+    signature: >-
+      + this_week, goal_gap, predicted_finish_formatted,
+      target_time_formatted, per-workout target_duration_formatted and Fix C
+      mile/pace fields; workouts list WINDOWED by default (trailing 14 +
+      upcoming 7 days); new arg full: bool = false restores complete list;
+      full-plan rollups unaffected by window
+  - name: "get_training_plan_status payload"
+    type: "tool_payload"
+    signature: "+ this_week, goal_gap, formatted time fields, Fix C fields on today/last_graded"
+  - name: "get_workout_detail / recovery_pattern payloads"
+    type: "tool_payload"
+    signature: "splits / matched workouts pass through _augment_workout (miles convention)"
+  - name: "prompt surfaces"
+    type: "prompt"
+    signature: >-
+      system_prompt + Charts bullet (render chart output in reply);
+      descriptions rewritten: chart, daily_snapshot, get_today_status,
+      get_brief_context, get_training_plan_progress; error strings point at
+      sync_garmin_data / fitness://schema instead of CLI commands
+  - name: "2026-07-10 doc fixes A/B/C"
+    type: "inherited"
+    signature: "generate_chart inline image + ALL_TOOLS promotion; get_today_status -> assemble_status; _augment_plan_workout"
+    description: "Ship verbatim per docs/plans/2026-07-10-mcp-tool-ux-efficiency-design.md."
+
+invariants:
+  checkable:
+    - "interpret.py imports nothing outside stdlib"
+    - "status.py and brief_planner.py delegate to interpret (no duplicated band constants)"
+    - "plans.weekly_rollup / goal_gap are I/O-free; _build_plan_section calls weekly_rollup"
+    - "plan_coach.build_prompt remains I/O-free (notes passed as text)"
+    - "grounding stays advisory on the PDF path (no gate)"
+    - "raw fields kept wherever formatted/interpreted siblings are added"
+    - "V1 prompt construction byte-identical if 4b ships (context assembled for grounding only)"
+    - "all 2026-07-10 contract invariants hold (Fix A/B/C)"
+  testable:
+    - "every interpret classifier: band boundaries pinned both sides; None/zero degenerate input never raises"
+    - "training_load_status.tsb_zone == interpret.tsb_zone(payload.tsb)"
+    - "correlate payload has computed strength/direction and no legend string"
+    - "find_anomalies rows: sd_distance == (value-mean)/sd to 2dp with direction"
+    - "compare_periods: cohens_d/magnitude consistent with effect_size; SUM metrics carry no cohens_d"
+    - "analysis-tool floats within dp budget (3dp r/slope/d, 2dp means/sd, 1dp pct)"
+    - "weekly_rollup fixture values equal the PDF section's displayed values (shared function)"
+    - "goal_gap sign: positive = slower than goal; None propagation"
+    - "long-plan fixture: default progress call windowed; full=true complete; rollups identical both modes"
+    - "format_hms(6420) == '1:47:00'; None -> None"
+    - "build_prompt contains notes text when provided; translation block always"
+    - "system_prompt contains Charts bullet; scripts/score_prompt.py stays green"
+    - "error strings mention sync_garmin_data / fitness://schema, not CLI wording"
+    - "ground_coaching_line flags invented adherence, passes faithful citations, empty list on numberless prose"
+    - "get_workout_detail splits + recovery_pattern workouts: distance_mi present in miles mode, absent in km mode"
+    - "all 2026-07-10 contract testable invariants (incl. enumerated test rewrites) hold"
+
+integration_points:
+  - "agent/tools.py — payload attachments, windowing, description rewrites, error strings"
+  - "agent/status.py — tsb delegation, sleep value_formatted"
+  - "agent/brief_planner.py — pct_change delegation, anomaly sd_distance/direction"
+  - "agent/plans.py — weekly_rollup, goal_gap"
+  - "agent/plan_coach.py — notes param, translation block, ground_coaching_line"
+  - "agent/prompts.py — Charts bullet in system_prompt"
+  - "agent/grounding.py — public wrapper/re-export for parser reuse"
+  - "agent/units.py — format_hms (conditional)"
+  - "web/mcp_server.py — _render_status sleep formatting"
+  - "agent/briefing.py — 4b V1 grounding-only context (designated cut)"
+  - "tests: test_interpret.py (new), test_plans.py, test_tools.py, test_plan_tools.py, test_mcp_server.py, test_plan_coach.py, test_status.py, test_briefing.py, test_smoke.py (count 33->34)"
+  - "CLAUDE.md — tool count, windowing note, Fix A/B notes (same PR)"
+  - "pyproject.toml 0.21.0 -> 0.22.0 + CHANGELOG + uv.lock sync"
+
+ambiguity_resolutions:
+  - "trend_direction flat band: implementer picks the named constant in interpret.py; invariant is a pinned test on both sides of the boundary, not a specific value"
+  - "format_hms only added if units.format_duration doesn't already emit H:MM:SS"
+  - "designated cuts if quality gate flags scope: 2g (compare_periods distance SUM) and 4b (V1 grounding)"
+  - "correlate legend string is removed (superseded by computed fields), not kept alongside"
+  - "windowing default (14 back / 7 ahead) anchored to the same grading frontier the tool already uses, not date.today()"
