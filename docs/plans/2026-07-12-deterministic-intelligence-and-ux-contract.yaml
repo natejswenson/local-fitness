@@ -11,22 +11,40 @@ api_surface:
     description: >-
       New pure module, stdlib-only imports (no db, no SDK, no schemas).
       Houses the shared classifiers: tsb_zone(tsb) -> str;
-      pct_change(now, then) -> float | None;
+      pct_change(now, then) -> float | None (returns UNROUNDED; rounding
+      stays at the boundaries — brief_planner keeps its round(..., 1) on
+      the signal, brief_planner.py:508, and training_load_status rounds
+      at the payload boundary per the 1dp pct budget);
       trend_direction(slope_per_day: float | None, *, flat_threshold) -> str
       ('no data' iff slope_per_day is None; 'flat' via INCLUSIVE
       abs(slope_per_day) <= flat_threshold, so a zero threshold from a
       constant series still classifies slope 0 as flat; the caller —
-      get_metric_trend — owns the n < 2 -> slope_per_day=None mapping,
-      since the tool otherwise computes slope 0.0 even for n=1 via its
-      'or 1e-9' denominator, tools.py:254);
+      get_metric_trend — supplies flat_threshold =
+      (0.5 * sample_sd) / max(n - 1, 1) per the flat-band ambiguity
+      resolution (slope is per-observation), and owns the n < 2 ->
+      slope_per_day=None mapping, since the tool otherwise computes slope
+      0.0 even for n=1 via its 'or 1e-9' denominator, tools.py:254);
       delta_direction(pct_change: float | None, *, flat_pct: float = 2.0)
       -> str (scalar %-delta classifier for fields with no series/slope:
       None -> 'no data'; abs(pct_change) <= flat_pct -> 'flat', inclusive;
       sign otherwise; 2.0 a named constant, boundary pinned both sides);
       baseline_position(sd_distance) -> str;
-      correlation_read(r) -> dict | None;
-      effect_size(mean_a, mean_b, sd_a, sd_b, n_a, n_b) -> dict | None;
-      sd_position(value, mean, sd) -> dict | None.
+      correlation_read(r) -> dict | None (legend thresholds mirrored from
+      tools.py:679, lower-bound INCLUSIVE: |r| >= 0.2 modest, >= 0.4
+      moderate, >= 0.6 strong, below 0.2 weak; direction at r == 0.0 ->
+      'positive' via >=, consistent with sd_position; r None -> None,
+      i.e. no strength/direction);
+      effect_size(mean_a, mean_b, sd_a, sd_b, n_a, n_b) -> dict | None —
+      degrades PER-FIELD, never whole-None unless ALL inputs are None:
+      delta_pct needs only the two means (None only when mean_b is 0/None
+      or mean_a is None, else computed even when SDs/ns can't support a
+      d); cohens_d/magnitude are None when either SD is 0/None or either
+      n < 2; magnitude bands lower-bound inclusive (|d| >= 0.2 small,
+      >= 0.5 moderate, >= 0.8 large, below 0.2 negligible);
+      sd_position(value, mean, sd) -> dict | None (direction at delta 0 is
+      'above' via >= — effectively unreachable in sane calls, though a
+      negative sd_threshold, sign unvalidated at tools.py:543, could reach
+      it via find_anomalies; defined and pinned regardless).
       All handle None/zero/degenerate input without raising.
   - name: "tools.weekly_rollup"
     type: "function"
@@ -40,10 +58,22 @@ api_surface:
       actual_mi suppression, and the totals sum from that same list — so
       per-day rows and totals agree by construction (single copy of
       window/convert/suppress; tests/test_tools.py:1701 per-day pin survives
-      via the shared suppression). _build_plan_section consumes days for the
-      PDF table (inline pace/display formatting only stays local);
-      get_training_plan_progress's this_week carries the three totals only
-      (its windowed workouts list already covers per-day data).
+      via the shared suppression). days is REVERSE-CHRONOLOGICAL (most
+      recent first) — pinned by tests/test_tools.py:1697-1698 and
+      load-bearing downstream: plan_coach.build_prompt says 'most recent
+      first' (plan_coach.py:77) and fallback_coaching_line picks the first
+      non-pending entry as the latest graded day, so a forward order would
+      silently change its verdict phrase. Empty window -> days: [] with
+      zero totals; the empty->None short-circuit stays in
+      _build_plan_section (consumer behavior — tests/test_tools.py:1713-1717
+      pin unchanged). _build_plan_section consumes days AS-IS as the PDF
+      table — current per-day entries carry exactly {date, type,
+      planned_mi, actual_mi, verdict} (tools.py:1792-1798), no pace
+      strings, so days IS the table with no per-day enrichment; only the
+      today payload's to_miles/pace-string formatting (tools.py:1813-1818)
+      stays local to the PDF. get_training_plan_progress's this_week
+      carries the three totals only (its windowed workouts list already
+      covers per-day data).
       Window: (trailing 7 days ending on target_date —
       deliberately different from plans.weekly_mileage's per-week_index
       rollup; matches the PDF's existing definition). Lives in
@@ -54,8 +84,9 @@ api_surface:
       tools.py, which imports units; tests import it directly from tools.
       Rounding order is part of the contract: per-day units.to_miles
       (2 dp), then sum, then round the total to 1 dp — the PDF's existing
-      order (tools.py:1786-1804); summing raw meters first can differ by
-      0.1. Documented aggregation semantics: the
+      order (per-day conversion and summing at tools.py:1786-1804; totals'
+      1dp rounding at tools.py:1837-1838); summing raw meters first can
+      differ by 0.1. Documented aggregation semantics: the
       function itself excludes actual distance for verdict in
       ("pending", "compliant") — the existing PDF rule promoted to the
       shared definition of "week actual mileage", so PDF and MCP agree by
@@ -97,8 +128,12 @@ api_surface:
       reads as a run duration; the repo deliberately renders sleep as
       "7h 33m" (brief_planner._hm in _SNAPSHOT_UNITS, brief_planner.py:596,
       per :437-439; prompts.py:64-65 mandates hours-and-minutes).
+      Reproduces _hm's current output EXACTLY (brief_planner.py:437-443):
+      f"{h}h {m:02d}m" at/over an hour — minutes zero-padded, "7h 05m"
+      not "7h 5m" — and "{m}m" sub-hour ("45m"); None in -> None out.
       brief_planner._hm delegates to it (single source; _hm keeps its
-      ""-on-None contract), and it formats _render_status's sleep row and
+      ""-on-None contract at its own boundary), and it formats
+      _render_status's sleep row and
       status._metric_rows' value_formatted/baseline_formatted on
       sleep_seconds — so brief pool and snapshot rows render sleep
       identically by construction.
@@ -145,14 +180,23 @@ api_surface:
   - name: "compare_periods payload"
     type: "tool_payload"
     signature: >-
-      + delta_pct, cohens_d, magnitude; floats rounded; (2g, designated
-      cut) accepts distance_meters (activities, SUM semantics): per-period
-      {n, total} (no mean/sd) + per-period total_mi convenience
+      + delta_pct, cohens_d, magnitude; effect_size degrades PER-FIELD —
+      delta_pct computed from the means alone (None only when mean_b is
+      0/None or mean_a is None), cohens_d/magnitude None when either SD is
+      0/None or either n < 2 (a single-sample period yields sd 0 via the
+      max(len-1, 1) denominator, tools.py:509), so two 1-day periods still
+      carry delta_pct with cohens_d/magnitude None; floats rounded; (2g,
+      designated cut) accepts distance_meters (activities, SUM semantics):
+      per-period {n, total} (no mean/sd) + per-period total_mi convenience
       (miles-gated); top-level delta + delta_pct; NO cohens_d/magnitude
       for SUM metrics (no per-observation SD to pool)
   - name: "get_metric_trend payload"
     type: "tool_payload"
-    signature: "+ slope_direction, vs_baseline; floats rounded"
+    signature: >-
+      + slope_direction, vs_baseline; floats rounded; for n < 2 the
+      payload's slope_per_day becomes null (not today's guarded 0.0)
+      alongside slope_direction 'no data' — a deliberate, enumerated
+      payload change
   - name: "get_training_plan_progress payload"
     type: "tool_payload"
     signature: >-
@@ -196,7 +240,10 @@ api_surface:
       get_training_plan_status (points at progress for week rollups / goal
       gap); error strings lose all CLI wording, remedies split per 3d:
       training_load_status's empty-DB error points at sync_garmin_data (a
-      pull genuinely fixes it); log_manual_workout /
+      pull genuinely fixes it — the same days_pulled > 0 gate applies but
+      benignly: a first pull on an empty DB pulls > 0 days and recomputes;
+      the exotic activities-exist-baselines-missing state falls back to
+      the nightly job); log_manual_workout /
       delete_manual_workout's recompute-failure warnings do NOT point at
       sync_garmin_data as an immediate fix (it recomputes only when
       days_pulled > 0, tools.py:579-580) — they keep the literal
@@ -247,20 +294,29 @@ invariants:
       all 2026-07-10 DESIGN-DOC invariants hold (Fix A/B/C — that doc has no
       separate contract file), with one supersession: its
       '_build_plan_section is unchanged' invariant is superseded by WS2a's
-      weekly_rollup call; the rest holds (no _augment_plan_workout call;
-      inline per-day to_miles/pace conversions kept)
+      weekly_rollup call; the rest holds — _build_plan_section does NOT
+      call _augment_plan_workout; it keeps only the today-payload
+      conversion (tools.py:1813-1818) and pace-string formatting — per-day
+      window/convert/suppress lives solely in weekly_rollup
   testable:
     - >-
       every interpret classifier: band boundaries pinned both sides;
       None/zero degenerate input never raises; <= inclusivity pinned
       explicitly — trend_direction at exactly flat_threshold -> 'flat'
       (incl. the threshold-0 constant-series case) and delta_direction at
-      exactly flat_pct -> 'flat'; None -> 'no data' for both
-    - "get_metric_trend passes slope_per_day=None when the window has n < 2 values (tool-side 'no data' mapping)"
+      exactly flat_pct -> 'flat'; None -> 'no data' for both;
+      correlation_read's 0.2/0.4/0.6 and effect_size's 0.2/0.5/0.8
+      thresholds pinned both sides (lower-bound inclusive: exactly at a
+      threshold takes the named band); direction at r == 0.0 ->
+      'positive'; r None -> correlation_read None; effect_size per-field
+      degradation pinned (sd 0/None or n < 2 nulls only cohens_d/magnitude
+      while delta_pct computes from the means; mean_b 0/None nulls only
+      delta_pct)
+    - "get_metric_trend passes slope_per_day=None when the window has n < 2 values (tool-side 'no data' mapping); the payload carries slope_per_day: null (not 0.0) on that path"
     - "training_load_status.tsb_zone == interpret.tsb_zone(payload.tsb)"
     - "correlate payload has computed strength/direction and no legend string"
     - "find_anomalies rows: sd_distance == (value-mean)/sd to 2dp with direction"
-    - "compare_periods: cohens_d/magnitude consistent with effect_size; SUM metrics: per-period {n, total} + total_mi (miles-gated), top-level delta/delta_pct, no cohens_d/magnitude, no mean/sd"
+    - "compare_periods: cohens_d/magnitude consistent with effect_size, incl. the per-field case — two 1-day periods -> delta_pct present (from the means), cohens_d/magnitude None; SUM metrics: per-period {n, total} + total_mi (miles-gated), top-level delta/delta_pct, no cohens_d/magnitude, no mean/sd"
     - "training_load_status.ctl_direction == delta_direction(payload.ctl_pct_change_14d)"
     - "analysis-tool floats within dp budget (3dp r/slope/d, 2dp means/sd, 1dp pct)"
     - >-
@@ -268,15 +324,17 @@ invariants:
       — holds by construction (shared function carries the suppression
       semantics and the per-day-2dp -> sum -> 1dp rounding order);
       tests/test_tools.py:1687 pin (week_actual_mi == 6.9)
-      survives unchanged; weekly_rollup tested via direct import from
-      tools, no DB
+      survives unchanged; days reverse-chronological (the :1697-1698 pin
+      survives) and _build_plan_section's empty-window -> None behavior
+      (the :1713-1717 pin) unchanged; weekly_rollup tested via direct
+      import from tools, no DB
     - "goal_gap sign: positive = slower than goal; None propagation"
     - >-
       long-plan fixture: default progress call windowed; full=true complete;
       rollups identical both modes; today in-window under a stale frontier;
       window defined when frontier is None
     - "format_duration(6420) == '1:47:00'; format_duration(2700) == '45:00' (sub-hour target); None -> None"
-    - "format_hm(27180) == '7h 33m'; sub-hour and None cases pinned; brief pool (_hm) and status sleep rows render the same seconds identically"
+    - "format_hm(27180) == '7h 33m'; zero-padded minutes pinned (format_hm(25500) == '7h 05m', not '7h 5m'); sub-hour ('45m') and None cases pinned; brief pool (_hm) and status sleep rows render the same seconds identically"
     - "build_prompt contains notes text when provided; translation block always"
     - "system_prompt contains Charts bullet; scripts/score_prompt.py stays green"
     - >-
@@ -336,16 +394,25 @@ ambiguity_resolutions:
   - >-
     trend_direction flat band: defined from the sample SD of the fetched
     window series (not the 60-day baseline SD — only rhr/sleep_seconds have
-    one): flat when abs(slope_per_day * window_days) <= 0.5 * sample_sd —
-    INCLUSIVE <=, so the constant-series case (sample_sd 0, slope 0) is
-    'flat' with no side-door. trend_direction returns 'no data' iff
-    slope_per_day is None; get_metric_trend owns the n < 2 ->
-    slope_per_day=None mapping (the tool otherwise computes slope 0.0 even
-    for n=1 via its 'or 1e-9' denominator, tools.py:254). The tool passes
-    flat_threshold = (0.5 * sample_sd) / window_days so the in-function
-    comparison abs(slope_per_day) <= flat_threshold equals the band above.
-    The 0.5 is a named constant in interpret.py; the <= inclusivity is
-    pinned (value exactly at threshold -> flat)
+    one). The slope is per-OBSERVATION, not per-day: get_metric_trend
+    regresses against the non-null sample index (xs = range(n),
+    tools.py:249-255), so the fitted total change across the window is
+    slope * (n - 1), NOT slope * window_days — flat when
+    abs(slope_per_day * (n - 1)) <= 0.5 * sample_sd, i.e. the tool passes
+    flat_threshold = (0.5 * sample_sd) / max(n - 1, 1) so the in-function
+    comparison abs(slope_per_day) <= flat_threshold equals that band
+    (dividing by window_days is the wrong units — ~10x too strict for
+    sparse metrics like vo2_max with n=4 over days=30). INCLUSIVE <=, so
+    the constant-series case (sample_sd 0, slope 0) is 'flat' with no
+    side-door. trend_direction returns 'no data' iff slope_per_day is
+    None; get_metric_trend owns the n < 2 -> slope_per_day=None mapping
+    (the tool otherwise computes slope 0.0 even for n=1 via its 'or 1e-9'
+    denominator, tools.py:254 — and the payload's slope_per_day key
+    becomes null on that path, a deliberate payload change) and skips the
+    threshold computation entirely for n < 2 (sample SD undefined at
+    n = 1; the max(..., 1) is belt-and-suspenders — that branch never
+    reaches the expression). The 0.5 is a named constant in interpret.py;
+    the <= inclusivity is pinned (value exactly at threshold -> flat)
   - >-
     ctl_direction does NOT route through trend_direction (a scalar % delta
     has no slope/series/SD): it uses the new delta_direction(pct_change, *,
