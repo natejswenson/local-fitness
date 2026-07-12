@@ -111,7 +111,11 @@ classifiers delegate to it so brief and tools agree by construction:
   sign otherwise. `2.0` is a named constant in `interpret.py`, boundary
   pinned on both sides.
 - `baseline_position(sd_distance: float | None) -> "elevated" | "normal" |
-  "suppressed" | "no data"` (bands: > +1 SD elevated, < −1 SD suppressed).
+  "suppressed" | "no data"` (bands: > +1 SD elevated, < −1 SD suppressed;
+  `None` → `"no data"`). The boundary side is explicit: exactly ±1.0 →
+  `"normal"` — the bands are **deliberately strict** (`> +1` / `< −1`),
+  unlike `correlation_read`/`effect_size`'s inclusive lower bounds; pinned
+  on both sides by test.
 - `correlation_read(r: float | None) -> {strength: "weak"|"modest"|
   "moderate"|"strong", direction: "positive"|"negative"} | None` — the bands
   already written in `correlate`'s legend string (tools.py:679: 0.2/0.4/0.6
@@ -152,7 +156,7 @@ Payload attachments (all additive; raw fields stay):
 | `correlate` | `strength`, `direction` (replaces the static legend string — the legend is deleted, the computed read supersedes it) |
 | `find_anomalies` | per-row `sd_distance`, `direction` |
 | `compare_periods` | `delta_pct`, `cohens_d`, `magnitude` |
-| `get_metric_trend` | `slope_direction`, `vs_baseline` (from `baseline_position` over the existing `current_vs_baseline_sd`) |
+| `get_metric_trend` | `slope_direction`, `vs_baseline` (from `baseline_position` over the existing `current_vs_baseline_sd`). `vs_baseline` is **always attached**, never conditionally omitted: only `rhr`/`sleep_seconds` carry baseline SDs (`current_vs_baseline_sd` is set only for `BASELINE_METRICS` with a non-zero SD, tools.py:240-246, :264-268), so for every other metric — and whenever the SD is absent/None — the key carries `"no data"` (the classifier's `None` mapping), deterministically |
 
 `brief_planner._rhr_anomalies` also attaches `sd_distance`/`direction` to
 `BriefContext.anomalies` entries via the same helper (additive keys on an
@@ -160,13 +164,43 @@ existing dict — `Brief`/`Takeaway` schemas unchanged; `BriefContext.anomalies`
 is a free-form list). Its above-only bias (`> 2*sd`) is *kept* — widening to
 low-side anomalies would change brief triggering behavior, out of scope.
 
+**`ctl_pct_change_14d`'s "then" value is shared, not re-derived.** The
+arithmetic (`pct_change`) is only half the agreement story — the *data
+source* must agree too. The brief signal's "then" CTL comes from a
+dedicated no-lookback-floor query (`SELECT ctl FROM baselines WHERE date
+<= ? AND ctl IS NOT NULL ORDER BY date DESC LIMIT 1`, anchored
+`today − 14d`, brief_planner.py:501-504), while `training_load_status` has
+only a 30-day history window in hand (tools.py:597-601) — picking a
+"then" point out of that window would diverge from the brief on gappy
+baselines (the oldest in-window row is not necessarily the row at-or-before
+the anchor). Change: extract the "then" lookup into a **public
+module-level function in `brief_planner`** —
+`ctl_at_or_before(conn, anchor_date: str) -> float | None` (the same SQL,
+no lookback floor) — used by BOTH `_compute_signals` and
+`training_load_status`. The tool runs it on its **existing** connection:
+one extra indexed point-query, and `training_load_status` is NOT in
+tests/test_perf_benchmarks.py's benchmarked set (verified — the benchmarks
+cover exactly `assemble_brief_context`, `get_training_plan_progress`,
+`get_training_plan_status`, `_build_plan_section`, `daily_snapshot`), so
+the extra query is allowed. The import direction already exists:
+`tools.py` imports `brief_planner` lazily inside `get_brief_context`
+(tools.py:1591-1594 — in-function because `brief_planner → status →
+tools` would cycle at module scope); `training_load_status` uses the same
+lazy-import pattern. Checkable invariant: the 14-day "then" lookup exists
+in exactly ONE place (`brief_planner`), consumed by both paths —
+agreement by construction, mirroring the `tsb_zone` treatment.
+
 **Float rounding at the payload boundary.** The analysis tools emit
 full-precision floats (`0.4285714285714286`). Round at the `_text({...})`
 boundary: correlation/slope/cohens_d → 3 dp; means/SDs/deltas/recovery-days
 → 2 dp; pct fields → 1 dp (matching `status.py:127`). Applies to
 `get_metric_trend`, `compare_periods`, `correlate`, `recovery_pattern`, and
 `training_load_status` (whose payload entry in the API surface already says
-"floats rounded"). No test currently pins raw precision — safe.
+"floats rounded"). No test currently pins raw precision — safe. One rule,
+stated once for all analysis tools: **rounding at the `_text` boundary
+skips `None` values** — a `None` passes through as `null`, unrounded.
+The concrete case: `correlate`'s `pearson_r` is `None` on a
+zero-variance denominator (tools.py:675), and `round(None, 3)` raises.
 
 **`flat_threshold` note.** `trend_direction`'s flat band is one of WS1's
 new named thresholds — alongside `delta_direction`'s 2.0% flat band and
@@ -237,10 +271,17 @@ per-day list and the totals**:
 
 ```python
 # agent/tools.py, module level
-weekly_rollup(workouts: list[dict], target_date: date) -> dict
+weekly_rollup(workouts: list[dict], target_date: str) -> dict
+# target_date is an ISO date string — the repo convention
 # -> {week_planned_mi, week_actual_mi, slips, days: list[dict]}
 # each day: {date, verdict, type, planned_mi, actual_mi}
 ```
+
+`target_date: str` (ISO date), not `date` — the repo convention:
+`_build_plan_section` already windows via ISO-*string* comparison
+(`window_start <= w["date"] <= target_date`, tools.py:1776-1778), and
+string comparison of ISO dates is order-correct, so the shared function
+takes the string directly with no parse/round-trip.
 
 taking already-graded workout dicts (no I/O, no connections — direct-import
 testable). The `days` list is the canonical per-day shape: the function owns
@@ -339,8 +380,16 @@ it matches the PDF section's existing definition, not plan-week boundaries.
 
 **2b. Goal-gap fields.** `plans.goal_gap(predicted_finish_s: float | None,
 target_time_s: int | None) -> {gap_seconds, gap_pct, on_pace: bool} | None`
-(None when either input is None; `predicted_finish_s` is a float because
-`riegel_predict` returns `float`, plans.py:341). Attached to `get_training_plan_progress` (top level, next to the
+(None when `predicted_finish_s` is None **or when `target_time_s` is None
+or `<= 0`**; `predicted_finish_s` is a float because `riegel_predict`
+returns `float`, plans.py:341). The `<= 0` guard is a real
+zero-denominator rule, not paranoia: `validate_plan_input` **admits** a
+zero `target_time_seconds` (plans.py:205-207 — `n < 0` rejects only
+negatives), and the stored value reaches `goal_gap` via
+`detail.get("target_time_seconds")` (tools.py:1550), so a storable zero
+goal time would otherwise divide `gap_pct` by zero. A zero goal time is
+storable but meaningless — there is no defined gap % against it. Pinned
+in the degenerate-input test list alongside the None cases. Attached to `get_training_plan_progress` (top level, next to the
 existing raw seconds) — **progress only. Correction: an earlier draft also
 attached it to `build_plan_status`'s payload so `get_training_plan_status`
 would carry it; that has no data source.** `build_plan_status`
@@ -368,9 +417,12 @@ always in-window even when the frontier is stale** (>7 days behind after a
 sync gap — and this is the very tool CLAUDE.md steers to for "show my plan
 through today"); the `else today` fallbacks make the window well-defined on
 a fresh DB where the frontier is None. A new optional boolean arg `full`
-(default false) returns the complete list. Full-plan rollups
-(`adherence_pct`, `days_to_race`, `predicted_finish_seconds`, `goal_gap`,
-`this_week`) are computed over the whole plan regardless of the window.
+(default false) returns the complete list. The rollups (`adherence_pct`,
+`days_to_race`, `predicted_finish_seconds`, `goal_gap`, `this_week`) are
+computed from the **full graded workout list, not the 2c-windowed
+projection**: `adherence_pct`/`days_to_race`/`goal_gap` remain whole-plan,
+and `this_week` is trailing-7-days *by definition* (so "regardless of
+window" phrasing would be sloppy — its window is its own, never 2c's).
 Description rewritten to say so and to name `get_training_plan_status` for
 "just today." Behavior change by design: an agent that wants the whole plan
 (e.g. "show my plan through today" for a plan older than 14 days) must pass
@@ -630,14 +682,17 @@ New module `src/local_fitness/agent/interpret.py` (all pure):
 - `pct_change(now: float | None, then: float | None) -> float | None`
 - `trend_direction(slope_per_day: float | None, *, flat_threshold: float) -> str` — `"no data"` iff `slope_per_day is None`; flat via inclusive `<=` (see WS1)
 - `delta_direction(pct_change: float | None, *, flat_pct: float = 2.0) -> str` — scalar %-delta classifier (see WS1)
-- `baseline_position(sd_distance: float | None) -> str`
+- `baseline_position(sd_distance: float | None) -> str` — strict bands (`> +1` / `< −1`; exactly ±1.0 → `"normal"` — deliberately strict, unlike `correlation_read`/`effect_size`'s inclusive lower bounds; see WS1)
 - `correlation_read(r: float | None) -> dict | None`
 - `effect_size(mean_a, mean_b, sd_a, sd_b, n_a, n_b) -> dict | None`
 - `sd_position(value, mean, sd) -> dict | None`
 
+New public function in `brief_planner` (takes a connection — not pure, but single-sourced):
+- `brief_planner.ctl_at_or_before(conn, anchor_date: str) -> float | None` — public module-level extraction of the 14-day CTL "then" lookup (same no-lookback-floor SQL, brief_planner.py:501-504); consumed by BOTH `_compute_signals` and `training_load_status` (which runs it on its existing connection via the same lazy in-function `brief_planner` import `get_brief_context` already uses, tools.py:1591-1594) — agreement by construction; see WS1's shared-"then" paragraph.
+
 New pure functions in existing modules:
-- `tools.weekly_rollup(workouts: list[dict], target_date: date) -> dict` — module-level in `agent/tools.py` (NOT `plans.py` — see 2a's relocation rationale); returns `{week_planned_mi, week_actual_mi, slips, days: list[dict]}` where each `days` entry is `{date, verdict, type, planned_mi, actual_mi}` — the canonical per-day shape, with the verdict-conditional `actual_mi` suppression (`verdict in ("pending", "compliant")` → `None`) applied inside the function and the totals summed from that same list; `days` is **reverse-chronological** (most recent first — the tests/test_tools.py:1697-1698 pin; see 2a for the downstream consumers that depend on it); rounding order: per-day `to_miles` 2 dp → sum → total 1 dp (see 2a). Empty window → `days: []` with zero totals; the empty→`None` short-circuit stays in `_build_plan_section` (see 2a). `_build_plan_section` consumes `days`; `get_training_plan_progress`'s `this_week` carries the three totals only.
-- `plans.goal_gap(predicted_finish_s: float | None, target_time_s: int | None) -> dict | None` (`predicted_finish_s` is float — `riegel_predict` returns `float`, plans.py:341).
+- `tools.weekly_rollup(workouts: list[dict], target_date: str) -> dict` — `target_date` is an ISO date string (repo convention — callers window via ISO-string comparison, tools.py:1776-1778, which is order-correct); module-level in `agent/tools.py` (NOT `plans.py` — see 2a's relocation rationale); returns `{week_planned_mi, week_actual_mi, slips, days: list[dict]}` where each `days` entry is `{date, verdict, type, planned_mi, actual_mi}` — the canonical per-day shape, with the verdict-conditional `actual_mi` suppression (`verdict in ("pending", "compliant")` → `None`) applied inside the function and the totals summed from that same list; `days` is **reverse-chronological** (most recent first — the tests/test_tools.py:1697-1698 pin; see 2a for the downstream consumers that depend on it); rounding order: per-day `to_miles` 2 dp → sum → total 1 dp (see 2a). Empty window → `days: []` with zero totals; the empty→`None` short-circuit stays in `_build_plan_section` (see 2a). `_build_plan_section` consumes `days`; `get_training_plan_progress`'s `this_week` carries the three totals only.
+- `plans.goal_gap(predicted_finish_s: float | None, target_time_s: int | None) -> dict | None` (`predicted_finish_s` is float — `riegel_predict` returns `float`, plans.py:341). Returns `None` when `predicted_finish_s` is None or when `target_time_s` is None **or `<= 0`** — a zero goal time is storable (`validate_plan_input` rejects only negatives, plans.py:205-207) but has no defined gap % (see 2b).
 - `units.format_hm(seconds: float | int | None) -> str | None` — reproduces `_hm`'s output exactly: `f"{h}h {m:02d}m"` at/over an hour (zero-padded minutes — `27180 → "7h 33m"`, `25500 → "7h 05m"`), `f"{m}m"` sub-hour (`"45m"`), `None` → `None`; the sleep-rendering convention (callers feed floats — `sleep_seconds` values and 60-day means; `_hm` already does `int(round(...))`, brief_planner.py:442); `brief_planner._hm` delegates to it, keeping its own ""-on-None contract at its boundary (see 3c).
 - No `units.format_hms` — the existing `units.format_duration` already emits `H:MM:SS` at/over an hour (units.py:55-68); reused as-is for workout/target durations (see 2d). `format_hm` is not an `H:MM:SS` sibling — it is the hours-and-minutes sleep shape (3c), a different convention.
 - `plan_coach.ground_coaching_line(text: str, plan_section: dict) -> list[GroundingFlag]` — flags carry `takeaway_index=0` (see 4a).
@@ -645,14 +700,14 @@ New pure functions in existing modules:
 - `plan_coach.generate_coaching_line(..., notes_text: str | None = None)` — signature extension, plumbed through to `build_prompt` (see 3a's enumerated test casualty).
 
 Tool payload changes (all additive unless noted):
-- `training_load_status`: + `tsb_zone`, `ctl_pct_change_14d`, `ctl_direction` (via `delta_direction`, not `trend_direction`); floats rounded.
-- `correlate`: + `strength`, `direction`; **legend string removed**; `pearson_r` rounded to 3 dp.
+- `training_load_status`: + `tsb_zone`, `ctl_pct_change_14d` (its "then" value via `brief_planner.ctl_at_or_before` on the tool's existing connection — the shared no-floor lookup, NOT a point picked from the tool's 30-day window; see WS1), `ctl_direction` (via `delta_direction`, not `trend_direction`); floats rounded.
+- `correlate`: + `strength`, `direction`; **legend string removed**; `pearson_r` rounded to 3 dp (skipped when `None` — the zero-denominator case, tools.py:675; the boundary-rounding rule skips `None` generally, see WS1's rounding paragraph).
 - `find_anomalies`: per-row + `sd_distance`, `direction`.
 - `compare_periods`: + `delta_pct`, `cohens_d`, `magnitude`; floats rounded; (2g) `distance_meters` accepted with SUM semantics — per-period `{n, total}` + `total_mi` (miles-gated), top-level `delta`/`delta_pct`, no `cohens_d`/`magnitude`.
-- `get_metric_trend`: + `slope_direction`, `vs_baseline`; floats rounded; for `n < 2` the payload's `slope_per_day` becomes `null` (not today's guarded 0.0) alongside `slope_direction` `"no data"` — a deliberate, enumerated payload change (see WS1's flat-threshold note).
+- `get_metric_trend`: + `slope_direction`, `vs_baseline` (**always attached** — `"no data"` when `current_vs_baseline_sd` is absent/None, i.e. every metric outside `rhr`/`sleep_seconds`, tools.py:240-246; deterministic, never conditionally omitted); floats rounded; for `n < 2` the payload's `slope_per_day` becomes `null` (not today's guarded 0.0) alongside `slope_direction` `"no data"` — a deliberate, enumerated payload change (see WS1's flat-threshold note).
 - `recovery_pattern`: matched workouts pass through `_augment_workout`; SELECT widened to add `avg_pace_sec_per_km` + `duration_seconds` (see 2f); floats rounded.
 - `get_workout_detail`: splits pass through `_augment_workout`.
-- `get_training_plan_progress`: + `this_week`, `goal_gap`, `predicted_finish_formatted`, `target_time_formatted`, per-workout `target_duration_formatted` (+ Fix C mile/pace fields); `workouts` **windowed by default** (`[anchor_back − 14d, anchor_fwd + 7d]` per 2c; `full=true` restores complete list) — one of the two non-additive changes among **this doc's own workstreams** (the other is `correlate`'s legend-string removal in WS1, unpinned by tests — tests/test_tools.py:371 asserts only `pearson_r` presence); the release's third non-additive change is folded-in Fix B, which replaces `get_today_status`'s whole payload shape and is enumerated in the 07-10 doc.
+- `get_training_plan_progress`: + `this_week`, `goal_gap`, `predicted_finish_formatted`, `target_time_formatted`, per-workout `target_duration_formatted` (+ Fix C mile/pace fields); `workouts` **windowed by default** (`[anchor_back − 14d, anchor_fwd + 7d]` per 2c; `full=true` restores complete list). This doc's own workstreams carry **three non-additive changes**, enumerated by name: (1) 2c's windowing here; (2) `correlate`'s legend-string removal in WS1 (unpinned by tests — tests/test_tools.py:371 asserts only `pearson_r` presence); (3) `get_metric_trend`'s `slope_per_day` 0.0 → `null` for `n < 2` (WS1's flat-threshold note). Folded-in Fix B is a **fourth at the release level** — it replaces `get_today_status`'s whole payload shape and is enumerated in the 07-10 doc.
 - `get_training_plan_status`: + `target_time_formatted`; `target_duration_formatted` + Fix C mile/pace fields on `today`/`last_graded`; description rewritten to point at `get_training_plan_progress` for week rollups / goal gap. **No** `this_week`, `goal_gap`, or `predicted_finish_formatted` — goal-gap/projection genuinely has no data source on that path (no Riegel query, see 2b); `this_week` is excluded by the slim-by-design contract + perf pins, not data absence (see 2a).
 - `BriefContext.anomalies` entries: + `sd_distance`, `direction` (schema class unchanged — free-form list).
 - `daily_snapshot` / `get_today_status` (via `status._metric_rows`): `sleep_seconds` row + `value_formatted`/`baseline_formatted` via `units.format_hm` (`"7h 33m"` shape — see 3c).
@@ -674,6 +729,11 @@ Prompt/instruction changes:
   tone thresholds (`tsb_fresh`/`tsb_very_fatigued`, brief_planner.py:47-48)
   reference interpret's constants where feasible; prose tool descriptions
   may restate the bands.
+- The 14-day CTL "then" lookup exists in exactly one place —
+  `brief_planner.ctl_at_or_before` — consumed by both `_compute_signals`
+  and `training_load_status`; neither path re-derives a "then" point from
+  a history window (agreement by construction, mirroring the `tsb_zone`
+  treatment — see WS1's shared-"then" paragraph).
 - `tools.weekly_rollup` (module-level in `agent/tools.py`) and
   `plans.goal_gap` are I/O-free — `weekly_rollup` opens no connections and
   is directly importable/testable; `plans.py` gains no `agent.units` import
@@ -709,7 +769,9 @@ Prompt/instruction changes:
   the `flat_threshold == 0`, slope-0 constant-series case), and
   `delta_direction` with `abs(pct_change)` exactly at `flat_pct` →
   `"flat"`; `trend_direction(None, ...)` and `delta_direction(None)` →
-  `"no data"`. `correlation_read`'s 0.2/0.4/0.6 thresholds and
+  `"no data"`. `baseline_position` at exactly ±1.0 → `"normal"` (the
+  strict-band side, pinned on both sides). `correlation_read`'s
+  0.2/0.4/0.6 thresholds and
   `effect_size`'s 0.2/0.5/0.8 magnitude thresholds pinned on both sides
   (lower-bound inclusive — a value exactly at a threshold takes the named
   band); direction at `r == 0.0` → `"positive"`; `pearson_r` None →
@@ -719,13 +781,23 @@ Prompt/instruction changes:
   (not 0.0) on that path.
 - `training_load_status` payload contains `tsb_zone` equal to
   `interpret.tsb_zone` of its own `tsb` value (agreement by construction).
+- `training_load_status`'s `ctl_pct_change_14d` equals the brief signal
+  for the same DB state — including a **gappy-baselines fixture** (no row
+  exactly at `today − 14d`, so the at-or-before lookup and a
+  window-derived point would differ): both paths must return the same
+  value because both call `brief_planner.ctl_at_or_before`.
 - `correlate` payload has computed `strength`/`direction` and no legend
   string; `find_anomalies` rows carry `sd_distance` matching
   `(value-mean)/sd` to 2 dp; `compare_periods` carries `cohens_d`/`magnitude`
   consistent with `effect_size`, including the per-field degradation case:
   two 1-day periods → `delta_pct` present (computed from the means),
   `cohens_d`/`magnitude` None.
-- Rounded floats: no analysis-tool payload float exceeds its dp budget.
+- Rounded floats: no analysis-tool payload float exceeds its dp budget;
+  `None` values are skipped by the boundary rounding (a `None` `pearson_r`
+  passes through as `null`, no exception).
+- `get_metric_trend`'s `vs_baseline` key is present on every metric —
+  `"no data"` for a non-baselined metric (e.g. `steps`), a real band for
+  `rhr`/`sleep_seconds` with a baseline SD in the fixture.
 - `weekly_rollup` over a fixture week equals the values the PDF section
   displays for the same fixture — this now holds **by construction** (the
   shared function carries the suppression semantics AND the rounding order:
@@ -735,7 +807,10 @@ Prompt/instruction changes:
   empty-window → `None` behavior of `_build_plan_section` (the :1713-1717
   pin) is unchanged; `weekly_rollup` is tested via direct import from
   `tools` with no DB.
-- `goal_gap` sign convention pinned (positive gap = slower than goal).
+- `goal_gap` sign convention pinned (positive gap = slower than goal);
+  degenerate inputs pinned: `target_time_s` of `None` **and of `0`** (and
+  negative) → `None`, `predicted_finish_s` `None` → `None` (see 2b's
+  zero-denominator rule).
 - `get_training_plan_progress` default call on a long-plan fixture returns
   only in-window workouts; `full=true` returns all; rollups identical in
   both modes; today is in-window under a stale frontier (frontier > 7 days
@@ -786,7 +861,8 @@ Prompt/instruction changes:
 
 - `tests/test_interpret.py` (new): exhaustive band/edge coverage for every
   classifier — this module should be trivially 100%.
-- `tests/test_plans.py`: `goal_gap` (None propagation, sign convention,
+- `tests/test_plans.py`: `goal_gap` (None propagation, the `target_time_s
+  <= 0` → None rule — zero and negative pinned, per 2b — sign convention,
   boundary values).
 - `tests/test_tools.py`: `weekly_rollup` via **direct import from `tools`**
   (pure, no DB, no connection — empty, single, flat, missing-data,
@@ -834,6 +910,10 @@ Prompt/instruction changes:
   `assemble_brief_context` gains the anomaly `sd_distance`/`direction`
   attachment in `_rhr_anomalies` — pure compute over rows already in hand,
   no new opens.
+  `training_load_status` is NOT in the benchmarked set (verified against
+  tests/test_perf_benchmarks.py), so WS1's one extra indexed point-query
+  (`ctl_at_or_before`, run on the tool's existing connection) is allowed —
+  no benchmarked path gains a query or a connection.
   One deliberate improvement: 2c's windowing *shrinks*
   `get_training_plan_progress`'s serialization work vs the committed
   baseline — CI-safe, since `--benchmark-compare-fail=min:15%` fails only
@@ -856,14 +936,17 @@ Prompt/instruction changes:
   computed from the means (None only when `mean_b` is 0/None or `mean_a`
   is None); two 1-day periods → `delta_pct` present, `cohens_d` None;
   `r` exactly on a band boundary → pinned by test.
-- Plan with no goal time or no best-effort projection → `goal_gap` None,
-  formatted fields absent.
+- Plan with no goal time, a **zero goal time** (storable —
+  `validate_plan_input` rejects only negatives, plans.py:205-207 — but
+  meaningless, and a bare zero would divide by zero), or no best-effort
+  projection → `goal_gap` None, formatted fields absent.
 - Windowing when the plan is entirely in the past (race done) or entirely
   future (starts next week): the 2c formula governs — there is **no
   clamping to plan bounds**. A fully-past or fully-future plan may legally
-  yield an empty `workouts` list, with the full-plan rollups
-  (`adherence_pct`, `days_to_race`, `goal_gap`, `this_week`, …) still
-  present; `full=true` remains the escape hatch for the complete list.
+  yield an empty `workouts` list, with the rollups (`adherence_pct`,
+  `days_to_race`, `goal_gap`, `this_week`, … — computed from the full
+  graded workout list, not the 2c-windowed projection) still present;
+  `full=true` remains the escape hatch for the complete list.
 - Windowing when the frontier is None (fresh DB, no daily rows): both
   anchors fall back to `today` — the window is `[today − 14d, today + 7d]`,
   never an exception.

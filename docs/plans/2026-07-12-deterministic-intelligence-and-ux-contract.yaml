@@ -28,7 +28,10 @@ api_surface:
       -> str (scalar %-delta classifier for fields with no series/slope:
       None -> 'no data'; abs(pct_change) <= flat_pct -> 'flat', inclusive;
       sign otherwise; 2.0 a named constant, boundary pinned both sides);
-      baseline_position(sd_distance) -> str;
+      baseline_position(sd_distance) -> str (bands STRICT: > +1 elevated,
+      < -1 suppressed, exactly +/-1.0 -> 'normal' — deliberately strict,
+      unlike correlation_read/effect_size's inclusive lower bounds; pinned
+      both sides; None -> 'no data');
       correlation_read(r) -> dict | None (legend thresholds mirrored from
       tools.py:679, lower-bound INCLUSIVE: |r| >= 0.2 modest, >= 0.4
       moderate, >= 0.6 strong, below 0.2 weak; direction at r == 0.0 ->
@@ -46,9 +49,29 @@ api_surface:
       negative sd_threshold, sign unvalidated at tools.py:543, could reach
       it via find_anomalies; defined and pinned regardless).
       All handle None/zero/degenerate input without raising.
+  - name: "brief_planner.ctl_at_or_before"
+    type: "function"
+    signature: "ctl_at_or_before(conn, anchor_date: str) -> float | None"
+    description: >-
+      NEW public module-level function in brief_planner: extraction of the
+      14-day CTL "then" lookup — the same no-lookback-floor SQL (SELECT ctl
+      FROM baselines WHERE date <= ? AND ctl IS NOT NULL ORDER BY date DESC
+      LIMIT 1, brief_planner.py:501-504). Consumed by BOTH _compute_signals
+      and training_load_status so ctl_pct_change_14d agrees by construction
+      (mirroring the tsb_zone treatment) — the tool must NOT pick a "then"
+      point from its 30-day window (tools.py:597-601), which diverges on
+      gappy baselines. The tool runs it on its EXISTING connection: one
+      extra indexed point-query, allowed because training_load_status is
+      not in tests/test_perf_benchmarks.py's benchmarked set (verified:
+      benchmarks cover assemble_brief_context, get_training_plan_progress,
+      get_training_plan_status, _build_plan_section, daily_snapshot only).
+      Import direction already exists: tools.py imports brief_planner
+      lazily in-function (get_brief_context, tools.py:1591-1594 — module
+      scope would cycle via brief_planner -> status -> tools);
+      training_load_status uses the same lazy-import pattern.
   - name: "tools.weekly_rollup"
     type: "function"
-    signature: "weekly_rollup(workouts: list[dict], target_date: date) -> dict  # module-level in agent/tools.py"
+    signature: "weekly_rollup(workouts: list[dict], target_date: str) -> dict  # target_date is an ISO date string; module-level in agent/tools.py"
     returns: "{week_planned_mi, week_actual_mi, slips, days: list[dict]}"
     description: >-
       Pure, I/O-free (no connections) extraction of _build_plan_section's
@@ -76,7 +99,11 @@ api_surface:
       covers per-day data).
       Window: (trailing 7 days ending on target_date —
       deliberately different from plans.weekly_mileage's per-week_index
-      rollup; matches the PDF's existing definition). Lives in
+      rollup; matches the PDF's existing definition). target_date is an
+      ISO date STRING, not a date object — the repo convention:
+      _build_plan_section already windows via ISO-string comparison
+      (tools.py:1776-1778), and string comparison of ISO dates is
+      order-correct, so no parse/round-trip. Lives in
       agent/tools.py, NOT plans.py: it needs units.to_miles, and plans.py
       imports only config/db (plans.py:18) with a km-internal convention —
       a core->agent.units import is unsanctioned; both consumers
@@ -104,8 +131,15 @@ api_surface:
     description: >-
       Pure seconds arithmetic — no units import needed, so plans.py is the
       right home (unlike weekly_rollup). predicted_finish_s is float |
-      None: riegel_predict returns float (plans.py:341). None when either
-      input is None. Positive gap = slower than goal.
+      None: riegel_predict returns float (plans.py:341). None when
+      predicted_finish_s is None OR when target_time_s is None or <= 0 —
+      the zero-denominator rule: validate_plan_input ADMITS a zero
+      target_time_seconds (plans.py:205-207 rejects only
+      negatives/non-finite) and it reaches goal_gap via
+      detail.get("target_time_seconds") (tools.py:1550); a zero goal time
+      is storable but meaningless (no defined gap %), and a bare zero
+      would divide gap_pct by zero. Pinned in the degenerate-input test
+      list. Positive gap = slower than goal.
       Attached to get_training_plan_progress ONLY — build_plan_status
       (plans.py:869-903) computes no Riegel projection, so
       get_training_plan_status has no data source for it.
@@ -168,12 +202,22 @@ api_surface:
   - name: "training_load_status payload"
     type: "tool_payload"
     signature: >-
-      + tsb_zone, ctl_pct_change_14d, ctl_direction (via
+      + tsb_zone, ctl_pct_change_14d (its "then" value from
+      brief_planner.ctl_at_or_before on the tool's existing connection —
+      the shared no-floor lookup, NEVER a point picked from the tool's
+      30-day window, which diverges on gappy baselines; see the
+      ctl_at_or_before api_surface entry), ctl_direction (via
       delta_direction(ctl_pct_change_14d) — a scalar % delta, NOT routed
       through trend_direction); floats rounded
   - name: "correlate payload"
     type: "tool_payload"
-    signature: "+ strength, direction; static legend string REMOVED; pearson_r 3dp"
+    signature: >-
+      + strength, direction; static legend string REMOVED; pearson_r 3dp —
+      rounding skipped when None (pearson_r can be None via the
+      zero-variance denominator, tools.py:675; round(None, 3) raises).
+      The rule is general, stated once for all analysis tools: rounding at
+      the _text boundary skips None values — a None passes through as
+      null, unrounded
   - name: "find_anomalies payload"
     type: "tool_payload"
     signature: "per-row + sd_distance, direction"
@@ -193,7 +237,12 @@ api_surface:
   - name: "get_metric_trend payload"
     type: "tool_payload"
     signature: >-
-      + slope_direction, vs_baseline; floats rounded; for n < 2 the
+      + slope_direction, vs_baseline; vs_baseline is ALWAYS attached —
+      'no data' when current_vs_baseline_sd is absent/None (only
+      rhr/sleep_seconds have baseline SDs, tools.py:240-246, and the SD
+      key is set only when the SD is non-zero, tools.py:264-268), i.e.
+      deterministic for every metric, never a conditionally-omitted key;
+      floats rounded; for n < 2 the
       payload's slope_per_day becomes null (not today's guarded 0.0)
       alongside slope_direction 'no data' — a deliberate, enumerated
       payload change
@@ -206,8 +255,12 @@ api_surface:
       ([anchor_back - 14d, anchor_fwd + 7d] where anchor_back = frontier if
       not None else today, anchor_fwd = max(frontier or today, today) —
       today always in-window, defined on a fresh DB); new arg
-      full: bool = false restores complete list; full-plan rollups
-      unaffected by window
+      full: bool = false restores complete list; the rollups
+      (adherence_pct, days_to_race, predicted_finish_seconds, goal_gap,
+      this_week) are computed from the FULL graded workout list, not the
+      2c-windowed projection — adherence_pct/days_to_race/goal_gap remain
+      whole-plan, and this_week is trailing-7-days by definition (its own
+      window, never 2c's)
   - name: "get_training_plan_status payload"
     type: "tool_payload"
     signature: >-
@@ -267,6 +320,12 @@ invariants:
       thresholds (tsb_fresh/tsb_very_fatigued) reference interpret's
       constants where feasible; prose tool descriptions may restate bands
     - >-
+      the 14-day CTL "then" lookup exists in exactly ONE place —
+      brief_planner.ctl_at_or_before — consumed by both _compute_signals
+      and training_load_status; neither path re-derives a "then" point
+      from a history window (agreement by construction, mirroring the
+      tsb_zone treatment)
+    - >-
       tools.weekly_rollup (module-level in agent/tools.py) and
       plans.goal_gap are I/O-free — weekly_rollup opens no connections and
       is direct-import testable; plans.py gains no agent.units import;
@@ -305,7 +364,10 @@ invariants:
       explicitly — trend_direction at exactly flat_threshold -> 'flat'
       (incl. the threshold-0 constant-series case) and delta_direction at
       exactly flat_pct -> 'flat'; None -> 'no data' for both;
-      correlation_read's 0.2/0.4/0.6 and effect_size's 0.2/0.5/0.8
+      baseline_position at exactly +/-1.0 -> 'normal' (the strict-band
+      side, pinned both sides — deliberately strict, unlike the inclusive
+      lower bounds below); correlation_read's 0.2/0.4/0.6 and
+      effect_size's 0.2/0.5/0.8
       thresholds pinned both sides (lower-bound inclusive: exactly at a
       threshold takes the named band); direction at r == 0.0 ->
       'positive'; r None -> correlation_read None; effect_size per-field
@@ -314,11 +376,18 @@ invariants:
       delta_pct)
     - "get_metric_trend passes slope_per_day=None when the window has n < 2 values (tool-side 'no data' mapping); the payload carries slope_per_day: null (not 0.0) on that path"
     - "training_load_status.tsb_zone == interpret.tsb_zone(payload.tsb)"
+    - >-
+      training_load_status.ctl_pct_change_14d equals the brief signal for
+      the same DB state — including a gappy-baselines fixture (no row
+      exactly at today - 14d, where an at-or-before lookup and a
+      window-derived point differ): both paths call
+      brief_planner.ctl_at_or_before
+    - "get_metric_trend's vs_baseline key present on EVERY metric: 'no data' for a non-baselined metric (e.g. steps), a real band for rhr/sleep_seconds with a baseline SD in the fixture"
     - "correlate payload has computed strength/direction and no legend string"
     - "find_anomalies rows: sd_distance == (value-mean)/sd to 2dp with direction"
     - "compare_periods: cohens_d/magnitude consistent with effect_size, incl. the per-field case — two 1-day periods -> delta_pct present (from the means), cohens_d/magnitude None; SUM metrics: per-period {n, total} + total_mi (miles-gated), top-level delta/delta_pct, no cohens_d/magnitude, no mean/sd"
     - "training_load_status.ctl_direction == delta_direction(payload.ctl_pct_change_14d)"
-    - "analysis-tool floats within dp budget (3dp r/slope/d, 2dp means/sd, 1dp pct)"
+    - "analysis-tool floats within dp budget (3dp r/slope/d, 2dp means/sd, 1dp pct); boundary rounding skips None values — a None pearson_r passes through as null, no exception"
     - >-
       weekly_rollup fixture values equal the PDF section's displayed values
       — holds by construction (shared function carries the suppression
@@ -328,7 +397,7 @@ invariants:
       survives) and _build_plan_section's empty-window -> None behavior
       (the :1713-1717 pin) unchanged; weekly_rollup tested via direct
       import from tools, no DB
-    - "goal_gap sign: positive = slower than goal; None propagation"
+    - "goal_gap sign: positive = slower than goal; None propagation; degenerate inputs pinned — target_time_s None, 0, and negative all -> None (the zero-denominator rule), predicted_finish_s None -> None"
     - >-
       long-plan fixture: default progress call windowed; full=true complete;
       rollups identical both modes; today in-window under a stale frontier;
@@ -368,7 +437,10 @@ invariants:
       _build_plan_section: weekly_rollup on data in hand; daily_snapshot
       via assemble_status: 3c sleep value_formatted/baseline_formatted;
       assemble_brief_context: anomaly sd_distance/direction) — zero new
-      db.connect() opens; the pinned one-connection tests
+      db.connect() opens; training_load_status is NOT in the benchmarked
+      set, so its one extra indexed point-query (ctl_at_or_before, run on
+      the existing connection — no new open) is allowed; the pinned
+      one-connection tests
       (tests/test_perf_benchmarks.py) stay green as-is; 2c's windowing
       SHRINKS get_training_plan_progress's serialization vs the committed
       baseline — CI-safe (min:15% fails only on regression); a deliberate
@@ -376,9 +448,9 @@ invariants:
     - "all 2026-07-10 design-doc testable invariants (incl. enumerated test rewrites) hold"
 
 integration_points:
-  - "agent/tools.py — payload attachments, windowing, description rewrites, error strings, module-level weekly_rollup (relocated here from the earlier draft's plans.py home — see 2a)"
+  - "agent/tools.py — payload attachments, windowing, description rewrites, error strings, module-level weekly_rollup (relocated here from the earlier draft's plans.py home — see 2a); training_load_status calls brief_planner.ctl_at_or_before via the same lazy in-function import get_brief_context already uses (tools.py:1591-1594)"
   - "agent/status.py — tsb delegation, sleep value_formatted/baseline_formatted via units.format_hm"
-  - "agent/brief_planner.py — pct_change delegation, anomaly sd_distance/direction, _hm delegates to units.format_hm"
+  - "agent/brief_planner.py — pct_change delegation, anomaly sd_distance/direction, _hm delegates to units.format_hm, NEW public ctl_at_or_before (the single-sourced 14-day CTL 'then' lookup — see api_surface)"
   - "plans.py (src/local_fitness/plans.py — top-level module, not under agent/) — goal_gap ONLY (pure seconds arithmetic; weekly_rollup lives in tools.py, keeping plans.py free of agent.units)"
   - "agent/plan_coach.py — notes param (build_prompt + generate_coaching_line), translation block, ground_coaching_line"
   - "agent/prompts.py — Charts bullet in system_prompt"
@@ -447,8 +519,10 @@ ambiguity_resolutions:
   - >-
     progress windowing does not clamp to plan bounds: the formula governs;
     a fully-past or fully-future plan may legally yield an empty workouts
-    list with full-plan rollups still present (full=true for the complete
-    list)
+    list with the rollups still present — computed from the FULL graded
+    workout list, not the 2c-windowed projection (this_week is trailing-7
+    by definition; adherence/days_to_race/goal_gap whole-plan); full=true
+    for the complete list
   - >-
     2g SUM-branch payload shape: per-period {n, total} (no mean/sd) +
     per-period total_mi (miles-gated); top-level delta + delta_pct; no
