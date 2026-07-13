@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-07-13
+
+### Fixed
+- **`run_sql`'s `fitness://schema` error pointer never fired on real
+  invalid queries.** A mistyped table/column raises
+  `sqlite3.OperationalError`, which the 0.22.0 rewording left on the old
+  generic "operational error" branch — the schema-resource remedy lived
+  only in the practically-unreachable `sqlite3.Error` branch. Caught by
+  the post-merge live MCP quality gate; both branches now carry the
+  pointer, with a regression test on the real bad-table path (the
+  time-budget message is unchanged).
+
 ## [0.22.0] - 2026-07-13
 
 ### Fixed
