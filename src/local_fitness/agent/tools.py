@@ -987,10 +987,16 @@ async def run_sql(args: dict) -> dict:
         rows = await asyncio.to_thread(_run_sql_blocking, q)
     except sqlite3.OperationalError as e:
         # "interrupted" is the deadline abort; "readonly database" is a write
-        # attempt that slipped past the denylist. Don't leak the raw string.
+        # attempt that slipped past the denylist. Don't leak the raw string —
+        # OperationalError is also what a mistyped table/column raises, so
+        # this branch (not the generic sqlite3.Error one) carries the
+        # schema-resource pointer.
         if "interrupt" in str(e).lower():
             return _err("query exceeded time budget")
-        return _err("query failed: operational error")
+        return _err(
+            "query failed: invalid query — check table/column names "
+            "against the fitness://schema resource"
+        )
     except sqlite3.Error:
         return _err(
             "query failed: invalid query — check table/column names "

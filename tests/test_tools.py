@@ -833,6 +833,17 @@ def test_run_sql_bad_query(seeded):
     assert err
 
 
+def test_run_sql_bad_table_points_at_schema_resource(seeded):
+    # Regression: a mistyped table/column raises sqlite3.OperationalError —
+    # the schema-resource pointer must fire on that REAL path, not only on
+    # the exotic sqlite3.Error branch (Phase-5 live gate caught the pointer
+    # living solely in the unreachable branch).
+    payload, err = call(tools.run_sql, {"query": "SELECT * FROM does_not_exist"})
+    assert err
+    assert "fitness://schema" in payload["error"]
+    assert "operational error" not in payload["error"]
+
+
 # --- day-window robustness: over-large N must be a clean _err, not OverflowError ---
 
 _BIG = 10**9  # timedelta(days=N) raises OverflowError around here
@@ -2506,10 +2517,8 @@ def test_training_load_status_empty_db_error_points_at_sync_tool(tmp_path, monke
 
 
 def test_run_sql_invalid_query_points_at_schema_resource(seeded, monkeypatch):
-    # sqlite3.OperationalError (bad table/column, syntax error, ...) is
-    # caught by the FIRST except clause ("operational error", pre-existing
-    # generic wording, unchanged). The rewording under 3d targets the
-    # SECOND except clause (any other sqlite3.Error) — force that path.
+    # Both except clauses carry the schema pointer now; this forces the
+    # rarer non-OperationalError sqlite3.Error branch to keep it covered.
     import sqlite3
 
     def boom(_q):
