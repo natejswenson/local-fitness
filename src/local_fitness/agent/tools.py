@@ -167,31 +167,31 @@ def _augment_workout(w: dict) -> dict:
     return w
 
 
+# Shared verbatim between get_today_status and daily_snapshot (Fix B,
+# 2026-07-10 doc): both tools now call status.assemble_status() and return
+# an identical payload, so one description string, not two that drift.
+_DAILY_SNAPSHOT_DESCRIPTION = (
+    "The full daily snapshot — today's metrics with baseline deltas / trend "
+    "arrows, current CTL/ATL/TSB, recent workouts (with mile + formatted "
+    "fields), and saved user notes. The same payload the brief and coach "
+    "prompt share. Pure read. No plan/anomalies/candidates in this payload — "
+    "use get_brief_context for the full read or anything plan-/trend-related."
+)
+
+
 @tool(
     "get_today_status",
-    "Today's metrics + last 7 days alongside the latest 60-day baselines. Call this first when assessing recovery or making 'should I train hard' decisions.",
+    _DAILY_SNAPSHOT_DESCRIPTION,
     {},
 )
 async def get_today_status(_args: dict) -> dict:
-    today = date.today().isoformat()
-    week_ago = (date.today() - timedelta(days=7)).isoformat()
-    with db.connect() as conn:
-        recent = [dict(r) for r in conn.execute(
-            "SELECT date, sleep_seconds, sleep_score, rhr, avg_stress, "
-            "body_battery_min, body_battery_max, steps, "
-            "intensity_minutes_moderate, intensity_minutes_vigorous "
-            "FROM daily_metrics WHERE date >= ? ORDER BY date DESC",
-            (week_ago,),
-        ).fetchall()]
-        baseline = conn.execute(
-            "SELECT * FROM baselines WHERE date <= ? ORDER BY date DESC LIMIT 1",
-            (today,),
-        ).fetchone()
-    return _text({
-        "today": today,
-        "recent_days": recent,
-        "current_baseline": dict(baseline) if baseline else None,
-    })
+    # Fix B (2026-07-10 doc): converges with daily_snapshot — same
+    # status.assemble_status() body, same richer payload, instead of an
+    # independent raw baseline-row query. Lazy import: status.py imports
+    # DAILY_NUMERIC_METRICS from this module, so a top-level import here
+    # would be circular (same pattern as daily_snapshot below).
+    from .status import assemble_status
+    return _text(assemble_status())
 
 
 @tool(
@@ -397,7 +397,7 @@ def _fetch_metric_series(metric: str, days: int) -> tuple[list[str], list[float]
     return dates, values
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
+@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner). Reproduce the full output in a fenced code block in your reply, then add the coach read — never leave it only in the collapsed tool call.", _CHART_SCHEMA)
 async def chart(args: dict) -> dict:
     metric = args["metric"]
     if metric not in _CHART_METRICS:
@@ -729,7 +729,10 @@ async def training_load_status(_args: dict) -> dict:
             (cutoff,),
         ).fetchall()]
         if not recent:
-            return _err("no training-load data yet — pull activities and run recompute-baselines")
+            return _err(
+                "no training-load data yet — call sync_garmin_data to pull "
+                "activities (baselines recompute automatically once data lands)"
+            )
         # The 14-day "then" CTL is single-sourced in brief_planner (the same
         # no-lookback-floor query the brief signal uses) so this agrees with
         # the brief by construction, even on gappy baselines — a point
@@ -989,7 +992,10 @@ async def run_sql(args: dict) -> dict:
             return _err("query exceeded time budget")
         return _err("query failed: operational error")
     except sqlite3.Error:
-        return _err("query failed: invalid query")
+        return _err(
+            "query failed: invalid query — check table/column names "
+            "against the fitness://schema resource"
+        )
     return _text({"rows": rows, "count": len(rows)})
 
 
@@ -1078,10 +1084,7 @@ async def delete_user_note(args: dict) -> dict:
 
 @tool(
     "daily_snapshot",
-    "The full daily snapshot — today's metrics with baseline deltas / trend "
-    "arrows, current CTL/ATL/TSB, recent workouts (with mile + formatted "
-    "fields), and saved user notes. The same payload the brief and coach "
-    "prompt share. Pure read.",
+    _DAILY_SNAPSHOT_DESCRIPTION,
     {},
 )
 async def daily_snapshot(_args: dict) -> dict:
@@ -1317,7 +1320,9 @@ async def log_manual_workout(args: dict) -> dict:
             "activity": _augment_workout(result),
             "recompute_failed": True,
             "warning": "workout saved but training-load recompute failed; "
-                       "run `fitness baselines` to refresh",
+                       "baselines may lag until the next successful sync "
+                       "(the nightly job, or sync_garmin_data once new "
+                       "Garmin data exists)",
             "error_detail": str(e),
         })
 
@@ -1369,7 +1374,9 @@ async def delete_manual_workout(args: dict) -> dict:
             "activity_id": aid,
             "recompute_failed": True,
             "warning": "workout deleted but training-load recompute failed; "
-                       "run `fitness baselines` to refresh",
+                       "baselines may lag until the next successful sync "
+                       "(the nightly job, or sync_garmin_data once new "
+                       "Garmin data exists)",
             "error_detail": str(e),
         })
 
@@ -1925,7 +1932,8 @@ async def save_brief(args: dict) -> dict:
     "14-day workout list, RHR anomalies, active-plan status + adherence + "
     "days-to-race, and recent-brief continuity. Prefer this over orchestrating "
     "many tools when answering 'how am I doing / what's today's read / what should "
-    "I do today' — every number is pre-computed and traceable to the data.",
+    "I do today' — every number is pre-computed and traceable to the data. "
+    "Overkill for a single-metric question — use get_metric/get_metric_trend instead.",
     {},
 )
 async def get_brief_context(_args: dict) -> dict:
@@ -1935,13 +1943,16 @@ async def get_brief_context(_args: dict) -> dict:
     return _text(brief_planner.assemble_brief_context().model_dump())
 
 
-# --- LOCAL_ONLY_TOOLS: generate_brief_report / generate_chart -------------
-# Beautiful PDF/chart rendering tools. Reachable ONLY via run_stdio() (see
-# web/mcp_server.py) — never merged into ALL_TOOLS, never served over the
-# streamable-HTTP /mcp/ transport. A phone-triggered call over that network
-# transport would get back a container-internal path with no way to
-# retrieve the file; this boundary is structural, not just documented (see
-# docs/plans/2026-07-07-pdf-chart-reports-design.md).
+# --- generate_brief_report: PDF report rendering ---------------------------
+# Reachable ONLY via run_stdio() (see web/mcp_server.py) — never merged into
+# ALL_TOOLS, never served over the streamable-HTTP /mcp/ transport. A
+# phone-triggered call over that network transport would get back a
+# container-internal path with no way to retrieve the file; this boundary is
+# structural, not just documented (see
+# docs/plans/2026-07-07-pdf-chart-reports-design.md). generate_chart used to
+# share this boundary but no longer does (Fix A, 2026-07-10 doc) — it's now
+# in ALL_TOOLS, since its inline image content block sidesteps the
+# no-file-retrieval problem that still applies to a PDF.
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -2234,6 +2245,7 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["adherence_pct"],
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
+                notes_text=notes.render_for_prompt(),
             )
         except Exception:
             LOG.warning(
@@ -2296,9 +2308,10 @@ _GENERATE_CHART_SCHEMA = {
 @tool(
     "generate_chart",
     "Render a beautiful standalone PNG chart (line/bar/combo) of a metric "
-    "over the last N days, for any ad-hoc trend question. Local-only: "
-    "reachable via stdio MCP clients (Claude Code/Claude Desktop on this "
-    "same machine), never over the network. Returns a local file path.",
+    "over the last N days, for any ad-hoc trend question. Returns the chart "
+    "inline as an image content block (plus its saved file path as text) — "
+    "reachable over any transport, local or networked. Use the `chart` tool "
+    "instead when a text-reproducible ASCII/emoji read is what's wanted.",
     _GENERATE_CHART_SCHEMA,
 )
 async def generate_chart(args: dict) -> dict:
@@ -2344,7 +2357,19 @@ async def generate_chart(args: dict) -> dict:
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
-    return _text({"path": str(final_path)})
+    # Fix A (2026-07-10 doc): add an inline image content block alongside the
+    # existing text (file path) block, so a networked /mcp/ client — which
+    # has no way to retrieve a local file path — still gets the chart.
+    # Reuses visuals._data_uri's base64 step, stripping the "data:...," prefix
+    # ImageContent.data doesn't want (the encoding math must not be re-derived
+    # at a second call site).
+    image_b64 = visuals._data_uri(png_bytes).split(",", 1)[1]
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps({"path": str(final_path)})},
+            {"type": "image", "data": image_b64, "mimeType": "image/png"},
+        ]
+    }
 
 
 ALL_TOOLS = [
@@ -2381,17 +2406,22 @@ ALL_TOOLS = [
     get_training_plan_status,
     get_training_plan_progress,
     save_brief,
+    generate_chart,
 ]
 
 # Registered ONLY here, never merged into ALL_TOOLS — wired into run_stdio()
 # alone (see web/mcp_server.py's build_server(extra_tools=...)), never into
-# build_session_manager()'s HTTP /mcp/ transport. A plain module-level list
-# literal referencing two already-defined function objects, symmetric with
-# and as trivially greppable as ALL_TOOLS — costs nothing to construct at
-# module scope. Only the heavy `import matplotlib`/`import weasyprint`
-# statements (inside the two functions' bodies and visuals.py's own module
+# build_session_manager()'s HTTP /mcp/ transport. A phone-triggered call over
+# that transport would get back a container-internal path with no way to
+# retrieve the file — a real constraint for a PDF, which isn't representable
+# as MCP ImageContent. generate_chart moved OUT of this list (Fix A,
+# 2026-07-10 doc): once it returns an inline image content block, the
+# "no way to retrieve the file remotely" problem no longer applies to it, so
+# it's reachable over both stdio and the networked /mcp/ transport via
+# ALL_TOOLS above. Only the heavy `import matplotlib`/`import weasyprint`
+# statements (inside generate_brief_report's body and visuals.py's own module
 # body) are deferred, not this list.
-LOCAL_ONLY_TOOLS = [generate_brief_report, generate_chart]
+LOCAL_ONLY_TOOLS = [generate_brief_report]
 
 
 def make_server(extra_tools: list | None = None):

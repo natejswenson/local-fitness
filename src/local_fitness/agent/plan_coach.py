@@ -34,6 +34,18 @@ _VERDICT_PHRASE = {
     "compliant": "Yesterday was a scheduled rest day.",
 }
 
+# Mirrors system_prompt's "Translate technical metrics on first use" bullet
+# (prompts.py) — always included so the PDF coaching line honors the same
+# metric-translation convention as chat/brief, regardless of whether any
+# metric abbreviation actually appears in this particular line.
+_METRIC_TRANSLATION_BLOCK = (
+    "Translate technical metrics on first use, the same way you always do: "
+    'CTL -> "fitness" (training base over the last six weeks), '
+    'ATL -> "fatigue" (load from the last 7 days), '
+    'TSB -> "freshness" (positive = rested, negative = worn down). '
+    "Pair every number with its plain-English meaning."
+)
+
 
 def _format_prescription(today_workout: dict) -> str:
     prescription = today_workout["type"]
@@ -51,17 +63,33 @@ def build_prompt(
     adherence_pct: int,
     days_to_race: int | None,
     goal_type: str,
+    notes_text: str | None = None,
 ) -> tuple[str, str]:
     """Assemble the ``(system_prompt, user_prompt)`` pair for the coaching
     line. Pure string assembly — no I/O, no randomness, fully unit-testable.
+
+    ``notes_text`` is the caller's already-rendered
+    ``notes.render_for_prompt()`` output (same pattern as
+    ``prompts.system_prompt``, prompts.py:26-33) — this function does no I/O
+    of its own. When provided (non-empty), it's appended as a notes section
+    so a saved preference ("stop roasting my steps") is honored on the PDF
+    coaching line exactly as it already is in chat/brief. The
+    metric-translation block is appended unconditionally, independent of
+    ``notes_text``.
     """
     system_prompt = (
         "You are Nate's running coach, writing ONE short paragraph (2-4 "
         "sentences, no more) that preps him for today's prescribed run.\n\n"
         f"{profile.dials_line}\n\n{profile.persona}\n\n"
+        f"{_METRIC_TRANSLATION_BLOCK}\n\n"
         "Output ONLY the coaching paragraph itself — no headline, no "
         'markdown, no quotation marks, no preamble like "Here\'s your line".'
     )
+    if notes_text:
+        system_prompt += (
+            "\n\n# What Nate has told you (most recent first — prefer the "
+            f"newer note when two conflict)\n{notes_text}"
+        )
 
     lines = [f"Today's prescribed workout: {_format_prescription(today_workout)}."]
     if today_workout.get("description"):
@@ -96,6 +124,7 @@ async def generate_coaching_line(
     *,
     model: str | None = None,
     timeout: float = 30.0,
+    notes_text: str | None = None,
 ) -> str:
     """Claude-generated coaching line prepping Nate for today's run.
 
@@ -108,7 +137,8 @@ async def generate_coaching_line(
     import of ``briefing`` here; see the module docstring for why. This
     call follows ``DEFAULT_MODEL`` automatically if that constant ever
     changes, rather than duplicating a literal that could drift out of
-    sync.
+    sync. ``notes_text`` is plumbed straight through to ``build_prompt`` —
+    see its docstring for the notes-parity rationale.
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 
@@ -119,6 +149,7 @@ async def generate_coaching_line(
 
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
+        notes_text=notes_text,
     )
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,

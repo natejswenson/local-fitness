@@ -122,14 +122,22 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
             if value is not None and base_val:
                 delta_pct = round((value - base_val) / base_val * 100, 1)
                 arrow = _arrow(value - base_val)
-            rows.append({
+            row = {
                 "metric": metric,
                 "value": value,
                 "treatment": "baseline_delta",
                 "baseline": base_val,
                 "delta_pct": delta_pct,
                 "arrow": arrow,
-            })
+            }
+            if metric == "sleep_seconds":
+                # Sleep renders as "7h 33m", not raw seconds or format_duration's
+                # "7:33:00" run-duration shape — units.format_hm is the single
+                # source (brief_planner._hm delegates to it), so the brief's
+                # grounding pool and this snapshot row agree by construction.
+                row["value_formatted"] = units.format_hm(value)
+                row["baseline_formatted"] = units.format_hm(base_val)
+            rows.append(row)
             continue
 
         if metric in _TREND_METRICS:

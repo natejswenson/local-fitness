@@ -68,6 +68,21 @@ def format_duration(seconds: float | int | None) -> str | None:
     return f"{minutes}:{secs:02d}"
 
 
+def format_hm(seconds: float | int | None) -> str | None:
+    """Seconds → hours-and-minutes sleep shape, e.g. ``27180 → "7h 33m"``.
+
+    NOT ``format_duration``'s ``H:MM:SS`` — that reads as a run duration.
+    The repo's deliberate sleep convention is hours-and-minutes: minutes are
+    zero-padded at/over an hour (``"7h 05m"``, not ``"7h 5m"``) and the
+    sub-hour form drops the hour entirely (``"45m"``). Reproduces
+    ``brief_planner._hm``'s output exactly. ``None`` in, ``None`` out.
+    """
+    if seconds is None:
+        return None
+    h, m = divmod(int(round(seconds)) // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
 def display_units() -> str:
     """The configured display-unit label, lowercased. Defaults to "miles"."""
     return os.environ.get("LOCAL_FITNESS_DISPLAY_UNITS", "miles").lower()

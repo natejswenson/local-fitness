@@ -371,3 +371,21 @@ def test_brief_planner_imports_no_claude_sdk():
     """Invariant: the deterministic planner must not import the Claude Agent SDK."""
     src = Path(bp.__file__).read_text()
     assert "claude_agent_sdk" not in src and "from claude" not in src
+
+
+# --- 3c: _hm delegates to units.format_hm -----------------------------------
+
+def test_hm_delegates_to_units_format_hm():
+    from local_fitness.agent import units
+
+    for seconds in (27180, 25500, 2700, 0):
+        assert bp._hm(seconds) == units.format_hm(seconds)
+
+
+def test_hm_keeps_its_own_empty_string_on_none_contract():
+    # _hm's own boundary keeps ""-on-None (unlike format_hm's None-on-None) —
+    # grounding's pool expects a plain string, not None.
+    from local_fitness.agent import units
+
+    assert bp._hm(None) == ""
+    assert units.format_hm(None) is None

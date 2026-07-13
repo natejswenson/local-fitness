@@ -73,6 +73,52 @@ def test_build_prompt_system_prompt_carries_coach_voice():
     assert "no headline" in system.lower() or "no markdown" in system.lower()
 
 
+# --- 3a: notes parity + metric-translation block ---------------------------
+
+def test_build_prompt_metric_translation_block_always_present():
+    # Always present, regardless of whether notes_text is provided.
+    system, _ = plan_coach.build_prompt(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+    assert "CTL" in system and "fitness" in system
+    assert "ATL" in system and "fatigue" in system
+    assert "TSB" in system and "freshness" in system
+
+    system_with_notes, _ = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k",
+        notes_text="[1] stop roasting my steps",
+    )
+    assert "CTL" in system_with_notes
+
+
+def test_build_prompt_appends_notes_text_to_system_prompt():
+    system, _ = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k",
+        notes_text="[1] stop roasting my steps",
+    )
+    assert "stop roasting my steps" in system
+
+
+def test_build_prompt_omits_notes_section_when_none():
+    system, _ = plan_coach.build_prompt(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+    assert "What Nate has told you" not in system
+
+
+def test_build_prompt_omits_notes_section_when_empty_string():
+    system, _ = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k", notes_text="",
+    )
+    assert "What Nate has told you" not in system
+
+
+def test_build_prompt_remains_pure_and_deterministic_with_notes():
+    a, _ = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k", notes_text="[1] note",
+    )
+    b, _ = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k", notes_text="[1] note",
+    )
+    assert a == b
+
+
 # --- fallback_coaching_line: pure, deterministic ---------------------------
 
 def test_fallback_partial_prior_day():
@@ -178,6 +224,25 @@ def test_generate_coaching_line_prompt_contains_prescription(patched_sdk):
         plan_coach.generate_coaching_line(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
     )
     assert "easy 4.0 mi @ 9:30/mi" in patched_sdk[0]["prompt"]
+
+
+def test_generate_coaching_line_plumbs_notes_text_to_build_prompt(patched_sdk):
+    # 3a: generate_coaching_line's notes_text param must reach build_prompt,
+    # landing in the assembled system prompt threaded to the SDK options.
+    asyncio.run(
+        plan_coach.generate_coaching_line(
+            _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k",
+            notes_text="[1] stop roasting my steps",
+        )
+    )
+    assert "stop roasting my steps" in patched_sdk[0]["options"].system_prompt
+
+
+def test_generate_coaching_line_defaults_notes_text_to_none(patched_sdk):
+    asyncio.run(
+        plan_coach.generate_coaching_line(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+    )
+    assert "What Nate has told you" not in patched_sdk[0]["options"].system_prompt
 
 
 def test_generate_coaching_line_empty_response_raises(monkeypatch):

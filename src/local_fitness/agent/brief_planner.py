@@ -438,11 +438,14 @@ def _commas(v: float | None) -> str:
 
 def _hm(seconds: float | None) -> str:
     """Render a duration as the coach-voice ``"7h 28m"`` (no seconds) — how sleep
-    is talked about, and so grounding's pool isn't polluted by stray seconds."""
-    if seconds is None:
-        return ""
-    h, m = divmod(int(round(seconds)) // 60, 60)
-    return f"{h}h {m:02d}m" if h else f"{m}m"
+    is talked about, and so grounding's pool isn't polluted by stray seconds.
+
+    Delegates to ``units.format_hm`` (single source of the "7h 33m" shape —
+    see status._metric_rows' sleep_seconds value_formatted/baseline_formatted)
+    but keeps its own ``""``-on-``None`` contract at this boundary, unlike
+    ``format_hm``'s ``None``-on-``None``.
+    """
+    return units.format_hm(seconds) or ""
 
 
 def _workout_evidence(sig: Signals) -> str:

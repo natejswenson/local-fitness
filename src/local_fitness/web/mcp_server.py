@@ -70,10 +70,12 @@ def _render_status(status: dict[str, Any]) -> str:
     for m in metrics:
         name = m.get("metric", "")
         value = m.get("value")
-        value_str = "—" if value is None else str(value)
+        # sleep_seconds carries a pre-formatted "7h 33m" shape (units.format_hm,
+        # via status._metric_rows) — use it over the raw seconds int when present.
+        value_str = "—" if value is None else str(m.get("value_formatted") or value)
         treatment = m.get("treatment")
         if treatment == "baseline_delta":
-            baseline = m.get("baseline")
+            baseline = m.get("baseline_formatted") or m.get("baseline")
             delta_pct = m.get("delta_pct")
             arrow = m.get("arrow") or ""
             if baseline is not None and delta_pct is not None:

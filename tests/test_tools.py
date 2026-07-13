@@ -88,10 +88,37 @@ def seeded(tmp_path, monkeypatch):
 
 
 def test_get_today_status(seeded):
+    # Fix B (2026-07-10 doc): get_today_status now delegates to
+    # status.assemble_status() — the old {today, recent_days,
+    # current_baseline} raw shape is gone, replaced by assemble_status()'s
+    # richer payload (metrics with baseline deltas, training_load, etc).
     payload, err = call(tools.get_today_status, {})
     assert not err
-    assert payload["recent_days"]
-    assert payload["current_baseline"]["ctl"] == 40.0
+    assert "recent_days" not in payload
+    assert "current_baseline" not in payload
+    assert payload["training_load"]["ctl"] == 40.0
+    assert payload["metrics"]
+    assert payload["date"] == date.today().isoformat()
+
+
+def test_get_today_status_matches_daily_snapshot(seeded):
+    # Fix B's convergence invariant: identical payload for identical DB state.
+    today_payload, err1 = call(tools.get_today_status, {})
+    snapshot_payload, err2 = call(tools.daily_snapshot, {})
+    assert not err1 and not err2
+    assert today_payload == snapshot_payload
+
+
+def test_get_today_status_description_mirrors_daily_snapshot():
+    today_tool = next(t for t in tools.ALL_TOOLS if t.name == "get_today_status")
+    snapshot_tool = next(t for t in tools.ALL_TOOLS if t.name == "daily_snapshot")
+    # Must no longer be the stale raw-shape description.
+    assert today_tool.description != (
+        "Today's metrics + last 7 days alongside the latest 60-day baselines. "
+        "Call this first when assessing recovery or making 'should I train "
+        "hard' decisions."
+    )
+    assert today_tool.description == snapshot_tool.description
 
 
 def test_get_metric_valid(seeded):
@@ -1436,6 +1463,14 @@ def test_fetch_metric_series_matches_chart_tool_output(seeded):
     assert fmt(max(values)) in text
 
 
+def test_chart_description_echoes_reply_rendering_rule():
+    # 3b: the chart tool's description gets a one-line echo of the
+    # system-prompt Charts bullet (reproduce full output in a fenced code
+    # block, then the coach read).
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "chart")
+    assert "fenced code block" in tool.description
+
+
 def test_fetch_metric_series_unknown_metric_raises(seeded):
     with pytest.raises(ValueError, match="unknown metric"):
         tools._fetch_metric_series("bogus", 14)
@@ -1871,6 +1906,36 @@ def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
     assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_generate_chart_response_carries_inline_image_block(seeded, reports_tmp):
+    # Fix A (2026-07-10 doc): the response gains a SECOND content block —
+    # an image, base64-decodable, matching the same PNG bytes written to disk.
+    import base64
+
+    result = asyncio.run(
+        tools.generate_chart.handler({"metric": "rhr", "days": 14, "chart_type": "line"})
+    )
+    assert result.get("is_error") is not True
+    content = result["content"]
+    assert content[0]["type"] == "text"
+    image_blocks = [c for c in content if c["type"] == "image"]
+    assert len(image_blocks) == 1
+    image = image_blocks[0]
+    assert image["mimeType"] == "image/png"
+    decoded = base64.b64decode(image["data"])
+    assert decoded[:8] == b"\x89PNG\r\n\x1a\n"
+    path = Path(json.loads(content[0]["text"])["path"])
+    assert decoded == path.read_bytes()
+
+
+def test_generate_chart_description_no_longer_local_only(seeded):
+    # generate_chart's registered description must no longer claim it's
+    # unreachable over the network — Fix A falsifies that claim outright.
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "generate_chart")
+    lowered = tool.description.lower()
+    assert "local-only" not in lowered
+    assert "never over the network" not in lowered
+
+
 def _spy_to_thread(monkeypatch, recorded):
     real_to_thread = asyncio.to_thread
 
@@ -1979,14 +2044,18 @@ def test_generate_chart_reports_dir_error_is_clean(seeded, monkeypatch):
     assert not tools.subprocess.run.called
 
 
-def test_generate_brief_report_and_generate_chart_excluded_from_all_tools():
-    # INV-4: the two local-only tools are never registered in ALL_TOOLS —
-    # only in LOCAL_ONLY_TOOLS.
+def test_generate_brief_report_excluded_from_all_tools_generate_chart_included():
+    # INV-4 (rewritten per Fix A, 2026-07-10 doc): generate_brief_report
+    # stays local-only (a PDF isn't representable as MCP ImageContent, and
+    # a remote caller has no way to retrieve the file) — but generate_chart
+    # is now IN ALL_TOOLS (reachable over both stdio and the networked
+    # /mcp/ transport) since its inline image content block sidesteps the
+    # no-file-retrieval problem that used to make it local-only too.
     all_names = {t.name for t in tools.ALL_TOOLS}
     assert "generate_brief_report" not in all_names
-    assert "generate_chart" not in all_names
+    assert "generate_chart" in all_names
     local_only_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
-    assert local_only_names == {"generate_brief_report", "generate_chart"}
+    assert local_only_names == {"generate_brief_report"}
 
 
 # --- 2026-07-09: Training Plan section (_build_plan_section + wiring) ------
@@ -2247,8 +2316,11 @@ def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
 
     calls = []
 
-    async def fake_generate(profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type):
-        calls.append((today_workout, adherence_pct, days_to_race, goal_type))
+    async def fake_generate(
+        profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
+        notes_text=None,
+    ):
+        calls.append((today_workout, adherence_pct, days_to_race, goal_type, notes_text))
         return "Go hit today's easy 4 clean."
 
     monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
@@ -2317,3 +2389,120 @@ def test_generate_brief_report_no_active_plan_has_no_plan_section(seeded, report
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
     assert "TRAINING PLAN" not in text
+
+
+# === WS3 3a — plan_coach notes parity ========================================
+
+def test_generate_brief_report_threads_saved_notes_into_coaching_line(
+    plan_seeded, reports_tmp, monkeypatch
+):
+    """3a: a saved preference must reach generate_coaching_line's
+    notes_text, exactly like it already reaches chat/brief via
+    notes.render_for_prompt()."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+    from local_fitness import notes as notes_mod
+    notes_mod.append_note("stop roasting my steps")
+
+    calls = []
+
+    async def fake_generate(
+        profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
+        notes_text=None,
+    ):
+        calls.append(notes_text)
+        return "Go hit today's easy 4 clean."
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    assert len(calls) == 1
+    assert "stop roasting my steps" in calls[0]
+
+
+# === WS3 3d — MCP-appropriate error strings ==================================
+
+def test_training_load_status_empty_db_error_points_at_sync_tool(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    payload, err = call(tools.training_load_status, {})
+    assert err
+    assert "sync_garmin_data" in payload["error"]
+    assert "recompute-baselines" not in payload["error"]
+    assert "fitness " not in payload["error"]  # no bare CLI-command wording
+
+
+def test_run_sql_invalid_query_points_at_schema_resource(seeded, monkeypatch):
+    # sqlite3.OperationalError (bad table/column, syntax error, ...) is
+    # caught by the FIRST except clause ("operational error", pre-existing
+    # generic wording, unchanged). The rewording under 3d targets the
+    # SECOND except clause (any other sqlite3.Error) — force that path.
+    import sqlite3
+
+    def boom(_q):
+        raise sqlite3.IntegrityError("boom")
+
+    monkeypatch.setattr(tools, "_run_sql_blocking", boom)
+    payload, err = call(tools.run_sql, {"query": "SELECT 1"})
+    assert err
+    assert "query failed: invalid query" in payload["error"]
+    assert "fitness://schema" in payload["error"]
+
+
+def test_log_manual_workout_recompute_failure_warning_no_cli_wording(seeded, monkeypatch):
+    from local_fitness.ingest import baselines
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(baselines, "recompute", boom)
+
+    payload, err = call(
+        tools.log_manual_workout,
+        {"activity_type": "strength", "duration_min": 45},
+    )
+    assert not err
+    assert payload["recompute_failed"] is True
+    assert "recompute failed" in payload["warning"]  # pinned literal, tests/test_tools.py:731
+    assert "fitness baselines" not in payload["warning"]
+    assert "sync_garmin_data" in payload["warning"]
+
+
+def test_delete_manual_workout_recompute_failure_warning_no_cli_wording(seeded, monkeypatch):
+    from local_fitness.ingest import baselines
+
+    saved, err = call(
+        tools.log_manual_workout, {"activity_type": "strength", "duration_min": 45}
+    )
+    assert not err
+    aid = saved["activity"]["activity_id"]
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(baselines, "recompute", boom)
+
+    payload, err = call(tools.delete_manual_workout, {"activity_id": aid})
+    assert not err
+    assert payload["recompute_failed"] is True
+    assert "recompute failed" in payload["warning"]  # pinned literal, tests/test_tools.py:754
+    assert "fitness baselines" not in payload["warning"]
+    assert "sync_garmin_data" in payload["warning"]
+
+
+# === WS3 3e — "when NOT to use" description lines ===========================
+
+def test_daily_snapshot_description_names_get_brief_context():
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "daily_snapshot")
+    assert "get_brief_context" in tool.description
+
+
+def test_get_brief_context_description_names_get_metric_trend():
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "get_brief_context")
+    assert "get_metric" in tool.description
+    assert "get_metric_trend" in tool.description
