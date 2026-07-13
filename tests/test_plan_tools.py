@@ -8,7 +8,7 @@ from datetime import date, timedelta
 import pytest
 
 from local_fitness import db, plans
-from local_fitness.agent import tools
+from local_fitness.agent import tools, units
 
 
 def call(tool, args):
@@ -248,6 +248,229 @@ def test_progress_verdict_parity_with_status(seeded):
     progress, _ = call(tools.get_training_plan_progress, {})
     today_wk = next(w for w in progress["workouts"] if w["date"] == t.isoformat())
     assert today_wk["verdict"] == status["today"]["verdict"]
+
+
+# === WS2 — plan-tool payload quality =========================================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2)
+
+# --- 2c: default windowing / full=true --------------------------------------
+
+def _plan_from_today(offsets, week_index=lambda o: 1):
+    t = date.today()
+    return t, [
+        dict(date=(t + timedelta(days=o)).isoformat(), week_index=week_index(o),
+             type="easy", target_distance_m=5000.0, description="easy run")
+        for o in offsets
+    ]
+
+
+def test_progress_default_call_windows_workouts(seeded):
+    t, workouts = _plan_from_today(range(0, 91))
+    pid = call(tools.propose_training_plan, _args(
+        race_date=(t + timedelta(days=120)).isoformat(), workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    dates = [w["date"] for w in body["workouts"]]
+    assert dates  # non-empty
+    # frontier == today (seeded's daily_metrics row) -> window [today-14, today+7]
+    assert max(dates) == (t + timedelta(days=7)).isoformat()
+    assert len(body["workouts"]) < len(workouts)  # truncated vs the full 91-day plan
+
+
+def test_progress_full_true_returns_complete_list(seeded):
+    t, workouts = _plan_from_today(range(0, 91))
+    pid = call(tools.propose_training_plan, _args(
+        race_date=(t + timedelta(days=120)).isoformat(), workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.get_training_plan_progress, {"full": True})
+    assert not err
+    assert len(body["workouts"]) == len(workouts)
+
+
+def test_progress_rollups_identical_windowed_and_full(seeded):
+    t, workouts = _plan_from_today(range(0, 91))
+    pid = call(tools.propose_training_plan, _args(
+        race_date=(t + timedelta(days=120)).isoformat(), workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    windowed, _ = call(tools.get_training_plan_progress, {})
+    full, _ = call(tools.get_training_plan_progress, {"full": True})
+    for key in ("adherence_pct", "days_to_race", "predicted_finish_seconds", "goal_gap", "this_week"):
+        assert windowed[key] == full[key]
+    assert len(windowed["workouts"]) != len(full["workouts"])
+
+
+def test_progress_today_in_window_under_stale_frontier(seeded, monkeypatch):
+    t, workouts = _plan_from_today([0, 10])  # today, and 10 days out (beyond +7)
+    pid = call(tools.propose_training_plan, _args(
+        race_date=(t + timedelta(days=30)).isoformat(), workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    stale = (t - timedelta(days=10)).isoformat()
+    monkeypatch.setattr(db, "last_known_daily_date", lambda *a, **k: stale)
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    dates = [w["date"] for w in body["workouts"]]
+    assert t.isoformat() in dates  # today stays in-window despite a 10d-stale frontier
+    assert (t + timedelta(days=10)).isoformat() not in dates  # beyond anchor_fwd(=today)+7
+
+
+def test_progress_window_defined_when_frontier_none(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)  # no daily_metrics rows at all -> frontier is None
+    t = date.today()
+    workouts = [dict(date=t.isoformat(), week_index=1, type="easy",
+                      target_distance_m=5000.0, description="today")]
+    pid = call(tools.propose_training_plan, _args(
+        race_date=(t + timedelta(days=30)).isoformat(), workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=p)
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    assert len(body["workouts"]) == 1  # falls back to [today-14, today+7], no crash
+
+
+def test_progress_fully_past_plan_workouts_empty_but_rollups_present(seeded, monkeypatch):
+    t = date.today()
+    crafted = dict(
+        goal_type="10k",
+        race_date=(t - timedelta(days=30)).isoformat(),
+        target_time_seconds=3000,
+        workouts=[dict(date=(t - timedelta(days=40)).isoformat(), week_index=1, type="easy",
+                       target_distance_m=6000.0, target_pace_sec_per_km=None,
+                       target_duration_sec=None, description="race week")],
+    )
+    monkeypatch.setattr(plans, "get_active_plan", lambda *a, **k: crafted)
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err and body["active"] is True
+    assert body["workouts"] == []  # entirely outside [today-14, today+7] -- no clamping
+    assert body["adherence_pct"] is not None  # rollups still computed from the FULL graded list
+    assert "this_week" in body
+
+
+# --- 2b/2d: goal_gap, this_week, formatted time fields -----------------------
+
+def test_progress_goal_gap_and_this_week_and_formatted_fields(seeded):
+    t = date.today()
+    with db.connect(seeded) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters, "
+            "duration_seconds, avg_pace_sec_per_km) VALUES (1, ?, 'running', 10000.0, 3300, 330.0)",
+            (t.isoformat(),),
+        )
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]  # 10k goal, target 3000s
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    assert body["predicted_finish_seconds"] == 3300
+    assert body["predicted_finish_formatted"] == "55:00"
+    assert body["target_time_seconds"] == 3000
+    assert body["target_time_formatted"] == "50:00"
+    assert body["goal_gap"] == {"gap_seconds": 300.0, "gap_pct": 10.0, "on_pace": False}
+    assert set(body["this_week"]) == {"week_planned_mi", "week_actual_mi", "slips"}
+
+
+def test_progress_goal_gap_none_without_projection(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]  # no recent effort seeded
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, _ = call(tools.get_training_plan_progress, {})
+    assert body["predicted_finish_seconds"] is None
+    assert body["predicted_finish_formatted"] is None
+    assert body["goal_gap"] is None
+
+
+# --- 2e (Fix C) + 2d: per-workout mile/pace + target_duration_formatted -----
+
+def test_progress_workouts_carry_fix_c_and_duration_formatted_fields(seeded):
+    t = date.today()
+    workouts = [dict(date=t.isoformat(), week_index=1, type="easy",
+                      target_distance_m=6000.0, target_pace_sec_per_km=330.0,
+                      target_duration_sec=1980.0, description="6km easy")]
+    with db.connect(seeded) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters, "
+            "duration_seconds, avg_pace_sec_per_km) VALUES (1, ?, 'running', 6100.0, 2000, 328.0)",
+            (t.isoformat(),),
+        )
+    pid = call(tools.propose_training_plan, _args(workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    w = next(w for w in body["workouts"] if w["date"] == t.isoformat())
+    assert w["target_distance_mi"] == units.to_miles(6000.0)
+    assert w["actual_distance_mi"] == units.to_miles(6100.0)
+    assert w["target_pace_min_per_mi"] == units.format_pace_min_per_mi(330.0)
+    assert w["actual_pace_min_per_mi"] == units.format_pace_min_per_mi(328.0)
+    assert w["target_duration_formatted"] == units.format_duration(1980.0)
+
+
+def test_progress_workouts_omit_distance_mi_in_km_mode(seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    t = date.today()
+    workouts = [dict(date=t.isoformat(), week_index=1, type="easy",
+                      target_distance_m=6000.0, target_pace_sec_per_km=330.0,
+                      description="6km easy")]
+    pid = call(tools.propose_training_plan, _args(workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    w = body["workouts"][0]
+    assert "target_distance_mi" not in w
+    assert "actual_distance_mi" not in w
+    assert w["target_pace_min_per_mi"] == units.format_pace_min_per_mi(330.0)  # unconditional
+
+
+# --- 2d/2e on get_training_plan_status ---------------------------------------
+
+def test_status_target_time_formatted(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, _ = call(tools.get_training_plan_status, {})
+    assert body["target_time_formatted"] == units.format_duration(3000)
+    assert "goal_gap" not in body and "this_week" not in body
+    assert "predicted_finish_formatted" not in body
+
+
+def test_status_today_carries_fix_c_and_duration_formatted_fields(seeded):
+    t = date.today()
+    workouts = [dict(date=t.isoformat(), week_index=1, type="easy",
+                      target_distance_m=6000.0, target_pace_sec_per_km=330.0,
+                      target_duration_sec=1980.0, description="6km easy")]
+    pid = call(tools.propose_training_plan, _args(workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, _ = call(tools.get_training_plan_status, {})
+    today_w = body["today"]
+    assert today_w is not None
+    assert today_w["target_distance_mi"] == units.to_miles(6000.0)
+    assert today_w["target_pace_min_per_mi"] == units.format_pace_min_per_mi(330.0)
+    assert today_w["target_duration_formatted"] == units.format_duration(1980.0)
+    # _slim_workout carries no actual_* keys at all -> nothing for the helper to convert
+    assert "actual_distance_mi" not in today_w and "actual_pace_min_per_mi" not in today_w
+
+
+def test_status_today_omits_distance_mi_in_km_mode(seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    t = date.today()
+    workouts = [dict(date=t.isoformat(), week_index=1, type="easy",
+                      target_distance_m=6000.0, target_pace_sec_per_km=330.0,
+                      description="6km easy")]
+    pid = call(tools.propose_training_plan, _args(workouts=workouts))[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, _ = call(tools.get_training_plan_status, {})
+    today_w = body["today"]
+    assert "target_distance_mi" not in today_w
+    assert today_w["target_pace_min_per_mi"] == units.format_pace_min_per_mi(330.0)
+
+
+# --- description rewrites ----------------------------------------------------
+
+def test_status_description_points_at_progress():
+    assert "get_training_plan_progress" in tools.get_training_plan_status.description
+
+
+def test_progress_description_mentions_full_and_points_at_status():
+    desc = tools.get_training_plan_progress.description
+    assert "full=true" in desc
+    assert "get_training_plan_status" in desc
 
 
 # --- update_plan_workout (agent edits the ACTIVE plan; UI is view-only) ------

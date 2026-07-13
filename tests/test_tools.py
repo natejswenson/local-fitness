@@ -629,6 +629,161 @@ def test_recovery_pattern_rounds_avg_recovery_days(tmp_path, monkeypatch):
     assert _decimal_places(payload["avg_recovery_days_body_battery"]) <= 2
 
 
+# === WS2 2f — remaining miles-convention gaps ===============================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2 2f)
+
+def test_get_workout_detail_splits_carry_mile_pace_fields(seeded):
+    payload, err = call(tools.get_workout_detail, {"activity_id": 1})
+    assert not err
+    split = payload["splits"][0]
+    # seeded's split: distance_meters=1000, duration_seconds=360, no pace.
+    assert split["distance_mi"] == 0.62
+    assert split["duration_formatted"] == "6:00"
+
+
+def test_get_workout_detail_splits_omit_distance_mi_in_km_mode(seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    payload, err = call(tools.get_workout_detail, {"activity_id": 1})
+    assert not err
+    split = payload["splits"][0]
+    assert "distance_mi" not in split
+    assert split["duration_formatted"] == "6:00"  # unconditional, not units-gated
+
+
+def test_recovery_pattern_matched_workouts_carry_mile_pace_fields(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "distance_meters, training_load, avg_pace_sec_per_km, duration_seconds) "
+            "VALUES (1, ?, ?, 'running', 8000, 50.0, 300.0, 2400)",
+            (wdate.isoformat(), wdate.isoformat() + "T07:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, body_battery_max_60day_mean) VALUES (?, 80.0)",
+            (wdate.isoformat(),),
+        )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    assert payload["recent_workouts"]
+    w = payload["recent_workouts"][0]
+    assert w["distance_mi"] == 4.97
+    assert w["pace_min_per_mi"] == "8:03"
+    assert w["duration_formatted"] == "40:00"
+
+
+def test_recovery_pattern_matched_workouts_omit_distance_mi_in_km_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "distance_meters, training_load, avg_pace_sec_per_km, duration_seconds) "
+            "VALUES (1, ?, ?, 'running', 8000, 50.0, 300.0, 2400)",
+            (wdate.isoformat(), wdate.isoformat() + "T07:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, body_battery_max_60day_mean) VALUES (?, 80.0)",
+            (wdate.isoformat(),),
+        )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    w = payload["recent_workouts"][0]
+    assert "distance_mi" not in w
+    assert w["pace_min_per_mi"] == "8:03"  # unconditional, not units-gated
+
+
+# === WS2 2g — compare_periods distance_meters SUM branch ====================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2 2g)
+
+@pytest.fixture
+def distance_seeded(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # period A (last 5 days): two runs, 5000m + 3000m = 8000m total.
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters) "
+            "VALUES (1, ?, 'running', 5000.0)", (today.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters) "
+            "VALUES (2, ?, 'running', 3000.0)",
+            ((today - timedelta(days=2)).isoformat(),),
+        )
+        # period B (30-40 days back): one run, 4000m total.
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters) "
+            "VALUES (3, ?, 'running', 4000.0)",
+            ((today - timedelta(days=35)).isoformat(),),
+        )
+    return p
+
+
+def test_compare_periods_distance_meters_sum_shape(distance_seeded):
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "distance_meters",
+         "period_a_start": (today - timedelta(days=5)).isoformat(),
+         "period_a_end": today.isoformat(),
+         "period_b_start": (today - timedelta(days=40)).isoformat(),
+         "period_b_end": (today - timedelta(days=30)).isoformat()},
+    )
+    assert not err
+    assert payload["period_a"] == {"n": 2, "total": 8000.0, "total_mi": 4.97}
+    assert payload["period_b"] == {"n": 1, "total": 4000.0, "total_mi": 2.49}
+    assert payload["delta"] == 4000.0  # a-minus-b
+    assert payload["delta_pct"] == 100.0
+    assert "mean" not in payload["period_a"] and "sd" not in payload["period_a"]
+    assert "cohens_d" not in payload and "magnitude" not in payload
+
+
+def test_compare_periods_distance_meters_omits_total_mi_in_km_mode(distance_seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "distance_meters",
+         "period_a_start": (today - timedelta(days=5)).isoformat(),
+         "period_a_end": today.isoformat(),
+         "period_b_start": (today - timedelta(days=40)).isoformat(),
+         "period_b_end": (today - timedelta(days=30)).isoformat()},
+    )
+    assert not err
+    assert "total_mi" not in payload["period_a"]
+    assert "total_mi" not in payload["period_b"]
+    assert payload["period_a"]["total"] == 8000.0
+
+
+def test_compare_periods_distance_meters_empty_period_yields_none_total(distance_seeded):
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "distance_meters",
+         "period_a_start": "2020-01-01", "period_a_end": "2020-01-02",  # nothing here
+         "period_b_start": (today - timedelta(days=40)).isoformat(),
+         "period_b_end": (today - timedelta(days=30)).isoformat()},
+    )
+    assert not err
+    assert payload["period_a"] == {"n": 0, "total": None}
+    assert payload["delta"] is None
+    assert payload["delta_pct"] is None
+
+
 def test_run_sql_select(seeded):
     payload, err = call(tools.run_sql, {"query": "SELECT COUNT(*) AS c FROM daily_metrics"})
     assert not err
@@ -1904,6 +2059,136 @@ def plan_seeded(tmp_path, monkeypatch):
         # d(6) long 6000m: no activity -> missed. d(0) today easy 4000m: no
         # activity -> pending (date >= frontier and raw classify is missed).
     return p
+
+
+# === WS2 — plan-tool payload quality =========================================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2)
+
+# --- 2a: weekly_rollup — direct import from tools, pure, no DB ---------------
+
+def test_weekly_rollup_empty_workouts_yields_zero_totals():
+    rollup = tools.weekly_rollup([], "2026-07-12")
+    assert rollup == {
+        "week_planned_mi": 0.0, "week_actual_mi": 0.0, "slips": 0, "days": [],
+    }
+
+
+def test_weekly_rollup_single_workout():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5100.0},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["days"] == [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "planned_mi": 3.11, "actual_mi": 3.17},
+    ]
+    assert rollup["week_planned_mi"] == 3.1
+    assert rollup["week_actual_mi"] == 3.2
+    assert rollup["slips"] == 0
+
+
+def test_weekly_rollup_days_reverse_chronological():
+    workouts = [
+        {"date": "2026-07-06", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5100.0},
+        {"date": "2026-07-10", "verdict": "done", "type": "tempo",
+         "target_distance_m": 3000.0, "actual_distance_m": 3050.0},
+        {"date": "2026-07-08", "verdict": "missed", "type": "long",
+         "target_distance_m": 6000.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    dates = [d["date"] for d in rollup["days"]]
+    assert dates == ["2026-07-10", "2026-07-08", "2026-07-06"]  # most recent first
+
+
+def test_weekly_rollup_suppresses_actual_for_pending_and_compliant():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "pending", "type": "easy",
+         "target_distance_m": 4000.0, "actual_distance_m": None},
+        # compliant rest day carrying a stray real actual_distance_m (e.g. an
+        # untracked walk) — still suppressed; suppression is verdict-keyed,
+        # not presence-of-data-keyed.
+        {"date": "2026-07-11", "verdict": "compliant", "type": "rest",
+         "target_distance_m": None, "actual_distance_m": 2000.0},
+        {"date": "2026-07-10", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5100.0},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    by_date = {d["date"]: d for d in rollup["days"]}
+    assert by_date["2026-07-12"]["actual_mi"] is None
+    assert by_date["2026-07-11"]["actual_mi"] is None
+    assert by_date["2026-07-10"]["actual_mi"] == 3.17
+
+
+def test_weekly_rollup_missing_target_distance_yields_planned_mi_none():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "compliant", "type": "rest",
+         "target_distance_m": None, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["days"][0]["planned_mi"] is None
+
+
+def test_weekly_rollup_zero_target_distance_yields_planned_mi_zero_not_none():
+    # units.to_miles's `is not None` convention (not truthy) — a synthetic
+    # 0-meter target yields 0.0, not None. On real data this never occurs
+    # (no 0-distance prescribed target; rest days carry None), but the
+    # convention is pinned here per the 07-10 doc's deferred truthy-vs-None
+    # flag, now picked up.
+    workouts = [
+        {"date": "2026-07-12", "verdict": "missed", "type": "easy",
+         "target_distance_m": 0.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["days"][0]["planned_mi"] == 0.0
+
+
+def test_weekly_rollup_window_excludes_outside_trailing_7_days():
+    workouts = [
+        {"date": "2026-07-05", "verdict": "done", "type": "easy",  # 7d back -> outside
+         "target_distance_m": 5000.0, "actual_distance_m": 5000.0},
+        {"date": "2026-07-06", "verdict": "done", "type": "easy",  # 6d back -> boundary, inside
+         "target_distance_m": 5000.0, "actual_distance_m": 5000.0},
+        {"date": "2026-07-13", "verdict": "pending", "type": "easy",  # after target_date -> outside
+         "target_distance_m": 5000.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    dates = [d["date"] for d in rollup["days"]]
+    assert dates == ["2026-07-06"]
+
+
+def test_weekly_rollup_rounding_order_per_day_then_sum():
+    # Divergence case: per-day-round(2dp)-then-sum-then-round(1dp) yields
+    # 2.6; summing raw meters first and converting once yields 2.5 — proving
+    # the rounding ORDER is load-bearing, not incidental (2a).
+    workouts = [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "target_distance_m": None, "actual_distance_m": 2730.0},
+        {"date": "2026-07-11", "verdict": "done", "type": "easy",
+         "target_distance_m": None, "actual_distance_m": 509.0},
+        {"date": "2026-07-10", "verdict": "done", "type": "easy",
+         "target_distance_m": None, "actual_distance_m": 861.0},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["week_actual_mi"] == 2.6  # not 2.5 (raw-sum-then-convert)
+
+
+def test_weekly_rollup_slips_counts_partial_and_missed_only():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5000.0},
+        {"date": "2026-07-11", "verdict": "partial", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 2000.0},
+        {"date": "2026-07-10", "verdict": "missed", "type": "long",
+         "target_distance_m": 8000.0, "actual_distance_m": None},
+        {"date": "2026-07-09", "verdict": "compliant", "type": "rest",
+         "target_distance_m": None, "actual_distance_m": None},
+        {"date": "2026-07-08", "verdict": "pending", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["slips"] == 2
 
 
 def test_build_plan_section_no_active_plan_is_none(seeded):
