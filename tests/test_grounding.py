@@ -134,3 +134,37 @@ def test_flag_never_mutates_the_brief():
 ])
 def test_parse_numeric_tokens(token, expected):
     assert g._parse(token) == expected
+
+
+# --- 4a: public re-exports for cross-module reuse (plan_coach.ground_coaching_line) -
+
+def test_parse_number_is_a_public_wrapper_around_parse():
+    assert g.parse_number("9.2k") == 9200.0
+    assert g.parse_number("not-a-number") is None
+
+
+def test_numeric_tokens_matches_flag_s_tokenizing_and_skips_time_windows():
+    # _NUM_RE's match includes trailing whitespace (its `\s*[kK%]?` tail) when
+    # there's no k/% suffix — the raw (unstripped) token is exactly what
+    # flag()/ground_coaching_line feed to parse_number, which strips it.
+    text = "3 runs in 14 days, RHR 58 this morning"
+    assert [t.strip() for t in g.numeric_tokens(text)] == ["3", "58"]
+
+
+def test_nearest_pool_match_returns_the_closest_entry():
+    pool = [(58.0, "rhr"), (11000.0, "steps")]
+    assert g.nearest_pool_match(53.0, pool) == (58.0, "rhr")
+    assert g.nearest_pool_match(10500.0, pool) == (11000.0, "steps")
+
+
+@pytest.mark.parametrize("value,verdict", [
+    (58.0, "faithful"),   # exact match
+    (53.0, "flag"),       # within NEARBY_REL but not EXACT_REL of rhr=58
+    (90.0, "ignore"),     # beyond NEARBY_REL of every pool entry
+])
+def test_classify_against_pool_bands(value, verdict):
+    pool = [(58.0, "rhr"), (11000.0, "steps")]
+    got_verdict, near_val, near_name = g.classify_against_pool(value, pool)
+    assert got_verdict == verdict
+    assert near_name == "rhr"
+    assert near_val == 58.0

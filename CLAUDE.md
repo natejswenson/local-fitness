@@ -202,12 +202,18 @@ When the user asks an ad-hoc question about their data ("show my plan through
 today", "how's my training load", "what did I run last week"):
 
 - **Use the structured `mcp__fitness__*` tools.** There's one for almost
-  everything — `get_training_plan_progress` (full graded plan day-by-day),
+  everything — `get_training_plan_progress` (graded plan day-by-day),
   `get_training_plan_status`, `query_workouts`, `get_metric_trend`,
   `daily_snapshot`, `training_load_status`, etc. Reach for `run_sql` only when
   no structured tool fits. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
+- **`get_training_plan_progress`'s `workouts` list is windowed by default**
+  (2026-07-13) — trailing 14 days + upcoming 7 days anchored to the data
+  frontier, not the full plan. "Show my plan through today" on a plan older
+  than 14 days needs the complete list, so pass `full=true` to get it; the
+  rollups (`adherence_pct`, `days_to_race`, `goal_gap`, `this_week`, …) are
+  always whole-plan regardless of the `workouts` window.
 - **The agent owns the entire plan lifecycle — there is no UI.** When the user
   wants to change their plan (move a long run, swap days, adjust a session),
   edit it with `update_plan_workout(date, type/distance_mi/pace_min_per_mi/description)`
@@ -267,6 +273,18 @@ These are settled — don't redesign without a reason.
   V2** — the MCP `mcp__fitness__*` tools and the MCP `_brief_prompt` (chat /
   external-agent path) still use V1's tool-driven approach (a deliberate scope
   choice; `grounding.flag` is the reusable follow-up there).
+- **Analysis tools carry deterministic interpretation, not just raw numbers**
+  (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
+  SDK) housing every classifier the brief path already computed in tested
+  Python — `tsb_zone`, `pct_change`, `trend_direction`, `delta_direction`,
+  `baseline_position`, `correlation_read`, `effect_size`, `sd_position` — and
+  `status.py`/`brief_planner.py` delegate to it rather than keeping their own
+  copies. The ad-hoc MCP tools (`training_load_status`, `correlate`,
+  `find_anomalies`, `compare_periods`, `get_metric_trend`) attach the same
+  fields (`tsb_zone`, `strength`/`direction`, `sd_distance`, `magnitude`,
+  `slope_direction`, etc.) to their payloads instead of leaving the model to
+  apply a static legend string by hand. The rule holds project-wide: the LLM
+  phrases a judgment, it never derives one that tested Python can compute.
 - **Daily brief job needs a Claude credential in `.env`.** The 06:30
   launchd job (`com.localfitness.brief` → `fitness brief`) couples pull →
   recompute-baselines → generate → save atomically. Its *generate* step
@@ -281,10 +299,14 @@ These are settled — don't redesign without a reason.
   (`Pull: success` in `logs/brief.launchd.out.log`) but generation returns
   empty (`chars=0 takeaways_yielded=0`, "no JSON found in agent response"
   in `logs/brief.launchd.err.log`), so **no brief saves** (orphaned sync —
-  pull ran, brief didn't) — surfaces as `get_brief_context`'s
-  `data_through_date` outrunning the brief's own `date` on the next MCP
-  query. Fix = put/refresh the token in `.env` (gitignored); re-mint on
-  expiry.
+  pull ran, brief didn't). There's no single field that surfaces this
+  directly (`BriefContext` carries no data-frontier field, and no
+  `data_through_date` exists anywhere in the schema — an earlier draft of
+  this note claimed otherwise); the mismatch shows up by comparing the
+  saved brief's own `date` against `db.last_known_daily_date()` /
+  the newest daily row on the next MCP query — if the daily data is newer
+  than the brief, the previous night's generation failed. Fix = put/refresh
+  the token in `.env` (gitignored); re-mint on expiry.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a
@@ -312,34 +334,41 @@ These are settled — don't redesign without a reason.
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
   could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
-- **`generate_brief_report`/`generate_chart` are stdio-only, never `ALL_TOOLS`.**
-  These two MCP tools (`agent/tools.py`'s `LOCAL_ONLY_TOOLS`) render a saved
-  daily brief into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline,
-  reusing the `budget` project's validated color theme) and render a
-  standalone matplotlib PNG chart on demand. Since the 2026-07-09 UX pass,
-  both write to and auto-open from an **ephemeral per-process tmp
-  directory by default** (`tempfile.mkdtemp`, PID-embedded naming, cleaned
-  up via `atexit` when the `fitness mcp-stdio` process exits — a fresh
-  subprocess per opencode/Claude session, so this is the natural
-  session-cleanup boundary) rather than the old persistent `./reports/`.
-  A best-effort liveness-checked sweep also reaps any prior session's
-  leaked directory (PID dead + >24h old) on each process's first call —
-  `atexit` doesn't fire on `SIGKILL`/`SIGTERM`, so an abrupt kill can still
-  leak until the sweep claims it; this is an accepted residual risk for a
-  personal, single-user tool, not something hardened further. After a
-  successful write, the file is auto-opened via macOS `open` (best-effort,
-  never fails the tool call; logs a warning and no-ops on other platforms).
-  Set `LOCAL_FITNESS_REPORTS_DIR` to opt back into a persistent directory
-  (still auto-opened, no auto-cleanup) — see `.env.example`. If you have an
+- **`generate_brief_report` (PDF) is the only stdio-only tool now —
+  `generate_chart` moved into `ALL_TOOLS` (2026-07-13, MCP-speed-and-UX-01
+  fold-in Fix A).** `generate_chart` renders a standalone matplotlib PNG on
+  demand and now returns it as an inline MCP image content block (alongside
+  the saved file path as text) — reachable over both `fitness mcp-stdio` and
+  the networked `/mcp/` transport, since a client no longer needs the local
+  file path to see the chart. `generate_brief_report` (`agent/tools.py`'s
+  `LOCAL_ONLY_TOOLS`, now just this one tool) renders a saved daily brief
+  into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline, reusing the
+  `budget` project's validated color theme) and stays stdio-only for the
+  same reason as before: a PDF isn't representable as an MCP content block,
+  so a phone-triggered call over `/mcp/` would get back a container-internal
+  path with no way to retrieve the file. Since the 2026-07-09 UX pass, it
+  writes to and auto-opens from an **ephemeral per-process tmp directory by
+  default** (`tempfile.mkdtemp`, PID-embedded naming, cleaned up via `atexit`
+  when the `fitness mcp-stdio` process exits — a fresh subprocess per
+  opencode/Claude session, so this is the natural session-cleanup boundary)
+  rather than the old persistent `./reports/`. A best-effort
+  liveness-checked sweep also reaps any prior session's leaked directory
+  (PID dead + >24h old) on each process's first call — `atexit` doesn't fire
+  on `SIGKILL`/`SIGTERM`, so an abrupt kill can still leak until the sweep
+  claims it; this is an accepted residual risk for a personal, single-user
+  tool, not something hardened further. After a successful write, the file
+  is auto-opened via macOS `open` (best-effort, never fails the tool call;
+  logs a warning and no-ops on other platforms). Set
+  `LOCAL_FITNESS_REPORTS_DIR` to opt back into a persistent directory (still
+  auto-opened, no auto-cleanup) — see `.env.example`. If you have an
   existing populated `./reports/` from before this change, it's vestigial
-  now and safe to delete by hand. They're registered ONLY via `run_stdio()`'s
-  `build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)` call — structurally,
-  not just by convention, unreachable over the authenticated streamable-HTTP
-  `/mcp/` transport (`build_session_manager()` calls `build_server()`
-  argument-free), since a phone-triggered call over that transport would get
-  back a container-internal path with no way to retrieve the file. WeasyPrint
-  needs native Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS
-  Homebrew's install isn't on the default dylib search path and needs
+  now and safe to delete by hand. `generate_brief_report` is registered ONLY
+  via `run_stdio()`'s `build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)`
+  call — structurally, not just by convention, unreachable over the
+  authenticated streamable-HTTP `/mcp/` transport (`build_session_manager()`
+  calls `build_server()` argument-free). WeasyPrint needs native
+  Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS Homebrew's
+  install isn't on the default dylib search path and needs
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
 - **The brief PDF (`generate_brief_report`) has a 2-column signal-card grid
   and a Training Plan section** (2026-07-09 redesign). `visuals.py`'s

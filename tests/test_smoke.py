@@ -41,7 +41,10 @@ def test_tool_schemas_well_formed():
     """Every tool has a name + description + handler."""
     # +commit_training_plan/discard_training_plan_draft/abandon_active_plan
     # (agent owns the full plan lifecycle post-UI-retirement)
-    assert len(agent_tools.ALL_TOOLS) == 33
+    # +generate_chart (Fix A, 2026-07-10 doc: promoted out of
+    # LOCAL_ONLY_TOOLS once it returns an inline image content block,
+    # sidestepping the no-file-retrieval problem that made it local-only)
+    assert len(agent_tools.ALL_TOOLS) == 34
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

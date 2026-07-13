@@ -27,7 +27,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .. import db, notes
-from . import units
+from . import interpret, units
 from .tools import DAILY_NUMERIC_METRICS
 
 # Explicit metric → (baseline mean column, baseline sd column | None). Do NOT
@@ -82,16 +82,12 @@ def _baseline_row(conn, today: str) -> dict[str, Any] | None:
 
 
 def _tsb_interpretation(tsb: float | None) -> str:
-    """Plain-English read of training stress balance."""
-    if tsb is None:
-        return "no training-load data yet"
-    if tsb < -20:
-        return "very fatigued"
-    if tsb < -10:
-        return "fatigued"
-    if tsb > 5:
-        return "fresh"
-    return "neutral"
+    """Plain-English read of training stress balance.
+
+    Delegates to interpret.tsb_zone — the single source of the TSB-zone
+    bands, so status.py and training_load_status agree by construction.
+    """
+    return interpret.tsb_zone(tsb)
 
 
 def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -126,14 +122,22 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
             if value is not None and base_val:
                 delta_pct = round((value - base_val) / base_val * 100, 1)
                 arrow = _arrow(value - base_val)
-            rows.append({
+            row = {
                 "metric": metric,
                 "value": value,
                 "treatment": "baseline_delta",
                 "baseline": base_val,
                 "delta_pct": delta_pct,
                 "arrow": arrow,
-            })
+            }
+            if metric == "sleep_seconds":
+                # Sleep renders as "7h 33m", not raw seconds or format_duration's
+                # "7:33:00" run-duration shape — units.format_hm is the single
+                # source (brief_planner._hm delegates to it), so the brief's
+                # grounding pool and this snapshot row agree by construction.
+                row["value_formatted"] = units.format_hm(value)
+                row["baseline_formatted"] = units.format_hm(base_val)
+            rows.append(row)
             continue
 
         if metric in _TREND_METRICS:

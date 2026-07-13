@@ -125,6 +125,57 @@ def _nearest(value: float, pool: list[tuple[float, str]]) -> tuple[float, str]:
     return best_val, best_name
 
 
+def parse_number(token: str) -> float | None:
+    """Public wrapper around the internal numeric-token parser (handles
+    commas, k, %). Re-exported so other modules that ground LLM prose against
+    a pool of known numbers (e.g. ``plan_coach.ground_coaching_line``) reuse
+    this exact parsing instead of importing the underscore-prefixed
+    ``_parse`` cross-module."""
+    return _parse(token)
+
+
+def numeric_tokens(text: str) -> list[str]:
+    """Numeric tokens in ``text``, in order, skipping any token immediately
+    followed by a time-window word ("14 days", "7-day", "two-week") — those
+    are windows, not metric citations (see ``_WINDOW_AFTER``). Public
+    re-export of ``flag()``'s tokenizing step (grounding.py:139-142) so
+    other callers scan prose identically."""
+    tokens: list[str] = []
+    for m in _NUM_RE.finditer(text):
+        if _WINDOW_AFTER.match(text, m.end()):
+            continue
+        tokens.append(m.group())
+    return tokens
+
+
+def nearest_pool_match(value: float, pool: list[tuple[float, str]]) -> tuple[float, str]:
+    """Public wrapper around the internal nearest-match search. ``pool`` must
+    be non-empty (callers guard with an empty-pool check first — see
+    ``flag()``'s ``if not pool: return []`` and its mirror in
+    ``plan_coach.ground_coaching_line``)."""
+    return _nearest(value, pool)
+
+
+def classify_against_pool(
+    value: float, pool: list[tuple[float, str]]
+) -> tuple[str, float, str]:
+    """Classify ``value`` against ``pool`` using the same relative-distance
+    bands ``flag()`` applies inline (grounding.py:150-156): ``"faithful"``
+    (within EXACT_REL, or within ABS_FLOOR absolute — a correct citation,
+    never flagged), ``"flag"`` (within NEARBY_REL but not EXACT_REL — looks
+    like a known metric but is off), or ``"ignore"`` (beyond NEARBY_REL — an
+    unrelated quantity, contradiction-only). Returns
+    ``(verdict, nearest_value, nearest_name)``. ``pool`` must be non-empty."""
+    near_val, near_name = _nearest(value, pool)
+    denom = max(value, near_val, 1.0)
+    rel = abs(value - near_val) / denom
+    if rel <= _EXACT_REL or abs(value - near_val) <= _ABS_FLOOR:
+        return "faithful", near_val, near_name
+    if rel <= _NEARBY_REL:
+        return "flag", near_val, near_name
+    return "ignore", near_val, near_name
+
+
 def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
     """Advisory: prose numbers that look like a known metric but are off.
 

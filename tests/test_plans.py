@@ -1,6 +1,8 @@
 """Tests for plans.py pure logic — validation, adherence, grading, projection."""
 from __future__ import annotations
 
+import pytest
+
 from local_fitness import plans
 
 
@@ -298,6 +300,49 @@ def test_riegel_projection():
 def test_riegel_none_without_effort():
     assert plans.riegel_predict(None, None, 10000.0) is None
     assert plans.riegel_predict(10000, 3000, None) is None
+
+
+# --- WS2 2b: goal_gap -------------------------------------------------------
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2)
+
+def test_goal_gap_none_when_predicted_finish_none():
+    assert plans.goal_gap(None, 3000) is None
+
+
+def test_goal_gap_none_when_target_time_none():
+    assert plans.goal_gap(3100.0, None) is None
+
+
+def test_goal_gap_none_when_target_time_zero():
+    # storable (validate_plan_input rejects only negatives) but meaningless —
+    # a bare zero would divide gap_pct by zero.
+    assert plans.goal_gap(3100.0, 0) is None
+
+
+def test_goal_gap_none_when_target_time_negative():
+    assert plans.goal_gap(3100.0, -1) is None
+
+
+def test_goal_gap_positive_when_slower_than_goal():
+    gap = plans.goal_gap(3100.0, 3000)
+    assert gap is not None
+    assert gap["gap_seconds"] == 100.0
+    assert gap["gap_pct"] == pytest.approx(3.3333, rel=1e-3)
+    assert gap["on_pace"] is False
+
+
+def test_goal_gap_negative_when_faster_than_goal():
+    gap = plans.goal_gap(2850.0, 3000)
+    assert gap is not None
+    assert gap["gap_seconds"] == -150.0
+    assert gap["gap_pct"] == pytest.approx(-5.0)
+    assert gap["on_pace"] is True
+
+
+def test_goal_gap_on_pace_true_at_exact_boundary():
+    # predicted finish == target time -> gap 0, on_pace True (<=, inclusive).
+    gap = plans.goal_gap(3000.0, 3000)
+    assert gap == {"gap_seconds": 0.0, "gap_pct": 0.0, "on_pace": True}
 
 
 def test_weekly_mileage_rollup():

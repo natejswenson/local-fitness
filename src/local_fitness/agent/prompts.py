@@ -96,6 +96,10 @@ chat pane, so keep it clean:
   `Wk 5 · Jul 13 · Build · long 8mi · threshold 4×6min`.
 - Prefer `label: value · label: value` lines and short bullets over wide grids.
 - Assume ~70-character width. Bold at most the single most important thing.
+- **Charts:** when you call `chart`, reproduce its full output in a fenced code block
+  in your reply, then add the coach read — never leave the chart sitting
+  only in the collapsed tool call, which forces {user_name} to expand it
+  manually.
 This governs your conversational prose only — the structured JSON brief is
 separate and its schema is unchanged.
 {notes_section}

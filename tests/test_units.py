@@ -67,6 +67,34 @@ def test_format_duration_at_or_over_an_hour():
     assert units.format_duration(3750) == "1:02:30"
 
 
+# --- format_hm (3c) ---------------------------------------------------------
+
+def test_format_hm_none_in_none_out():
+    assert units.format_hm(None) is None
+
+
+def test_format_hm_hours_and_minutes():
+    # 27180 s = 7h 33m.
+    assert units.format_hm(27180) == "7h 33m"
+
+
+def test_format_hm_zero_pads_minutes():
+    # 25500 s = 7h 05m — zero-padded, NOT "7h 5m".
+    assert units.format_hm(25500) == "7h 05m"
+
+
+def test_format_hm_sub_hour_drops_hour():
+    # 2700 s = 45m, no "0h" prefix.
+    assert units.format_hm(2700) == "45m"
+
+
+def test_format_hm_rounds_and_accepts_float_seconds():
+    # brief_planner._hm's callers feed float seconds (60-day means); the
+    # function int(round())s internally before the divmod. 27239.6 rounds
+    # to 27240s == exactly 7h 34m.
+    assert units.format_hm(27239.6) == "7h 34m"
+
+
 # --- display_units ---------------------------------------------------------
 
 def test_display_units_defaults_to_miles(monkeypatch):
