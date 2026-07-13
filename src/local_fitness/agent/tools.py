@@ -2260,6 +2260,18 @@ async def generate_brief_report(args: dict) -> dict:
             )
         plan_section["today"]["coaching_line"] = coaching_line
 
+        # 4a: advisory grounding of the coaching line against the deterministic
+        # plan section — mirrors grounding.log_grounding's pattern (log-only,
+        # never gates, never alters the PDF). Runs whichever line ended up in
+        # the section (Claude-generated or the deterministic fallback above).
+        try:
+            flags = plan_coach.ground_coaching_line(coaching_line, plan_section)
+            detail = "".join(
+                f" [{f.nearest_metric}:{f.token}Δ{f.delta}]" for f in flags[:5])
+            LOG.info("plan_coach_grounding flags=%d%s", len(flags), detail)
+        except Exception:  # noqa: BLE001 — an advisory signal must never break the PDF
+            LOG.exception("plan_coach_grounding failed (advisory, ignored)")
+
     try:
         async with visuals.RENDER_LOCK:
             pdf_bytes = await asyncio.to_thread(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -2422,6 +2423,73 @@ def test_generate_brief_report_threads_saved_notes_into_coaching_line(
     assert not err
     assert len(calls) == 1
     assert "stop roasting my steps" in calls[0]
+
+
+# === WS4 4a — ground the PDF coaching line ===================================
+
+def test_generate_brief_report_logs_coaching_line_grounding(
+    plan_seeded, reports_tmp, monkeypatch, caplog
+):
+    """4a: the coaching line is checked against the deterministic plan
+    section — advisory-only (logged, never gates the PDF). An invented
+    adherence number close to but not equal to the real 75% (plan_seeded's
+    fixture value) must produce a logged flag while the PDF still renders
+    normally, mirroring grounding.log_grounding's log-only pattern."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    async def fake_generate(*_a, **_k):
+        # 80% is a subtle corruption of the real 75% adherence — close enough
+        # to look like the same metric (within grounding's NEARBY band) but
+        # not equal (outside the EXACT band) -> a "flag" verdict, not silent.
+        return "You're running at 80% adherence this week — keep it up."
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.tools"):
+        payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err  # advisory grounding must never fail the PDF
+
+    pdf_bytes = Path(payload["path"]).read_bytes()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    assert "TRAINING PLAN" in text
+    # The invented line still renders verbatim -- grounding never alters the PDF.
+    assert "80% adherence" in text
+
+    flag_logs = [r for r in caplog.records if "plan_coach_grounding" in r.message]
+    assert len(flag_logs) == 1
+    assert "flags=1" in flag_logs[0].message
+    assert "adherence_pct" in flag_logs[0].message
+
+
+def test_generate_brief_report_coaching_line_grounding_clean_line_logs_zero_flags(
+    plan_seeded, reports_tmp, monkeypatch, caplog
+):
+    """A coaching line that only cites faithful numbers (or none at all)
+    logs flags=0 -- the signal doesn't manufacture false positives on a
+    clean line."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    async def fake_generate(*_a, **_k):
+        return "Solid week. Keep showing up and trust the process."
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.tools"):
+        payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+
+    flag_logs = [r for r in caplog.records if "plan_coach_grounding" in r.message]
+    assert len(flag_logs) == 1
+    assert "flags=0" in flag_logs[0].message
 
 
 # === WS3 3d — MCP-appropriate error strings ==================================

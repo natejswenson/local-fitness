@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 
+from . import grounding
 from .coach import CoachProfile
+from .grounding import GroundingFlag
 
 _VERDICT_PHRASE = {
     "done": "You hit yesterday's session clean.",
@@ -199,3 +201,95 @@ def fallback_coaching_line(
         parts.append(f"Working toward your {goal_type}.")
 
     return " ".join(parts)
+
+
+def _plan_section_pool(plan_section: dict) -> list[tuple[float, str]]:
+    """The citable-number pool for ``ground_coaching_line``, built from the
+    deterministic plan section — the same shape ``tools._build_plan_section``
+    returns. Mirrors ``grounding._grounded_pool``'s (magnitude, source-name)
+    shape so ``grounding.classify_against_pool`` works unmodified.
+
+    Pace is a string ("9:23"/mi) — tokenized numerically (9, 23) the same way
+    ``grounding._display_numbers`` tokenizes a GroundedValue's ``display``
+    string, per the design's tokenizer-false-positive caveat.
+    """
+    pool: list[tuple[float, str]] = []
+
+    adherence_pct = plan_section.get("adherence_pct")
+    if adherence_pct is not None:
+        pool.append((abs(float(adherence_pct)), "adherence_pct"))
+
+    days_to_race = plan_section.get("days_to_race")
+    if days_to_race is not None:
+        pool.append((abs(float(days_to_race)), "days_to_race"))
+
+    today = plan_section.get("today") or {}
+    distance_mi = today.get("distance_mi")
+    if distance_mi is not None:
+        pool.append((abs(float(distance_mi)), "today_distance_mi"))
+    pace = today.get("pace_min_per_mi")
+    if pace:
+        for tok in grounding.numeric_tokens(str(pace)):
+            v = grounding.parse_number(tok)
+            if v is not None:
+                pool.append((abs(v), "today_pace_min_per_mi"))
+
+    week_planned_mi = plan_section.get("week_planned_mi")
+    if week_planned_mi is not None:
+        pool.append((abs(float(week_planned_mi)), "week_planned_mi"))
+    week_actual_mi = plan_section.get("week_actual_mi")
+    if week_actual_mi is not None:
+        pool.append((abs(float(week_actual_mi)), "week_actual_mi"))
+
+    return pool
+
+
+def ground_coaching_line(text: str, plan_section: dict) -> list[GroundingFlag]:
+    """Advisory grounding for the PDF's Claude-generated coaching line — the
+    one LLM output entering a user-facing artifact with zero numeric
+    validation until now.
+
+    Pure (no I/O). Reuses ``grounding``'s numeric-token parser and
+    nearest-match bands (``grounding.numeric_tokens`` / ``parse_number`` /
+    ``classify_against_pool``) over a pool built from the deterministic plan
+    section (``adherence_pct``, ``days_to_race``, today's
+    ``distance_mi``/pace, ``week_planned_mi``/``week_actual_mi`` — see
+    ``_plan_section_pool``). Replicates ``flag()``'s empty-pool guard
+    explicitly (``if not pool: return []``) — in practice the pool is never
+    empty (``adherence_pct`` defaults to 0 in ``_build_plan_section``), but
+    the guard is kept since ``_nearest``/``classify_against_pool`` document a
+    non-empty-pool precondition.
+
+    Flags always carry ``takeaway_index=0`` — the PDF has exactly one
+    coaching line, so there is no takeaway list to index into.
+
+    Never raises on arbitrary text: any parse/lookup failure downgrades to
+    "no flags" rather than propagating, matching this module's advisory-
+    signal contract (grounding is a measurement, never a gate — see
+    ``generate_brief_report``, which only logs these flags).
+
+    Two advisory-signal caveats, so the flags aren't over-read: the pool
+    includes string-shaped pace values tokenized the way ``_display_numbers``
+    tokenizes a GroundedValue's display string, and a ``days_to_race`` cited
+    in prose is typically skipped by ``grounding``'s time-window rule (e.g.
+    "12 days to your 10k"). Same partial-coverage character as the brief
+    path's ``flag()`` signal.
+    """
+    try:
+        pool = _plan_section_pool(plan_section)
+        if not pool:
+            return []
+        flags: list[GroundingFlag] = []
+        for tok in grounding.numeric_tokens(text):
+            x = grounding.parse_number(tok)
+            if x is None:
+                continue
+            ax = abs(x)
+            verdict, near_val, near_name = grounding.classify_against_pool(ax, pool)
+            if verdict == "flag":
+                flags.append(GroundingFlag(
+                    takeaway_index=0, token=tok.strip(),
+                    nearest_metric=near_name, delta=round(x - near_val, 2)))
+        return flags
+    except Exception:
+        return []

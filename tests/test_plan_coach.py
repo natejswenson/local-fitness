@@ -279,3 +279,75 @@ def test_generate_coaching_line_times_out(monkeypatch):
                 _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k", timeout=0.05
             )
         )
+
+
+# --- 4a: ground_coaching_line — advisory grounding of the PDF coaching line -
+
+_PLAN_SECTION = {
+    "adherence_pct": 75,
+    "days_to_race": 71,
+    "goal_type": "10k",
+    "week_planned_mi": 13.7,
+    "week_actual_mi": 6.9,
+    "slips": 2,
+    "today": {
+        "type": "easy",
+        "distance_mi": 2.49,
+        "pace_min_per_mi": "9:23",
+        "description": "keep HR under 140",
+    },
+    "last_7_days": _LAST_7_DAYS,
+}
+
+
+def test_ground_coaching_line_flags_an_invented_adherence_number():
+    # 80% is a subtle corruption of the real 75% adherence: close enough to
+    # read as the same metric (within the NEARBY band) but not equal (past
+    # the EXACT band) -> flagged, not silently accepted.
+    text = "You're running at 80% adherence this week -- keep it up."
+    flags = plan_coach.ground_coaching_line(text, _PLAN_SECTION)
+    assert len(flags) == 1
+    assert flags[0].nearest_metric == "adherence_pct"
+    assert flags[0].takeaway_index == 0
+    assert flags[0].token == "80%"
+
+
+def test_ground_coaching_line_passes_faithful_citations_including_pace_string():
+    # Cites the real adherence (75%) and the real pace string "9:23/mi" --
+    # the tokenizer splits "9:23" into (9, 23), the same numeric tokens the
+    # pool derives from today's pace_min_per_mi ("9:23") -- both match their
+    # pool entries exactly, so this is a faithful citation, not a flag.
+    text = "Solid 75% adherence lately. Today's easy goes out around 9:23/mi."
+    flags = plan_coach.ground_coaching_line(text, _PLAN_SECTION)
+    assert flags == []
+
+
+def test_ground_coaching_line_empty_list_on_numberless_prose():
+    text = "Keep showing up and trust the process."
+    assert plan_coach.ground_coaching_line(text, _PLAN_SECTION) == []
+
+
+def test_ground_coaching_line_empty_pool_guard_returns_empty_list():
+    # A plan_section with no citable numbers at all (e.g. malformed/partial
+    # data) must short-circuit to [] rather than raise inside _nearest, which
+    # documents a non-empty-pool precondition.
+    empty_section = {"today": {}}
+    text = "You're crushing it at 80% adherence."
+    assert plan_coach.ground_coaching_line(text, empty_section) == []
+
+
+def test_ground_coaching_line_never_raises_on_malformed_plan_section():
+    # A structurally-wrong plan_section (wrong types) must downgrade to "no
+    # flags" rather than propagate -- the module's advisory-signal contract.
+    malformed = {"adherence_pct": "not-a-number", "today": "not-a-dict"}
+    assert plan_coach.ground_coaching_line("80% adherence", malformed) == []
+
+
+def test_ground_coaching_line_days_to_race_cited_in_prose_typically_skipped():
+    # grounding's time-window rule skips a number immediately followed by
+    # "days" -- "71 days to your 10k" reads as a window, not a metric claim,
+    # so it produces no flag even though 71 IS in the pool (contrast: an
+    # invented, non-window-worded citation of a nearby-but-wrong number would
+    # still flag).
+    text = "71 days to your 10k -- stay the course."
+    assert plan_coach.ground_coaching_line(text, _PLAN_SECTION) == []
