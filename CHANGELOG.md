@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-07-13
+
+### Fixed
+- **Brief takeaway tables could render as one flattened line of pipes.**
+  Two gaps in the deterministic table-repair layer
+  (`render.fix_table_row_breaks`), both observed live in the 2026-07-13
+  brief: (1) a table glued directly to surrounding prose
+  (`**Header:**\n| Metric |…`) is not parsed as a table by strict
+  CommonMark/GFM renderers — repair now isolates table blocks with blank
+  lines on both sides; (2) the dropped-backslash `\n` artifact could land
+  after the final row's closing pipe (`| ↓ |n`), which the `|n|`-only
+  repair missed — now stripped. Both idempotent, prose untouched,
+  regression-tested against the observed shapes.
+
 ## [0.22.1] - 2026-07-13
 
 ### Fixed
