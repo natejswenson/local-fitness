@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
-from . import briefs, charts, coach, plan_coach, units
+from . import briefs, charts, coach, interpret, plan_coach, units
 from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
@@ -249,10 +249,29 @@ async def get_metric_trend(args: dict) -> dict:
     values = [r["v"] for r in rows]
     n = len(values)
     mean = sum(values) / n
-    xs = list(range(n))
-    x_mean = (n - 1) / 2
-    denom = sum((x - x_mean) ** 2 for x in xs) or 1e-9
-    slope = sum((xs[i] - x_mean) * (values[i] - mean) for i in range(n)) / denom
+
+    # n < 2 -> no defined slope: get_metric_trend owns this None mapping (the
+    # least-squares denominator below is guarded with `or 1e-9`, so without
+    # this the tool would compute a slope of 0.0 even for a single sample,
+    # making "no data" unreachable). The sample SD used for the flat band is
+    # likewise undefined at n=1, so the threshold computation is skipped too.
+    slope: float | None
+    flat_threshold = 0.0
+    if n < 2:
+        slope = None
+    else:
+        xs = list(range(n))
+        x_mean = (n - 1) / 2
+        denom = sum((x - x_mean) ** 2 for x in xs) or 1e-9
+        slope = sum((xs[i] - x_mean) * (values[i] - mean) for i in range(n)) / denom
+        # Flat band: the fitted total change across the window (slope is
+        # per-observation, not per-day — xs is the sample index) stays within
+        # half a sample SD. flat_threshold = (0.5 * sample_sd) / (n - 1) so
+        # the in-function abs(slope) <= flat_threshold comparison equals that.
+        sample_sd = (sum((v - mean) ** 2 for v in values) / max(n - 1, 1)) ** 0.5
+        flat_threshold = (interpret.TREND_FLAT_SD_MULTIPLIER * sample_sd) / max(n - 1, 1)
+
+    current_vs_baseline_sd = None
     payload = {
         "metric": metric,
         "days_window": days,
@@ -260,12 +279,26 @@ async def get_metric_trend(args: dict) -> dict:
         "mean": mean,
         "current": values[-1],
         "slope_per_day": slope,
+        "slope_direction": interpret.trend_direction(slope, flat_threshold=flat_threshold),
     }
     if baseline and baseline["m"] is not None:
         payload["baseline_60day_mean"] = baseline["m"]
         payload["baseline_60day_sd"] = baseline["sd"]
         if baseline["sd"]:
-            payload["current_vs_baseline_sd"] = (values[-1] - baseline["m"]) / baseline["sd"]
+            current_vs_baseline_sd = (values[-1] - baseline["m"]) / baseline["sd"]
+            payload["current_vs_baseline_sd"] = current_vs_baseline_sd
+    # vs_baseline is ALWAYS attached — "no data" whenever current_vs_baseline_sd
+    # is absent/None (every metric outside rhr/sleep_seconds, or a zero SD).
+    payload["vs_baseline"] = interpret.baseline_position(current_vs_baseline_sd)
+
+    # Round at the payload boundary; None passes through unrounded.
+    for field, ndigits in (
+        ("mean", 2), ("slope_per_day", 3),
+        ("baseline_60day_mean", 2), ("baseline_60day_sd", 2),
+        ("current_vs_baseline_sd", 2),
+    ):
+        if payload.get(field) is not None:
+            payload[field] = round(payload[field], ndigits)
     return _text(payload)
 
 
@@ -513,7 +546,28 @@ async def compare_periods(args: dict) -> dict:
         a = _stats(conn, args["period_a_start"], args["period_a_end"])
         b = _stats(conn, args["period_b_start"], args["period_b_end"])
     delta = (a["mean"] - b["mean"]) if (a["mean"] is not None and b["mean"] is not None) else None
-    return _text({"metric": metric, "period_a": a, "period_b": b, "delta_mean_a_minus_b": delta})
+
+    # _stats always returns an int n (0 on no rows), so effect_size's
+    # whole-None branch is unreachable here — it always returns a dict.
+    effect = interpret.effect_size(a["mean"], b["mean"], a["sd"], b["sd"], a["n"], b["n"])
+    delta_pct = effect["delta_pct"] if effect else None
+    cohens_d = effect["cohens_d"] if effect else None
+    magnitude = effect["magnitude"] if effect else None
+
+    payload = {
+        "metric": metric, "period_a": a, "period_b": b,
+        "delta_mean_a_minus_b": delta,
+        "delta_pct": delta_pct, "cohens_d": cohens_d, "magnitude": magnitude,
+    }
+    # Round at the payload boundary; None passes through unrounded.
+    for period in (payload["period_a"], payload["period_b"]):
+        for field in ("mean", "sd"):
+            if period.get(field) is not None:
+                period[field] = round(period[field], 2)
+    for field, ndigits in (("delta_mean_a_minus_b", 2), ("delta_pct", 1), ("cohens_d", 3)):
+        if payload.get(field) is not None:
+            payload[field] = round(payload[field], ndigits)
+    return _text(payload)
 
 
 _FIND_ANOMALIES_SCHEMA = {
@@ -556,11 +610,19 @@ async def find_anomalies(args: dict) -> dict:
                 ORDER BY dm.date DESC""",
             (cutoff, threshold),
         ).fetchall()
+    anomalies = []
+    for r in rows:
+        row = dict(r)
+        position = interpret.sd_position(row.get("value"), row.get("baseline_mean"), row.get("baseline_sd"))
+        if position is not None:
+            row["sd_distance"] = round(position["sd_distance"], 2)
+            row["direction"] = position["direction"]
+        anomalies.append(row)
     return _text({
         "metric": metric,
         "lookback_days": days,
         "sd_threshold": threshold,
-        "anomalies": [dict(r) for r in rows],
+        "anomalies": anomalies,
     })
 
 
@@ -594,6 +656,10 @@ async def sync_garmin_data(_args: dict) -> dict:
     {},
 )
 async def training_load_status(_args: dict) -> dict:
+    # Lazy import: brief_planner -> status -> tools would cycle at module
+    # scope (same pattern as get_brief_context, tools.py:1591-1594).
+    from . import brief_planner
+
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     with db.connect() as conn:
         recent = [dict(r) for r in conn.execute(
@@ -601,11 +667,36 @@ async def training_load_status(_args: dict) -> dict:
             "WHERE date >= ? AND ctl IS NOT NULL ORDER BY date DESC",
             (cutoff,),
         ).fetchall()]
-    if not recent:
-        return _err("no training-load data yet — pull activities and run recompute-baselines")
+        if not recent:
+            return _err("no training-load data yet — pull activities and run recompute-baselines")
+        # The 14-day "then" CTL is single-sourced in brief_planner (the same
+        # no-lookback-floor query the brief signal uses) so this agrees with
+        # the brief by construction, even on gappy baselines — a point
+        # picked from this tool's own 30-day window could disagree. Runs on
+        # this tool's existing connection: not in tests/test_perf_benchmarks.py's
+        # benchmarked set, so the extra indexed point-query is allowed.
+        anchor = (date.today() - timedelta(days=brief_planner._LOOKBACK_DAYS)).isoformat()
+        ctl_then = brief_planner.ctl_at_or_before(conn, anchor)
+
+    current = recent[0]
+    ctl_pct = interpret.pct_change(current.get("ctl"), ctl_then)
+    if ctl_pct is not None:
+        ctl_pct = round(ctl_pct, 1)
+    tsb_zone = interpret.tsb_zone(current.get("tsb"))
+    # A scalar %-delta, not a slope/series — delta_direction, not trend_direction.
+    ctl_direction = interpret.delta_direction(ctl_pct)
+
+    for row in recent:  # current IS recent[0] — rounding recent rounds current too.
+        for field in ("ctl", "atl", "tsb"):
+            if row.get(field) is not None:
+                row[field] = round(row[field], 2)
+
     return _text({
-        "current": recent[0],
+        "current": current,
         "history_30d": recent,
+        "tsb_zone": tsb_zone,
+        "ctl_pct_change_14d": ctl_pct,
+        "ctl_direction": ctl_direction,
         "interpretation": {
             "ctl": "chronic training load (fitness) — 42-day EWMA of activity training_load",
             "atl": "acute training load (fatigue) — 7-day EWMA",
@@ -673,10 +764,13 @@ async def correlate(args: dict) -> dict:
     var_b = sum((p[1] - mean_b) ** 2 for p in pairs) / n
     denom = (var_a * var_b) ** 0.5
     r_val = (cov / denom) if denom else None
+    read = interpret.correlation_read(r_val)
     return _text({
         "metric_a": a, "metric_b": b, "days": days, "lag_days": lag,
-        "n_pairs": n, "pearson_r": r_val,
-        "interpretation": "|r| < 0.2 weak, 0.2-0.4 modest, 0.4-0.6 moderate, > 0.6 strong",
+        "n_pairs": n,
+        "pearson_r": round(r_val, 3) if r_val is not None else None,
+        "strength": read["strength"] if read else None,
+        "direction": read["direction"] if read else None,
     })
 
 
@@ -766,8 +860,8 @@ async def recovery_pattern(args: dict) -> dict:
     rhr_vals = [r["recovery_days_to_rhr_baseline"] for r in results if r["recovery_days_to_rhr_baseline"]]
     return _text({
         "n_workouts_matched": len(results),
-        "avg_recovery_days_body_battery": (sum(bb_vals) / len(bb_vals)) if bb_vals else None,
-        "avg_recovery_days_rhr": (sum(rhr_vals) / len(rhr_vals)) if rhr_vals else None,
+        "avg_recovery_days_body_battery": round(sum(bb_vals) / len(bb_vals), 2) if bb_vals else None,
+        "avg_recovery_days_rhr": round(sum(rhr_vals) / len(rhr_vals), 2) if rhr_vals else None,
         "recent_workouts": results[-10:],
     })
 

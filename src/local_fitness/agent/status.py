@@ -27,7 +27,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .. import db, notes
-from . import units
+from . import interpret, units
 from .tools import DAILY_NUMERIC_METRICS
 
 # Explicit metric → (baseline mean column, baseline sd column | None). Do NOT
@@ -82,16 +82,12 @@ def _baseline_row(conn, today: str) -> dict[str, Any] | None:
 
 
 def _tsb_interpretation(tsb: float | None) -> str:
-    """Plain-English read of training stress balance."""
-    if tsb is None:
-        return "no training-load data yet"
-    if tsb < -20:
-        return "very fatigued"
-    if tsb < -10:
-        return "fatigued"
-    if tsb > 5:
-        return "fresh"
-    return "neutral"
+    """Plain-English read of training stress balance.
+
+    Delegates to interpret.tsb_zone — the single source of the TSB-zone
+    bands, so status.py and training_load_status agree by construction.
+    """
+    return interpret.tsb_zone(tsb)
 
 
 def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict[str, Any]]:

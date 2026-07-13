@@ -315,6 +315,34 @@ def test_rhr_anomalies_needs_mean_and_sd():
     assert bp._rhr_anomalies({}, _FIXED, None) == []
 
 
+def test_rhr_anomalies_attaches_sd_distance_and_direction():
+    # rhr 60 vs mean 52 / sd 2 -> (60-52)/2 = 4.0 SD above, well past the
+    # >2*sd trigger condition; direction "above" (WS1 sd_position attach).
+    today = _FIXED
+    rows = {today.isoformat(): {"rhr": 60}}
+    out = bp._rhr_anomalies(rows, today, {"rhr_60day_mean": 52, "rhr_60day_sd": 2})
+    assert len(out) == 1
+    assert out[0]["sd_distance"] == 4.0
+    assert out[0]["direction"] == "above"
+
+
+def test_ctl_at_or_before_returns_latest_row_on_or_before_anchor(tmp_path):
+    p = tmp_path / "db.db"
+    db.init_schema(p)
+    with db.connect(p) as conn:
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES ('2026-06-01', 8.0)")
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES ('2026-06-10', 10.0)")
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES ('2026-06-20', 15.0)")
+        # No row exactly on the anchor date — the at-or-before lookup must
+        # fall back to the latest row strictly before it (06-10), not the
+        # nearest-in-either-direction row (06-20).
+        assert bp.ctl_at_or_before(conn, "2026-06-15") == 10.0
+        # Exact match on the anchor date is used directly.
+        assert bp.ctl_at_or_before(conn, "2026-06-10") == 10.0
+        # No row on or before the anchor at all -> None.
+        assert bp.ctl_at_or_before(conn, "2026-05-01") is None
+
+
 def test_ctl_pct_change_computed_from_baseline_history(tmp_path):
     p = tmp_path / "db.db"
     db.init_schema(p)

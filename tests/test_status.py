@@ -187,6 +187,15 @@ def test_tsb_interpretation_all_bands():
     assert status_mod._tsb_interpretation(0) == "neutral"
 
 
+def test_tsb_interpretation_delegates_to_interpret_tsb_zone():
+    """WS1: status._tsb_interpretation delegates to interpret.tsb_zone so
+    the brief path and training_load_status agree by construction."""
+    from local_fitness.agent import interpret
+
+    for tsb in (None, -25, -20, -15, -10, 0, 5, 10):
+        assert status_mod._tsb_interpretation(tsb) == interpret.tsb_zone(tsb)
+
+
 # --- assemble_status: trend slope + pace-bearing workout -------------------
 
 @pytest.fixture

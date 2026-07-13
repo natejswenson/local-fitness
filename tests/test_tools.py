@@ -24,7 +24,7 @@ import pdfplumber
 import pytest
 
 from local_fitness import db, plans
-from local_fitness.agent import tools
+from local_fitness.agent import interpret, tools
 
 
 def test_text_emits_compact_json():
@@ -393,6 +393,240 @@ def test_recovery_pattern(seeded):
     assert not err
     assert payload["n_workouts_matched"] >= 0
     assert "recent_workouts" in payload
+
+
+# === WS1 — interpretation-parity payload attachments ========================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS1)
+
+def _decimal_places(x: float) -> int:
+    s = repr(float(x))
+    return len(s.split(".", 1)[1]) if "." in s else 0
+
+
+def test_get_metric_trend_slope_direction_present(seeded):
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["slope_direction"] in ("rising", "falling", "flat", "no data")
+
+
+def test_get_metric_trend_vs_baseline_strict_boundary_for_rhr(seeded):
+    # seeded's rhr baseline is mean=52.0, sd=2.0 constant; today's (most
+    # recent) rhr is 50 -> current_vs_baseline_sd == (50-52)/2 == -1.0
+    # exactly — the strict-band boundary (baseline_position's exactly -1.0
+    # is "normal", not "suppressed").
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["current_vs_baseline_sd"] == -1.0
+    assert payload["vs_baseline"] == "normal"
+
+
+def test_get_metric_trend_vs_baseline_no_data_for_non_baselined_metric(seeded):
+    payload, err = call(tools.get_metric_trend, {"metric": "steps", "days": 14})
+    assert not err
+    assert "current_vs_baseline_sd" not in payload
+    assert payload["vs_baseline"] == "no data"
+
+
+def test_get_metric_trend_single_sample_yields_null_slope_and_no_data(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today().isoformat()
+    with db.connect(p) as conn:
+        conn.execute("INSERT INTO daily_metrics (date, vo2_max) VALUES (?, ?)", (today, 45.0))
+    payload, err = call(tools.get_metric_trend, {"metric": "vo2_max", "days": 5})
+    assert not err
+    assert payload["n_samples"] == 1
+    assert payload["slope_per_day"] is None  # not the guarded 0.0
+    assert payload["slope_direction"] == "no data"
+
+
+def test_get_metric_trend_dp_budget(seeded):
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert _decimal_places(payload["mean"]) <= 2
+    assert _decimal_places(payload["slope_per_day"]) <= 3
+    assert _decimal_places(payload["baseline_60day_mean"]) <= 2
+    assert _decimal_places(payload["baseline_60day_sd"]) <= 2
+    assert _decimal_places(payload["current_vs_baseline_sd"]) <= 2
+
+
+def test_compare_periods_effect_size_fields(seeded):
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "rhr",
+         "period_a_start": (today - timedelta(days=10)).isoformat(),
+         "period_a_end": today.isoformat(),
+         "period_b_start": (today - timedelta(days=30)).isoformat(),
+         "period_b_end": (today - timedelta(days=20)).isoformat()},
+    )
+    assert not err
+    assert "delta_pct" in payload
+    assert "cohens_d" in payload
+    assert "magnitude" in payload
+    assert _decimal_places(payload["period_a"]["mean"]) <= 2
+    assert _decimal_places(payload["period_a"]["sd"]) <= 2
+    assert _decimal_places(payload["delta_mean_a_minus_b"]) <= 2
+    if payload["delta_pct"] is not None:
+        assert _decimal_places(payload["delta_pct"]) <= 1
+    if payload["cohens_d"] is not None:
+        assert _decimal_places(payload["cohens_d"]) <= 3
+
+
+def test_compare_periods_two_one_day_periods_degrades_per_field(seeded):
+    # The designated realistic case for effect_size's per-field degradation:
+    # each period has n=1 (sd forced to 0 via max(len-1, 1)) -> delta_pct is
+    # still computed from the means; cohens_d/magnitude are None.
+    today = date.today()
+    a_day = today.isoformat()
+    b_day = (today - timedelta(days=20)).isoformat()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "rhr", "period_a_start": a_day, "period_a_end": a_day,
+         "period_b_start": b_day, "period_b_end": b_day},
+    )
+    assert not err
+    assert payload["period_a"]["n"] == 1
+    assert payload["period_b"]["n"] == 1
+    assert payload["delta_pct"] is not None
+    assert payload["cohens_d"] is None
+    assert payload["magnitude"] is None
+
+
+def test_correlate_has_computed_fields_no_legend(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i in range(10):
+            d = (today - timedelta(days=i)).isoformat()
+            # steps and rhr move in perfect lockstep -> pearson_r == 1.0
+            conn.execute(
+                "INSERT INTO daily_metrics (date, steps, rhr) VALUES (?, ?, ?)",
+                (d, 1000 * i, 50 + i),
+            )
+    payload, err = call(tools.correlate, {"metric_a": "steps", "metric_b": "rhr", "days": 10})
+    assert not err
+    assert payload["pearson_r"] == 1.0
+    assert payload["strength"] == "strong"
+    assert payload["direction"] == "positive"
+    assert "interpretation" not in payload
+
+
+def test_correlate_pearson_r_none_when_zero_variance_skips_rounding(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i in range(10):
+            d = (today - timedelta(days=i)).isoformat()
+            conn.execute(  # steps constant -> zero variance -> denom == 0
+                "INSERT INTO daily_metrics (date, steps, rhr) VALUES (?, ?, ?)",
+                (d, 5000, 50 + i),
+            )
+    payload, err = call(tools.correlate, {"metric_a": "steps", "metric_b": "rhr", "days": 10})
+    assert not err
+    assert payload["pearson_r"] is None  # round(None, 3) must not raise
+    assert payload["strength"] is None
+    assert payload["direction"] is None
+
+
+def test_find_anomalies_sd_distance_and_direction(seeded):
+    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.1})
+    assert not err
+    assert payload["anomalies"]
+    for row in payload["anomalies"]:
+        expected = round((row["value"] - row["baseline_mean"]) / row["baseline_sd"], 2)
+        assert row["sd_distance"] == expected
+        assert row["direction"] in ("above", "below")
+
+
+def test_training_load_status_tsb_zone_matches_interpret(seeded):
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    assert payload["tsb_zone"] == interpret.tsb_zone(payload["current"]["tsb"])
+
+
+def test_training_load_status_ctl_direction_matches_delta_direction(seeded):
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    assert "ctl_pct_change_14d" in payload
+    assert payload["ctl_direction"] == interpret.delta_direction(payload["ctl_pct_change_14d"])
+
+
+def test_training_load_status_dp_budget(seeded):
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    for field in ("ctl", "atl", "tsb"):
+        assert _decimal_places(payload["current"][field]) <= 2
+    if payload["ctl_pct_change_14d"] is not None:
+        assert _decimal_places(payload["ctl_pct_change_14d"]) <= 1
+
+
+def test_training_load_status_ctl_pct_change_matches_brief_on_gappy_baselines(tmp_path, monkeypatch):
+    """Gappy-baselines agreement test (WS1): no baselines row exactly at
+    today - 14d, so a window-derived "then" point would differ from the
+    at-or-before lookup — both paths must call the shared
+    brief_planner.ctl_at_or_before and therefore agree."""
+    from local_fitness.agent import brief_planner as bp
+
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i in range(0, 30, 3):  # gappy: 0, 3, 6, 9, 12, 15, ... — never 14
+            d = (today - timedelta(days=i)).isoformat()
+            ctl = 40.0 - i * 0.1
+            conn.execute(
+                "INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, ?, ?, ?)",
+                (d, ctl, 20.0, ctl - 20.0),
+            )
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+
+    with db.connect(p) as conn:
+        baseline = bp.status_mod._baseline_row(conn, today.isoformat())
+        sig = bp._compute_signals(conn, today.isoformat(), baseline, 10000, None, None)
+    assert payload["ctl_pct_change_14d"] == sig.ctl_pct_change_14d
+
+
+def test_recovery_pattern_rounds_avg_recovery_days(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # Three matched workouts recovering to baseline in 1, 2, and 4 days
+        # respectively -> avg = 7/3 = 2.3333... rounds to 2.33.
+        for idx, offset in enumerate((1, 2, 4)):
+            wdate = today - timedelta(days=30 - idx * 8)
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+                "distance_meters, training_load) VALUES (?, ?, ?, 'running', 8000, 50.0)",
+                (idx + 1, wdate.isoformat(), wdate.isoformat() + "T07:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO baselines (date, body_battery_max_60day_mean) VALUES (?, 80.0)",
+                (wdate.isoformat(),),
+            )
+            recovered_date = wdate + timedelta(days=offset)
+            conn.execute(
+                "INSERT INTO daily_metrics (date, body_battery_max) VALUES (?, 80.0)",
+                (recovered_date.isoformat(),),
+            )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 60})
+    assert not err
+    assert payload["avg_recovery_days_body_battery"] == pytest.approx(2.33)
+    assert _decimal_places(payload["avg_recovery_days_body_battery"]) <= 2
 
 
 def test_run_sql_select(seeded):

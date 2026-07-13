@@ -22,6 +22,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from .. import db
+from . import interpret
 from . import status as status_mod
 from . import units
 from .coach import CoachProfile, resolve_coach_profile
@@ -43,9 +44,10 @@ _TRIGGERS = {
     "bb_low_max": 50,            # body battery topping under 50 ...
     "bb_low_nights": 3,          # ... for 3+ nights
     "stress_7d_high": 40,        # 7-day stress average above 40
-    # Training-load freshness bands (status._tsb_interpretation)
-    "tsb_fresh": 5.0,            # TSB > +5 = fresh / green light
-    "tsb_very_fatigued": -20.0,  # TSB < -20 = very fatigued
+    # Training-load freshness bands — reference interpret's single-sourced
+    # TSB-zone constants (status._tsb_interpretation delegates to the same).
+    "tsb_fresh": interpret.TSB_FRESH,             # TSB > +5 = fresh / green light
+    "tsb_very_fatigued": interpret.TSB_VERY_FATIGUED,  # TSB < -20 = very fatigued
 }
 
 # Fixed priority — the prompt's order (prompts.py:251-271). Lower = earlier.
@@ -459,6 +461,22 @@ def _running(activity_type: str | None) -> bool:
     return (activity_type or "").lower() in _RUNNING_TYPES
 
 
+def ctl_at_or_before(conn, anchor_date: str) -> float | None:
+    """CTL value at-or-before ``anchor_date`` (no lookback floor).
+
+    The 14-day "then" lookup for ``ctl_pct_change_14d`` — single-sourced here
+    (same SQL as before, now public) and consumed by BOTH _compute_signals
+    and tools.training_load_status, so the two paths agree by construction
+    instead of training_load_status picking a "then" point out of its own
+    30-day history window (which would diverge on gappy baselines).
+    """
+    row = conn.execute(
+        "SELECT ctl FROM baselines WHERE date <= ? AND ctl IS NOT NULL ORDER BY date DESC LIMIT 1",
+        (anchor_date,),
+    ).fetchone()
+    return row["ctl"] if row else None
+
+
 def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | None,
                      plan_today: dict | None, days_to_race: int | None) -> Signals:
     today_d = date.fromisoformat(today)
@@ -497,15 +515,15 @@ def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | N
     stress_recent = _recent("avg_stress", 7)
     steps_recent = _recent("steps", 7)
 
-    # CTL % change over 14d from the baselines table.
-    ctl_then = conn.execute(
-        "SELECT ctl FROM baselines WHERE date <= ? AND ctl IS NOT NULL ORDER BY date DESC LIMIT 1",
-        ((today_d - timedelta(days=_LOOKBACK_DAYS)).isoformat(),),
-    ).fetchone()
+    # CTL % change over 14d from the baselines table. The "then" lookup is
+    # single-sourced (ctl_at_or_before) so tools.training_load_status agrees
+    # by construction; the arithmetic delegates to interpret.pct_change,
+    # keeping only the rounding here (interpret returns unrounded).
+    ctl_then = ctl_at_or_before(conn, (today_d - timedelta(days=_LOOKBACK_DAYS)).isoformat())
     ctl_now = baseline.get("ctl") if baseline else None
-    ctl_pct = None
-    if ctl_now is not None and ctl_then and ctl_then["ctl"]:
-        ctl_pct = round((ctl_now - ctl_then["ctl"]) / ctl_then["ctl"] * 100, 1)
+    ctl_pct = interpret.pct_change(ctl_now, ctl_then)
+    if ctl_pct is not None:
+        ctl_pct = round(ctl_pct, 1)
 
     # Run history. Bounded — see _ACTIVITY_LOOKBACK_DAYS.
     activity_floor = (today_d - timedelta(days=_ACTIVITY_LOOKBACK_DAYS)).isoformat()
@@ -565,8 +583,12 @@ def _rhr_anomalies(rows: dict, today_d: date, baseline: dict | None) -> list[dic
         day = (today_d - timedelta(days=d)).isoformat()
         row = rows.get(day)
         if row and row.get("rhr") is not None and (row["rhr"] - mean) > 2 * sd:
-            out.append({"date": day, "metric": "rhr", "value": row["rhr"],
-                        "baseline": mean})
+            entry = {"date": day, "metric": "rhr", "value": row["rhr"], "baseline": mean}
+            position = interpret.sd_position(row["rhr"], mean, sd)
+            if position is not None:
+                entry["sd_distance"] = round(position["sd_distance"], 2)
+                entry["direction"] = position["direction"]
+            out.append(entry)
     return out
 
 
