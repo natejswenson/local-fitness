@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -24,7 +25,7 @@ import pdfplumber
 import pytest
 
 from local_fitness import db, plans
-from local_fitness.agent import tools
+from local_fitness.agent import interpret, tools
 
 
 def test_text_emits_compact_json():
@@ -88,10 +89,37 @@ def seeded(tmp_path, monkeypatch):
 
 
 def test_get_today_status(seeded):
+    # Fix B (2026-07-10 doc): get_today_status now delegates to
+    # status.assemble_status() — the old {today, recent_days,
+    # current_baseline} raw shape is gone, replaced by assemble_status()'s
+    # richer payload (metrics with baseline deltas, training_load, etc).
     payload, err = call(tools.get_today_status, {})
     assert not err
-    assert payload["recent_days"]
-    assert payload["current_baseline"]["ctl"] == 40.0
+    assert "recent_days" not in payload
+    assert "current_baseline" not in payload
+    assert payload["training_load"]["ctl"] == 40.0
+    assert payload["metrics"]
+    assert payload["date"] == date.today().isoformat()
+
+
+def test_get_today_status_matches_daily_snapshot(seeded):
+    # Fix B's convergence invariant: identical payload for identical DB state.
+    today_payload, err1 = call(tools.get_today_status, {})
+    snapshot_payload, err2 = call(tools.daily_snapshot, {})
+    assert not err1 and not err2
+    assert today_payload == snapshot_payload
+
+
+def test_get_today_status_description_mirrors_daily_snapshot():
+    today_tool = next(t for t in tools.ALL_TOOLS if t.name == "get_today_status")
+    snapshot_tool = next(t for t in tools.ALL_TOOLS if t.name == "daily_snapshot")
+    # Must no longer be the stale raw-shape description.
+    assert today_tool.description != (
+        "Today's metrics + last 7 days alongside the latest 60-day baselines. "
+        "Call this first when assessing recovery or making 'should I train "
+        "hard' decisions."
+    )
+    assert today_tool.description == snapshot_tool.description
 
 
 def test_get_metric_valid(seeded):
@@ -395,6 +423,395 @@ def test_recovery_pattern(seeded):
     assert "recent_workouts" in payload
 
 
+# === WS1 — interpretation-parity payload attachments ========================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS1)
+
+def _decimal_places(x: float) -> int:
+    s = repr(float(x))
+    return len(s.split(".", 1)[1]) if "." in s else 0
+
+
+def test_get_metric_trend_slope_direction_present(seeded):
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["slope_direction"] in ("rising", "falling", "flat", "no data")
+
+
+def test_get_metric_trend_vs_baseline_strict_boundary_for_rhr(seeded):
+    # seeded's rhr baseline is mean=52.0, sd=2.0 constant; today's (most
+    # recent) rhr is 50 -> current_vs_baseline_sd == (50-52)/2 == -1.0
+    # exactly — the strict-band boundary (baseline_position's exactly -1.0
+    # is "normal", not "suppressed").
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["current_vs_baseline_sd"] == -1.0
+    assert payload["vs_baseline"] == "normal"
+
+
+def test_get_metric_trend_vs_baseline_no_data_for_non_baselined_metric(seeded):
+    payload, err = call(tools.get_metric_trend, {"metric": "steps", "days": 14})
+    assert not err
+    assert "current_vs_baseline_sd" not in payload
+    assert payload["vs_baseline"] == "no data"
+
+
+def test_get_metric_trend_single_sample_yields_null_slope_and_no_data(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today().isoformat()
+    with db.connect(p) as conn:
+        conn.execute("INSERT INTO daily_metrics (date, vo2_max) VALUES (?, ?)", (today, 45.0))
+    payload, err = call(tools.get_metric_trend, {"metric": "vo2_max", "days": 5})
+    assert not err
+    assert payload["n_samples"] == 1
+    assert payload["slope_per_day"] is None  # not the guarded 0.0
+    assert payload["slope_direction"] == "no data"
+
+
+def test_get_metric_trend_dp_budget(seeded):
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert _decimal_places(payload["mean"]) <= 2
+    assert _decimal_places(payload["slope_per_day"]) <= 3
+    assert _decimal_places(payload["baseline_60day_mean"]) <= 2
+    assert _decimal_places(payload["baseline_60day_sd"]) <= 2
+    assert _decimal_places(payload["current_vs_baseline_sd"]) <= 2
+
+
+def test_compare_periods_effect_size_fields(seeded):
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "rhr",
+         "period_a_start": (today - timedelta(days=10)).isoformat(),
+         "period_a_end": today.isoformat(),
+         "period_b_start": (today - timedelta(days=30)).isoformat(),
+         "period_b_end": (today - timedelta(days=20)).isoformat()},
+    )
+    assert not err
+    assert "delta_pct" in payload
+    assert "cohens_d" in payload
+    assert "magnitude" in payload
+    assert _decimal_places(payload["period_a"]["mean"]) <= 2
+    assert _decimal_places(payload["period_a"]["sd"]) <= 2
+    assert _decimal_places(payload["delta_mean_a_minus_b"]) <= 2
+    if payload["delta_pct"] is not None:
+        assert _decimal_places(payload["delta_pct"]) <= 1
+    if payload["cohens_d"] is not None:
+        assert _decimal_places(payload["cohens_d"]) <= 3
+
+
+def test_compare_periods_two_one_day_periods_degrades_per_field(seeded):
+    # The designated realistic case for effect_size's per-field degradation:
+    # each period has n=1 (sd forced to 0 via max(len-1, 1)) -> delta_pct is
+    # still computed from the means; cohens_d/magnitude are None.
+    today = date.today()
+    a_day = today.isoformat()
+    b_day = (today - timedelta(days=20)).isoformat()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "rhr", "period_a_start": a_day, "period_a_end": a_day,
+         "period_b_start": b_day, "period_b_end": b_day},
+    )
+    assert not err
+    assert payload["period_a"]["n"] == 1
+    assert payload["period_b"]["n"] == 1
+    assert payload["delta_pct"] is not None
+    assert payload["cohens_d"] is None
+    assert payload["magnitude"] is None
+
+
+def test_correlate_has_computed_fields_no_legend(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i in range(10):
+            d = (today - timedelta(days=i)).isoformat()
+            # steps and rhr move in perfect lockstep -> pearson_r == 1.0
+            conn.execute(
+                "INSERT INTO daily_metrics (date, steps, rhr) VALUES (?, ?, ?)",
+                (d, 1000 * i, 50 + i),
+            )
+    payload, err = call(tools.correlate, {"metric_a": "steps", "metric_b": "rhr", "days": 10})
+    assert not err
+    assert payload["pearson_r"] == 1.0
+    assert payload["strength"] == "strong"
+    assert payload["direction"] == "positive"
+    assert "interpretation" not in payload
+
+
+def test_correlate_pearson_r_none_when_zero_variance_skips_rounding(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i in range(10):
+            d = (today - timedelta(days=i)).isoformat()
+            conn.execute(  # steps constant -> zero variance -> denom == 0
+                "INSERT INTO daily_metrics (date, steps, rhr) VALUES (?, ?, ?)",
+                (d, 5000, 50 + i),
+            )
+    payload, err = call(tools.correlate, {"metric_a": "steps", "metric_b": "rhr", "days": 10})
+    assert not err
+    assert payload["pearson_r"] is None  # round(None, 3) must not raise
+    assert payload["strength"] is None
+    assert payload["direction"] is None
+
+
+def test_find_anomalies_sd_distance_and_direction(seeded):
+    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.1})
+    assert not err
+    assert payload["anomalies"]
+    for row in payload["anomalies"]:
+        expected = round((row["value"] - row["baseline_mean"]) / row["baseline_sd"], 2)
+        assert row["sd_distance"] == expected
+        assert row["direction"] in ("above", "below")
+
+
+def test_training_load_status_tsb_zone_matches_interpret(seeded):
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    assert payload["tsb_zone"] == interpret.tsb_zone(payload["current"]["tsb"])
+
+
+def test_training_load_status_ctl_direction_matches_delta_direction(seeded):
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    assert "ctl_pct_change_14d" in payload
+    assert payload["ctl_direction"] == interpret.delta_direction(payload["ctl_pct_change_14d"])
+
+
+def test_training_load_status_dp_budget(seeded):
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    for field in ("ctl", "atl", "tsb"):
+        assert _decimal_places(payload["current"][field]) <= 2
+    if payload["ctl_pct_change_14d"] is not None:
+        assert _decimal_places(payload["ctl_pct_change_14d"]) <= 1
+
+
+def test_training_load_status_ctl_pct_change_matches_brief_on_gappy_baselines(tmp_path, monkeypatch):
+    """Gappy-baselines agreement test (WS1): no baselines row exactly at
+    today - 14d, so a window-derived "then" point would differ from the
+    at-or-before lookup — both paths must call the shared
+    brief_planner.ctl_at_or_before and therefore agree."""
+    from local_fitness.agent import brief_planner as bp
+
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i in range(0, 30, 3):  # gappy: 0, 3, 6, 9, 12, 15, ... — never 14
+            d = (today - timedelta(days=i)).isoformat()
+            ctl = 40.0 - i * 0.1
+            conn.execute(
+                "INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, ?, ?, ?)",
+                (d, ctl, 20.0, ctl - 20.0),
+            )
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+
+    with db.connect(p) as conn:
+        baseline = bp.status_mod._baseline_row(conn, today.isoformat())
+        sig = bp._compute_signals(conn, today.isoformat(), baseline, 10000, None, None)
+    assert payload["ctl_pct_change_14d"] == sig.ctl_pct_change_14d
+
+
+def test_recovery_pattern_rounds_avg_recovery_days(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # Three matched workouts recovering to baseline in 1, 2, and 4 days
+        # respectively -> avg = 7/3 = 2.3333... rounds to 2.33.
+        for idx, offset in enumerate((1, 2, 4)):
+            wdate = today - timedelta(days=30 - idx * 8)
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+                "distance_meters, training_load) VALUES (?, ?, ?, 'running', 8000, 50.0)",
+                (idx + 1, wdate.isoformat(), wdate.isoformat() + "T07:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO baselines (date, body_battery_max_60day_mean) VALUES (?, 80.0)",
+                (wdate.isoformat(),),
+            )
+            recovered_date = wdate + timedelta(days=offset)
+            conn.execute(
+                "INSERT INTO daily_metrics (date, body_battery_max) VALUES (?, 80.0)",
+                (recovered_date.isoformat(),),
+            )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 60})
+    assert not err
+    assert payload["avg_recovery_days_body_battery"] == pytest.approx(2.33)
+    assert _decimal_places(payload["avg_recovery_days_body_battery"]) <= 2
+
+
+# === WS2 2f — remaining miles-convention gaps ===============================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2 2f)
+
+def test_get_workout_detail_splits_carry_mile_pace_fields(seeded):
+    payload, err = call(tools.get_workout_detail, {"activity_id": 1})
+    assert not err
+    split = payload["splits"][0]
+    # seeded's split: distance_meters=1000, duration_seconds=360, no pace.
+    assert split["distance_mi"] == 0.62
+    assert split["duration_formatted"] == "6:00"
+
+
+def test_get_workout_detail_splits_omit_distance_mi_in_km_mode(seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    payload, err = call(tools.get_workout_detail, {"activity_id": 1})
+    assert not err
+    split = payload["splits"][0]
+    assert "distance_mi" not in split
+    assert split["duration_formatted"] == "6:00"  # unconditional, not units-gated
+
+
+def test_recovery_pattern_matched_workouts_carry_mile_pace_fields(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "distance_meters, training_load, avg_pace_sec_per_km, duration_seconds) "
+            "VALUES (1, ?, ?, 'running', 8000, 50.0, 300.0, 2400)",
+            (wdate.isoformat(), wdate.isoformat() + "T07:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, body_battery_max_60day_mean) VALUES (?, 80.0)",
+            (wdate.isoformat(),),
+        )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    assert payload["recent_workouts"]
+    w = payload["recent_workouts"][0]
+    assert w["distance_mi"] == 4.97
+    assert w["pace_min_per_mi"] == "8:03"
+    assert w["duration_formatted"] == "40:00"
+
+
+def test_recovery_pattern_matched_workouts_omit_distance_mi_in_km_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "distance_meters, training_load, avg_pace_sec_per_km, duration_seconds) "
+            "VALUES (1, ?, ?, 'running', 8000, 50.0, 300.0, 2400)",
+            (wdate.isoformat(), wdate.isoformat() + "T07:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, body_battery_max_60day_mean) VALUES (?, 80.0)",
+            (wdate.isoformat(),),
+        )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    w = payload["recent_workouts"][0]
+    assert "distance_mi" not in w
+    assert w["pace_min_per_mi"] == "8:03"  # unconditional, not units-gated
+
+
+# === WS2 2g — compare_periods distance_meters SUM branch ====================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2 2g)
+
+@pytest.fixture
+def distance_seeded(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # period A (last 5 days): two runs, 5000m + 3000m = 8000m total.
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters) "
+            "VALUES (1, ?, 'running', 5000.0)", (today.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters) "
+            "VALUES (2, ?, 'running', 3000.0)",
+            ((today - timedelta(days=2)).isoformat(),),
+        )
+        # period B (30-40 days back): one run, 4000m total.
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, distance_meters) "
+            "VALUES (3, ?, 'running', 4000.0)",
+            ((today - timedelta(days=35)).isoformat(),),
+        )
+    return p
+
+
+def test_compare_periods_distance_meters_sum_shape(distance_seeded):
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "distance_meters",
+         "period_a_start": (today - timedelta(days=5)).isoformat(),
+         "period_a_end": today.isoformat(),
+         "period_b_start": (today - timedelta(days=40)).isoformat(),
+         "period_b_end": (today - timedelta(days=30)).isoformat()},
+    )
+    assert not err
+    assert payload["period_a"] == {"n": 2, "total": 8000.0, "total_mi": 4.97}
+    assert payload["period_b"] == {"n": 1, "total": 4000.0, "total_mi": 2.49}
+    assert payload["delta"] == 4000.0  # a-minus-b
+    assert payload["delta_pct"] == 100.0
+    assert "mean" not in payload["period_a"] and "sd" not in payload["period_a"]
+    assert "cohens_d" not in payload and "magnitude" not in payload
+
+
+def test_compare_periods_distance_meters_omits_total_mi_in_km_mode(distance_seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "distance_meters",
+         "period_a_start": (today - timedelta(days=5)).isoformat(),
+         "period_a_end": today.isoformat(),
+         "period_b_start": (today - timedelta(days=40)).isoformat(),
+         "period_b_end": (today - timedelta(days=30)).isoformat()},
+    )
+    assert not err
+    assert "total_mi" not in payload["period_a"]
+    assert "total_mi" not in payload["period_b"]
+    assert payload["period_a"]["total"] == 8000.0
+
+
+def test_compare_periods_distance_meters_empty_period_yields_none_total(distance_seeded):
+    today = date.today()
+    payload, err = call(
+        tools.compare_periods,
+        {"metric": "distance_meters",
+         "period_a_start": "2020-01-01", "period_a_end": "2020-01-02",  # nothing here
+         "period_b_start": (today - timedelta(days=40)).isoformat(),
+         "period_b_end": (today - timedelta(days=30)).isoformat()},
+    )
+    assert not err
+    assert payload["period_a"] == {"n": 0, "total": None}
+    assert payload["delta"] is None
+    assert payload["delta_pct"] is None
+
+
 def test_run_sql_select(seeded):
     payload, err = call(tools.run_sql, {"query": "SELECT COUNT(*) AS c FROM daily_metrics"})
     assert not err
@@ -414,6 +831,17 @@ def test_run_sql_rejects_forbidden_keyword(seeded):
 def test_run_sql_bad_query(seeded):
     _payload, err = call(tools.run_sql, {"query": "SELECT * FROM does_not_exist"})
     assert err
+
+
+def test_run_sql_bad_table_points_at_schema_resource(seeded):
+    # Regression: a mistyped table/column raises sqlite3.OperationalError —
+    # the schema-resource pointer must fire on that REAL path, not only on
+    # the exotic sqlite3.Error branch (Phase-5 live gate caught the pointer
+    # living solely in the unreachable branch).
+    payload, err = call(tools.run_sql, {"query": "SELECT * FROM does_not_exist"})
+    assert err
+    assert "fitness://schema" in payload["error"]
+    assert "operational error" not in payload["error"]
 
 
 # --- day-window robustness: over-large N must be a clean _err, not OverflowError ---
@@ -1047,6 +1475,14 @@ def test_fetch_metric_series_matches_chart_tool_output(seeded):
     assert fmt(max(values)) in text
 
 
+def test_chart_description_echoes_reply_rendering_rule():
+    # 3b: the chart tool's description gets a one-line echo of the
+    # system-prompt Charts bullet (reproduce full output in a fenced code
+    # block, then the coach read).
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "chart")
+    assert "fenced code block" in tool.description
+
+
 def test_fetch_metric_series_unknown_metric_raises(seeded):
     with pytest.raises(ValueError, match="unknown metric"):
         tools._fetch_metric_series("bogus", 14)
@@ -1482,6 +1918,36 @@ def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
     assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_generate_chart_response_carries_inline_image_block(seeded, reports_tmp):
+    # Fix A (2026-07-10 doc): the response gains a SECOND content block —
+    # an image, base64-decodable, matching the same PNG bytes written to disk.
+    import base64
+
+    result = asyncio.run(
+        tools.generate_chart.handler({"metric": "rhr", "days": 14, "chart_type": "line"})
+    )
+    assert result.get("is_error") is not True
+    content = result["content"]
+    assert content[0]["type"] == "text"
+    image_blocks = [c for c in content if c["type"] == "image"]
+    assert len(image_blocks) == 1
+    image = image_blocks[0]
+    assert image["mimeType"] == "image/png"
+    decoded = base64.b64decode(image["data"])
+    assert decoded[:8] == b"\x89PNG\r\n\x1a\n"
+    path = Path(json.loads(content[0]["text"])["path"])
+    assert decoded == path.read_bytes()
+
+
+def test_generate_chart_description_no_longer_local_only(seeded):
+    # generate_chart's registered description must no longer claim it's
+    # unreachable over the network — Fix A falsifies that claim outright.
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "generate_chart")
+    lowered = tool.description.lower()
+    assert "local-only" not in lowered
+    assert "never over the network" not in lowered
+
+
 def _spy_to_thread(monkeypatch, recorded):
     real_to_thread = asyncio.to_thread
 
@@ -1590,14 +2056,18 @@ def test_generate_chart_reports_dir_error_is_clean(seeded, monkeypatch):
     assert not tools.subprocess.run.called
 
 
-def test_generate_brief_report_and_generate_chart_excluded_from_all_tools():
-    # INV-4: the two local-only tools are never registered in ALL_TOOLS —
-    # only in LOCAL_ONLY_TOOLS.
+def test_generate_brief_report_excluded_from_all_tools_generate_chart_included():
+    # INV-4 (rewritten per Fix A, 2026-07-10 doc): generate_brief_report
+    # stays local-only (a PDF isn't representable as MCP ImageContent, and
+    # a remote caller has no way to retrieve the file) — but generate_chart
+    # is now IN ALL_TOOLS (reachable over both stdio and the networked
+    # /mcp/ transport) since its inline image content block sidesteps the
+    # no-file-retrieval problem that used to make it local-only too.
     all_names = {t.name for t in tools.ALL_TOOLS}
     assert "generate_brief_report" not in all_names
-    assert "generate_chart" not in all_names
+    assert "generate_chart" in all_names
     local_only_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
-    assert local_only_names == {"generate_brief_report", "generate_chart"}
+    assert local_only_names == {"generate_brief_report"}
 
 
 # --- 2026-07-09: Training Plan section (_build_plan_section + wiring) ------
@@ -1672,6 +2142,136 @@ def plan_seeded(tmp_path, monkeypatch):
     return p
 
 
+# === WS2 — plan-tool payload quality =========================================
+# (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2)
+
+# --- 2a: weekly_rollup — direct import from tools, pure, no DB ---------------
+
+def test_weekly_rollup_empty_workouts_yields_zero_totals():
+    rollup = tools.weekly_rollup([], "2026-07-12")
+    assert rollup == {
+        "week_planned_mi": 0.0, "week_actual_mi": 0.0, "slips": 0, "days": [],
+    }
+
+
+def test_weekly_rollup_single_workout():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5100.0},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["days"] == [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "planned_mi": 3.11, "actual_mi": 3.17},
+    ]
+    assert rollup["week_planned_mi"] == 3.1
+    assert rollup["week_actual_mi"] == 3.2
+    assert rollup["slips"] == 0
+
+
+def test_weekly_rollup_days_reverse_chronological():
+    workouts = [
+        {"date": "2026-07-06", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5100.0},
+        {"date": "2026-07-10", "verdict": "done", "type": "tempo",
+         "target_distance_m": 3000.0, "actual_distance_m": 3050.0},
+        {"date": "2026-07-08", "verdict": "missed", "type": "long",
+         "target_distance_m": 6000.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    dates = [d["date"] for d in rollup["days"]]
+    assert dates == ["2026-07-10", "2026-07-08", "2026-07-06"]  # most recent first
+
+
+def test_weekly_rollup_suppresses_actual_for_pending_and_compliant():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "pending", "type": "easy",
+         "target_distance_m": 4000.0, "actual_distance_m": None},
+        # compliant rest day carrying a stray real actual_distance_m (e.g. an
+        # untracked walk) — still suppressed; suppression is verdict-keyed,
+        # not presence-of-data-keyed.
+        {"date": "2026-07-11", "verdict": "compliant", "type": "rest",
+         "target_distance_m": None, "actual_distance_m": 2000.0},
+        {"date": "2026-07-10", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5100.0},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    by_date = {d["date"]: d for d in rollup["days"]}
+    assert by_date["2026-07-12"]["actual_mi"] is None
+    assert by_date["2026-07-11"]["actual_mi"] is None
+    assert by_date["2026-07-10"]["actual_mi"] == 3.17
+
+
+def test_weekly_rollup_missing_target_distance_yields_planned_mi_none():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "compliant", "type": "rest",
+         "target_distance_m": None, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["days"][0]["planned_mi"] is None
+
+
+def test_weekly_rollup_zero_target_distance_yields_planned_mi_zero_not_none():
+    # units.to_miles's `is not None` convention (not truthy) — a synthetic
+    # 0-meter target yields 0.0, not None. On real data this never occurs
+    # (no 0-distance prescribed target; rest days carry None), but the
+    # convention is pinned here per the 07-10 doc's deferred truthy-vs-None
+    # flag, now picked up.
+    workouts = [
+        {"date": "2026-07-12", "verdict": "missed", "type": "easy",
+         "target_distance_m": 0.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["days"][0]["planned_mi"] == 0.0
+
+
+def test_weekly_rollup_window_excludes_outside_trailing_7_days():
+    workouts = [
+        {"date": "2026-07-05", "verdict": "done", "type": "easy",  # 7d back -> outside
+         "target_distance_m": 5000.0, "actual_distance_m": 5000.0},
+        {"date": "2026-07-06", "verdict": "done", "type": "easy",  # 6d back -> boundary, inside
+         "target_distance_m": 5000.0, "actual_distance_m": 5000.0},
+        {"date": "2026-07-13", "verdict": "pending", "type": "easy",  # after target_date -> outside
+         "target_distance_m": 5000.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    dates = [d["date"] for d in rollup["days"]]
+    assert dates == ["2026-07-06"]
+
+
+def test_weekly_rollup_rounding_order_per_day_then_sum():
+    # Divergence case: per-day-round(2dp)-then-sum-then-round(1dp) yields
+    # 2.6; summing raw meters first and converting once yields 2.5 — proving
+    # the rounding ORDER is load-bearing, not incidental (2a).
+    workouts = [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "target_distance_m": None, "actual_distance_m": 2730.0},
+        {"date": "2026-07-11", "verdict": "done", "type": "easy",
+         "target_distance_m": None, "actual_distance_m": 509.0},
+        {"date": "2026-07-10", "verdict": "done", "type": "easy",
+         "target_distance_m": None, "actual_distance_m": 861.0},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["week_actual_mi"] == 2.6  # not 2.5 (raw-sum-then-convert)
+
+
+def test_weekly_rollup_slips_counts_partial_and_missed_only():
+    workouts = [
+        {"date": "2026-07-12", "verdict": "done", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 5000.0},
+        {"date": "2026-07-11", "verdict": "partial", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": 2000.0},
+        {"date": "2026-07-10", "verdict": "missed", "type": "long",
+         "target_distance_m": 8000.0, "actual_distance_m": None},
+        {"date": "2026-07-09", "verdict": "compliant", "type": "rest",
+         "target_distance_m": None, "actual_distance_m": None},
+        {"date": "2026-07-08", "verdict": "pending", "type": "easy",
+         "target_distance_m": 5000.0, "actual_distance_m": None},
+    ]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["slips"] == 2
+
+
 def test_build_plan_section_no_active_plan_is_none(seeded):
     assert tools._build_plan_section(date.today().isoformat()) is None
 
@@ -1728,8 +2328,11 @@ def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
 
     calls = []
 
-    async def fake_generate(profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type):
-        calls.append((today_workout, adherence_pct, days_to_race, goal_type))
+    async def fake_generate(
+        profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
+        notes_text=None,
+    ):
+        calls.append((today_workout, adherence_pct, days_to_race, goal_type, notes_text))
         return "Go hit today's easy 4 clean."
 
     monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
@@ -1766,9 +2369,24 @@ def test_generate_brief_report_coaching_line_failure_falls_back(
     pdf_bytes = Path(payload["path"]).read_bytes()
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
+        # The 2026-07-09 layout puts signal cards and the Training Plan
+        # side by side as two real page columns — plain extract_text()
+        # reads left-to-right across the FULL page width per visual row,
+        # interleaving words from both columns and breaking up a phrase
+        # that lives entirely in the (right) plan column. Crop to the
+        # right half before extracting to read that phrase intact.
+        plan_text = "\n".join(
+            p.crop((p.width * 0.45, 0, p.width, p.height)).extract_text() or ""
+            for p in doc.pages
+        )
     assert "TRAINING PLAN" in text
+    # The narrow right rail can word-wrap mid phrase (e.g. "9:23/" then
+    # "mi." on the next PDF line, with no real space between them) — strip
+    # ALL whitespace from both sides so a wrap-induced newline can't be
+    # mistaken for (or masked by) a real space.
+    squashed = "".join(plan_text.split())
     # fallback_coaching_line's deterministic phrasing for a partial prior day.
-    assert "Today: easy 2.49 mi @ 9:23/mi." in text
+    assert "".join("Today: easy 2.49 mi @ 9:23/mi.".split()) in squashed
 
 
 def test_generate_brief_report_no_active_plan_has_no_plan_section(seeded, reports_tmp):
@@ -1783,3 +2401,185 @@ def test_generate_brief_report_no_active_plan_has_no_plan_section(seeded, report
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
     assert "TRAINING PLAN" not in text
+
+
+# === WS3 3a — plan_coach notes parity ========================================
+
+def test_generate_brief_report_threads_saved_notes_into_coaching_line(
+    plan_seeded, reports_tmp, monkeypatch
+):
+    """3a: a saved preference must reach generate_coaching_line's
+    notes_text, exactly like it already reaches chat/brief via
+    notes.render_for_prompt()."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+    from local_fitness import notes as notes_mod
+    notes_mod.append_note("stop roasting my steps")
+
+    calls = []
+
+    async def fake_generate(
+        profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
+        notes_text=None,
+    ):
+        calls.append(notes_text)
+        return "Go hit today's easy 4 clean."
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+    assert len(calls) == 1
+    assert "stop roasting my steps" in calls[0]
+
+
+# === WS4 4a — ground the PDF coaching line ===================================
+
+def test_generate_brief_report_logs_coaching_line_grounding(
+    plan_seeded, reports_tmp, monkeypatch, caplog
+):
+    """4a: the coaching line is checked against the deterministic plan
+    section — advisory-only (logged, never gates the PDF). An invented
+    adherence number close to but not equal to the real 75% (plan_seeded's
+    fixture value) must produce a logged flag while the PDF still renders
+    normally, mirroring grounding.log_grounding's log-only pattern."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    async def fake_generate(*_a, **_k):
+        # 80% is a subtle corruption of the real 75% adherence — close enough
+        # to look like the same metric (within grounding's NEARBY band) but
+        # not equal (outside the EXACT band) -> a "flag" verdict, not silent.
+        return "You're running at 80% adherence this week — keep it up."
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.tools"):
+        payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err  # advisory grounding must never fail the PDF
+
+    pdf_bytes = Path(payload["path"]).read_bytes()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    assert "TRAINING PLAN" in text
+    # The invented line still renders verbatim -- grounding never alters the PDF.
+    assert "80% adherence" in text
+
+    flag_logs = [r for r in caplog.records if "plan_coach_grounding" in r.message]
+    assert len(flag_logs) == 1
+    assert "flags=1" in flag_logs[0].message
+    assert "adherence_pct" in flag_logs[0].message
+
+
+def test_generate_brief_report_coaching_line_grounding_clean_line_logs_zero_flags(
+    plan_seeded, reports_tmp, monkeypatch, caplog
+):
+    """A coaching line that only cites faithful numbers (or none at all)
+    logs flags=0 -- the signal doesn't manufacture false positives on a
+    clean line."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+
+    async def fake_generate(*_a, **_k):
+        return "Solid week. Keep showing up and trust the process."
+
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+
+    with caplog.at_level(logging.INFO, logger="local_fitness.agent.tools"):
+        payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err
+
+    flag_logs = [r for r in caplog.records if "plan_coach_grounding" in r.message]
+    assert len(flag_logs) == 1
+    assert "flags=0" in flag_logs[0].message
+
+
+# === WS3 3d — MCP-appropriate error strings ==================================
+
+def test_training_load_status_empty_db_error_points_at_sync_tool(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    payload, err = call(tools.training_load_status, {})
+    assert err
+    assert "sync_garmin_data" in payload["error"]
+    assert "recompute-baselines" not in payload["error"]
+    assert "fitness " not in payload["error"]  # no bare CLI-command wording
+
+
+def test_run_sql_invalid_query_points_at_schema_resource(seeded, monkeypatch):
+    # Both except clauses carry the schema pointer now; this forces the
+    # rarer non-OperationalError sqlite3.Error branch to keep it covered.
+    import sqlite3
+
+    def boom(_q):
+        raise sqlite3.IntegrityError("boom")
+
+    monkeypatch.setattr(tools, "_run_sql_blocking", boom)
+    payload, err = call(tools.run_sql, {"query": "SELECT 1"})
+    assert err
+    assert "query failed: invalid query" in payload["error"]
+    assert "fitness://schema" in payload["error"]
+
+
+def test_log_manual_workout_recompute_failure_warning_no_cli_wording(seeded, monkeypatch):
+    from local_fitness.ingest import baselines
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(baselines, "recompute", boom)
+
+    payload, err = call(
+        tools.log_manual_workout,
+        {"activity_type": "strength", "duration_min": 45},
+    )
+    assert not err
+    assert payload["recompute_failed"] is True
+    assert "recompute failed" in payload["warning"]  # pinned literal, tests/test_tools.py:731
+    assert "fitness baselines" not in payload["warning"]
+    assert "sync_garmin_data" in payload["warning"]
+
+
+def test_delete_manual_workout_recompute_failure_warning_no_cli_wording(seeded, monkeypatch):
+    from local_fitness.ingest import baselines
+
+    saved, err = call(
+        tools.log_manual_workout, {"activity_type": "strength", "duration_min": 45}
+    )
+    assert not err
+    aid = saved["activity"]["activity_id"]
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(baselines, "recompute", boom)
+
+    payload, err = call(tools.delete_manual_workout, {"activity_id": aid})
+    assert not err
+    assert payload["recompute_failed"] is True
+    assert "recompute failed" in payload["warning"]  # pinned literal, tests/test_tools.py:754
+    assert "fitness baselines" not in payload["warning"]
+    assert "sync_garmin_data" in payload["warning"]
+
+
+# === WS3 3e — "when NOT to use" description lines ===========================
+
+def test_daily_snapshot_description_names_get_brief_context():
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "daily_snapshot")
+    assert "get_brief_context" in tool.description
+
+
+def test_get_brief_context_description_names_get_metric_trend():
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "get_brief_context")
+    assert "get_metric" in tool.description
+    assert "get_metric_trend" in tool.description

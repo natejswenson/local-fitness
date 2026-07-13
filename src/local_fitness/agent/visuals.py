@@ -170,121 +170,156 @@ def _report_url_fetcher():
 
 
 _CSS = f"""
+@page {{ size: A4; margin: 1.6cm; }}
 body {{
   font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
   color: {INK};
-  margin: 2em;
+  font-size: 11.3pt;
+  line-height: 1.42;
+  margin: 0;
 }}
-h1 {{ font-size: 1.4em; margin-bottom: 0.2em; }}
-h1 .date {{ color: {INK_FAINT}; font-weight: normal; font-size: 0.7em; }}
 
-/* Section 1: signal cards (formerly one stacked column of takeaways),
-   now a 2-column flex grid — robust to any takeaway count, not a fixed
-   2x2 (brief_planner triggers a variable N per day). Flexbox, not CSS
-   Grid: the longer-established, more reliably-supported layout model in
-   WeasyPrint. An odd-count last card spans the full width (.span-full,
-   computed in Python) rather than leaving a dangling gap. */
-div.signals {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1em;
-  margin: 1em 0;
+/* Header: full-width banner above the 2-column body — a colored rule +
+   pill date badge instead of a plain heading, so the report opens with
+   some personality rather than a bare title line. */
+div.header {{
+  display: table;
+  width: 100%;
+  border-bottom: 2.5px solid {PRIMARY};
+  padding-bottom: 0.5em;
+  margin-bottom: 0.9em;
 }}
+div.header h1 {{
+  display: table-cell;
+  font-size: 1.55em;
+  font-weight: 800;
+  margin: 0;
+  vertical-align: middle;
+}}
+div.header .date-pill {{
+  display: table-cell;
+  text-align: right;
+  vertical-align: middle;
+}}
+div.header .date-pill span {{
+  display: inline-block;
+  background: {_rgba(PRIMARY, 0.12)};
+  color: {PRIMARY};
+  font-weight: 700;
+  font-size: 0.82em;
+  padding: 0.3em 0.8em;
+  border-radius: 100px;
+}}
+
+/* Whole-page 2-column layout: signal cards (left) run in parallel with
+   the Training Plan (right) instead of stacking sequentially — this is
+   what actually buys back the vertical room to fit one page, not just
+   tighter type. An HTML table, not flex/grid: both were tried for the
+   signal-card pairing earlier and both are broken in WeasyPrint 69.0 for
+   this content shape (every flex/grid item lands on its own row/track
+   regardless of basis, content length, or surrounding rules — confirmed
+   via pdfplumber word bounding boxes, not by eyeballing a render). Table
+   layout is the one primitive that reliably holds a real 2-column split
+   here, so the whole-page structure reuses it too. */
+table.page-layout {{ width: 100%; table-layout: fixed; border-collapse: collapse; }}
+table.page-layout > tr > td {{ vertical-align: top; padding: 0; }}
+td.col-signals {{ width: 56%; padding-right: 0.9em; }}
+td.col-plan {{ width: 44%; padding-left: 0.9em; border-left: 1px solid {NEUTRAL}; }}
+/* No active plan: signals run the full page width, no second rail. */
+div.col-signals-full {{ width: 100%; }}
+
+/* Signal cards: stacked single-column within the left rail. Tone-tinted
+   background wash (not just a border) + rounded corners so each card
+   reads as a distinct, colorful tile rather than a plain ruled list. */
 section.signal-card {{
-  flex: 1 1 calc(50% - 0.5em);
-  min-width: 0;
-  border-left: 4px solid {PRIMARY};
-  padding: 0.6em 1em;
+  border-left: 5px solid {PRIMARY};
+  border-radius: 0 8px 8px 0;
+  padding: 0.65em 0.9em;
+  margin-bottom: 0.8em;
   page-break-inside: avoid;
+  background: {_rgba(PRIMARY, 0.05)};
 }}
-section.signal-card.span-full {{ flex-basis: 100%; }}
-section.tone-positive {{ border-left-color: {GOOD}; }}
-section.tone-caution {{ border-left-color: {WARNING}; }}
-section.tone-critical {{ border-left-color: {CRITICAL}; }}
-section.tone-neutral {{ border-left-color: {PRIMARY}; }}
-h2 {{ font-size: 1.05em; margin: 0 0 0.2em 0; }}
-p.summary {{ color: {INK_MUTED}; margin: 0 0 0.6em 0; }}
-img.chart {{ max-width: 100%; margin: 0.4em 0; }}
-div.details {{ font-size: 0.92em; }}
-div.details table {{ border-collapse: collapse; margin: 0.6em 0; }}
+section.tone-positive {{ border-left-color: {GOOD}; background: {_rgba(GOOD, 0.06)}; }}
+section.tone-caution {{ border-left-color: {WARNING}; background: {_rgba(WARNING, 0.10)}; }}
+section.tone-critical {{ border-left-color: {CRITICAL}; background: {_rgba(CRITICAL, 0.07)}; }}
+section.tone-neutral {{ border-left-color: {PRIMARY}; background: {_rgba(PRIMARY, 0.05)}; }}
+h2 {{ font-size: 1.02em; margin: 0 0 0.15em 0; }}
+p.summary {{ color: {INK_MUTED}; margin: 0 0 0.35em 0; }}
+img.chart {{ max-width: 100%; margin: 0.3em 0; }}
+div.details {{ font-size: 0.93em; }}
+div.details p {{ margin: 0; }}
+div.details table {{ border-collapse: collapse; margin: 0.4em 0; }}
 div.details th, div.details td {{
   border: 1px solid {NEUTRAL};
-  padding: 0.3em 0.6em;
+  padding: 0.25em 0.5em;
   text-align: left;
 }}
 
-/* Section 2: Training Plan (new). Omitted entirely (no heading, no empty
-   tiles) when there's nothing to show — see _render_plan_section_html. */
-section.plan-section {{ margin: 1.6em 0 0 0; }}
+/* Training Plan (right rail). */
 h2.plan-heading {{
-  font-size: 0.8em;
+  font-size: 0.78em;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
   color: {INK_FAINT};
   border-bottom: 1px solid {NEUTRAL};
-  padding-bottom: 0.4em;
-  margin: 0 0 0.8em 0;
+  padding-bottom: 0.3em;
+  margin: 0 0 0.6em 0;
 }}
-div.stat-strip {{
-  display: flex;
-  gap: 0.6em;
-  margin-bottom: 0.9em;
-}}
-div.stat-tile {{
-  flex: 1 1 0;
-  background: {NEUTRAL};
-  border-radius: 3px;
-  padding: 0.6em 0.5em;
+table.stat-strip {{ width: 100%; border-collapse: separate; border-spacing: 0.4em; margin: -0.4em -0.4em 0.5em -0.4em; table-layout: fixed; }}
+td.stat-tile {{
+  background: {_rgba(PRIMARY, 0.08)};
+  border-radius: 6px;
+  padding: 0.5em 0.3em;
   text-align: center;
 }}
-div.stat-tile .value {{ font-size: 1.15em; font-weight: 700; color: {INK}; }}
-div.stat-tile .label {{
-  margin-top: 0.25em;
-  font-size: 0.62em;
-  letter-spacing: 0.05em;
+td.stat-tile .value {{ font-size: 1.1em; font-weight: 800; color: {PRIMARY}; }}
+td.stat-tile .label {{
+  margin-top: 0.15em;
+  font-size: 0.6em;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
   color: {INK_FAINT};
 }}
 div.today-callout {{
   border-left: 4px solid {PRIMARY};
   background: {_rgba(PRIMARY, 0.08)};
-  padding: 0.7em 1em;
-  border-radius: 0 3px 3px 0;
-  margin-bottom: 1em;
+  padding: 0.55em 0.7em;
+  border-radius: 0 6px 6px 0;
+  margin-bottom: 0.7em;
   page-break-inside: avoid;
 }}
 div.today-callout .eyebrow {{
-  font-size: 0.68em;
+  font-size: 0.65em;
   font-weight: 700;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.09em;
   text-transform: uppercase;
   color: {PRIMARY};
-  margin: 0 0 0.3em 0;
+  margin: 0 0 0.25em 0;
 }}
-div.today-callout .rx {{ font-weight: 700; margin: 0 0 0.35em 0; }}
-div.today-callout p.coaching-line {{ margin: 0; color: {INK}; }}
-table.week-table {{ width: 100%; border-collapse: collapse; font-size: 0.88em; }}
+div.today-callout .rx {{ font-weight: 700; margin: 0 0 0.25em 0; }}
+div.today-callout p.coaching-line {{ margin: 0; color: {INK}; font-size: 0.95em; }}
+table.week-table {{ width: 100%; border-collapse: collapse; font-size: 0.85em; }}
 table.week-table th {{
   text-align: left;
-  font-size: 0.65em;
-  letter-spacing: 0.06em;
+  font-size: 0.62em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   color: {INK_FAINT};
-  padding: 0 0.6em 0.4em 0;
+  padding: 0 0.4em 0.3em 0;
   border-bottom: 1px solid {NEUTRAL};
 }}
 table.week-table td {{
-  padding: 0.45em 0.6em 0.45em 0;
+  padding: 0.3em 0.4em 0.3em 0;
   border-bottom: 1px solid {NEUTRAL};
   color: {INK_MUTED};
 }}
 table.week-table tr:last-child td {{ border-bottom: none; }}
 span.verdict {{
   display: inline-block;
-  font-size: 0.78em;
+  font-size: 0.76em;
   font-weight: 600;
-  padding: 0.15em 0.55em;
+  padding: 0.1em 0.5em;
   border-radius: 100px;
 }}
 span.verdict-done {{ background: {_rgba(GOOD, 0.14)}; color: {GOOD}; }}
@@ -317,25 +352,32 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
         tile2_value = html.escape(plan_section["goal_type"])
         tile2_label = "Goal"
 
+    # 2x2, not a 4-across strip: the right rail is roughly 44% of page
+    # width now (2-column page layout), too narrow for 4 tiles side by
+    # side to hold "11.0 mi / 16.0 mi" without wrapping badly.
     stat_strip = f"""
-    <div class="stat-strip">
-      <div class="stat-tile">
-        <div class="value">{plan_section["adherence_pct"]}%</div>
-        <div class="label">Adherence</div>
-      </div>
-      <div class="stat-tile">
-        <div class="value">{tile2_value}</div>
-        <div class="label">{tile2_label}</div>
-      </div>
-      <div class="stat-tile">
-        <div class="value">{_fmt_mi(plan_section["week_actual_mi"])} / {_fmt_mi(plan_section["week_planned_mi"])}</div>
-        <div class="label">This Week</div>
-      </div>
-      <div class="stat-tile">
-        <div class="value">{plan_section["slips"]}</div>
-        <div class="label">Slips</div>
-      </div>
-    </div>
+    <table class="stat-strip">
+      <tr>
+        <td class="stat-tile">
+          <div class="value">{plan_section["adherence_pct"]}%</div>
+          <div class="label">Adherence</div>
+        </td>
+        <td class="stat-tile">
+          <div class="value">{tile2_value}</div>
+          <div class="label">{tile2_label}</div>
+        </td>
+      </tr>
+      <tr>
+        <td class="stat-tile">
+          <div class="value">{_fmt_mi(plan_section["week_actual_mi"])} / {_fmt_mi(plan_section["week_planned_mi"])}</div>
+          <div class="label">This Week</div>
+        </td>
+        <td class="stat-tile">
+          <div class="value">{plan_section["slips"]}</div>
+          <div class="label">Slips</div>
+        </td>
+      </tr>
+    </table>
     """
 
     today = plan_section.get("today")
@@ -395,13 +437,12 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
 
 def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | None) -> str:
     """Assemble the full report HTML string. Separated from `render_brief_pdf`
-    so layout/structure (e.g. which signal card gets `.span-full`) is
-    testable via plain string assertions, without needing to introspect
-    WeasyPrint's PDF layout output."""
+    so layout/structure (e.g. which row gets `colspan="2"`) is testable via
+    plain string assertions, without needing to introspect WeasyPrint's PDF
+    layout output."""
     import markdown as md_lib
 
-    n = len(brief.takeaways)
-    sections: list[str] = []
+    cards: list[str] = []
     for index, takeaway in enumerate(brief.takeaways):
         headline = html.escape(takeaway.headline)
         summary = html.escape(takeaway.summary)
@@ -412,9 +453,8 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
         details_html = md_lib.markdown(takeaway.details, extensions=["tables"])
         png_bytes = charts.get(str(index))
         chart_img = f'<img class="chart" src="{_data_uri(png_bytes)}" alt="chart">' if png_bytes else ""
-        span_full = " span-full" if (n % 2 == 1 and index == n - 1) else ""
-        sections.append(f"""
-        <section class="signal-card tone-{html.escape(takeaway.tone)}{span_full}">
+        cards.append(f"""
+        <section class="signal-card tone-{html.escape(takeaway.tone)}">
           <h2>{headline}</h2>
           <p class="summary">{summary}</p>
           {chart_img}
@@ -422,16 +462,33 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
         </section>
         """)
 
-    signals_html = f'<div class="signals">{"".join(sections)}</div>' if sections else ""
+    # Stacked single-column, not paired 2-up: the 2-column split now
+    # happens at the whole-page level (signals rail vs. plan rail — see
+    # the `table.page-layout` CSS comment), so each card gets the left
+    # rail's full width rather than half of it again.
+    signals_html = "".join(cards)
     plan_html = _render_plan_section_html(plan_section)
+
+    # No plan section → no second rail (no dangling empty column with a
+    # divider rule); signals just take the full page width.
+    body_html = (
+        f'<table class="page-layout"><tr>'
+        f'<td class="col-signals">{signals_html}</td>'
+        f'<td class="col-plan">{plan_html}</td>'
+        f'</tr></table>'
+        if plan_html
+        else f'<div class="col-signals col-signals-full">{signals_html}</div>'
+    )
 
     return f"""<!doctype html>
 <html>
 <head><meta charset="utf-8"><style>{_CSS}</style></head>
 <body>
-  <h1>{html.escape(brief.user_name)}'s Brief <span class="date">{html.escape(brief.date)}</span></h1>
-  {signals_html}
-  {plan_html}
+  <div class="header">
+    <h1>{html.escape(brief.user_name)}'s Brief</h1>
+    <div class="date-pill"><span>{html.escape(brief.date)}</span></div>
+  </div>
+  {body_html}
 </body>
 </html>"""
 

@@ -341,6 +341,36 @@ def riegel_predict(
     return best_time_s * (target_distance_m / best_distance_m) ** RIEGEL_EXP
 
 
+def goal_gap(
+    predicted_finish_s: float | None, target_time_s: int | None
+) -> dict | None:
+    """Gap between a Riegel-projected finish and the plan's goal time.
+
+    Pure seconds arithmetic — no units import needed (unlike
+    ``agent.tools.weekly_rollup``), so ``plans.py`` is the right home.
+    ``predicted_finish_s`` is ``float | None`` because ``riegel_predict``
+    returns ``float``.
+
+    ``None`` when ``predicted_finish_s`` is ``None`` OR when
+    ``target_time_s`` is ``None`` or ``<= 0`` — a zero goal time is
+    *storable* (``validate_plan_input`` rejects only negatives/non-finite
+    values) but meaningless: there's no defined gap % against a zero
+    denominator.
+
+    ``gap_seconds = predicted_finish_s - target_time_s``: positive means
+    the projection is SLOWER than the goal.
+    """
+    if predicted_finish_s is None or target_time_s is None or target_time_s <= 0:
+        return None
+    gap_seconds = predicted_finish_s - target_time_s
+    gap_pct = gap_seconds / target_time_s * 100
+    return {
+        "gap_seconds": gap_seconds,
+        "gap_pct": gap_pct,
+        "on_pace": gap_seconds <= 0,
+    }
+
+
 def weekly_mileage(
     workouts: list[dict], activities_by_date: dict[str, list[dict]],
     cfg: GradingConfig = GradingConfig(),

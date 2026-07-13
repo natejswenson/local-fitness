@@ -173,28 +173,62 @@ def _takeaways(n: int) -> list[Takeaway]:
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 5])
-def test_build_html_span_full_count_matches_parity(n):
+def test_build_html_cards_stack_single_column_not_paired(n):
+    # 2026-07-09 layout: cards no longer pair 2-up into table rows — the
+    # 2-column split moved to the whole-page level (signals rail vs. plan
+    # rail), so every card renders as its own top-level <section>, and
+    # there is no per-pair <tr>/colspan wrapping at all regardless of N.
     brief = _brief(_takeaways(n))
     html_out = visuals._build_html(brief, {}, None)
-    # ' span-full"' (leading space, trailing quote) matches only the actual
-    # rendered class attribute (`class="signal-card tone-x span-full"`) —
-    # a bare "span-full" substring also matches this file's own CSS rule
-    # and its explanatory comment, which are present in every render
-    # regardless of takeaway count.
-    span_full_count = html_out.count(' span-full"')
-    assert span_full_count == (1 if n % 2 == 1 else 0)
+    assert html_out.count('class="signal-card') == n
+    assert "<tr>" not in html_out
+    assert "colspan" not in html_out
 
 
-def test_build_html_span_full_is_on_the_last_card_specifically():
-    brief = _brief(_takeaways(3))
-    html_out = visuals._build_html(brief, {}, None)
-    # Split into per-card chunks on the signal-card class and confirm only
-    # the chunk containing "h2" (the 3rd, last, 0-indexed card) has span-full.
-    cards = html_out.split('class="signal-card')[1:]
-    assert len(cards) == 3
-    assert ' span-full"' not in cards[0]
-    assert ' span-full"' not in cards[1]
-    assert ' span-full"' in cards[2]
+def _heading_positions(pdf_bytes: bytes, words: list[str]) -> dict[str, tuple[float, float]]:
+    """Map each single-token headline word to its (x0, top) position on the
+    first PDF page. Used to assert genuine rendered column placement — HTML
+    string assertions alone can't catch a layout engine silently collapsing
+    a 2-column design to one column (which is exactly what happened here:
+    the flex/grid-based CSS looked correct as a string but WeasyPrint 69.0
+    rendered every card on its own row regardless)."""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+        found = {w["text"]: (w["x0"], w["top"]) for w in doc.pages[0].extract_words()}
+    missing = [w for w in words if w not in found]
+    assert not missing, f"expected headline tokens not found in rendered PDF: {missing}"
+    return {w: found[w] for w in words}
+
+
+def test_render_brief_pdf_cards_stack_in_a_single_column():
+    # No plan section → signal cards run the full page width, one per row.
+    words = ["Alphahead", "Betahead", "Gammahead"]
+    brief = _brief([
+        Takeaway(headline=w, summary=f"s{i}", tone="neutral", details=f"d{i}")
+        for i, w in enumerate(words)
+    ])
+    pdf = visuals.render_brief_pdf(brief, {})
+    pos = _heading_positions(pdf, words)
+
+    x0s = {pos[w][0] for w in words}
+    assert len(x0s) == 1, f"expected one shared column x0, got {x0s}"
+    tops = [pos[w][1] for w in words]
+    assert tops == sorted(tops) and len(set(tops)) == len(tops)
+
+
+def test_render_brief_pdf_signals_and_plan_render_as_two_page_columns():
+    # With a plan section present, the WHOLE PAGE is 2 columns: the signal
+    # cards rail (left) and the Training Plan rail (right) run in parallel
+    # rather than stacking sequentially — this is what actually buys back
+    # the vertical room to fit a full brief on one page.
+    brief = _brief([Takeaway(headline="Alphahead", summary="s", tone="neutral", details="d")])
+    pdf = visuals.render_brief_pdf(brief, {}, plan_section=_PLAN_SECTION)
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        words = {w["text"]: (w["x0"], w["top"]) for w in doc.pages[0].extract_words()}
+    assert "Alphahead" in words
+    assert "TRAINING" in words  # "TRAINING PLAN" heading, uppercased via CSS but literal in text
+    # The plan rail sits well to the right of the signals rail — not merely
+    # a few points over the way sub-pixel padding differences would.
+    assert words["TRAINING"][0] - words["Alphahead"][0] > 100
 
 
 def test_render_plan_section_html_none_is_empty_string():

@@ -604,13 +604,65 @@ def test_v2_logs_grounding_signal_without_altering_brief(stream_env, monkeypatch
 
 
 def test_v1_path_does_not_run_grounding(stream_env, monkeypatch, caplog):
-    """V1 (fallback) has no BriefContext → no grounding log."""
+    """4b: V1 (LOCAL_FITNESS_BRIEF_V2=0) now assembles a BriefContext SOLELY
+    to ground against, restoring the invention-rate signal on the rollback
+    path — inverting the pre-4b behavior this test used to pin (V1 had no
+    BriefContext at all, so grounding never ran)."""
     import logging
     monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
     _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
     with caplog.at_level(logging.INFO, logger="local_fitness.agent.grounding"):
         _drain(save=True)
+    assert any(
+        "brief_grounding" in r.message and "invention_rate" in r.message
+        for r in caplog.records
+    )
+
+
+def test_v1_grounding_context_failure_is_isolated(stream_env, monkeypatch, caplog):
+    """4b's error-isolation requirement: V1 is the rollback path, so a
+    planner failure while assembling the grounding-only context must never
+    crash generation — the pool silently becomes None, grounding is skipped,
+    and the brief still generates and saves exactly as it would without 4b."""
+    import logging
+
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
+    _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
+
+    def boom(*_a, **_k):
+        raise RuntimeError("planner exploded")
+
+    monkeypatch.setattr(briefing.brief_planner, "assemble_brief_context", boom)
+
+    with caplog.at_level(logging.INFO):
+        events = _drain(save=True)
+
+    done = [e for e in events if e["type"] == "done"]
+    assert len(done) == 1 and not [e for e in events if e["type"] == "error"]
+    assert (stream_env / f"{date_today()}.json").exists()
     assert not any("brief_grounding" in r.message for r in caplog.records)
+    assert any(
+        "V1 grounding-context assembly failed" in r.message
+        for r in caplog.records
+    )
+
+
+def test_v1_prompts_equal_live_builders_after_grounding_added(stream_env, monkeypatch):
+    """4b introduces no prompt change of its own: the V1 system prompt still
+    equals the live prompts.system_prompt(...) output and the user prompt is
+    still briefing_prompt(...)'s output, verbatim — building a BriefContext
+    for grounding must not leak into (or alter) prompt construction."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
+    cap = _install_query_capture(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
+    _drain(save=False)
+
+    user_name = db.get_setting("user_name", prompts.DEFAULT_USER_NAME)
+    coach_profile = coach.resolve_coach_profile()
+    recent_briefs = briefing._recent_briefs_summary()
+
+    assert cap["options"].system_prompt == prompts.system_prompt(user_name, coach_profile)
+    assert cap["prompt"] == prompts.briefing_prompt(
+        user_name, 10000, recent_briefs, coach_profile)
 
 
 # --- alt-model (gemma4/Ollama + opencode) shadow-run dispatch ---------------

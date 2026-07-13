@@ -187,6 +187,15 @@ def test_tsb_interpretation_all_bands():
     assert status_mod._tsb_interpretation(0) == "neutral"
 
 
+def test_tsb_interpretation_delegates_to_interpret_tsb_zone():
+    """WS1: status._tsb_interpretation delegates to interpret.tsb_zone so
+    the brief path and training_load_status agree by construction."""
+    from local_fitness.agent import interpret
+
+    for tsb in (None, -25, -20, -15, -10, 0, 5, 10):
+        assert status_mod._tsb_interpretation(tsb) == interpret.tsb_zone(tsb)
+
+
 # --- assemble_status: trend slope + pace-bearing workout -------------------
 
 @pytest.fixture
@@ -241,3 +250,54 @@ def test_assemble_status_seeded_tsb_interpretation(seeded_status_db):
     status = assemble_status()
     assert status["training_load"]["tsb"] == -5.0
     assert status["training_load"]["interpretation"] == "neutral"
+
+
+# --- 3c: sleep_seconds row value_formatted/baseline_formatted --------------
+
+@pytest.fixture
+def sleep_status_db(tmp_path, monkeypatch):
+    """Seeded with a sleep_seconds baseline mean so the sleep row's
+    value_formatted/baseline_formatted (units.format_hm) fields fire."""
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today().isoformat()
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics (date, sleep_seconds) VALUES (?, ?)",
+            (today, 27180),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, sleep_seconds_60day_mean, "
+            "sleep_seconds_60day_sd) VALUES (?, 25500.0, 900.0)",
+            (today,),
+        )
+    return p
+
+
+def test_sleep_row_carries_formatted_hm_fields(sleep_status_db):
+    status = assemble_status()
+    sleep_row = next(m for m in status["metrics"] if m["metric"] == "sleep_seconds")
+    assert sleep_row["value_formatted"] == "7h 33m"
+    assert sleep_row["baseline_formatted"] == "7h 05m"
+
+
+def test_non_sleep_baseline_delta_rows_have_no_formatted_fields(sleep_status_db):
+    # rhr is baseline_delta too, but only sleep_seconds gets the hm treatment.
+    status = assemble_status()
+    rhr_row = next(m for m in status["metrics"] if m["metric"] == "rhr")
+    assert "value_formatted" not in rhr_row
+    assert "baseline_formatted" not in rhr_row
+
+
+def test_sleep_row_cross_path_identity_with_brief_planner_hm(sleep_status_db):
+    # 3c's cross-path invariant: brief_planner._hm and status._metric_rows'
+    # value_formatted render the exact same seconds identically, by
+    # construction (both delegate to units.format_hm).
+    from local_fitness.agent import brief_planner
+
+    status = assemble_status()
+    sleep_row = next(m for m in status["metrics"] if m["metric"] == "sleep_seconds")
+    assert sleep_row["value_formatted"] == brief_planner._hm(sleep_row["value"])
+    assert sleep_row["baseline_formatted"] == brief_planner._hm(sleep_row["baseline"])

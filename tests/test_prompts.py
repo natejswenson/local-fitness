@@ -134,6 +134,15 @@ def test_system_prompt_no_notes_section_when_empty(monkeypatch):
     assert "has told you" not in p
 
 
+def test_system_prompt_has_charts_bullet():
+    # 3b: chart-rendering guidance (CLAUDE.md's most emphatic convention)
+    # must reach the connecting LLM via the delivered instructions/prompt.
+    p = prompts.system_prompt("Dana")
+    assert "Charts" in p
+    assert "fenced code block" in p
+    assert "chart" in p.lower()
+
+
 def test_briefing_prompt_schema_lock():
     p = prompts.briefing_prompt("Dana")
     low = p.lower()

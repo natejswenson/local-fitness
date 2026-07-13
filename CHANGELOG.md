@@ -6,6 +6,125 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-07-13
+
+### Fixed
+- **Brief takeaway tables could render as one flattened line of pipes.**
+  Two gaps in the deterministic table-repair layer
+  (`render.fix_table_row_breaks`), both observed live in the 2026-07-13
+  brief: (1) a table glued directly to surrounding prose
+  (`**Header:**\n| Metric |…`) is not parsed as a table by strict
+  CommonMark/GFM renderers — repair now isolates table blocks with blank
+  lines on both sides; (2) the dropped-backslash `\n` artifact could land
+  after the final row's closing pipe (`| ↓ |n`), which the `|n|`-only
+  repair missed — now stripped. Both idempotent, prose untouched,
+  regression-tested against the observed shapes.
+
+## [0.22.1] - 2026-07-13
+
+### Fixed
+- **`run_sql`'s `fitness://schema` error pointer never fired on real
+  invalid queries.** A mistyped table/column raises
+  `sqlite3.OperationalError`, which the 0.22.0 rewording left on the old
+  generic "operational error" branch — the schema-resource remedy lived
+  only in the practically-unreachable `sqlite3.Error` branch. Caught by
+  the post-merge live MCP quality gate; both branches now carry the
+  pointer, with a regression test on the real bad-table path (the
+  time-budget message is unchanged).
+
+## [0.22.0] - 2026-07-13
+
+### Fixed
+- **The brief PDF's 2-column signal-card grid never actually rendered as
+  2 columns.** Shipped in the 0.20.0 redesign, the `display: flex;
+  flex-wrap: wrap` (and a subsequently-tried `display: grid;
+  grid-template-columns: 1fr 1fr`) CSS both looked correct as source but
+  WeasyPrint 69.0 rendered every card on its own row regardless — a gap
+  only caught by objectively measuring rendered word positions with
+  `pdfplumber`, not by eyeballing a thumbnail or checking HTML class
+  names. Replaced with an HTML `<table>` (the one layout primitive
+  WeasyPrint reliably supports for this), verified correct against real,
+  wrapping takeaway content, with new geometry-based regression tests
+  (`tests/test_visuals.py`) that assert actual rendered x/y positions
+  instead of just HTML structure.
+
+### Changed
+- **The brief PDF is redesigned to fit one page and look more polished.**
+  The whole-page layout is now 2 columns — the signal-card rail (left)
+  runs in parallel with the Training Plan section (right) instead of
+  stacking sequentially — which buys back the vertical room a 3-5
+  takeaway brief plus a full plan section needs to fit on one A4 page.
+  Built as an HTML `<table>` (the one layout primitive WeasyPrint 69.0
+  reliably supports for real multi-column placement — flex/grid were
+  both tried and both silently collapse to one column for this content
+  shape). Signal cards get a tone-tinted background wash and rounded
+  left-accent border instead of a plain ruled list; the header gains a
+  colored rule and a pill-styled date badge; the plan rail's stat strip
+  becomes a 2x2 tile grid (the narrower rail can't fit 4 tiles across).
+  Verified 1-page fit via `pdfplumber` page-count checks against the
+  documented 3-5 takeaway maximum, not by eyeballing a render.
+- **Interpretation parity on the ad-hoc analysis tools.** The brief path has
+  always computed judgments (TSB zones, trend arrows, effect reads) in tested
+  Python and left the model to only phrase them; the ad-hoc MCP tools
+  (`training_load_status`, `correlate`, `find_anomalies`, `compare_periods`,
+  `get_metric_trend`) left the same judgments to the connecting LLM, applying
+  static legend text by hand. New pure module `agent/interpret.py` supplies
+  shared classifiers — `tsb_zone`, `pct_change`, `trend_direction`,
+  `delta_direction`, `baseline_position`, `correlation_read`, `effect_size`,
+  `sd_position` — and both `status.py` and `brief_planner.py` now delegate to
+  it instead of keeping their own copies. Payload adds: `training_load_status`
+  gains `tsb_zone`/`ctl_pct_change_14d`/`ctl_direction` (the 14-day CTL "then"
+  value is now a shared `brief_planner.ctl_at_or_before` lookup, so the brief
+  and the tool agree by construction); `correlate` gains `strength`/`direction`
+  and drops its static legend string; `find_anomalies` rows gain
+  `sd_distance`/`direction`; `compare_periods` gains `delta_pct`/`cohens_d`/
+  `magnitude`; `get_metric_trend` gains `slope_direction`/`vs_baseline`. All
+  analysis-tool floats are now rounded at the payload boundary (3 dp for
+  correlation/slope/cohens_d, 2 dp for means/SDs/deltas, 1 dp for percentages),
+  skipping `None` rather than raising.
+- **Plan-tool payload quality.** `get_training_plan_progress` gains a
+  `this_week` rollup (`week_planned_mi`/`week_actual_mi`/`slips`, shared with
+  the PDF's identical section via a new `tools.weekly_rollup`) and a
+  `goal_gap` (`plans.goal_gap`: gap seconds/pct/on-pace vs. the Riegel
+  projection). Its `workouts` list is now windowed by default (trailing 14 +
+  upcoming 7 days anchored to the data frontier) — pass `full=true` for the
+  complete plan across the whole date range. Both plan tools gain formatted
+  time fields (`target_duration_formatted`, `target_time_formatted`,
+  `predicted_finish_formatted`) alongside the existing raw seconds.
+  `get_workout_detail`'s splits and `recovery_pattern`'s matched workouts now
+  carry mile/pace fields under the same miles-display gate as the rest of the
+  API. `compare_periods` accepts `distance_meters` as a SUM metric (total
+  mileage per period, with `delta`/`delta_pct`) for "how much did I run this
+  week vs. last."
+- **Agent UX surface.** `system_prompt` gains an explicit "Charts" bullet so
+  the connecting LLM reproduces `chart` output in the reply instead of
+  leaving it collapsed in the tool call. `plan_coach.build_prompt` /
+  `generate_coaching_line` now accept the same user-notes and
+  metric-translation context as chat/brief, so a saved preference is honored
+  in the PDF's coaching line too. Sleep now renders as `"7h 33m"`
+  (`units.format_hm`) everywhere it's shown — the status snapshot's sleep row
+  as well as the existing brief grounding pool — replacing a raw-seconds
+  display in the snapshot table. `training_load_status`,
+  `log_manual_workout`, and `delete_manual_workout` error strings no longer
+  point MCP-only users at CLI commands they can't run. Tool descriptions for
+  `daily_snapshot`/`get_today_status`/`get_brief_context` now state explicitly
+  when *not* to use them. `generate_chart` now returns its PNG as an inline
+  MCP image content block (in addition to the saved file path) and has moved
+  into `ALL_TOOLS`, making it reachable over the networked `/mcp/` transport
+  for the first time. `get_today_status` now converges on the same
+  `assemble_status()` path as `daily_snapshot`.
+- **Layer-separation hardening.** The brief PDF's coaching line — the one LLM
+  output entering a user-facing artifact with no numeric validation — is now
+  checked by a new `plan_coach.ground_coaching_line`, logged advisorily
+  alongside the existing V2 grounding signal, never gating the PDF. The V1
+  brief-generation rollback path (`LOCAL_FITNESS_BRIEF_V2=0`) now also
+  assembles a grounding pool (for measurement only, wrapped in
+  `try/except Exception` so a planner failure can't break the rollback path
+  itself) instead of losing the invention-rate signal entirely.
+
+No new user-facing features — this is an efficiency, UX, and layer-separation
+release across the MCP tool surface.
+
 ## [0.21.0] - 2026-07-09
 
 ### Removed

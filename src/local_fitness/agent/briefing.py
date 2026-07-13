@@ -525,8 +525,11 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         daily_step_goal = 10000
     coach_profile = coach.resolve_coach_profile()
     recent_briefs = _recent_briefs_summary()
-    # The V2 BriefContext, kept for the post-stream advisory grounding check.
-    # None on the V1 path (no toolless context → nothing to ground against).
+    # The BriefContext, kept for the post-stream advisory grounding check.
+    # Stays None unless a branch below assembles one — V2 always does (it's
+    # also the toolless generation input); V1 does too since 4b, but SOLELY
+    # to ground against, wrapped in try/except so a planner failure can't
+    # crash the rollback path (see the V1 branch below).
     brief_context = None
 
     # Alt-model branch: reached by every shadow-run entry point (scripts/
@@ -636,6 +639,23 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         )
         prompt_text = prompts.briefing_prompt(
             user_name, daily_step_goal, recent_briefs, coach_profile)
+        # 4b: V1 has no BriefContext by construction (no toolless pipeline), so
+        # it silently loses the advisory invention-rate grounding signal. Build
+        # one SOLELY to ground against below — options/prompt_text above are
+        # already fully assembled, so this cannot change V1's prompt. Isolated
+        # in try/except: V1 is the *rollback* path (LOCAL_FITNESS_BRIEF_V2=0),
+        # so an unguarded planner call here must never make rollback crash on
+        # the very planner bug that may have motivated flipping the flag in
+        # the first place. Any failure -> brief_context stays None -> grounding
+        # is skipped -> generation proceeds exactly as it did before this change.
+        try:
+            brief_context = brief_planner.assemble_brief_context(
+                today=date.today().isoformat())
+        except Exception:
+            LOG.warning(
+                "V1 grounding-context assembly failed (advisory, skipped)",
+                exc_info=True)
+            brief_context = None
     chunks: list[str] = []
     # NDJSON state — yield each takeaway exactly once as it appears in the
     # accumulating model output.

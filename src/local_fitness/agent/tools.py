@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
-from . import briefs, charts, coach, plan_coach, units
+from . import briefs, charts, coach, interpret, plan_coach, units
 from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
@@ -167,31 +167,31 @@ def _augment_workout(w: dict) -> dict:
     return w
 
 
+# Shared verbatim between get_today_status and daily_snapshot (Fix B,
+# 2026-07-10 doc): both tools now call status.assemble_status() and return
+# an identical payload, so one description string, not two that drift.
+_DAILY_SNAPSHOT_DESCRIPTION = (
+    "The full daily snapshot — today's metrics with baseline deltas / trend "
+    "arrows, current CTL/ATL/TSB, recent workouts (with mile + formatted "
+    "fields), and saved user notes. The same payload the brief and coach "
+    "prompt share. Pure read. No plan/anomalies/candidates in this payload — "
+    "use get_brief_context for the full read or anything plan-/trend-related."
+)
+
+
 @tool(
     "get_today_status",
-    "Today's metrics + last 7 days alongside the latest 60-day baselines. Call this first when assessing recovery or making 'should I train hard' decisions.",
+    _DAILY_SNAPSHOT_DESCRIPTION,
     {},
 )
 async def get_today_status(_args: dict) -> dict:
-    today = date.today().isoformat()
-    week_ago = (date.today() - timedelta(days=7)).isoformat()
-    with db.connect() as conn:
-        recent = [dict(r) for r in conn.execute(
-            "SELECT date, sleep_seconds, sleep_score, rhr, avg_stress, "
-            "body_battery_min, body_battery_max, steps, "
-            "intensity_minutes_moderate, intensity_minutes_vigorous "
-            "FROM daily_metrics WHERE date >= ? ORDER BY date DESC",
-            (week_ago,),
-        ).fetchall()]
-        baseline = conn.execute(
-            "SELECT * FROM baselines WHERE date <= ? ORDER BY date DESC LIMIT 1",
-            (today,),
-        ).fetchone()
-    return _text({
-        "today": today,
-        "recent_days": recent,
-        "current_baseline": dict(baseline) if baseline else None,
-    })
+    # Fix B (2026-07-10 doc): converges with daily_snapshot — same
+    # status.assemble_status() body, same richer payload, instead of an
+    # independent raw baseline-row query. Lazy import: status.py imports
+    # DAILY_NUMERIC_METRICS from this module, so a top-level import here
+    # would be circular (same pattern as daily_snapshot below).
+    from .status import assemble_status
+    return _text(assemble_status())
 
 
 @tool(
@@ -249,10 +249,29 @@ async def get_metric_trend(args: dict) -> dict:
     values = [r["v"] for r in rows]
     n = len(values)
     mean = sum(values) / n
-    xs = list(range(n))
-    x_mean = (n - 1) / 2
-    denom = sum((x - x_mean) ** 2 for x in xs) or 1e-9
-    slope = sum((xs[i] - x_mean) * (values[i] - mean) for i in range(n)) / denom
+
+    # n < 2 -> no defined slope: get_metric_trend owns this None mapping (the
+    # least-squares denominator below is guarded with `or 1e-9`, so without
+    # this the tool would compute a slope of 0.0 even for a single sample,
+    # making "no data" unreachable). The sample SD used for the flat band is
+    # likewise undefined at n=1, so the threshold computation is skipped too.
+    slope: float | None
+    flat_threshold = 0.0
+    if n < 2:
+        slope = None
+    else:
+        xs = list(range(n))
+        x_mean = (n - 1) / 2
+        denom = sum((x - x_mean) ** 2 for x in xs) or 1e-9
+        slope = sum((xs[i] - x_mean) * (values[i] - mean) for i in range(n)) / denom
+        # Flat band: the fitted total change across the window (slope is
+        # per-observation, not per-day — xs is the sample index) stays within
+        # half a sample SD. flat_threshold = (0.5 * sample_sd) / (n - 1) so
+        # the in-function abs(slope) <= flat_threshold comparison equals that.
+        sample_sd = (sum((v - mean) ** 2 for v in values) / max(n - 1, 1)) ** 0.5
+        flat_threshold = (interpret.TREND_FLAT_SD_MULTIPLIER * sample_sd) / max(n - 1, 1)
+
+    current_vs_baseline_sd = None
     payload = {
         "metric": metric,
         "days_window": days,
@@ -260,12 +279,26 @@ async def get_metric_trend(args: dict) -> dict:
         "mean": mean,
         "current": values[-1],
         "slope_per_day": slope,
+        "slope_direction": interpret.trend_direction(slope, flat_threshold=flat_threshold),
     }
     if baseline and baseline["m"] is not None:
         payload["baseline_60day_mean"] = baseline["m"]
         payload["baseline_60day_sd"] = baseline["sd"]
         if baseline["sd"]:
-            payload["current_vs_baseline_sd"] = (values[-1] - baseline["m"]) / baseline["sd"]
+            current_vs_baseline_sd = (values[-1] - baseline["m"]) / baseline["sd"]
+            payload["current_vs_baseline_sd"] = current_vs_baseline_sd
+    # vs_baseline is ALWAYS attached — "no data" whenever current_vs_baseline_sd
+    # is absent/None (every metric outside rhr/sleep_seconds, or a zero SD).
+    payload["vs_baseline"] = interpret.baseline_position(current_vs_baseline_sd)
+
+    # Round at the payload boundary; None passes through unrounded.
+    for field, ndigits in (
+        ("mean", 2), ("slope_per_day", 3),
+        ("baseline_60day_mean", 2), ("baseline_60day_sd", 2),
+        ("current_vs_baseline_sd", 2),
+    ):
+        if payload.get(field) is not None:
+            payload[field] = round(payload[field], ndigits)
     return _text(payload)
 
 
@@ -364,7 +397,7 @@ def _fetch_metric_series(metric: str, days: int) -> tuple[list[str], list[float]
     return dates, values
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner).", _CHART_SCHEMA)
+@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner). Reproduce the full output in a fenced code block in your reply, then add the coach read — never leave it only in the collapsed tool call.", _CHART_SCHEMA)
 async def chart(args: dict) -> dict:
     metric = args["metric"]
     if metric not in _CHART_METRICS:
@@ -467,7 +500,7 @@ async def get_workout_detail(args: dict) -> dict:
             "WHERE activity_id = ? ORDER BY zone",
             (aid,),
         ).fetchall()]
-        splits = [dict(r) for r in conn.execute(
+        splits = [_augment_workout(dict(r)) for r in conn.execute(
             "SELECT * FROM activity_splits WHERE activity_id = ? ORDER BY split_index",
             (aid,),
         ).fetchall()]
@@ -476,9 +509,63 @@ async def get_workout_detail(args: dict) -> dict:
     return _text({"activity": activity, "hr_zones": zones, "splits": splits})
 
 
+# 2g: distance_meters is SUM-per-period semantics (a running total, not a
+# per-observation mean/sd) — kept as a separate frozen whitelist so the
+# metric column is still membership-checked before it reaches an f-string,
+# same discipline as DAILY_NUMERIC_METRICS / the "training_load" special case.
+_COMPARE_SUM_METRICS = frozenset({"distance_meters"})
+
+
+def _compare_periods_sum(conn, metric: str, args: dict) -> dict:
+    """SUM-semantics branch of compare_periods (2g): "how much did I run this
+    week vs last" has no per-observation stats — a period total, not a
+    mean/sd. Per-period {n, total} (+ total_mi, miles-gated, the same
+    display_units() gate _augment_workout uses); top-level delta/delta_pct
+    follow the same a-minus-b convention as effect_size's delta_pct, but
+    there is no per-observation SD to pool, so no cohens_d/magnitude.
+    """
+    def _period_total(start: str, end: str) -> dict:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n, SUM({metric}) AS total FROM activities "
+            f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL",
+            (start, end),
+        ).fetchone()
+        return {"n": row["n"] or 0, "total": row["total"]}
+
+    a = _period_total(args["period_a_start"], args["period_a_end"])
+    b = _period_total(args["period_b_start"], args["period_b_end"])
+
+    if units.display_units() == "miles":
+        if a["total"] is not None:
+            a["total_mi"] = units.to_miles(a["total"])
+        if b["total"] is not None:
+            b["total_mi"] = units.to_miles(b["total"])
+
+    delta = None
+    delta_pct = None
+    if a["total"] is not None and b["total"] is not None:
+        delta = a["total"] - b["total"]
+        if b["total"]:
+            delta_pct = (a["total"] - b["total"]) / b["total"] * 100
+
+    for period in (a, b):
+        if period.get("total") is not None:
+            period["total"] = round(period["total"], 2)
+    if delta is not None:
+        delta = round(delta, 2)
+    if delta_pct is not None:
+        delta_pct = round(delta_pct, 1)
+
+    return {"metric": metric, "period_a": a, "period_b": b, "delta": delta, "delta_pct": delta_pct}
+
+
 @tool(
     "compare_periods",
-    "Compare a metric between two ISO date ranges. Returns mean, SD, count for each + delta. Use for things like 'last 30d vs prior 30d'.",
+    "Compare a metric between two ISO date ranges. Returns mean, SD, count "
+    "for each + delta. Also accepts distance_meters (activities, SUMMED per "
+    "period — no mean/SD for a period total, but a total_mi convenience and "
+    "top-level delta/delta_pct). Use for things like 'last 30d vs prior 30d' "
+    "or 'how much did I run this week vs last'.",
     {
         "metric": str,
         "period_a_start": str,
@@ -489,12 +576,19 @@ async def get_workout_detail(args: dict) -> dict:
 )
 async def compare_periods(args: dict) -> dict:
     metric = args["metric"]
+    if metric in _COMPARE_SUM_METRICS:
+        with db.connect() as conn:
+            payload = _compare_periods_sum(conn, metric, args)
+        return _text(payload)
     if metric == "training_load":
         table = "activities"
     elif metric in DAILY_NUMERIC_METRICS:
         table = "daily_metrics"
     else:
-        return _err(f"unknown metric '{metric}'", allowed=sorted(DAILY_NUMERIC_METRICS | {"training_load"}))
+        return _err(
+            f"unknown metric '{metric}'",
+            allowed=sorted(DAILY_NUMERIC_METRICS | {"training_load"} | _COMPARE_SUM_METRICS),
+        )
 
     def _stats(conn, start: str, end: str) -> dict:
         rows = conn.execute(
@@ -513,7 +607,28 @@ async def compare_periods(args: dict) -> dict:
         a = _stats(conn, args["period_a_start"], args["period_a_end"])
         b = _stats(conn, args["period_b_start"], args["period_b_end"])
     delta = (a["mean"] - b["mean"]) if (a["mean"] is not None and b["mean"] is not None) else None
-    return _text({"metric": metric, "period_a": a, "period_b": b, "delta_mean_a_minus_b": delta})
+
+    # _stats always returns an int n (0 on no rows), so effect_size's
+    # whole-None branch is unreachable here — it always returns a dict.
+    effect = interpret.effect_size(a["mean"], b["mean"], a["sd"], b["sd"], a["n"], b["n"])
+    delta_pct = effect["delta_pct"] if effect else None
+    cohens_d = effect["cohens_d"] if effect else None
+    magnitude = effect["magnitude"] if effect else None
+
+    payload = {
+        "metric": metric, "period_a": a, "period_b": b,
+        "delta_mean_a_minus_b": delta,
+        "delta_pct": delta_pct, "cohens_d": cohens_d, "magnitude": magnitude,
+    }
+    # Round at the payload boundary; None passes through unrounded.
+    for period in (payload["period_a"], payload["period_b"]):
+        for field in ("mean", "sd"):
+            if period.get(field) is not None:
+                period[field] = round(period[field], 2)
+    for field, ndigits in (("delta_mean_a_minus_b", 2), ("delta_pct", 1), ("cohens_d", 3)):
+        if payload.get(field) is not None:
+            payload[field] = round(payload[field], ndigits)
+    return _text(payload)
 
 
 _FIND_ANOMALIES_SCHEMA = {
@@ -556,11 +671,19 @@ async def find_anomalies(args: dict) -> dict:
                 ORDER BY dm.date DESC""",
             (cutoff, threshold),
         ).fetchall()
+    anomalies = []
+    for r in rows:
+        row = dict(r)
+        position = interpret.sd_position(row.get("value"), row.get("baseline_mean"), row.get("baseline_sd"))
+        if position is not None:
+            row["sd_distance"] = round(position["sd_distance"], 2)
+            row["direction"] = position["direction"]
+        anomalies.append(row)
     return _text({
         "metric": metric,
         "lookback_days": days,
         "sd_threshold": threshold,
-        "anomalies": [dict(r) for r in rows],
+        "anomalies": anomalies,
     })
 
 
@@ -594,6 +717,10 @@ async def sync_garmin_data(_args: dict) -> dict:
     {},
 )
 async def training_load_status(_args: dict) -> dict:
+    # Lazy import: brief_planner -> status -> tools would cycle at module
+    # scope (same pattern as get_brief_context, tools.py:1591-1594).
+    from . import brief_planner
+
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     with db.connect() as conn:
         recent = [dict(r) for r in conn.execute(
@@ -601,11 +728,39 @@ async def training_load_status(_args: dict) -> dict:
             "WHERE date >= ? AND ctl IS NOT NULL ORDER BY date DESC",
             (cutoff,),
         ).fetchall()]
-    if not recent:
-        return _err("no training-load data yet — pull activities and run recompute-baselines")
+        if not recent:
+            return _err(
+                "no training-load data yet — call sync_garmin_data to pull "
+                "activities (baselines recompute automatically once data lands)"
+            )
+        # The 14-day "then" CTL is single-sourced in brief_planner (the same
+        # no-lookback-floor query the brief signal uses) so this agrees with
+        # the brief by construction, even on gappy baselines — a point
+        # picked from this tool's own 30-day window could disagree. Runs on
+        # this tool's existing connection: not in tests/test_perf_benchmarks.py's
+        # benchmarked set, so the extra indexed point-query is allowed.
+        anchor = (date.today() - timedelta(days=brief_planner._LOOKBACK_DAYS)).isoformat()
+        ctl_then = brief_planner.ctl_at_or_before(conn, anchor)
+
+    current = recent[0]
+    ctl_pct = interpret.pct_change(current.get("ctl"), ctl_then)
+    if ctl_pct is not None:
+        ctl_pct = round(ctl_pct, 1)
+    tsb_zone = interpret.tsb_zone(current.get("tsb"))
+    # A scalar %-delta, not a slope/series — delta_direction, not trend_direction.
+    ctl_direction = interpret.delta_direction(ctl_pct)
+
+    for row in recent:  # current IS recent[0] — rounding recent rounds current too.
+        for field in ("ctl", "atl", "tsb"):
+            if row.get(field) is not None:
+                row[field] = round(row[field], 2)
+
     return _text({
-        "current": recent[0],
+        "current": current,
         "history_30d": recent,
+        "tsb_zone": tsb_zone,
+        "ctl_pct_change_14d": ctl_pct,
+        "ctl_direction": ctl_direction,
         "interpretation": {
             "ctl": "chronic training load (fitness) — 42-day EWMA of activity training_load",
             "atl": "acute training load (fatigue) — 7-day EWMA",
@@ -673,10 +828,13 @@ async def correlate(args: dict) -> dict:
     var_b = sum((p[1] - mean_b) ** 2 for p in pairs) / n
     denom = (var_a * var_b) ** 0.5
     r_val = (cov / denom) if denom else None
+    read = interpret.correlation_read(r_val)
     return _text({
         "metric_a": a, "metric_b": b, "days": days, "lag_days": lag,
-        "n_pairs": n, "pearson_r": r_val,
-        "interpretation": "|r| < 0.2 weak, 0.2-0.4 modest, 0.4-0.6 moderate, > 0.6 strong",
+        "n_pairs": n,
+        "pearson_r": round(r_val, 3) if r_val is not None else None,
+        "strength": read["strength"] if read else None,
+        "direction": read["direction"] if read else None,
     })
 
 
@@ -718,9 +876,13 @@ async def recovery_pattern(args: dict) -> dict:
     where_sql = " AND ".join(where)
 
     with db.connect() as conn:
+        # 2f: avg_pace_sec_per_km + duration_seconds widened in so
+        # _augment_workout below can produce its full field set (pace,
+        # duration_formatted), not just distance_mi.
         workouts = [dict(r) for r in conn.execute(
             f"SELECT activity_id, date, activity_type, distance_meters, "
-            f"training_load, aerobic_te FROM activities WHERE {where_sql} ORDER BY date",
+            f"training_load, aerobic_te, avg_pace_sec_per_km, duration_seconds "
+            f"FROM activities WHERE {where_sql} ORDER BY date",
             params,
         ).fetchall()]
         results = []
@@ -756,18 +918,18 @@ async def recovery_pattern(args: dict) -> dict:
                     and row["rhr"] <= baseline["rhr"] * 1.03
                 ):
                     rhr_recovery = offset
-            results.append({
+            results.append(_augment_workout({
                 **w,
                 "recovery_days_to_bb_baseline": bb_recovery,
                 "recovery_days_to_rhr_baseline": rhr_recovery,
-            })
+            }))
 
     bb_vals = [r["recovery_days_to_bb_baseline"] for r in results if r["recovery_days_to_bb_baseline"]]
     rhr_vals = [r["recovery_days_to_rhr_baseline"] for r in results if r["recovery_days_to_rhr_baseline"]]
     return _text({
         "n_workouts_matched": len(results),
-        "avg_recovery_days_body_battery": (sum(bb_vals) / len(bb_vals)) if bb_vals else None,
-        "avg_recovery_days_rhr": (sum(rhr_vals) / len(rhr_vals)) if rhr_vals else None,
+        "avg_recovery_days_body_battery": round(sum(bb_vals) / len(bb_vals), 2) if bb_vals else None,
+        "avg_recovery_days_rhr": round(sum(rhr_vals) / len(rhr_vals), 2) if rhr_vals else None,
         "recent_workouts": results[-10:],
     })
 
@@ -825,12 +987,21 @@ async def run_sql(args: dict) -> dict:
         rows = await asyncio.to_thread(_run_sql_blocking, q)
     except sqlite3.OperationalError as e:
         # "interrupted" is the deadline abort; "readonly database" is a write
-        # attempt that slipped past the denylist. Don't leak the raw string.
+        # attempt that slipped past the denylist. Don't leak the raw string —
+        # OperationalError is also what a mistyped table/column raises, so
+        # this branch (not the generic sqlite3.Error one) carries the
+        # schema-resource pointer.
         if "interrupt" in str(e).lower():
             return _err("query exceeded time budget")
-        return _err("query failed: operational error")
+        return _err(
+            "query failed: invalid query — check table/column names "
+            "against the fitness://schema resource"
+        )
     except sqlite3.Error:
-        return _err("query failed: invalid query")
+        return _err(
+            "query failed: invalid query — check table/column names "
+            "against the fitness://schema resource"
+        )
     return _text({"rows": rows, "count": len(rows)})
 
 
@@ -919,10 +1090,7 @@ async def delete_user_note(args: dict) -> dict:
 
 @tool(
     "daily_snapshot",
-    "The full daily snapshot — today's metrics with baseline deltas / trend "
-    "arrows, current CTL/ATL/TSB, recent workouts (with mile + formatted "
-    "fields), and saved user notes. The same payload the brief and coach "
-    "prompt share. Pure read.",
+    _DAILY_SNAPSHOT_DESCRIPTION,
     {},
 )
 async def daily_snapshot(_args: dict) -> dict:
@@ -1158,7 +1326,9 @@ async def log_manual_workout(args: dict) -> dict:
             "activity": _augment_workout(result),
             "recompute_failed": True,
             "warning": "workout saved but training-load recompute failed; "
-                       "run `fitness baselines` to refresh",
+                       "baselines may lag until the next successful sync "
+                       "(the nightly job, or sync_garmin_data once new "
+                       "Garmin data exists)",
             "error_detail": str(e),
         })
 
@@ -1210,7 +1380,9 @@ async def delete_manual_workout(args: dict) -> dict:
             "activity_id": aid,
             "recompute_failed": True,
             "warning": "workout deleted but training-load recompute failed; "
-                       "run `fitness baselines` to refresh",
+                       "baselines may lag until the next successful sync "
+                       "(the nightly job, or sync_garmin_data once new "
+                       "Garmin data exists)",
             "error_detail": str(e),
         })
 
@@ -1464,12 +1636,117 @@ async def abandon_active_plan(_args: dict) -> dict:
     return _text({"plan_id": plan_id, "status": "archived"})
 
 
+def weekly_rollup(workouts: list[dict], target_date: str) -> dict:
+    """Trailing-7-day (ending on ``target_date``) planned/actual mileage
+    rollup, shared by ``_build_plan_section`` (the PDF) and
+    ``get_training_plan_progress`` (``this_week``).
+
+    Pure, I/O-free: ``workouts`` is an already-graded workout list (each
+    entry needs ``date``/``verdict``/``type``/``target_distance_m``/
+    ``actual_distance_m``) — no DB connection, directly import-testable.
+    ``target_date`` is an ISO date STRING (the repo's window-comparison
+    convention: callers already window via ISO-string comparison, and
+    string comparison of ISO dates is order-correct) — the comparison
+    stays string-based; computing ``window_start`` still parses the date
+    once.
+
+    Owns the whole aggregation contract, so the per-day rows and the
+    three totals agree by construction:
+    - the trailing-7-day window ending on ``target_date`` (deliberately
+      different from ``plans.weekly_mileage``'s per-``week_index``
+      rollup — this matches the PDF section's existing definition);
+    - the per-day ``units.to_miles`` conversion (2 dp);
+    - the verdict-conditional suppression of ``actual_mi`` for
+      ``pending``/``compliant`` days — a run that hasn't been graded yet,
+      or a rest day, doesn't count into "actual mileage" (the existing
+      PDF rule, promoted to the shared definition);
+    - the totals are summed from that same ``days`` list, THEN rounded to
+      1 dp — summing raw meters first and converting once can differ by
+      0.1 from the per-day-rounded sum.
+
+    ``days`` is REVERSE-CHRONOLOGICAL (most recent first) — load-bearing
+    downstream: ``plan_coach.build_prompt`` labels the list "most recent
+    first" and ``fallback_coaching_line`` picks the first non-pending
+    entry as the latest graded day. Empty window -> ``days: []`` with
+    zero totals; the empty -> ``None`` short-circuit for callers that
+    want that behavior (``_build_plan_section``) lives in the caller, not
+    here.
+    """
+    window_start = (date.fromisoformat(target_date) - timedelta(days=6)).isoformat()
+    week_workouts = sorted(
+        (w for w in workouts if window_start <= w["date"] <= target_date),
+        key=lambda w: w["date"],
+        reverse=True,
+    )
+    days: list[dict] = []
+    for w in week_workouts:
+        target_m = w.get("target_distance_m")
+        planned_mi = units.to_miles(target_m) if target_m is not None else None
+        if w["verdict"] in ("pending", "compliant"):
+            actual_mi = None
+        else:
+            actual_m = w.get("actual_distance_m")
+            actual_mi = units.to_miles(actual_m) if actual_m is not None else None
+        days.append({
+            "date": w["date"],
+            "verdict": w["verdict"],
+            "type": w["type"],
+            "planned_mi": planned_mi,
+            "actual_mi": actual_mi,
+        })
+    week_planned_mi = round(sum(d["planned_mi"] or 0 for d in days), 1)
+    week_actual_mi = round(sum(d["actual_mi"] or 0 for d in days), 1)
+    slips = sum(1 for d in days if d["verdict"] in ("partial", "missed"))
+    return {
+        "week_planned_mi": week_planned_mi,
+        "week_actual_mi": week_actual_mi,
+        "slips": slips,
+        "days": days,
+    }
+
+
+def _augment_plan_workout(w: dict) -> dict:
+    """Fix C (2026-07-10 doc): attach mile/pace convenience fields to a plan
+    workout dict, reproducing ``_augment_workout``'s exact
+    ``display_units()`` gating split — distance gated behind miles mode,
+    pace unconditional.
+
+    Symmetric field set: ``target_distance_mi``/``actual_distance_mi``
+    (miles-mode only, omitted entirely — not ``None`` — in km mode) and
+    ``target_pace_min_per_mi``/``actual_pace_min_per_mi`` (always, when the
+    underlying raw value is present), mirroring the raw ``target_*``/
+    ``actual_*`` pairs already on the payload. Used by
+    ``get_training_plan_progress`` (every workout entry) and
+    ``get_training_plan_status`` (``today``/``last_graded``, individually
+    None-guarded by the caller — that path has no ``actual_*`` keys at all,
+    so ``.get`` returning ``None`` naturally omits the actual-mile/pace
+    fields there). NOT used by ``_build_plan_section``, which keeps its own
+    inline conversion + verdict-suppression logic (see ``weekly_rollup``).
+    """
+    if units.display_units() == "miles":
+        target_mi = units.to_miles(w.get("target_distance_m"))
+        if target_mi is not None:
+            w["target_distance_mi"] = target_mi
+        actual_mi = units.to_miles(w.get("actual_distance_m"))
+        if actual_mi is not None:
+            w["actual_distance_mi"] = actual_mi
+    target_pace = units.format_pace_min_per_mi(w.get("target_pace_sec_per_km"))
+    if target_pace is not None:
+        w["target_pace_min_per_mi"] = target_pace
+    actual_pace = units.format_pace_min_per_mi(w.get("actual_pace_sec_per_km"))
+    if actual_pace is not None:
+        w["actual_pace_min_per_mi"] = actual_pace
+    return w
+
+
 @tool(
     "get_training_plan_status",
     "Status of the ACTIVE training plan: goal, days to race, the most recent "
     "graded day's prescription + verdict, today's prescribed session, and "
     "overall adherence. Returns {active: false} when there is no active plan. "
-    "Call this first in a brief to decide whether to fold the plan in.",
+    "Call this first in a brief to decide whether to fold the plan in. Slim "
+    "by design — for week rollups, goal gap, or projected finish, use "
+    "get_training_plan_progress instead.",
     {},
 )
 async def get_training_plan_status(_args: dict) -> dict:
@@ -1484,21 +1761,54 @@ async def get_training_plan_status(_args: dict) -> dict:
         end = max([today, *dates] + ([frontier] if frontier else []))
         activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
         cfg = plans.resolve_grading_config(conn=conn)
-    return _text(plans.build_plan_status(active, frontier, activities_by_date, today, cfg))
+    status = plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
+
+    # 2d: pure formatting of data already in hand — plans.py gains no units
+    # import (consistent with the existing invariant); no goal_gap/this_week/
+    # predicted_finish_formatted here, this tool has no Riegel projection.
+    status["target_time_formatted"] = units.format_duration(status.get("target_time_seconds"))
+    for key in ("today", "last_graded"):
+        w = status.get(key)
+        if w is not None:
+            _augment_plan_workout(w)
+            duration_formatted = units.format_duration(w.get("target_duration_sec"))
+            if duration_formatted is not None:
+                w["target_duration_formatted"] = duration_formatted
+    return _text(status)
+
+
+_PROGRESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "full": {
+            "type": "boolean",
+            "description": (
+                "Return the complete workout list for the whole plan instead of "
+                "the default rolling window (14 days back from the data "
+                "frontier, 7 days forward from today). Default false."
+            ),
+        },
+    },
+    "required": [],
+}
 
 
 @tool(
     "get_training_plan_progress",
-    "Full day-by-day progress of the ACTIVE training plan: every prescribed "
+    "Day-by-day progress of the ACTIVE training plan: every prescribed "
     "workout with its graded verdict (done | partial | missed | compliant | "
-    "pending), plus goal, days-to-race, adherence %, and projected finish. "
-    "Returns {active: false} when there is no active plan. Prefer this over "
-    "get_training_plan_status (a slim one-day summary) to answer 'show my plan "
-    "through today' / 'how is my plan going' — never query the DB by hand for "
-    "this.",
-    {},
+    "pending), plus goal, days-to-race, adherence %, projected finish, goal "
+    "gap, and this week's planned/actual mileage. The `workouts` list is "
+    "windowed by default (14 days back from the data frontier, 7 days "
+    "forward from today — today is always in-window even under a stale "
+    "frontier) — pass full=true for the complete list across the whole plan "
+    "(e.g. 'show my plan through today' on a plan older than 2 weeks). "
+    "Returns {active: false} when there is no active plan. For just today's "
+    "prescribed session, use get_training_plan_status (a slim one-day "
+    "summary) instead — never query the DB by hand for this.",
+    _PROGRESS_SCHEMA,
 )
-async def get_training_plan_progress(_args: dict) -> dict:
+async def get_training_plan_progress(args: dict) -> dict:
     with db.connect() as conn:
         active = plans.get_active_plan(conn=conn)
         if active is None:  # build_plan_detail has no None guard — guard here first.
@@ -1527,7 +1837,7 @@ async def get_training_plan_progress(_args: dict) -> dict:
     # Deliberate projection: keep the fields an agent needs to answer a
     # plan-progress question; drop identifiers / internal rollups (plan_id,
     # status, ability_snapshot, weekly_mileage, …) that build_plan_detail spreads.
-    workouts = [
+    workouts_full = [
         {
             "date": w.get("date"),
             "week_index": w.get("week_index"),
@@ -1543,14 +1853,58 @@ async def get_training_plan_progress(_args: dict) -> dict:
         }
         for w in detail["workouts"]
     ]
+    # 2d/2e: per-workout mile/pace convenience fields (Fix C) + a formatted
+    # target duration — pure computation over rows already fetched, applied
+    # before windowing so both full=true and the default window see it.
+    for w in workouts_full:
+        _augment_plan_workout(w)
+        duration_formatted = units.format_duration(w.get("target_duration_sec"))
+        if duration_formatted is not None:
+            w["target_duration_formatted"] = duration_formatted
+
+    full = bool(args.get("full", False))
+    if full:
+        workouts = workouts_full
+    else:
+        # 2c: [anchor_back - 14d, anchor_fwd + 7d]. anchor_back anchors to the
+        # data frontier (keeps graded history in view); anchor_fwd's max(...,
+        # today) guarantees today (and today's prescribed workout) stays
+        # in-window even when the frontier is stale (>7d behind, after a sync
+        # gap) — the `else today` fallbacks keep the window defined on a
+        # fresh DB where frontier is None. No clamping to plan bounds.
+        anchor_back = frontier if frontier is not None else today
+        anchor_fwd = max(frontier or today, today)
+        window_start = (date.fromisoformat(anchor_back) - timedelta(days=14)).isoformat()
+        window_end = (date.fromisoformat(anchor_fwd) + timedelta(days=7)).isoformat()
+        workouts = [w for w in workouts_full if window_start <= w["date"] <= window_end]
+
+    # Rollups are computed from the FULL graded workout list (detail /
+    # detail["workouts"]), never the 2c-windowed projection — adherence_pct/
+    # days_to_race/goal_gap stay whole-plan, this_week is its own
+    # trailing-7-days window (never 2c's), so both are identical whether
+    # full is true or false.
+    predicted_finish_seconds = detail.get("predicted_finish_seconds")
+    target_time_seconds = detail.get("target_time_seconds")
+    goal_gap = plans.goal_gap(predicted_finish_seconds, target_time_seconds)
+    rollup = weekly_rollup(detail["workouts"], today)
+    this_week = {
+        "week_planned_mi": rollup["week_planned_mi"],
+        "week_actual_mi": rollup["week_actual_mi"],
+        "slips": rollup["slips"],
+    }
+
     return _text({
         "active": True,
         "goal_type": detail.get("goal_type"),
         "race_date": detail.get("race_date"),
-        "target_time_seconds": detail.get("target_time_seconds"),
+        "target_time_seconds": target_time_seconds,
+        "target_time_formatted": units.format_duration(target_time_seconds),
         "days_to_race": days_to_race,
         "adherence_pct": detail.get("adherence_pct"),
-        "predicted_finish_seconds": detail.get("predicted_finish_seconds"),
+        "predicted_finish_seconds": predicted_finish_seconds,
+        "predicted_finish_formatted": units.format_duration(predicted_finish_seconds),
+        "goal_gap": goal_gap,
+        "this_week": this_week,
         "workouts": workouts,
     })
 
@@ -1584,7 +1938,8 @@ async def save_brief(args: dict) -> dict:
     "14-day workout list, RHR anomalies, active-plan status + adherence + "
     "days-to-race, and recent-brief continuity. Prefer this over orchestrating "
     "many tools when answering 'how am I doing / what's today's read / what should "
-    "I do today' — every number is pre-computed and traceable to the data.",
+    "I do today' — every number is pre-computed and traceable to the data. "
+    "Overkill for a single-metric question — use get_metric/get_metric_trend instead.",
     {},
 )
 async def get_brief_context(_args: dict) -> dict:
@@ -1594,13 +1949,16 @@ async def get_brief_context(_args: dict) -> dict:
     return _text(brief_planner.assemble_brief_context().model_dump())
 
 
-# --- LOCAL_ONLY_TOOLS: generate_brief_report / generate_chart -------------
-# Beautiful PDF/chart rendering tools. Reachable ONLY via run_stdio() (see
-# web/mcp_server.py) — never merged into ALL_TOOLS, never served over the
-# streamable-HTTP /mcp/ transport. A phone-triggered call over that network
-# transport would get back a container-internal path with no way to
-# retrieve the file; this boundary is structural, not just documented (see
-# docs/plans/2026-07-07-pdf-chart-reports-design.md).
+# --- generate_brief_report: PDF report rendering ---------------------------
+# Reachable ONLY via run_stdio() (see web/mcp_server.py) — never merged into
+# ALL_TOOLS, never served over the streamable-HTTP /mcp/ transport. A
+# phone-triggered call over that network transport would get back a
+# container-internal path with no way to retrieve the file; this boundary is
+# structural, not just documented (see
+# docs/plans/2026-07-07-pdf-chart-reports-design.md). generate_chart used to
+# share this boundary but no longer does (Fix A, 2026-07-10 doc) — it's now
+# in ALL_TOOLS, since its inline image content block sidesteps the
+# no-file-retrieval problem that still applies to a PDF.
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -1773,36 +2131,18 @@ def _build_plan_section(target_date: str) -> dict | None:
     # param is best_effort, a Riegel-projection dict, not a date).
     detail = plans.build_plan_detail(active, frontier, activities_by_date, cfg=cfg)
 
-    window_start = (date.fromisoformat(target_date) - timedelta(days=6)).isoformat()
-    week_workouts = sorted(
-        (w for w in detail["workouts"] if window_start <= w["date"] <= target_date),
-        key=lambda w: w["date"],
-        reverse=True,
-    )
-
-    last_7_days: list[dict] = []
-    for w in week_workouts:
-        target_m = w.get("target_distance_m")
-        planned_mi = units.to_miles(target_m) if target_m else None
-        if w["verdict"] in ("pending", "compliant"):
-            actual_mi = None
-        else:
-            actual_m = w.get("actual_distance_m")
-            actual_mi = units.to_miles(actual_m) if actual_m is not None else None
-        last_7_days.append({
-            "date": w["date"],
-            "type": w["type"],
-            "planned_mi": planned_mi,
-            "actual_mi": actual_mi,
-            "verdict": w["verdict"],
-        })
-
+    # 2a: weekly_rollup owns the windowing, per-day to_miles conversion, and
+    # verdict-conditional actual_mi suppression — days IS the last_7_days
+    # table as-is (no per-day enrichment needed here); the empty->None
+    # short-circuit stays local to this consumer.
+    rollup = weekly_rollup(detail["workouts"], target_date)
+    last_7_days = rollup["days"]
     if not last_7_days:
         return None
 
-    week_planned_mi = sum(d["planned_mi"] or 0 for d in last_7_days)
-    week_actual_mi = sum(d["actual_mi"] or 0 for d in last_7_days)
-    slips = sum(1 for d in last_7_days if d["verdict"] in ("partial", "missed"))
+    week_planned_mi = rollup["week_planned_mi"]
+    week_actual_mi = rollup["week_actual_mi"]
+    slips = rollup["slips"]
     adherence_pct = detail.get("adherence_pct")
     if adherence_pct is None:
         adherence_pct = 0
@@ -1834,8 +2174,8 @@ def _build_plan_section(target_date: str) -> dict | None:
         "adherence_pct": adherence_pct,
         "goal_type": detail.get("goal_type") or "goal",
         "days_to_race": days_to_race,
-        "week_planned_mi": round(week_planned_mi, 1),
-        "week_actual_mi": round(week_actual_mi, 1),
+        "week_planned_mi": week_planned_mi,
+        "week_actual_mi": week_actual_mi,
         "slips": slips,
         "today": today_payload,
         "last_7_days": last_7_days,
@@ -1911,6 +2251,7 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["adherence_pct"],
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
+                notes_text=notes.render_for_prompt(),
             )
         except Exception:
             LOG.warning(
@@ -1924,6 +2265,18 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["goal_type"],
             )
         plan_section["today"]["coaching_line"] = coaching_line
+
+        # 4a: advisory grounding of the coaching line against the deterministic
+        # plan section — mirrors grounding.log_grounding's pattern (log-only,
+        # never gates, never alters the PDF). Runs whichever line ended up in
+        # the section (Claude-generated or the deterministic fallback above).
+        try:
+            flags = plan_coach.ground_coaching_line(coaching_line, plan_section)
+            detail = "".join(
+                f" [{f.nearest_metric}:{f.token}Δ{f.delta}]" for f in flags[:5])
+            LOG.info("plan_coach_grounding flags=%d%s", len(flags), detail)
+        except Exception:  # noqa: BLE001 — an advisory signal must never break the PDF
+            LOG.exception("plan_coach_grounding failed (advisory, ignored)")
 
     try:
         async with visuals.RENDER_LOCK:
@@ -1973,9 +2326,10 @@ _GENERATE_CHART_SCHEMA = {
 @tool(
     "generate_chart",
     "Render a beautiful standalone PNG chart (line/bar/combo) of a metric "
-    "over the last N days, for any ad-hoc trend question. Local-only: "
-    "reachable via stdio MCP clients (Claude Code/Claude Desktop on this "
-    "same machine), never over the network. Returns a local file path.",
+    "over the last N days, for any ad-hoc trend question. Returns the chart "
+    "inline as an image content block (plus its saved file path as text) — "
+    "reachable over any transport, local or networked. Use the `chart` tool "
+    "instead when a text-reproducible ASCII/emoji read is what's wanted.",
     _GENERATE_CHART_SCHEMA,
 )
 async def generate_chart(args: dict) -> dict:
@@ -2021,7 +2375,19 @@ async def generate_chart(args: dict) -> dict:
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
-    return _text({"path": str(final_path)})
+    # Fix A (2026-07-10 doc): add an inline image content block alongside the
+    # existing text (file path) block, so a networked /mcp/ client — which
+    # has no way to retrieve a local file path — still gets the chart.
+    # Reuses visuals._data_uri's base64 step, stripping the "data:...," prefix
+    # ImageContent.data doesn't want (the encoding math must not be re-derived
+    # at a second call site).
+    image_b64 = visuals._data_uri(png_bytes).split(",", 1)[1]
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps({"path": str(final_path)})},
+            {"type": "image", "data": image_b64, "mimeType": "image/png"},
+        ]
+    }
 
 
 ALL_TOOLS = [
@@ -2058,17 +2424,22 @@ ALL_TOOLS = [
     get_training_plan_status,
     get_training_plan_progress,
     save_brief,
+    generate_chart,
 ]
 
 # Registered ONLY here, never merged into ALL_TOOLS — wired into run_stdio()
 # alone (see web/mcp_server.py's build_server(extra_tools=...)), never into
-# build_session_manager()'s HTTP /mcp/ transport. A plain module-level list
-# literal referencing two already-defined function objects, symmetric with
-# and as trivially greppable as ALL_TOOLS — costs nothing to construct at
-# module scope. Only the heavy `import matplotlib`/`import weasyprint`
-# statements (inside the two functions' bodies and visuals.py's own module
+# build_session_manager()'s HTTP /mcp/ transport. A phone-triggered call over
+# that transport would get back a container-internal path with no way to
+# retrieve the file — a real constraint for a PDF, which isn't representable
+# as MCP ImageContent. generate_chart moved OUT of this list (Fix A,
+# 2026-07-10 doc): once it returns an inline image content block, the
+# "no way to retrieve the file remotely" problem no longer applies to it, so
+# it's reachable over both stdio and the networked /mcp/ transport via
+# ALL_TOOLS above. Only the heavy `import matplotlib`/`import weasyprint`
+# statements (inside generate_brief_report's body and visuals.py's own module
 # body) are deferred, not this list.
-LOCAL_ONLY_TOOLS = [generate_brief_report, generate_chart]
+LOCAL_ONLY_TOOLS = [generate_brief_report]
 
 
 def make_server(extra_tools: list | None = None):

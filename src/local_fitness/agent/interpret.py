@@ -1,0 +1,231 @@
+"""Shared, pure interpretation classifiers — zones, deltas, strengths, gaps.
+
+Every judgment here is a plain function over already-computed numbers: no I/O,
+no SDK, no schemas, stdlib only. This is what makes ``status.py`` (the brief
+path) and the ad-hoc analysis tools (``agent/tools.py``) agree by
+construction instead of the LLM re-deriving the same read twice, once well
+and once by eyeballing a raw float.
+
+Design notes:
+
+* Every classifier handles ``None``/zero/degenerate input without raising —
+  the same guarantee the rest of the read paths make on an empty DB.
+* Two different inclusivity conventions are used **deliberately**, not by
+  accident: ``baseline_position``'s ±1 SD bands are strict (`` > +1`` /
+  ``< -1``), while ``correlation_read`` and ``effect_size`` use inclusive
+  lower bounds (``>=``). ``trend_direction`` and ``delta_direction``'s flat
+  bands are inclusive (``<=``) so a zero threshold / zero delta still
+  classifies as flat, with no side door. See each function's docstring.
+* Named constants exist for every band so a boundary value can be pinned by
+  test on both sides, and so callers outside this module (``brief_planner``'s
+  ``_TRIGGERS``) can reference the same numbers instead of re-stating them.
+"""
+from __future__ import annotations
+
+# --- tsb_zone ---------------------------------------------------------------
+# Training stress balance (CTL - ATL) zone bands — extracted from
+# status._tsb_interpretation; status.py delegates here so the brief and the
+# analysis tools agree by construction.
+TSB_VERY_FATIGUED = -20.0
+TSB_FATIGUED = -10.0
+TSB_FRESH = 5.0
+
+# --- delta_direction ---------------------------------------------------------
+# Flat band for scalar %-delta fields with no series/slope behind them (e.g.
+# ctl_pct_change_14d).
+DELTA_DIRECTION_FLAT_PCT = 2.0
+
+# --- baseline_position -------------------------------------------------------
+# Strict (non-inclusive) SD bands — exactly ±1.0 is "normal".
+BASELINE_POSITION_SD = 1.0
+
+# --- correlation_read ---------------------------------------------------------
+# |r| thresholds, lower-bound inclusive. Mirrors the bands that used to live
+# in correlate's static legend string (tools.py:679).
+CORRELATION_MODEST = 0.2
+CORRELATION_MODERATE = 0.4
+CORRELATION_STRONG = 0.6
+
+# --- effect_size ---------------------------------------------------------
+# Cohen's d conventional magnitude thresholds, lower-bound inclusive.
+COHENS_D_SMALL = 0.2
+COHENS_D_MODERATE = 0.5
+COHENS_D_LARGE = 0.8
+
+# --- trend_direction ---------------------------------------------------------
+# Multiplier on the fetched window's sample SD that defines "flat" fitted
+# total change across the window (see get_metric_trend's flat_threshold
+# derivation).
+TREND_FLAT_SD_MULTIPLIER = 0.5
+
+
+def tsb_zone(tsb: float | None) -> str:
+    """Plain-English read of training stress balance.
+
+    Extracted from ``status._tsb_interpretation`` (status.py delegates here).
+    On ``None`` this deliberately returns ``_tsb_interpretation``'s existing
+    None-case string ("no training-load data yet" — a sentence, not a zone
+    label) for delegation consistency; reachable on ``training_load_status``
+    since its SQL filters on ``ctl``, not ``tsb``.
+    """
+    if tsb is None:
+        return "no training-load data yet"
+    if tsb < TSB_VERY_FATIGUED:
+        return "very fatigued"
+    if tsb < TSB_FATIGUED:
+        return "fatigued"
+    if tsb > TSB_FRESH:
+        return "fresh"
+    return "neutral"
+
+
+def pct_change(now: float | None, then: float | None) -> float | None:
+    """Percent change from ``then`` to ``now``.
+
+    ``None`` when either input is ``None`` or ``then == 0`` (a zero baseline
+    has no defined % change — matches the source truthiness guard at
+    brief_planner.py:507). Returns the **unrounded** float; rounding stays at
+    the boundaries (callers round).
+    """
+    if now is None or then is None or then == 0:
+        return None
+    return (now - then) / then * 100
+
+
+def trend_direction(slope_per_day: float | None, *, flat_threshold: float) -> str:
+    """Classify a per-observation slope into rising/falling/flat/no data.
+
+    Returns ``"no data"`` **iff** ``slope_per_day is None`` — it never sees
+    ``n``; the None-mapping for too-few-samples windows is the caller's job
+    (see ``get_metric_trend``). ``"flat"`` when
+    ``abs(slope_per_day) <= flat_threshold`` (inclusive — so a zero threshold
+    from a constant-series SD still classifies slope 0 as flat, no side
+    door); sign otherwise.
+    """
+    if slope_per_day is None:
+        return "no data"
+    if abs(slope_per_day) <= flat_threshold:
+        return "flat"
+    return "rising" if slope_per_day > 0 else "falling"
+
+
+def delta_direction(pct_change: float | None, *, flat_pct: float = DELTA_DIRECTION_FLAT_PCT) -> str:
+    """Classify a scalar %-delta field with no series/slope behind it (e.g.
+    ``ctl_pct_change_14d``) — routing this through ``trend_direction`` would
+    be shape-incoherent, hence a separate classifier.
+
+    ``None`` -> ``"no data"``; ``abs(pct_change) <= flat_pct`` -> ``"flat"``
+    (inclusive); sign otherwise.
+    """
+    if pct_change is None:
+        return "no data"
+    if abs(pct_change) <= flat_pct:
+        return "flat"
+    return "rising" if pct_change > 0 else "falling"
+
+
+def baseline_position(sd_distance: float | None) -> str:
+    """Classify a signed SD distance against the current-vs-baseline bands.
+
+    Bands are **deliberately strict** (unlike ``correlation_read`` /
+    ``effect_size``'s inclusive lower bounds): exactly ``+1.0`` or ``-1.0``
+    is ``"normal"``. ``None`` -> ``"no data"``.
+    """
+    if sd_distance is None:
+        return "no data"
+    if sd_distance > BASELINE_POSITION_SD:
+        return "elevated"
+    if sd_distance < -BASELINE_POSITION_SD:
+        return "suppressed"
+    return "normal"
+
+
+def correlation_read(r: float | None) -> dict | None:
+    """Strength/direction read of a Pearson r.
+
+    ``r is None`` -> ``None`` (no strength/direction — e.g. ``correlate``'s
+    zero-variance-denominator case). Lower-bound **inclusive** thresholds:
+    ``|r| >= 0.2`` modest, ``>= 0.4`` moderate, ``>= 0.6`` strong, below 0.2
+    weak. Direction at ``r == 0.0`` is ``"positive"`` via ``>=`` (consistent
+    with ``sd_position``'s rule).
+    """
+    if r is None:
+        return None
+    abs_r = abs(r)
+    if abs_r >= CORRELATION_STRONG:
+        strength = "strong"
+    elif abs_r >= CORRELATION_MODERATE:
+        strength = "moderate"
+    elif abs_r >= CORRELATION_MODEST:
+        strength = "modest"
+    else:
+        strength = "weak"
+    direction = "positive" if r >= 0 else "negative"
+    return {"strength": strength, "direction": direction}
+
+
+def effect_size(
+    mean_a: float | None, mean_b: float | None,
+    sd_a: float | None, sd_b: float | None,
+    n_a: int | None, n_b: int | None,
+) -> dict | None:
+    """``delta_pct`` + Cohen's d read between two samples (pooled SD).
+
+    ``delta_pct = (mean_a - mean_b) / mean_b * 100`` — matching
+    ``compare_periods``'s ``delta_mean_a_minus_b`` a-minus-b direction.
+
+    Degrades **per-field**, not whole-function: whole-``None`` only when ALL
+    six inputs are ``None`` (unreachable from ``compare_periods``, whose
+    ``_stats`` always returns an int ``n`` — kept as a pure-function contract
+    for direct callers/tests). Otherwise: ``delta_pct`` needs only the two
+    means (``None`` only when ``mean_b`` is 0/None or ``mean_a`` is ``None``)
+    and is computed even when the SDs/ns can't support a d;
+    ``cohens_d``/``magnitude`` are ``None`` when either SD is 0/None or
+    either ``n < 2``. Magnitude bands are lower-bound inclusive: ``|d| >=
+    0.2`` small, ``>= 0.5`` moderate, ``>= 0.8`` large, below 0.2 negligible.
+    """
+    if (mean_a is None and mean_b is None and sd_a is None and sd_b is None
+            and n_a is None and n_b is None):
+        return None
+
+    delta_pct = None
+    if mean_a is not None and mean_b:
+        delta_pct = (mean_a - mean_b) / mean_b * 100
+
+    cohens_d = None
+    magnitude = None
+    sds_ok = sd_a not in (None, 0) and sd_b not in (None, 0)
+    ns_ok = n_a is not None and n_b is not None and n_a >= 2 and n_b >= 2
+    means_ok = mean_a is not None and mean_b is not None
+    if sds_ok and ns_ok and means_ok:
+        pooled_sd = (((n_a - 1) * sd_a ** 2 + (n_b - 1) * sd_b ** 2) / (n_a + n_b - 2)) ** 0.5
+        if pooled_sd:
+            cohens_d = (mean_a - mean_b) / pooled_sd
+            abs_d = abs(cohens_d)
+            if abs_d >= COHENS_D_LARGE:
+                magnitude = "large"
+            elif abs_d >= COHENS_D_MODERATE:
+                magnitude = "moderate"
+            elif abs_d >= COHENS_D_SMALL:
+                magnitude = "small"
+            else:
+                magnitude = "negligible"
+
+    return {"delta_pct": delta_pct, "cohens_d": cohens_d, "magnitude": magnitude}
+
+
+def sd_position(value: float | None, mean: float | None, sd: float | None) -> dict | None:
+    """Signed SD distance + direction of ``value`` against ``mean``/``sd``.
+
+    ``None`` when ``value``/``mean``/``sd`` is missing or ``sd`` is 0 (no
+    ``ZeroDivisionError``). Direction at a delta of exactly 0 is ``"above"``
+    via ``>=`` (``value >= mean`` -> ``"above"``) — effectively unreachable
+    in sane calls (``find_anomalies``'s SQL requires
+    ``ABS(value - mean) > sd * threshold``; ``_rhr_anomalies`` requires
+    ``> 2*sd``), but defined and pinned regardless.
+    """
+    if value is None or mean is None or not sd:
+        return None
+    sd_distance = (value - mean) / sd
+    direction = "above" if value >= mean else "below"
+    return {"sd_distance": sd_distance, "direction": direction}

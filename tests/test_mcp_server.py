@@ -35,6 +35,47 @@ def _seed_db() -> Path:
     return p
 
 
+# --- 3c: _render_status renders sleep_seconds via units.format_hm ---------
+
+def test_render_status_sleep_row_uses_format_hm():
+    # 3c: the sleep_seconds row must render as "7h 33m" (units.format_hm),
+    # not the raw seconds int and not format_duration's "7:33:00" shape.
+    status = {
+        "date": "2026-07-12",
+        "metrics": [
+            {
+                "metric": "sleep_seconds", "value": 27180, "treatment": "baseline_delta",
+                "baseline": 25500.0, "delta_pct": 6.6, "arrow": "↑",
+                "value_formatted": "7h 33m", "baseline_formatted": "7h 05m",
+            },
+        ],
+        "training_load": {"ctl": None, "atl": None, "tsb": None,
+                           "interpretation": "no training-load data yet"},
+        "recent_workouts": [],
+    }
+    text = mcp_server._render_status(status)
+    assert "7h 33m" in text
+    assert "7h 05m" in text
+    assert "27180" not in text
+    assert "25500" not in text
+
+
+def test_render_status_falls_back_to_raw_value_when_unformatted():
+    # A metric with no value_formatted key (every metric but sleep_seconds)
+    # renders its raw value exactly as before.
+    status = {
+        "date": "2026-07-12",
+        "metrics": [
+            {"metric": "steps", "value": 9000, "treatment": "raw"},
+        ],
+        "training_load": {"ctl": None, "atl": None, "tsb": None,
+                           "interpretation": "no training-load data yet"},
+        "recent_workouts": [],
+    }
+    text = mcp_server._render_status(status)
+    assert "9000" in text
+
+
 # --- prompts: coach + brief both advertised and resolve -------------------
 
 def test_list_prompts_includes_coach_and_brief():
@@ -261,7 +302,11 @@ def test_tool_call_returns_unwrapped_content():
     assert result.isError is not True
     assert result.content and result.content[0].type == "text"
     payload = json.loads(result.content[0].text)
-    assert "recent_days" in payload  # the real handler's shape, not re-wrapped
+    # Fix B (2026-07-10 doc): get_today_status now delegates to
+    # status.assemble_status(); "recent_days" doesn't exist on that shape
+    # anymore. "training_load" is a key assemble_status() always guarantees
+    # (present even on an empty DB — see status.assemble_status's docstring).
+    assert "training_load" in payload  # the real handler's shape, not re-wrapped
 
 
 # --- allowed_hosts env parsing --------------------------------------------
@@ -365,10 +410,13 @@ def _tools_list_body() -> str:
 
 
 def test_mcp_http_transport_excludes_local_only_tools():
-    # INV-T9: an authed tools/list call over the real /mcp/ HTTP transport
-    # must never include generate_brief_report/generate_chart — a
-    # phone-triggered call over this transport would get back a
-    # container-internal path with no way to retrieve the file.
+    # INV-T9 (rewritten per Fix A, 2026-07-10 doc): an authed tools/list call
+    # over the real /mcp/ HTTP transport must exclude generate_brief_report
+    # (a PDF isn't representable as MCP ImageContent, and a phone-triggered
+    # call over this transport would get back a container-internal path with
+    # no way to retrieve the file) but now MUST include generate_chart — its
+    # inline image content block sidesteps that problem, so it's reachable
+    # over the network transport too.
     from starlette.testclient import TestClient
     app = _make_app(token="secret", hosts=["fitness.home.local", "testserver"])
     auth = {**_HDRS, "Authorization": "Bearer secret"}
@@ -382,19 +430,22 @@ def test_mcp_http_transport_excludes_local_only_tools():
         names = {t["name"] for t in payload["result"]["tools"]}
         assert names == {t.name for t in agent_tools.ALL_TOOLS}
         assert "generate_brief_report" not in names
-        assert "generate_chart" not in names
+        assert "generate_chart" in names
 
 
 def test_build_server_with_local_only_tools_serves_both():
     # INV-T10: the exact call run_stdio() makes — build_server(extra_tools=
-    # agent_tools.LOCAL_ONLY_TOOLS) — serves both local-only tool names.
+    # agent_tools.LOCAL_ONLY_TOOLS) — serves ALL_TOOLS plus whatever's still
+    # local-only. Post-Fix A, LOCAL_ONLY_TOOLS shrank to just
+    # {generate_brief_report} (generate_chart moved into ALL_TOOLS), so this
+    # union is now idempotent for generate_chart specifically — it no longer
+    # demonstrates local-only reachability for that tool, just that the
+    # union still holds correctly with a smaller LOCAL_ONLY_TOOLS.
     server = mcp_server.build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
     handler = server.request_handlers[types.ListToolsRequest]
     res = asyncio.run(handler(types.ListToolsRequest(method="tools/list")))
     served = {t.name for t in res.root.tools}
-    assert served == {t.name for t in agent_tools.ALL_TOOLS} | {
-        "generate_brief_report", "generate_chart",
-    }
+    assert served == {t.name for t in agent_tools.ALL_TOOLS} | {"generate_brief_report"}
 
 
 def test_spa_catchall_does_not_shadow_mcp():
