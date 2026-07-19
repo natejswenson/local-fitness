@@ -137,6 +137,18 @@ def recompute_baselines(lookback: int):
     click.echo(f"Recomputed baselines for {n} dates.")
 
 
+def _notify(message: str) -> None:
+    """Best-effort macOS notification (no-op failure on other platforms)."""
+    subprocess.run(
+        [
+            "osascript",
+            "-e",
+            f'display notification "{message}" with title "fitness"',
+        ],
+        check=False,
+    )
+
+
 @main.command()
 @click.option("--no-pull", is_flag=True, help="Skip the pull step")
 @click.option("--no-notify", is_flag=True, help="Skip the macOS notification")
@@ -147,17 +159,20 @@ def brief(no_pull: bool, no_notify: bool, opus: bool):
         result = daily_ingest.pull()
         click.echo(f"Pull: {result['status']} ({result['days_pulled']} days)")
     baselines.recompute()
-    path = briefing_mod.generate_and_save(model=OPUS if opus else SONNET)
+    try:
+        path = briefing_mod.generate_and_save(model=OPUS if opus else SONNET)
+    except Exception:
+        # A failed generation used to be signaled only by the ABSENCE of the
+        # success notification — invisible at 06:30. Fire a distinct failure
+        # notification so a missed brief is a signal, not silence, then
+        # re-raise so launchd still records a non-zero exit and the full
+        # traceback still lands in brief.launchd.err.log.
+        if not no_notify:
+            _notify("Brief generation FAILED — check logs/brief.launchd.err.log")
+        raise
     click.echo(f"Brief written to: {path}")
     if not no_notify:
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                'display notification "Today\'s brief is ready" with title "fitness"',
-            ],
-            check=False,
-        )
+        _notify("Today's brief is ready")
 
 
 @main.group()

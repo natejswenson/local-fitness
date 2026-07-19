@@ -13,6 +13,8 @@ from pathlib import Path
 
 from mcp import types
 
+from datetime import date as _dt_date
+
 from local_fitness import db
 from local_fitness.agent import tools as agent_tools
 from local_fitness.web import mcp_server
@@ -508,3 +510,57 @@ def test_instructions_fail_open_on_resolve_error(monkeypatch):
     monkeypatch.setattr(mcp_server.coach, "resolve_coach_profile", _boom)
     opts = server.create_initialization_options()  # must not raise
     assert opts.instructions is None
+
+
+def test_read_brief_resource_stale_brief_carries_warning_banner(monkeypatch, tmp_path):
+    # A brief older than today must lead with a STALE banner — without it, a
+    # client on a failed-generation morning silently reads a days-old brief
+    # as current (2026-07-19 facet review: three consecutive missed briefs
+    # were invisible from the MCP surface).
+    _seed_db()
+    bdir = tmp_path / "briefings"
+    bdir.mkdir()
+    (bdir / "2026-06-01.json").write_text(
+        json.dumps({
+            "date": "2026-06-01",
+            "user_name": "Nate",
+            "takeaways": [{
+                "headline": "Old news",
+                "summary": "s",
+                "tone": "positive",
+                "details": "d",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mcp_server, "DEFAULT_BRIEFINGS_DIR", bdir)
+    md = mcp_server._latest_brief_markdown()
+    stale_days = (_dt_date.today() - _dt_date(2026, 6, 1)).days
+    assert f"STALE — this brief is {stale_days} day(s) old" in md
+    assert "written for 2026-06-01" in md
+    # Banner precedes the first takeaway so it can't be missed.
+    assert md.index("STALE") < md.index("Old news")
+
+
+def test_read_brief_resource_todays_brief_has_no_stale_banner(monkeypatch, tmp_path):
+    _seed_db()
+    bdir = tmp_path / "briefings"
+    bdir.mkdir()
+    today = _dt_date.today().isoformat()
+    (bdir / f"{today}.json").write_text(
+        json.dumps({
+            "date": today,
+            "user_name": "Nate",
+            "takeaways": [{
+                "headline": "Fresh",
+                "summary": "s",
+                "tone": "positive",
+                "details": "d",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mcp_server, "DEFAULT_BRIEFINGS_DIR", bdir)
+    md = mcp_server._latest_brief_markdown()
+    assert "STALE" not in md
+    assert "Fresh" in md

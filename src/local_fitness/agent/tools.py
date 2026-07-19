@@ -2244,7 +2244,7 @@ async def generate_brief_report(args: dict) -> dict:
     if plan_section is not None and plan_section["today"] is not None:
         profile = coach.resolve_coach_profile()
         try:
-            coaching_line = await plan_coach.generate_coaching_line(
+            coaching_line = await plan_coach.generate_coaching_line_cached(
                 profile,
                 plan_section["today"],
                 plan_section["last_7_days"],

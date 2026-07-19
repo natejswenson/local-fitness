@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-19
+
+Driven by a four-facet review (accuracy / completeness / efficiency /
+agent UX) of three weeks of real interaction transcripts and launchd logs,
+which found the nightly brief silently failing on ~half its runs.
+
+### Fixed
+- **Nightly brief no longer dies on one bad SDK stream.** The Agent SDK
+  stream was observed dying two ways (idle-out with zero output after
+  3–5 minutes; subprocess crash mid-stream) and a single failure cost the
+  whole day's brief — 5 of the 8 mornings before this release had no
+  brief. `generate_and_save` now makes up to 3 attempts (transient
+  failures routinely succeed on retry), and a per-message idle watchdog
+  (`_iter_with_idle_timeout`, 120s) kills a hung stream fast instead of
+  letting it burn minutes producing nothing. Env knobs:
+  `LOCAL_FITNESS_BRIEF_IDLE_TIMEOUT_S` / `_BRIEF_MAX_ATTEMPTS` /
+  `_BRIEF_RETRY_DELAY_S`.
+- **Empty generator output now reports the real cause.** chars=0 used to
+  fall into the JSON parser and surface as "no JSON found in agent
+  response:" — pointing at the parser (and the credential, per the old
+  docs) when the stream had died. The empty case now gets its own
+  diagnostic before parsing is attempted.
+- **Grounding invention-rate signal un-saturated.** The advisory
+  brief-grounding monitor was pinned at 1.000 by cross-unit false
+  positives (an HR cap of 140 bpm "matching" a 147% steps-vs-goal value
+  within the NEARBY band), making it useless for catching real
+  inventions. Matching is now kind-partitioned: percent-suffixed prose
+  tokens compare only against percent pool values, plain magnitudes only
+  against plain.
+
+### Added
+- **Brief failure is now a signal, not silence.** `fitness brief` fires a
+  distinct macOS failure notification ("Brief generation FAILED — check
+  logs…") when generation fails; previously the only failure signal was
+  the *absence* of the success notification.
+- **Brief staleness is visible from the tool surface.**
+  `assemble_status()` (→ `get_today_status` / `daily_snapshot`) now
+  carries `latest_brief_date` + `brief_stale_days`, and the
+  `fitness://brief/latest` MCP resource leads with a "⚠ STALE — N day(s)
+  old" banner when serving a brief older than today. The "orphaned sync"
+  failure (pull succeeded, brief didn't) was previously detectable only
+  by manually comparing dates.
+- **PDF coaching line cached per input-set.**
+  `plan_coach.generate_coaching_line_cached` keys a single-entry disk
+  cache on the pure `build_prompt` output — 9 same-day PDF renders were
+  observed making 9 identical SDK round-trips for the same one-line
+  paragraph. Failures are never cached; any input change regenerates.
+
 ## [0.22.2] - 2026-07-13
 
 ### Fixed

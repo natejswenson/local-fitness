@@ -27,7 +27,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .. import db, notes
-from . import interpret, units
+from . import briefs, interpret, units
 from .tools import DAILY_NUMERIC_METRICS
 
 # Explicit metric → (baseline mean column, baseline sd column | None). Do NOT
@@ -199,6 +199,34 @@ def _recent_workouts(conn, limit: int = 5) -> list[dict[str, Any]]:
     return out
 
 
+def _latest_brief_freshness(today: str) -> tuple[str | None, int | None]:
+    """``(latest_brief_date, brief_stale_days)`` from the briefings dir.
+
+    Filename-only (``YYYY-MM-DD.json`` sorts lexically == chronologically) —
+    no JSON parse, so the snapshot hot path pays a directory listing, not a
+    pydantic validation. Surfaces the "orphaned sync" failure the 2026-07-19
+    facet review found undetectable from the tool surface: pull advances the
+    data frontier but brief generation fails, and until this field existed the
+    only way to notice was manually comparing the newest brief's date against
+    the newest daily row. ``(None, None)`` when no briefs exist; never raises.
+    """
+    briefings_dir = briefs.DEFAULT_BRIEFINGS_DIR
+    try:
+        dates = []
+        for p in briefings_dir.glob("*.json"):
+            try:
+                dates.append(date.fromisoformat(p.stem))
+            except ValueError:
+                continue  # tmp/junk filename — not a brief, not a poison pill
+        if not dates:
+            return None, None
+        latest = max(dates)
+        stale = (date.fromisoformat(today) - latest).days
+        return latest.isoformat(), max(0, stale)
+    except (OSError, ValueError):
+        return None, None
+
+
 def assemble_status(today: str | None = None) -> dict[str, Any]:
     """Assemble the daily snapshot. Pure read; never raises on an empty DB.
 
@@ -207,7 +235,10 @@ def assemble_status(today: str | None = None) -> dict[str, Any]:
     bare callers are unchanged.
 
     Returns a dict with keys: ``date``, ``metrics``, ``training_load``,
-    ``recent_workouts``, ``user_notes``.
+    ``recent_workouts``, ``user_notes``, ``latest_brief_date``,
+    ``brief_stale_days`` (days between ``today`` and the newest saved brief;
+    0 = today's brief exists, ``None`` = no briefs on disk — >0 means the
+    nightly generation has been failing).
     """
     today = today or date.today().isoformat()
     with db.connect() as conn:
@@ -217,6 +248,7 @@ def assemble_status(today: str | None = None) -> dict[str, Any]:
         recent_workouts = _recent_workouts(conn)
 
     user_notes = [n.text for n in notes.read_notes() if n.text]
+    latest_brief_date, brief_stale_days = _latest_brief_freshness(today)
 
     return {
         "date": today,
@@ -224,4 +256,6 @@ def assemble_status(today: str | None = None) -> dict[str, Any]:
         "training_load": training_load,
         "recent_workouts": recent_workouts,
         "user_notes": user_notes,
+        "latest_brief_date": latest_brief_date,
+        "brief_stale_days": brief_stale_days,
     }
