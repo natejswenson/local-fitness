@@ -351,3 +351,85 @@ def test_ground_coaching_line_days_to_race_cited_in_prose_typically_skipped():
     # still flag).
     text = "71 days to your 10k -- stay the course."
     assert plan_coach.ground_coaching_line(text, _PLAN_SECTION) == []
+
+
+# --- generate_coaching_line_cached (2026-07-19 facet review) -----------------
+# 9 PDF renders in one day fired 9 identical SDK round-trips for the same
+# one-line paragraph. The cache keys on the pure build_prompt output, so
+# identical inputs reuse the line and any input change regenerates.
+
+def _fake_generator(lines):
+    """A stand-in for generate_coaching_line that pops from ``lines`` and
+    counts calls."""
+    calls = {"n": 0}
+
+    async def fake(profile, today_workout, last_7_days, adherence_pct,
+                   days_to_race, goal_type, *, model=None, timeout=30.0,
+                   notes_text=None):
+        calls["n"] += 1
+        result = lines[calls["n"] - 1]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    return fake, calls
+
+
+def test_cached_line_reused_for_identical_inputs(monkeypatch, tmp_path):
+    fake, calls = _fake_generator(["Get out the door."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+    first = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    second = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert first == second == "Get out the door."
+    assert calls["n"] == 1  # second render never touched the SDK
+
+
+def test_cache_regenerates_when_any_input_changes(monkeypatch, tmp_path):
+    fake, calls = _fake_generator(["Line A.", "Line B."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+
+    a = asyncio.run(plan_coach.generate_coaching_line_cached(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k", cache_path=cache))
+    b = asyncio.run(plan_coach.generate_coaching_line_cached(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 90, 12, "10k", cache_path=cache))
+    assert (a, b) == ("Line A.", "Line B.")
+    assert calls["n"] == 2
+
+
+def test_generation_failure_is_not_cached(monkeypatch, tmp_path):
+    fake, calls = _fake_generator([RuntimeError("SDK down"), "Recovered line."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+
+    with pytest.raises(RuntimeError, match="SDK down"):
+        asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert not cache.exists()  # the failure left nothing behind
+
+    recovered = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert recovered == "Recovered line."
+    assert calls["n"] == 2
+    # And the recovery IS cached for the next render.
+    again = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert again == "Recovered line."
+    assert calls["n"] == 2
+
+
+def test_corrupt_cache_file_is_ignored_and_rewritten(monkeypatch, tmp_path):
+    fake, calls = _fake_generator(["Clean line."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+    cache.write_text("{ not json at all", encoding="utf-8")
+
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+    line = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert line == "Clean line."
+    assert calls["n"] == 1
+    # Cache healed: the entry now round-trips.
+    import json as _json
+    entry = _json.loads(cache.read_text(encoding="utf-8"))
+    assert entry["line"] == "Clean line."

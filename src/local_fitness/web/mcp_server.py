@@ -15,6 +15,7 @@ Design: ``docs/plans/2026-06-16-fitness-mcp-server-design.md``.
 from __future__ import annotations
 
 import os
+from datetime import date
 from typing import Any
 
 from mcp import types
@@ -146,8 +147,26 @@ def _render_schema_resource() -> str:
 
 
 def _render_brief(brief: Brief) -> str:
-    """Markdown rendering of a persisted ``Brief`` (latest morning brief)."""
+    """Markdown rendering of a persisted ``Brief`` (latest morning brief).
+
+    When the brief is older than today, a stale warning leads the render:
+    the resource always serves the most-recent brief on disk, so without the
+    banner a client on a failed-generation morning silently reads a days-old
+    brief as if it were current (2026-07-19 facet review — three consecutive
+    missed briefs were invisible from the MCP surface)."""
     lines: list[str] = [f"# Morning brief — {brief.date}", ""]
+    try:
+        stale_days = (date.today() - date.fromisoformat(brief.date)).days
+    except ValueError:
+        stale_days = 0
+    if stale_days > 0:
+        lines.append(
+            f"> ⚠️ STALE — this brief is {stale_days} day(s) old "
+            f"(written for {brief.date}; today is {date.today().isoformat()}). "
+            "The nightly generation has likely been failing; run "
+            "`fitness brief` and check `logs/brief.launchd.err.log`."
+        )
+        lines.append("")
     if brief.generated_at:
         lines.append(f"_Generated {brief.generated_at}_")
         lines.append("")

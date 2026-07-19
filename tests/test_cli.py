@@ -350,3 +350,43 @@ def test_help_lists_subcommands(runner):
     assert result.exit_code == 0
     for cmd in ("pull", "backfill", "brief", "status", "config"):
         assert cmd in result.output
+
+
+def test_brief_failure_fires_distinct_failure_notification(runner, monkeypatch):
+    # A failed generation used to be signaled only by the ABSENCE of the
+    # success notification. Now it must fire a failure notification and still
+    # exit non-zero so launchd records the failure.
+    notified: list[str] = []
+    monkeypatch.setattr(cli.baselines, "recompute", lambda: 0)
+
+    def boom(*, model):
+        raise ValueError("stream died")
+
+    monkeypatch.setattr(cli.briefing_mod, "generate_and_save", boom)
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda cmd, **kw: notified.append(" ".join(cmd)))
+
+    result = runner.invoke(cli.main, ["brief", "--no-pull"])
+    assert result.exit_code != 0
+    assert len(notified) == 1
+    assert "FAILED" in notified[0]
+    assert "brief.launchd.err.log" in notified[0]
+    assert "ready" not in notified[0]
+
+
+def test_brief_failure_with_no_notify_stays_silent(runner, monkeypatch):
+    notified: list[str] = []
+    monkeypatch.setattr(cli.baselines, "recompute", lambda: 0)
+
+    def boom(*, model):
+        raise ValueError("stream died")
+
+    monkeypatch.setattr(cli.briefing_mod, "generate_and_save", boom)
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda cmd, **kw: notified.append(" ".join(cmd)))
+
+    result = runner.invoke(cli.main, ["brief", "--no-pull", "--no-notify"])
+    assert result.exit_code != 0
+    assert notified == []

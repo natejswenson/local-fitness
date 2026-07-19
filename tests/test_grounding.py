@@ -168,3 +168,40 @@ def test_classify_against_pool_bands(value, verdict):
     assert got_verdict == verdict
     assert near_name == "rhr"
     assert near_val == 58.0
+
+
+# --- kind-partitioned matching (2026-07-19 facet review) ---------------------
+# Cross-unit magnitude collisions pinned production invention_rate at 1.000:
+# an HR cap of 140 bpm flagged against a 147% steps-vs-goal value, a 94.7 run
+# load flagged against a 101% percentage. Percent tokens and plain magnitudes
+# are separate matching kinds now.
+
+def test_plain_prose_number_never_matches_percent_pool_value():
+    # The exact production false positive: "keep HR under 140" vs 147% of goal.
+    ctx = _ctx(snapshot=[GroundedValue(
+        name="avg_frac_of_goal", value=147, unit="pct", display="147% of goal")])
+    assert g.flag(_brief("keep HR under 140 today"), ctx) == []
+
+
+def test_percent_prose_number_never_matches_plain_pool_value():
+    # 92% in prose sits near a plain 94.7 load — cross-kind, must not flag.
+    ctx = _ctx(snapshot=[GroundedValue(
+        name="run_load", value=94.7, unit="none", display="94.7")])
+    assert g.flag(_brief("you closed 92% of the gap"), ctx) == []
+
+
+def test_percent_token_still_flags_against_offset_percent_value():
+    # Same-kind near-miss must STILL flag: 78% cited when the real value is 82%.
+    ctx = _ctx(snapshot=[GroundedValue(
+        name="sleep_score", value=82, unit="pct", display="82%")])
+    flags = g.flag(_brief("sleep quality landed at 78% overnight"), ctx)
+    assert len(flags) == 1
+    assert flags[0].nearest_metric == "sleep_score"
+    assert flags[0].token == "78%"
+    assert flags[0].delta == -4.0
+
+
+def test_faithful_percent_citation_is_not_flagged():
+    ctx = _ctx(snapshot=[GroundedValue(
+        name="sleep_score", value=82, unit="pct", display="82%")])
+    assert g.flag(_brief("sleep quality held at 82% overnight"), ctx) == []

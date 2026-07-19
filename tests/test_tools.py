@@ -2330,7 +2330,7 @@ def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
 
     async def fake_generate(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        notes_text=None,
+        *, model=None, timeout=30.0, notes_text=None,
     ):
         calls.append((today_workout, adherence_pct, days_to_race, goal_type, notes_text))
         return "Go hit today's easy 4 clean."
@@ -2423,7 +2423,7 @@ def test_generate_brief_report_threads_saved_notes_into_coaching_line(
 
     async def fake_generate(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        notes_text=None,
+        *, model=None, timeout=30.0, notes_text=None,
     ):
         calls.append(notes_text)
         return "Go hit today's easy 4 clean."

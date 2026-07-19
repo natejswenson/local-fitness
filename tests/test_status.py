@@ -301,3 +301,49 @@ def test_sleep_row_cross_path_identity_with_brief_planner_hm(sleep_status_db):
     sleep_row = next(m for m in status["metrics"] if m["metric"] == "sleep_seconds")
     assert sleep_row["value_formatted"] == brief_planner._hm(sleep_row["value"])
     assert sleep_row["baseline_formatted"] == brief_planner._hm(sleep_row["baseline"])
+
+
+# --- brief freshness (2026-07-19 facet review: orphaned-sync detection) ------
+
+def test_brief_freshness_reports_latest_date_and_staleness(empty_db, tmp_path, monkeypatch):
+    from local_fitness.agent import briefs
+    bdir = tmp_path / "briefings"
+    bdir.mkdir()
+    (bdir / "2026-07-14.json").write_text("{}", encoding="utf-8")
+    (bdir / "2026-07-16.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", bdir)
+    s = assemble_status(today="2026-07-19")
+    assert s["latest_brief_date"] == "2026-07-16"
+    assert s["brief_stale_days"] == 3  # three mornings with no brief
+
+
+def test_brief_freshness_zero_when_todays_brief_exists(empty_db, tmp_path, monkeypatch):
+    from local_fitness.agent import briefs
+    bdir = tmp_path / "briefings"
+    bdir.mkdir()
+    (bdir / "2026-07-19.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", bdir)
+    s = assemble_status(today="2026-07-19")
+    assert s["latest_brief_date"] == "2026-07-19"
+    assert s["brief_stale_days"] == 0
+
+
+def test_brief_freshness_none_when_no_briefs(empty_db, tmp_path, monkeypatch):
+    from local_fitness.agent import briefs
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", tmp_path / "missing")
+    s = assemble_status(today="2026-07-19")
+    assert s["latest_brief_date"] is None
+    assert s["brief_stale_days"] is None
+
+
+def test_brief_freshness_ignores_non_date_junk_files(empty_db, tmp_path, monkeypatch):
+    from local_fitness.agent import briefs
+    bdir = tmp_path / "briefings"
+    bdir.mkdir()
+    (bdir / "2026-07-15.json").write_text("{}", encoding="utf-8")
+    (bdir / "zzz-not-a-date.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", bdir)
+    s = assemble_status(today="2026-07-19")
+    # The junk filename is skipped, not a poison pill — the real brief wins.
+    assert s["latest_brief_date"] == "2026-07-15"
+    assert s["brief_stale_days"] == 4

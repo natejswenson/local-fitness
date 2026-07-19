@@ -24,10 +24,16 @@ finished initializing.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
+from pathlib import Path
 
 from . import grounding
 from .coach import CoachProfile
 from .grounding import GroundingFlag
+
+_LOG = logging.getLogger(__name__)
 
 _VERDICT_PHRASE = {
     "done": "You hit yesterday's session clean.",
@@ -173,6 +179,85 @@ async def generate_coaching_line(
     if not text:
         raise RuntimeError("coaching-line generator returned an empty response")
     return text
+
+
+def _cache_path() -> Path:
+    """The single-entry coaching-line cache, kept next to the SQLite DB (the
+    per-deployment data directory — already gitignored, already the one
+    host/container-shared writable location)."""
+    from .. import db  # lazy: keep module import-cost near zero (module docstring)
+
+    return db.DEFAULT_DB_PATH.parent / "plan_coach_cache.json"
+
+
+def _read_cached_line(path: Path, key: str) -> str | None:
+    """The cached line if ``path`` holds an entry for exactly ``key``; else
+    None. Tolerates a missing/corrupt cache file — never raises."""
+    try:
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(entry, dict) and entry.get("key") == key:
+            line = entry.get("line")
+            if isinstance(line, str) and line:
+                return line
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _write_cached_line(path: Path, key: str, line: str) -> None:
+    """Best-effort single-entry cache write (latest key wins). A cache write
+    failure must never fail the PDF render — swallow and log."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"key": key, "line": line}), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        _LOG.warning("plan_coach cache write failed (ignored)", exc_info=True)
+
+
+async def generate_coaching_line_cached(
+    profile: CoachProfile,
+    today_workout: dict,
+    last_7_days: list[dict],
+    adherence_pct: int,
+    days_to_race: int | None,
+    goal_type: str,
+    *,
+    model: str | None = None,
+    timeout: float = 30.0,
+    notes_text: str | None = None,
+    cache_path: Path | None = None,
+) -> str:
+    """``generate_coaching_line`` behind a single-entry disk cache.
+
+    The 2026-07-19 facet review counted 9 PDF renders on one day with
+    byte-identical inputs — 9 separate LLM round-trips for the same one-line
+    paragraph. ``build_prompt`` is pure, so the (system, user) prompt pair
+    fully captures every input (prescription, week, adherence, notes, voice);
+    its hash is the cache key. Same key → the cached line, no SDK call; any
+    input change (new day, edited plan, new note) → a fresh generation. Only
+    successful generations are cached — a fallback line is never stored, so a
+    transient SDK failure doesn't pin a template line for the rest of the day.
+    """
+    system_prompt, user_prompt = build_prompt(
+        profile, today_workout, last_7_days, adherence_pct, days_to_race,
+        goal_type, notes_text=notes_text,
+    )
+    key = hashlib.sha256(
+        "\x00".join([system_prompt, user_prompt, model or "default"]).encode("utf-8")
+    ).hexdigest()
+    path = cache_path or _cache_path()
+    cached = _read_cached_line(path, key)
+    if cached is not None:
+        _LOG.info("plan_coach cache hit — reusing coaching line")
+        return cached
+    line = await generate_coaching_line(
+        profile, today_workout, last_7_days, adherence_pct, days_to_race,
+        goal_type, model=model, timeout=timeout, notes_text=notes_text,
+    )
+    _write_cached_line(path, key, line)
+    return line
 
 
 def fallback_coaching_line(

@@ -79,13 +79,20 @@ def _parse(token: str) -> float | None:
         return None
 
 
-def _display_numbers(gv: GroundedValue) -> list[float]:
-    """The numbers in a GroundedValue's coach-ready display (post-conversion)."""
+def _is_percent_token(token: str) -> bool:
+    """True when a numeric token is percent-suffixed ("147%")."""
+    return token.rstrip().endswith("%")
+
+
+def _display_numbers(gv: GroundedValue) -> list[tuple[float, bool]]:
+    """The ``(number, is_percent)`` pairs in a GroundedValue's coach-ready
+    display (post-conversion). The percent tag rides along so the pool can
+    keep percentages and plain magnitudes in separate matching kinds."""
     out = []
     for tok in _NUM_RE.findall(gv.display):
         v = _parse(tok)
         if v is not None:
-            out.append(v)
+            out.append((v, _is_percent_token(tok)))
     return out
 
 
@@ -100,17 +107,24 @@ def _union(context: BriefContext) -> list[GroundedValue]:
     return out
 
 
-def _grounded_pool(context: BriefContext) -> list[tuple[float, str]]:
-    """(magnitude, source-name) for every known number the prose may cite."""
-    pool: list[tuple[float, str]] = []
+def _grounded_pool(context: BriefContext) -> list[tuple[float, str, bool]]:
+    """(magnitude, source-name, is_percent) for every known number the prose
+    may cite. The percent tag exists because matching by magnitude alone
+    saturated the invention-rate signal at 1.0 with cross-unit false positives
+    — an HR cap of 140 bpm sitting within the NEARBY band of a 147%
+    steps-vs-goal value, a 94.7 run load matching a 101% percentage
+    (2026-07-19 facet review). Percent values and plain magnitudes are
+    different kinds; ``flag()`` only matches a prose token against its own
+    kind's sub-pool."""
+    pool: list[tuple[float, str, bool]] = []
     for gv in _union(context):
-        for n in _display_numbers(gv):
-            pool.append((abs(n), gv.name))
+        for n, is_pct in _display_numbers(gv):
+            pool.append((abs(n), gv.name, is_pct))
     # Scalar context numbers that are legitimate to cite but aren't GroundedValues.
     if context.step_goal is not None:
-        pool.append((float(context.step_goal), "step_goal"))
+        pool.append((float(context.step_goal), "step_goal", False))
     if context.days_to_race is not None:
-        pool.append((float(abs(context.days_to_race)), "days_to_race"))
+        pool.append((float(abs(context.days_to_race)), "days_to_race", False))
     return pool
 
 
@@ -180,10 +194,18 @@ def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
     """Advisory: prose numbers that look like a known metric but are off.
 
     Never raises, never mutates the brief. Returns [] when the context carries
-    no citable numbers (nothing to contradict)."""
-    pool = _grounded_pool(context)
-    if not pool:
+    no citable numbers (nothing to contradict).
+
+    Matching is kind-partitioned: a percent-suffixed prose token is compared
+    only against percent-valued pool entries, a plain token only against plain
+    magnitudes. Cross-kind magnitude collisions (HR 140 vs 147% of step goal)
+    are exactly the false positives that pinned invention_rate at 1.0 and made
+    the signal useless as a monitor."""
+    tagged_pool = _grounded_pool(context)
+    if not tagged_pool:
         return []
+    pct_pool = [(v, n) for v, n, is_pct in tagged_pool if is_pct]
+    plain_pool = [(v, n) for v, n, is_pct in tagged_pool if not is_pct]
     flags: list[GroundingFlag] = []
     for i, tk in enumerate(brief.takeaways):
         text = f"{tk.headline} {tk.summary} {tk.details}"
@@ -194,6 +216,9 @@ def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
             x = _parse(tok)
             if x is None:  # pragma: no cover - defensive; _NUM_RE only matches parseable tokens
                 continue
+            pool = pct_pool if _is_percent_token(tok) else plain_pool
+            if not pool:
+                continue  # no same-kind numbers to contradict
             ax = abs(x)
             near_val, near_name = _nearest(ax, pool)
             denom = max(ax, near_val, 1.0)
