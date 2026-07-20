@@ -30,7 +30,9 @@ from pydantic import ValidationError
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
-from . import briefs, charts, coach, interpret, plan_coach, report_card, units
+from . import (
+    briefs, charts, coach, interpret, plan_coach, report_card, units, workout_coach,
+)
 from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
@@ -2629,9 +2631,13 @@ async def workout_report_card(args: dict) -> dict:
         return _err(f"unknown format '{fmt}'", allowed=sorted(_REPORT_CARD_FORMATS))
     activity_id = args.get("activity_id")
 
+    # The per-sample HR trace is only worth resolving for the PDF (it can reach
+    # the network on a cache miss, and the markdown card has nowhere to plot
+    # it). format='table' therefore stays a purely local, no-network read.
     with db.connect() as conn:
         inputs = report_card.load_report_card_inputs(
-            conn, activity_id=activity_id, target_date=target_date
+            conn, activity_id=activity_id, target_date=target_date,
+            hr_trace=fmt != "table",
         )
     if inputs is None:
         return _err(
@@ -2639,8 +2645,22 @@ async def workout_report_card(args: dict) -> dict:
 
     card = report_card.build_card(
         inputs["activity"], inputs["splits"], inputs["plan_workout"],
-        inputs["reference"], inputs["context"],
+        inputs["reference"], inputs["context"], inputs.get("hr_samples"),
     )
+
+    # The coach's verbal read leads the card. Claude-generated behind the same
+    # single-entry disk cache plan_coach uses, with a deterministic template
+    # fallback — a missing credential or a dead stream costs the phrasing, never
+    # the card, since every grade in it was already computed in Python.
+    profile = coach.resolve_coach_profile()
+    try:
+        card["coach_read"] = await workout_coach.generate_read_cached(
+            profile, card, notes_text=notes.render_for_prompt())
+    except Exception:
+        LOG.warning(
+            "workout read generation failed for activity %s, using fallback",
+            inputs["activity"]["activity_id"], exc_info=True)
+        card["coach_read"] = workout_coach.fallback_read(card)
     payload = {
         "markdown": report_card.render_markdown(card),
         "activity_id": inputs["activity"]["activity_id"],
@@ -2661,7 +2681,14 @@ async def workout_report_card(args: dict) -> dict:
     from . import visuals  # lazy: defers matplotlib/weasyprint import cost
 
     split_chart: bytes | None = None
-    if card["splits"]["available"] and any(r.get("avg_hr") for r in card["splits"]["rows"]):
+    # The trace can exist without per-lap splits (backfilled activities have no
+    # splits but Garmin still holds their details), so either series is reason
+    # enough to chart.
+    has_series = bool(card.get("hr_trace")) or (
+        card["splits"]["available"]
+        and any(r.get("avg_hr") for r in card["splits"]["rows"])
+    )
+    if has_series:
         try:
             async with visuals.RENDER_LOCK:
                 split_chart = await asyncio.to_thread(visuals.render_split_hr_png, card)

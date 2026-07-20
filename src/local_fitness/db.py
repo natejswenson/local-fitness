@@ -119,6 +119,23 @@ CREATE TABLE IF NOT EXISTS activity_splits (
     PRIMARY KEY (activity_id, split_index)
 );
 
+-- Per-sample HR trace, fetched on demand (never by the daily sync) for the
+-- one activity a report card is being rendered for. Garmin's activity-details
+-- endpoint returns ~1700 samples for a 3-mile run, which is why this is NOT
+-- pulled for every activity: 747 activities x ~1700 rows to serve a feature
+-- that reads one activity at a time is a backfill nobody asked for, and the
+-- repeated detail calls are exactly the shape that trips the 429 the token
+-- cache was added to avoid. `distance_meters` is cumulative from the start of
+-- the activity — the binner needs distance, not time, to place a sample in a
+-- tenth-of-a-mile bucket.
+CREATE TABLE IF NOT EXISTS activity_hr_samples (
+    activity_id      INTEGER NOT NULL,
+    sample_index     INTEGER NOT NULL,
+    distance_meters  REAL,
+    hr               INTEGER,
+    PRIMARY KEY (activity_id, sample_index)
+);
+
 CREATE TABLE IF NOT EXISTS baselines (
     date                          TEXT PRIMARY KEY,
     rhr_60day_mean                REAL,

@@ -59,8 +59,8 @@ __all__ = [
     "grade_from_deviation", "intent_class", "infer_intent", "resolve_intent",
     "distance_deviation", "pace_deviation", "hr_deviation", "load_deviation",
     "overall_grade", "label_splits", "hr_drift_pct", "build_card",
-    "render_markdown", "reference_line", "load_report_card_inputs",
-    "rolling_reference",
+    "render_markdown", "reference_line", "gpa_explainer", "bin_hr_trace",
+    "load_report_card_inputs", "rolling_reference",
 ]
 
 # 1 international mile, exactly — matches units.py's constant.
@@ -75,6 +75,10 @@ MIN_REFERENCE_ACTIVITIES = 5
 REFERENCE_WINDOW_DAYS = 60
 # Advisory only: a 2x-median load day is a fact worth printing, not an F.
 LOAD_SPIKE_FACTOR = 2.0
+# Bucket width for the per-sample HR trace chart. A tenth of a mile is fine
+# enough to show where a run actually turned over, coarse enough that a
+# 3-mile run yields ~31 readable bars rather than 1700.
+HR_TRACE_BIN_MI = 0.1
 
 # The one band table. `d` is a non-negative relative deviation; every metric
 # reduces to one, which is why there is exactly one grader.
@@ -346,6 +350,61 @@ def label_splits(splits: list[dict]) -> dict:
     }
 
 
+def bin_hr_trace(
+    samples: list[tuple[float, int]], bin_mi: float = HR_TRACE_BIN_MI
+) -> list[dict]:
+    """Average HR per fixed distance bucket, from a cumulative-distance trace.
+
+    `samples` is `(cumulative_distance_m, hr)` in order, as
+    `ingest.details.parse_hr_samples` returns it. Each sample lands in the
+    bucket its distance falls in and every bucket reports the MEAN of its
+    samples — not the last value, which would turn the chart into a sampling
+    artifact rather than a summary.
+
+    Sampling is time-based (roughly every few seconds), so a bucket's sample
+    count varies with pace: a slow tenth collects more samples than a fast one.
+    That is correct — each bucket answers "what was my HR over this stretch of
+    ground", and a stretch you spent longer on legitimately has more evidence.
+
+    The trailing bucket is almost always short (a 3.06-mile run ends 0.06 into
+    its 31st tenth). It is kept and flagged `partial`, the same convention
+    `label_splits` uses, so the renderer can de-emphasize it instead of
+    presenting a fragment as a full interval.
+    """
+    if not samples or bin_mi <= 0:
+        return []
+
+    bin_m = bin_mi * MILE_M
+    buckets: dict[int, list[int]] = {}
+    for distance_m, hr in samples:
+        if distance_m is None or distance_m < 0:
+            continue
+        buckets.setdefault(int(distance_m // bin_m), []).append(hr)
+    if not buckets:
+        return []
+
+    total_m = max(d for d, _ in samples)
+    last = max(buckets)
+    rows: list[dict] = []
+    for idx in range(last + 1):
+        hrs = buckets.get(idx)
+        if not hrs:
+            # A gap (GPS dropout, paused watch) — skip rather than plot a zero.
+            continue
+        start_mi = idx * bin_mi
+        # The final bucket ends where the activity does, not at a full bin.
+        end_mi = min((idx + 1) * bin_mi, total_m / MILE_M)
+        rows.append({
+            "index": idx + 1,
+            "start_mi": round(start_mi, 3),
+            "end_mi": round(end_mi, 3),
+            "avg_hr": round(sum(hrs) / len(hrs)),
+            "samples": len(hrs),
+            "partial": (end_mi - start_mi) < bin_mi * (1 - MILE_TOLERANCE),
+        })
+    return rows
+
+
 def hr_drift_pct(full_rows: list[dict]) -> float | None:
     """Back-half mean HR vs front-half mean HR, as a percentage. Displayed as
     context, never graded — cardiac drift is expected on a long run and is not
@@ -380,9 +439,15 @@ def build_card(
     plan_workout: dict | None,
     reference: dict,
     context: dict | None = None,
+    hr_samples: list[tuple[float, int]] | None = None,
 ) -> dict:
     """Assemble the full report card. Pure — every input is a plain dict, so
-    the whole rubric is testable without a DB."""
+    the whole rubric is testable without a DB.
+
+    ``hr_samples`` is the optional per-sample ``(distance_m, hr)`` trace. Like
+    ``splits`` it is presentation-only: no grade reads it, so a card renders
+    identically whether or not the trace was available.
+    """
     intent, intent_source = resolve_intent(activity, plan_workout, reference)
     cls = intent_class(intent)
     has_rolling = reference.get("mode") == "rolling_60d"
@@ -456,6 +521,7 @@ def build_card(
         "metrics": metrics,
         "overall": overall_grade(metrics),
         "splits": label_splits(splits),
+        "hr_trace": bin_hr_trace(hr_samples or []),
         "context": context or {},
     }
 
@@ -510,6 +576,48 @@ def _delta_text(key: str, metric: dict) -> str:
     return f"{(actual / expected - 1) * 100:+.0f}%"
 
 
+def gpa_explainer(card: dict) -> str:
+    """One line stating how the overall GPA was actually computed.
+
+    The card shows a number to two decimals; that number has to be
+    reconstructible from the letters printed above it, or it reads as an
+    oracle. Lists only the metrics that were actually graded, with the weights
+    ACTUALLY used — an n/a metric drops out and the rest renormalize, so the
+    static 30/30/25/15 table would be a lie on a card with a missing metric.
+
+    States plainly that +/- modifiers don't move the number: they are a
+    within-band position cue, and a reader doing the arithmetic with B- as 2.7
+    would not reproduce the printed GPA.
+    """
+    overall = card["overall"]
+    if overall.get("gpa") is None:
+        return ""
+
+    graded = [(k, label) for k, label in _METRIC_LABELS
+              if card["metrics"][k].get("grade") and k in METRIC_WEIGHTS]
+    if not graded:
+        return ""
+    total_w = sum(METRIC_WEIGHTS[k] for k, _ in graded)
+    # Independently-rounded shares sum to 99% or 101% often enough to matter in
+    # a line whose whole job is letting the reader reproduce the number. The
+    # last share absorbs the rounding remainder so they always total 100.
+    pcts = [round(100 * METRIC_WEIGHTS[k] / total_w) for k, _ in graded]
+    pcts[-1] = 100 - sum(pcts[:-1])
+    parts = []
+    for (key, label), pct in zip(graded, pcts):
+        letter = base_letter(card["metrics"][key]["grade"])
+        parts.append(f"{label} {letter} ({GRADE_POINTS[letter]:.0f}) x {pct}%")
+
+    tail = ""
+    if len(graded) < len(METRIC_WEIGHTS):
+        tail = (f" {len(METRIC_WEIGHTS) - len(graded)} metric(s) were n/a, so the "
+                "remaining weights were rescaled to 100%.")
+    return (f"GPA is a weighted 4.0 scale (A=4, B=3, C=2, D=1, F=0): "
+            f"{' + '.join(parts)} = {overall['gpa']:.2f} → {overall['grade']}. "
+            f"Plus/minus marks position inside a band and does not move the "
+            f"number.{tail}")
+
+
 def reference_line(card: dict, *, markdown: bool = True) -> str:
     """One sentence naming the yardstick. The card must never leave this
     ambiguous — the same run grades differently under a plan than under the
@@ -553,11 +661,22 @@ def render_markdown(card: dict) -> str:
         f"in {units.format_duration(act.get('duration_seconds')) or '—'} · "
         f"{_fmt_pace(act.get('avg_pace_sec_per_km'))}",
         "",
+    ]
+    # The coach's read leads, above the grades — a person wants to be told how
+    # the run went before being shown the table that proves it. Absent when
+    # the caller didn't generate one (format='table', or a failed SDK call
+    # with no fallback), in which case the card opens on the grade as before.
+    if card.get("coach_read"):
+        lines += [card["coach_read"], ""]
+    lines += [
         f"## Overall: {overall['grade']}{gpa}",
         "",
         reference_line(card),
         "",
     ]
+    explainer = gpa_explainer(card)
+    if explainer:
+        lines += [f"_{explainer}_", ""]
 
     rows = []
     for key, label in _METRIC_LABELS:
@@ -589,20 +708,22 @@ def render_markdown(card: dict) -> str:
         avg_hr = act.get("avg_hr")
         split_rows = []
         for r in card["splits"]["rows"]:
+            # The label already carries the partial lap's distance, which is
+            # why there is no Distance column: for every full lap it would
+            # read "1.00 mi" beside a column literally headed "Mile".
             label = (f"{card['splits']['unit']} {r['index']}" if not r["partial"]
                      else f"final {r['distance_mi']:.2f} mi")
             hr = r.get("avg_hr")
             elev = r.get("elevation_gain_meters")
             split_rows.append([
                 label,
-                f"{r['distance_mi']:.2f} mi" if r["distance_mi"] is not None else "—",
                 f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—",
                 f"{hr} bpm" if hr else "—",
                 f"{hr - avg_hr:+d}" if hr and avg_hr else "—",
                 f"{elev:.0f} m" if elev is not None else "—",
             ])
         lines.append(render.render_table(
-            [card["splits"]["unit"], "Distance", "Pace", "Avg HR", "vs run", "Elev"],
+            [card["splits"]["unit"], "Pace", "Avg HR", "vs run", "Elev"],
             split_rows))
         drift = card["splits"]["hr_drift_pct"]
         if drift is not None:
@@ -727,8 +848,17 @@ def load_report_card_inputs(
     conn: sqlite3.Connection,
     activity_id: int | None = None,
     target_date: str | None = None,
+    *,
+    hr_trace: bool = False,
 ) -> dict | None:
-    """Every input ``build_card`` needs, or ``None`` when no activity matches."""
+    """Every input ``build_card`` needs, or ``None`` when no activity matches.
+
+    ``hr_trace=True`` additionally resolves the per-sample HR trace, which may
+    reach the network on a cache miss (see ``ingest.details.get_hr_samples``).
+    It defaults to OFF so the plain tabular path — and every existing caller —
+    stays purely local and fast; only the PDF render, which already accepts
+    seconds of latency for WeasyPrint, opts in.
+    """
     row = _select_activity(conn, activity_id, target_date)
     if row is None:
         return None
@@ -756,9 +886,16 @@ def load_report_card_inputs(
     if base is not None:
         context = {k: base[k] for k in ("ctl", "atl", "tsb")}
 
+    hr_samples: list[tuple[float, int]] = []
+    if hr_trace:
+        from ..ingest import details  # lazy: keeps garminconnect off the hot path
+
+        hr_samples = details.get_hr_samples(conn, aid)
+
     return {
         "activity": activity,
         "splits": splits,
+        "hr_samples": hr_samples,
         "plan_workout": plan_workout,
         "reference": rolling_reference(conn, activity),
         "context": context,

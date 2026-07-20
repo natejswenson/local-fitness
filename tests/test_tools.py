@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,7 +26,7 @@ import pdfplumber
 import pytest
 
 from local_fitness import db, plans
-from local_fitness.agent import interpret, tools
+from local_fitness.agent import branding, interpret, report_card, tools, visuals
 
 
 def test_text_emits_compact_json():
@@ -2840,6 +2841,102 @@ def test_report_card_path_escape_is_error(rc_seeded, reports_tmp, monkeypatch):
     payload, err = call(tools.workout_report_card, {})
     assert err
     assert "escaped reports directory" in payload["error"]
+
+
+def test_report_card_table_format_never_reaches_the_network(rc_seeded, monkeypatch):
+    """format='table' must stay a purely local read. The HR trace is the only
+    thing on this path that can hit Garmin, and a markdown card has nowhere to
+    plot it — so it must not even be resolved."""
+    from local_fitness.ingest import details
+
+    monkeypatch.setattr(
+        details, "fetch_hr_samples",
+        lambda *a, **k: pytest.fail("format='table' attempted a Garmin fetch"))
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert payload["markdown"]
+
+
+def test_report_card_pdf_resolves_the_hr_trace(rc_seeded, reports_tmp, monkeypatch):
+    """The PDF path opts into the trace, and a fetched trace is cached so the
+    second render makes no second call."""
+    from local_fitness.ingest import details
+
+    calls = []
+
+    def _fetch(activity_id):
+        calls.append(activity_id)
+        # ~0.3 mi of samples: enough for three tenth-mile buckets.
+        return [(float(i) * 40.0, 120 + i) for i in range(13)]
+
+    monkeypatch.setattr(details, "fetch_hr_samples", _fetch)
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert calls == [1]
+    _, err2 = call(tools.workout_report_card, {})
+    assert not err2
+    assert calls == [1]  # served from the SQLite cache the first render wrote
+
+
+def test_report_card_coach_read_failure_falls_back_and_still_renders(
+    rc_seeded, reports_tmp, monkeypatch, caplog
+):
+    """A dead SDK stream costs the phrasing, never the card — every grade on it
+    was computed in Python before the model was ever asked."""
+    async def _boom(*a, **k):
+        raise RuntimeError("stream died")
+
+    monkeypatch.setattr(tools.workout_coach, "generate_read_cached", _boom)
+    with caplog.at_level(logging.WARNING):
+        payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert Path(payload["path"]).read_bytes()[:5] == b"%PDF-"
+    assert any("workout read generation failed" in r.message for r in caplog.records)
+
+
+def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monkeypatch):
+    async def _read(*a, **k):
+        return "You left something out there and you know it."
+
+    monkeypatch.setattr(tools.workout_coach, "generate_read_cached", _read)
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    assert "You left something out there" in text
+    # And the GPA is reconstructible from the page, not an oracle.
+    assert "weighted 4.0 scale" in text
+
+
+def test_report_card_pdf_splits_table_has_no_distance_column(rc_seeded, reports_tmp):
+    """Dropped as duplicative: the row label already IS the distance, so a
+    Distance column printed '1.00 mi' beside a column headed 'Mile'."""
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    html_out = visuals._render_splits_html(
+        report_card.build_card(
+            {"activity_id": 1, "date": "2026-07-19", "activity_type": "running",
+             "distance_meters": 10000, "duration_seconds": 3000,
+             "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+            [{"activity_id": 1, "split_index": 0, "distance_meters": 1609.344,
+              "duration_seconds": 480, "avg_hr": 148, "avg_pace_sec_per_km": 298,
+              "elevation_gain_meters": 10}],
+            None, {"mode": "insufficient_data", "n": 0},
+        ),
+        None,
+    )
+    headers = re.findall(r"<th>(.*?)</th>", html_out)
+    assert "Distance" not in headers
+    assert headers == ["Mile", "Pace", "Avg HR", "vs run", "Elev"]
+
+
+def test_report_card_grade_column_is_left_aligned_like_the_others():
+    """Every column in both tables shares one alignment; the grade is already
+    the loudest cell by weight and size and doesn't also need a different one."""
+    css = visuals._report_card_css(branding.load_theme())
+    assert "td.metric-grade {{" not in css  # not an unformatted f-string
+    grade_rule = [ln for ln in css.splitlines() if ln.startswith("td.metric-grade")]
+    assert grade_rule and "text-align: left" in grade_rule[0]
 
 
 def test_report_card_is_local_only():

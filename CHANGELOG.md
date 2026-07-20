@@ -39,6 +39,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Local-only**, alongside `generate_brief_report` and for the same
     reason: it hands back a filesystem path, which is meaningless to a
     remote `/mcp/` caller.
+- **The card opens with the coach's verbal read.** A new
+  `agent/workout_coach.py` (sibling of `plan_coach.py`) phrases what the
+  already-computed grades MEAN, in the resolved coach voice and honoring
+  saved user notes. Toolless single-shot SDK call behind a single-entry disk
+  cache, with a deterministic template fallback — a missing credential or a
+  dead stream costs the phrasing, never the card. The model is explicitly
+  told the grades are not its to revise.
+- **Per-tenth-of-a-mile HR chart, fully labeled.** A new
+  `ingest/details.py` fetches one activity's ~1700-sample HR trace on demand
+  (never as a backfill — 747 activities of detail calls is the shape that
+  trips Garmin's 429) and caches it in a new `activity_hr_samples` table.
+  `report_card.bin_hr_trace` averages samples into tenth-mile buckets; the
+  chart carries an axis title, both axis labels, and the run's own average as
+  a reference line. Falls back to the per-lap chart whenever no trace is
+  available, so an offline render or an activity Garmin has no details for
+  behaves exactly as before.
+- **GPA is now explained on the card.** A `gpa_explainer()` line states the
+  weighted-4.0 arithmetic with the weights ACTUALLY used (an n/a metric drops
+  out and the rest renormalize), so the printed number is reconstructible
+  rather than an oracle. It also says plainly that +/- modifiers mark position
+  within a band and do not move the number.
+- **Per-mile table drops its Distance column** as duplicative — the row label
+  already is the distance, so it printed "1.00 mi" beside a column headed
+  "Mile".
+- **The Grade column is left-aligned** like every other column in both tables.
+
+### Fixed
+- **The coaching-read cache key now includes `activity_id`.** Two sessions on
+  the same day with the same name and the same grades — a double day, which
+  the tool already reports via `other_activities_on_date` — hashed identically,
+  so the second card served the first's read.
+- **GPA explainer weights no longer sum to 99%.** Independently-rounded shares
+  drifted off 100; the last share now absorbs the remainder, which matters in
+  a line whose entire job is letting the reader reproduce the number.
+- **The report card's SDK timeout was too tight.** Measured at 22.2s against a
+  30s ceiling, so an ordinary cold start silently served the template fallback.
+  Now 90s.
+- **Tests no longer make live Claude calls.** Every report-card render
+  generates a read, so the suite quietly started making real network calls —
+  10 seconds became 7 minutes, at real cost, while still passing. A conftest
+  autouse fixture now blocks `claude_agent_sdk.query` outright; callers
+  degrade to their deterministic fallbacks, and a test wanting specific
+  generated text patches its own generator.
 
 ## [0.24.1] - 2026-07-19
 

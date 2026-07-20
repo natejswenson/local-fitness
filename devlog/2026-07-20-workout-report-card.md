@@ -70,3 +70,56 @@ reads them; they render, and that's all.
 1234 tests pass, 94% coverage (`report_card.py` at 98%), ruff clean, and the
 tool was smoke-tested end-to-end against the real DB — rendered PDF inspected
 for the 0.24.1 overflow class of bug before shipping.
+
+---
+
+## Round 2 — five fixes from first real use
+
+Looking at an actual rendered card surfaced five things, four cosmetic and one
+that turned into real infrastructure.
+
+**The card now opens with the coach talking.** A report card that leads with a
+table is a spreadsheet. `workout_coach.py` phrases what the grades mean, in
+voice, before the grades appear — same shape as `plan_coach` (single-shot,
+cached, deterministic fallback), separate module because prepping a run you
+haven't done and judging one you have share a voice but nothing else.
+
+**Per-tenth-mile HR was the expensive one.** The samples weren't in the DB at
+all — `activity_splits` is per-lap and `raw_json` is the activity summary.
+Garmin's details endpoint has them (~1700 per run), so: fetch on demand for the
+one activity being graded, cache in a new table, never backfill. 747 activities
+of detail calls is precisely the shape that produced the 429 the token cache
+was added to fix. The chart now carries a title, both axis labels, and the
+run's own average as a reference line.
+
+**GPA needed explaining, so it now explains itself.** The card printed 3.45
+with no way to reconstruct it. The explainer lists the weights actually used —
+and had to learn to renormalize when a metric is n/a, and to absorb the
+rounding remainder so the shares sum to 100 rather than 99.
+
+Two one-liners: the Distance column came out of the per-mile table (it printed
+"1.00 mi" next to a column headed "Mile"), and the Grade column moved to
+left-aligned with everything else.
+
+### What the tests caught that review didn't
+
+- **The read cache ignored `activity_id`.** Two sessions on one day with the
+  same name and grades — a double day, which this tool already reports —
+  hashed identically, so the second card served the first's read.
+- **`.get("grade", "")` doesn't default when the key exists holding `None`.**
+  That's exactly the insufficient-history card, and it raised
+  `AttributeError` in the fallback path — the code that only runs when
+  something else already failed.
+
+### The one that mattered most
+
+Adding the read meant *every* report-card render called Claude, so the test
+suite quietly started making live network calls. It went from 10 seconds to 7
+minutes and cost real money — and stayed green the whole time, which is why it
+would have shipped unnoticed. `conftest.py` now blocks `claude_agent_sdk.query`
+outright for the whole suite, at the choke point rather than per-caller, so a
+future generator module inherits it without anyone remembering.
+
+That also exposed the timeout: with the SDK actually reachable, a real card
+took 22.2s against a 30s ceiling. Raised to 90s. Every prior "successful" local
+render had been silently serving the template fallback.

@@ -698,7 +698,10 @@ table.metric-table td, table.split-table td {{
   overflow-wrap: break-word;
 }}
 td.metric-name {{ font-family: {f["display_stack"]}; font-weight: 800; }}
-td.metric-grade {{ text-align: right; font-weight: 900; font-size: 1.15em; }}
+/* Left-aligned like every other column — the grade is the loudest cell on the
+   page by weight and size, and it does not also need a different alignment to
+   be found. */
+td.metric-grade {{ text-align: left; font-weight: 900; font-size: 1.15em; }}
 /* The accent's whole job: the grades that went wrong. */
 .grade-D, .grade-F {{ color: {accent}; }}
 .grade-na {{ color: {dim}; font-weight: 400; }}
@@ -722,6 +725,25 @@ ul.card-notes {{
    the table above them, not the page's subject, and at 100% they out-shouted
    the grades. */
 img.split-chart {{ width: 84%; margin-top: 0.7em; }}
+/* The coach's read: serif italic is the theme's commentary voice, and this is
+   the one block on the page that is a human talking rather than data. */
+p.coach-read {{
+  font-family: {f["serif_stack"]};
+  font-style: italic;
+  font-size: 1.12em;
+  line-height: 1.45;
+  color: {c["ink"]};
+  margin: 0 0 1.2em 0;
+  padding-bottom: 1.0em;
+  border-bottom: 1px solid {rule};
+}}
+p.gpa-explainer {{
+  font-family: {mono};
+  font-size: 0.7em;
+  line-height: 1.5;
+  color: {dim};
+  margin: 0.6em 0 0 0;
+}}
 """
 
 
@@ -733,10 +755,58 @@ def _grade_class(grade: str | None) -> str:
     return f"grade-{grade[0]}"
 
 
+def hr_chart_series(card: dict) -> dict | None:
+    """Pick which HR series the chart draws, and describe it.
+
+    Prefers the per-sample trace (a bar per tenth of a mile, positioned on a
+    real distance axis) and falls back to per-lap splits when no trace was
+    resolved — an activity whose details Garmin never returned, or an offline
+    render. Returns None when neither is available.
+
+    Split out from ``render_split_hr_png`` so the choice, the axis positions
+    and every label are assertable without rendering a PNG and reading pixels.
+    """
+    from . import report_card as rc
+
+    trace = card.get("hr_trace") or []
+    if trace:
+        bin_mi = rc.HR_TRACE_BIN_MI
+        return {
+            "source": "trace",
+            # Bars sit at their true start distance, so the x-axis is miles —
+            # not a bar ordinal that only looks like distance.
+            "positions": [r["start_mi"] for r in trace],
+            "values": [r["avg_hr"] for r in trace],
+            "partials": [bool(r["partial"]) for r in trace],
+            "width": bin_mi * 0.9,
+            "xlabel": "Distance (miles)",
+            # The label states the resolution actually binned, read from the
+            # binner's own constant so it can never overstate it.
+            "title": f"Heart rate every {bin_mi:g} mi",
+            "xmax": max(r["end_mi"] for r in trace),
+        }
+
+    rows = card.get("splits", {}).get("rows") or []
+    if not rows:
+        return None
+    unit = card["splits"]["unit"]
+    return {
+        "source": "splits",
+        "positions": [r["index"] - 1 for r in rows],
+        "values": [r["avg_hr"] or 0 for r in rows],
+        "partials": [bool(r["partial"]) for r in rows],
+        "width": 0.9,
+        "xlabel": unit,
+        "title": f"Heart rate by {unit.lower()}",
+        "xmax": len(rows),
+    }
+
+
 def render_split_hr_png(card: dict) -> bytes:
-    """Per-lap HR bar chart. Presentation only — nothing on the card is graded
-    from splits. Partial laps are drawn dim so a 90-meter fragment doesn't read
-    as a real data point next to full miles."""
+    """HR bar chart — per tenth-mile from the sample trace when available, else
+    per lap. Presentation only: nothing on the card is graded from either
+    series. Partial intervals are drawn dim so a 90-meter fragment doesn't read
+    as a real data point next to full ones."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -745,24 +815,56 @@ def render_split_hr_png(card: dict) -> bytes:
     from matplotlib.figure import Figure
 
     theme = branding.load_theme()
-    paper, ink, dim = (
-        theme["colors"]["paper"], theme["colors"]["ink"], theme["colors"]["dim"])
-    rows = card["splits"]["rows"]
-    values = [r["avg_hr"] or 0 for r in rows]
-    labels = [str(r["index"]) for r in rows]
-    colors = [dim if r["partial"] else ink for r in rows]
+    paper, ink, dim, accent = (
+        theme["colors"]["paper"], theme["colors"]["ink"],
+        theme["colors"]["dim"], theme["colors"]["accent"])
 
-    fig = Figure(figsize=(8, 1.9), dpi=150, facecolor=paper)
+    series = hr_chart_series(card)
+    if series is None:
+        raise ValueError("no HR series available to chart")
+    values = series["values"]
+    colors = [dim if p else ink for p in series["partials"]]
+
+    # Short on purpose: at 2.4in the rendered image no longer fit in the space
+    # left below the splits table and WeasyPrint orphaned it onto a second page
+    # with a hand-sized gap above it. The coach read varies in length, so the
+    # slack matters — this is sized to survive a long one.
+    fig = Figure(figsize=(8, 1.8), dpi=150, facecolor=paper)
     FigureCanvasAgg(fig)  # explicit non-global canvas attach, never via pyplot
     ax = fig.add_subplot(111)
     ax.set_facecolor(paper)
-    x = np.arange(len(labels))
-    ax.bar(x, values, color=colors)
+    ax.bar(series["positions"], values, color=colors,
+           width=series["width"], align="edge")
     ylo, yhi = value_axis_bounds([v for v in values if v] or [0, 1])
     ax.set_ylim(max(0, ylo), yhi)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8)
-    ax.set_xlabel(card["splits"]["unit"], fontsize=8, color=dim)
+    ax.set_xlim(0, series["xmax"])
+
+    if series["source"] == "trace":
+        # A tick per tenth is unreadable at this width; tick whole miles and
+        # let the bars carry the resolution.
+        ax.set_xticks(np.arange(0, np.floor(series["xmax"]) + 1, 1))
+    else:
+        ax.set_xticks([p + 0.5 for p in series["positions"]])
+        ax.set_xticklabels([str(i + 1) for i in range(len(values))], fontsize=8)
+
+    # The run's own average, so each bar reads as above or below the day's
+    # effort instead of against a bare axis. Accent is the theme's "look here"
+    # color and this is the one reference the reader needs.
+    avg_hr = card.get("activity", {}).get("avg_hr")
+    if avg_hr:
+        ax.axhline(avg_hr, color=accent, linewidth=1.0, linestyle="--", zorder=3)
+        # A paper-colored backing box, because the label sits over the bars and
+        # the reference line runs near the middle of the data by construction —
+        # there is no corner of this chart guaranteed to be empty.
+        ax.annotate(
+            f"run avg {avg_hr} bpm", xy=(0.998, avg_hr),
+            xycoords=("axes fraction", "data"), ha="right", va="bottom",
+            fontsize=7, color=accent, zorder=5,
+            bbox={"facecolor": paper, "edgecolor": "none", "pad": 1.5})
+
+    ax.set_xlabel(series["xlabel"], fontsize=8, color=dim)
+    ax.set_ylabel("Heart rate (bpm)", fontsize=8, color=dim)
+    ax.set_title(series["title"], fontsize=9, color=ink, loc="left", pad=6)
     ax.tick_params(colors=dim, labelsize=8)
     ax.grid(axis="y", color=dim, linewidth=0.6, alpha=0.35)
     ax.set_axisbelow(True)
@@ -813,12 +915,20 @@ def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
     carries none). Never a blank section."""
     splits = card["splits"]
     if not splits["available"]:
-        return """
+        # No per-lap table, but the sample trace may still exist — a backfilled
+        # activity has no splits while Garmin still holds its details. Show the
+        # chart rather than dropping the only HR detail the card has.
+        chart_only = (
+            f'<img class="split-chart" src="{_data_uri(split_chart)}" '
+            f'alt="heart rate by distance">' if split_chart else ""
+        )
+        return f"""
         <section>
-          <h2 class="card-heading">Per-mile breakdown</h2>
+          <h2 class="card-heading">Heart rate</h2>
           <p class="no-splits">No per-mile splits recorded for this activity.
           Splits are captured only by the daily sync path — backfilled
           activities have none.</p>
+          {chart_only}
         </section>
         """
     unit = splits["unit"]
@@ -830,10 +940,12 @@ def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
         hr = r.get("avg_hr")
         elev = r.get("elevation_gain_meters")
         pace = f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—"
+        # No Distance column: the label already carries the partial lap's
+        # distance, and for every full lap it would print "1.00 mi" beside a
+        # column headed "Mile".
         body += f"""
         <tr class="{'split-partial' if r['partial'] else ''}">
           <td>{html.escape(label)}</td>
-          <td>{f"{r['distance_mi']:.2f} mi" if r["distance_mi"] is not None else "—"}</td>
           <td>{html.escape(pace)}</td>
           <td>{f"{hr} bpm" if hr else "—"}</td>
           <td>{f"{hr - avg_hr:+d}" if hr and avg_hr else "—"}</td>
@@ -854,11 +966,11 @@ def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
       <h2 class="card-heading">Per-{html.escape(unit.lower())} breakdown</h2>
       <table class="split-table">
         <colgroup>
-          <col style="width:20%"><col style="width:16%"><col style="width:18%">
-          <col style="width:16%"><col style="width:13%"><col style="width:13%">
+          <col style="width:26%"><col style="width:20%"><col style="width:19%">
+          <col style="width:16%"><col style="width:15%">
         </colgroup>
         <thead><tr>
-          <th>{html.escape(unit)}</th><th>Distance</th><th>Pace</th>
+          <th>{html.escape(unit)}</th><th>Pace</th>
           <th>Avg HR</th><th>vs run</th><th>Elev</th>
         </tr></thead>
         <tbody>{body}</tbody>
@@ -913,6 +1025,18 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
         f'on this date.</p>'
     ) if ctx.get("ctl") is not None else ""
 
+    # The coach's read leads the page, above the grade. Omitted entirely when
+    # absent rather than rendered as an empty block — a card generated with no
+    # credential opens on the grade exactly as it did before this section.
+    coach_html = (
+        f'<p class="coach-read">{html.escape(card["coach_read"])}</p>'
+        if card.get("coach_read") else ""
+    )
+    explainer = rc.gpa_explainer(card)
+    gpa_html = (
+        f'<p class="gpa-explainer">{html.escape(explainer)}</p>' if explainer else ""
+    )
+
     return f"""<!doctype html>
 <html>
 <head><meta charset="utf-8"><style>{_build_css(theme)}{_report_card_css(theme)}</style></head>
@@ -924,6 +1048,8 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
     </tr></table>
     <h1>{html.escape(str(name))}</h1>
   </div>
+
+  {coach_html}
 
   <table class="grade-hero"><tr>
     <td class="grade-letter {_grade_class(overall["grade"])}">{html.escape(overall["grade"])}</td>
@@ -937,6 +1063,7 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
     <h2 class="card-heading">Grades</h2>
     {_render_metric_table_html(card)}
     {notes_html}
+    {gpa_html}
     {ctx_html}
   </section>
 

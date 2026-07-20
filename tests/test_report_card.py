@@ -384,7 +384,10 @@ def test_render_markdown_tables_are_well_formed():
     assert table_lines
     # Every row of a given table has the same column count as its header.
     widths = {ln.count("|") for ln in table_lines}
-    assert widths == {6, 7}   # 5-col metric table, 6-col split table
+    # Both tables are 5-col: metric (Metric/Actual/Expected/Delta/Grade) and
+    # split (Mile/Pace/Avg HR/vs run/Elev). The split table's Distance column
+    # was dropped as duplicative — the row label already IS the distance.
+    assert widths == {6}
     assert "Morning Run" in md
 
 

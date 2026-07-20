@@ -424,6 +424,46 @@ These are settled — don't redesign without a reason.
     history and mean different things on different rows.
   - The pure section is stdlib-only and unit-testable with plain dicts; DB
     access lives under a persistence divider, mirroring `plans.py`.
+  - **The card's opening verbal read is `agent/workout_coach.py`** — a sibling
+    of `plan_coach.py`, same shape (toolless single-shot SDK call, lazy
+    imports to dodge the `tools -> workout_coach -> briefing -> tools` cycle,
+    single-entry disk cache keyed on the pure `build_prompt` hash **plus
+    `activity_id`**, deterministic `fallback_read`). Separate module because
+    `plan_coach` preps a run not yet done from a prescription while this one
+    judges a run already done from graded results — different inputs, tense,
+    and failure mode. The model is told the grades are not its to revise: it
+    phrases them, it never re-derives them. Timeout is 90s
+    (`DEFAULT_TIMEOUT_S`), not `plan_coach`'s 30 — a real card measured 22.2s,
+    so 30 silently fell back on any cold start.
+  - **`gpa_explainer()` must keep the printed GPA reconstructible.** It lists
+    the weights ACTUALLY used (an n/a metric drops out and the rest
+    renormalize; the last share absorbs the rounding remainder so they total
+    100) and states that +/- marks band position without moving the number.
+    If the weighting ever changes, that line changes with it.
+- **Per-sample HR traces are fetched on demand, never backfilled**
+  (`ingest/details.py`, 0.25.0). `get_activity_details` returns ~1700 samples
+  per run; pulling that for all 747 activities is both a backfill nobody asked
+  for and exactly the repeated-detail-call shape that trips Garmin's 429. So:
+  one call for the one activity being graded, cached forever after in
+  `activity_hr_samples`, and only when the PDF path asks
+  (`load_report_card_inputs(hr_trace=True)` — `format='table'` stays purely
+  local with no network). Every function there is best-effort by contract: a
+  missing credential, an expired token, a payload with no HR channel, or a
+  pre-0.25.0 DB missing the table all return "no samples", and the chart falls
+  back to per-lap. **Read the metric channels BY NAME** via
+  `metricDescriptors[].key` — `activityDetailMetrics[].metrics` is a positional
+  array whose column order varies by device, so a hardcoded index silently
+  reads cadence as heart rate. A failed fetch caches nothing, so a transient
+  outage never pins an empty trace.
+- **Tests must never make a live Claude call.** `tests/conftest.py` has an
+  autouse fixture that blocks `claude_agent_sdk.query` outright. It exists
+  because `workout_report_card` generates a read on every render, so the suite
+  silently started making real network calls — 10 seconds became 7 minutes, at
+  real cost, while still passing green. Patching the single SDK choke point
+  (rather than each caller) means a future generator module inherits the
+  protection. Callers all degrade to deterministic fallbacks, so the default
+  test path exercises the offline branch; a test that needs specific generated
+  text patches its own module's generate function.
 - **Every generated PDF/PNG is styled by a local-overridable brand theme**
   (2026-07-19). `agent/branding.py` owns the tokens: the checked-in default
   is **PRESS** (Nate's cross-project brand — warm paper #F5F0E6, ink
