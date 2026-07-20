@@ -36,10 +36,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${{ steps.ver.outputs.version }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "$tag already released — nothing to do."
-            exit 0
-          fi
           # Pull this version's section out of the changelog for release notes.
           notes=$(awk -v v="${{ steps.ver.outputs.version }}" '
             $0 ~ "^## \\[" v "\\]" {f=1; next}
@@ -47,6 +43,24 @@ jobs:
             f {print}
           ' CHANGELOG.md)
           [ -z "$notes" ] && notes="Release $tag"
-          gh release create "$tag" --target "${{ github.event.workflow_run.head_sha }}" \
-            --title "$tag" --notes "$notes"
-          echo "Released $tag."
+          # Retry loop: a transient GitHub API failure (v0.23.0 was lost to an
+          # HTTP 503 on `gh release create`, 2026-07-20) must not silently eat
+          # the release — the job used to die on the first failed call. The
+          # already-released check lives INSIDE the loop so a create that
+          # succeeded server-side but failed to respond is caught as "already
+          # released" on the next pass instead of double-creating.
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "$tag already released — nothing to do."
+              exit 0
+            fi
+            if gh release create "$tag" --target "${{ github.event.workflow_run.head_sha }}" \
+                --title "$tag" --notes "$notes"; then
+              echo "Released $tag."
+              exit 0
+            fi
+            echo "gh release create failed (attempt $attempt/5) — retrying in 30s"
+            sleep 30
+          done
+          echo "::error::failed to create $tag after 5 attempts"
+          exit 1
