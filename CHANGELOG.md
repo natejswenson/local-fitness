@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-19
+
+Facet-review backlog clearance — the deferred round-1/round-2 items.
+
+### Added
+- **Double-day (`seq`) support on `update_plan_workout`** — the schema
+  always allowed AM/PM doubles but only the first session was editable
+  ("move my evening intervals" silently edited the morning row). Optional
+  `seq` param (1 = AM default, 2 = PM), threaded to
+  `update_active_workout`; `get_training_plan_progress` now carries `seq`
+  so double-day payloads are distinguishable.
+- **Structural (plan_id, date, seq) uniqueness** — a partial unique index
+  backs the validation-time dedup, so a validation bypass fails loudly
+  instead of leaving `UPDATE` statements hitting two rows.
+
+### Changed
+- **Prompt-text drift corrections** (verified via `score_prompt` 11/11
+  before and after + a full rendered-prompt differential diff showing
+  exactly the intended lines changed): the chat/coach system prompt no
+  longer claims blanket "read-only access" while instructing note/plan
+  writes two sections later (Garmin metrics are read-only; writes go
+  through the dedicated tools); both brief prompts drop the "so the UI
+  can render" phrasing (the React UI is retired — takeaway cards are
+  rendered by the PDF/markdown consumers).
+
+### Fixed
+- Flat non-zero bar charts paint neutral mid-heat (🟨) instead of the
+  "coldest" blue — full-width bars no longer read as "low".
+- Short-window line charts no longer overflow the canvas with a
+  two-label footer that can't fit (start label only below ~12 columns).
+
 ## [0.24.0] - 2026-07-19
 
 Round 2 of the facet review: three focused reviewers (charts, plan-lifecycle

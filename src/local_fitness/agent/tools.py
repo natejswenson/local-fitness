@@ -1698,6 +1698,7 @@ _UPDATE_WORKOUT_SCHEMA = {
         "pace_min_per_mi": {"type": "number", "description": "target pace in min/mi, e.g. 9.65 for 9:39/mi"},
         "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
         "description": {"type": "string", "description": "prose prescription for the day"},
+        "seq": {"type": "integer", "description": "intra-day session on a double day: 1 = first/AM (default), 2 = second/PM"},
     },
     "required": ["date"],
 }
@@ -1750,8 +1751,14 @@ async def update_plan_workout(args: dict) -> dict:
         return _err("nothing to update — pass type / distance_mi / "
                     "pace_min_per_mi / duration_min / description")
 
+    seq = args.get("seq")
+    if seq is None:
+        seq = 1
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        return _err("seq must be a positive integer (1 = first/AM session)")
+
     try:
-        row = plans.update_active_workout(date_str, fields)
+        row = plans.update_active_workout(date_str, fields, seq=seq)
     except plans.NoActivePlanError:
         return _err("no active training plan")
     except ValueError as e:
@@ -2025,6 +2032,7 @@ async def get_training_plan_progress(args: dict) -> dict:
     workouts_full = [
         {
             "date": w.get("date"),
+            "seq": w.get("seq", 1),
             "week_index": w.get("week_index"),
             "type": w.get("type"),
             "target_distance_m": w.get("target_distance_m"),
