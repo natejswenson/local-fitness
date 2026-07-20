@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-07-19
+
+### Added
+- **Brand-themed PDF/PNG rendering, local-overridable.** Every generated
+  PDF (brief report) and chart PNG is styled from a brand theme
+  (`agent/branding.py`). The checked-in default is **PRESS** — the repo
+  owner's editorial brand: warm cream paper, near-black ink rules, one
+  orange signature accent, sans 800–900 structure + serif-italic
+  commentary + mono data voices, no rounded corners/shadows/gradients.
+  The report gets a masthead (heavy ink rule, rotated accent stamp,
+  tracked-caps eyebrow, byline), ruled editorial signal sections with
+  serif standfirsts, PRESS numerals in the plan rail, and typographic
+  PRESS-strict tones/verdicts (done = ink, partial = dim italic,
+  MISSED = the one accent). Charts render on paper with ink marks and an
+  accent trend line. Set `LOCAL_FITNESS_BRAND_FILE` to a JSON file to
+  deep-merge your own colors/fonts/identity over the default (see
+  `.env.example`); `fonts.mono_file` embeds a real TTF via @font-face.
+  A missing/broken brand file never breaks a render.
+
 ## [0.23.0] - 2026-07-19
 
 One consolidated release for the day's facet-review loop: four review
