@@ -659,3 +659,74 @@ def test_plan_chart_auto_weekly_past_threshold(seeded):
 def test_plan_chart_registered_but_not_in_brief_allowlist():
     assert "plan_chart" in {t.name for t in tools.ALL_TOOLS}
     assert "mcp__fitness__plan_chart" not in tools.read_only_tool_names()
+
+
+# --- round-2 backlog: seq (double-day) support + structural dedup ------------
+
+def _active_double_day(seeded):
+    """ACTIVE plan with an AM easy run + PM interval on the same date."""
+    d = (date.today() + timedelta(days=1)).isoformat()
+    args = _args(workouts=[
+        dict(date=d, seq=1, week_index=1, type="easy",
+             target_distance_m=5000.0, description="AM easy 5k"),
+        dict(date=d, seq=2, week_index=1, type="interval",
+             target_duration_sec=1800, description="PM intervals 30min"),
+    ])
+    body, err = call(tools.propose_training_plan, args)
+    assert not err
+    plans.commit_plan(body["plan_id"], now="2026-06-26T00:00:00", db_path=seeded)
+    return d
+
+
+def test_update_plan_workout_seq_targets_second_session(seeded):
+    d = _active_double_day(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "seq": 2, "duration_min": 40})
+    assert not err
+    with db.connect(seeded) as conn:
+        rows = conn.execute(
+            "SELECT seq, type, target_duration_sec, target_distance_m "
+            "FROM plan_workouts WHERE date=? ORDER BY seq", (d,)).fetchall()
+    # PM session updated to 40 min; AM session untouched.
+    assert rows[1]["seq"] == 2 and rows[1]["target_duration_sec"] == 2400
+    assert rows[0]["seq"] == 1 and rows[0]["target_distance_m"] == 5000.0
+
+
+def test_update_plan_workout_seq_defaults_to_first_session(seeded):
+    d = _active_double_day(seeded)
+    _body, err = call(tools.update_plan_workout, {"date": d, "distance_mi": 4.0})
+    assert not err
+    with db.connect(seeded) as conn:
+        rows = conn.execute(
+            "SELECT seq, target_distance_m, target_duration_sec "
+            "FROM plan_workouts WHERE date=? ORDER BY seq", (d,)).fetchall()
+    assert abs(rows[0]["target_distance_m"] - 4 * 1609.344) < 1
+    assert rows[1]["target_duration_sec"] == 1800  # PM untouched
+
+
+def test_update_plan_workout_rejects_bad_seq(seeded):
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": d, "type": "easy", "seq": 0})
+    assert err and "seq" in body["error"]
+
+
+def test_progress_projection_carries_seq(seeded):
+    d = _active_double_day(seeded)
+    body, err = call(tools.get_training_plan_progress, {"full": True})
+    assert not err
+    same_day = [w for w in body["workouts"] if w["date"] == d]
+    assert sorted(w["seq"] for w in same_day) == [1, 2]
+
+
+def test_plan_workouts_duplicate_day_rejected_by_db(seeded):
+    # LOW-2: the (plan_id, date, seq) invariant is structural now, not just
+    # validation-time — a direct duplicate insert fails loudly.
+    import sqlite3
+    body, _ = call(tools.propose_training_plan, _args())
+    pid = body["plan_id"]
+    d = (date.today() + timedelta(days=1)).isoformat()  # _args seeds this day
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.connect(seeded) as conn:
+            conn.execute(
+                "INSERT INTO plan_workouts (plan_id, date, seq, week_index, type, description) "
+                "VALUES (?, ?, 1, 1, 'easy', 'dupe')", (pid, d))

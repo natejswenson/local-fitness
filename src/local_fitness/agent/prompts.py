@@ -36,10 +36,12 @@ def system_prompt(
 
     return f"""You are {user_name}'s personal running coach.
 
-You have read-only access to a SQLite database of {user_name}'s Garmin
-Connect data: sleep, resting heart rate, stress, body battery, workouts,
+You have access to a SQLite database of {user_name}'s Garmin Connect
+data: sleep, resting heart rate, stress, body battery, workouts,
 training load, plus pre-computed 60-day rolling baselines and the
-Banister CTL/ATL/TSB training-load model.
+Banister CTL/ATL/TSB training-load model. The Garmin metrics themselves
+are read-only; your writes (notes, observations, manual workouts,
+training-plan changes) go only through the dedicated tools for them.
 
 {user_name}'s device is a Garmin Instinct Solar (no overnight HRV — uses
 Body Battery + all-day stress as HRV-derived signals instead). {user_name}
@@ -227,8 +229,8 @@ Continuity rules:
         recent_section = ""
 
     return f"""Build today's morning brief for {user_name} as STRUCTURED JSON
-(not markdown) so the UI can render each takeaway as its own expandable
-card with an embedded chart.
+(not markdown) so each takeaway renders as its own expandable card with
+an embedded chart.
 {recent_section}
 
 # Step 1 — gather the data
@@ -714,8 +716,8 @@ Reference the recent thread when relevant; call out follow-through or its lack
 (escalate the tone if you flagged something yesterday and it's unchanged). These
 shape TONE/CONTINUITY only — they never add JSON fields.
 """
-    return f"""{intro} so the
-UI can render each takeaway as an expandable card with an embedded chart.
+    return f"""{intro} so each
+takeaway renders as an expandable card with an embedded chart.
 {continuity}
 {_v2_voice_mandates(user_name, daily_step_goal, profile)}
 

@@ -110,7 +110,10 @@ def render_bar_chart(
         else:
             frac = (v / denom) if zero_based else ((v - lo) / span)
         n = max(0, round(frac * width))
-        rel = (v - lo) / span
+        # A flat series has no within-window relative position — paint it the
+        # neutral mid-heat instead of (v-lo)/span==0's "coldest" blue, which
+        # made full-width bars read as "low".
+        rel = 0.5 if flat else (v - lo) / span
         bar = _heat(rel) * n
         lines.append(f"{lab:<{label_w}} {bar} {value_fmt(v)}")
     return "\n".join(lines)
@@ -389,6 +392,12 @@ def render_line(
         lab = f"{value_fmt(v_at):>{axis_w}}" if yi in (0, rows // 2, rows) else " " * axis_w
         out.append(f"{lab} ┤{''.join(grid[yi])}")
     out.append(f"{' ' * axis_w} └{'─' * n}")
-    pad = max(1, n - len(labels[0]) - len(labels[-1]))
-    out.append(f"{' ' * axis_w}  {labels[0]}{' ' * pad}{labels[-1]}")
+    # Both endpoint labels only when they fit under the chart width — a short
+    # window would otherwise overflow the canvas by up to a full label.
+    l0, l1 = labels[0], labels[-1]
+    if n >= len(l0) + len(l1) + 1:
+        pad = n - len(l0) - len(l1)
+        out.append(f"{' ' * axis_w}  {l0}{' ' * pad}{l1}")
+    else:
+        out.append(f"{' ' * axis_w}  {l0}")
     return "\n".join(out)

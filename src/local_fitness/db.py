@@ -193,6 +193,12 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
 );
 CREATE INDEX IF NOT EXISTS idx_plan_workouts_plan ON plan_workouts(plan_id);
 CREATE INDEX IF NOT EXISTS idx_plan_workouts_date ON plan_workouts(date);
+-- One prescription per (plan, date, seq): validate_plan_input dedups at
+-- propose time; this makes the invariant structural, so a validation bypass
+-- fails loudly instead of leaving update_active_workout's UPDATE hitting
+-- two rows.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_workouts_day
+    ON plan_workouts(plan_id, date, seq);
 """
 
 

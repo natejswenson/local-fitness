@@ -407,3 +407,34 @@ def test_plan_vs_actual_bars_start_in_same_column():
             if i >= 0:
                 starts.add(i)
     assert len(starts) == 1
+
+
+# --- round-2 backlog: cosmetic fixes ----------------------------------------
+
+def test_bar_chart_flat_nonzero_series_paints_neutral_midheat():
+    # D2: a flat [5,5] series renders full-width bars; painting them the
+    # "coldest" blue read as "low". Flat now paints the neutral mid-heat.
+    out = charts.render_bar_chart(["a", "b"], [5.0, 5.0])
+    for line in out.split("\n"):
+        assert "🟨" in line and "🟦" not in line
+    neg = charts.render_bar_chart(["a", "b"], [-5.0, -5.0])
+    for line in neg.split("\n"):
+        assert "🟨" in line
+
+
+def test_line_chart_short_window_footer_fits_canvas():
+    # D3: two MM-DD labels are 10 chars — under a <12-column chart the footer
+    # used to overflow the canvas. Short windows now show the start label only.
+    dates = [f"2026-06-{d:02d}" for d in range(1, 7)]
+    out = charts.render_line(dates, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    footer = out.split("\n")[-1]
+    assert "06-01" in footer and "06-06" not in footer
+    axis_line = out.split("\n")[-2]  # the └──── baseline
+    assert len(footer) <= len(axis_line)
+
+
+def test_line_chart_long_window_footer_keeps_both_labels():
+    dates = [f"2026-06-{d:02d}" for d in range(1, 29)]
+    out = charts.render_line(dates, [float(d % 7) for d in range(28)])
+    footer = out.split("\n")[-1]
+    assert "06-01" in footer and "06-28" in footer
