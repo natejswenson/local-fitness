@@ -39,13 +39,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Local-only**, alongside `generate_brief_report` and for the same
     reason: it hands back a filesystem path, which is meaningless to a
     remote `/mcp/` caller.
-- **The card opens with the coach's verbal read.** A new
-  `agent/workout_coach.py` (sibling of `plan_coach.py`) phrases what the
-  already-computed grades MEAN, in the resolved coach voice and honoring
-  saved user notes. Toolless single-shot SDK call behind a single-entry disk
-  cache, with a deterministic template fallback — a missing credential or a
-  dead stream costs the phrasing, never the card. The model is explicitly
-  told the grades are not its to revise.
+- **The card opens with the coach's read — four short paragraphs, one per
+  graded area.** A new `agent/workout_coach.py` (sibling of `plan_coach.py`)
+  phrases what the already-computed grades MEAN, in the resolved coach voice
+  and honoring saved user notes. Toolless single-shot SDK call behind a
+  single-entry disk cache, with a deterministic four-section template fallback
+  — a missing credential or a dead stream costs the phrasing, never the card.
+  - **It never names a letter grade.** The letters print in the table directly
+    below; repeating them spends the only words the read gets. It makes the
+    reason obvious from the numbers instead.
+  - **Hindsight and foresight.** The read is given the graded day's trailing
+    runs and the next 7 days of prescriptions, so it can say "two days after a
+    412-load session" and "intervals hit Tuesday" rather than judging the run
+    in isolation.
+  - Output is parsed into typed sections (`parse_read`); a generation missing
+    any of the four falls back to the template rather than rendering a card
+    with a blank paragraph, and is never cached.
+  - The training-load model (CTL/ATL/TSB) is deliberately withheld from this
+    prompt — it is printed elsewhere on the card, and handing it over bought a
+    freshness lecture in place of a distance verdict.
 - **Per-tenth-of-a-mile HR chart, fully labeled.** A new
   `ingest/details.py` fetches one activity's ~1700-sample HR trace on demand
   (never as a backfill — 747 activities of detail calls is the shape that
@@ -59,6 +71,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already is the distance, so it printed "1.00 mi" beside a column headed
   "Mile".
 - **The Grade column is left-aligned** like every other column in both tables.
+- **The standalone "graded against…" sentence is gone.** The Expected column
+  states each metric's target, which is where a reader checks it; the
+  plan-vs-median disclosure now rides the hero's meta line as
+  `easy (plan)` / `easy (60d median)`.
 
 ### Fixed
 - **The coaching-read cache key now includes `activity_id`.** Two sessions on

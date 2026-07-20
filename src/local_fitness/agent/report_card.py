@@ -80,6 +80,15 @@ LOAD_SPIKE_FACTOR = 2.0
 # enough to show where a run actually turned over, coarse enough that a
 # 3-mile run yields ~31 readable bars rather than 1700.
 HR_TRACE_BIN_MI = 0.1
+# How far either side of the graded day the coaching read gets to look. Enough
+# to say "your third run this week" and "you have intervals Thursday" without
+# handing the model a training log to summarize.
+RECENT_WINDOW_DAYS = 14
+UPCOMING_WINDOW_DAYS = 7
+# The read is told not to narrate the calendar, so it does not need the whole
+# window enumerated — a handful either side is enough to place the run, and
+# every extra row is prompt the model pays to read.
+MAX_CONTEXT_ACTIVITIES = 5
 
 # The one band table. `d` is a non-negative relative deviation; every metric
 # reduces to one, which is why there is exactly one grader.
@@ -499,6 +508,8 @@ def build_card(
     reference: dict,
     context: dict | None = None,
     hr_samples: list[tuple[float, int]] | None = None,
+    recent_activities: list[dict] | None = None,
+    upcoming_workouts: list[dict] | None = None,
 ) -> dict:
     """Assemble the full report card. Pure — every input is a plain dict, so
     the whole rubric is testable without a DB.
@@ -593,6 +604,10 @@ def build_card(
         "overall": overall_grade(metrics),
         "splits": label_splits(splits),
         "hr_trace": bin_hr_trace(hr_samples or []),
+        # Prompt-only, like splits and the trace: no grade reads either, so a
+        # card grades identically with or without them.
+        "recent_activities": recent_activities or [],
+        "upcoming_workouts": upcoming_workouts or [],
         "context": context or {},
     }
 
@@ -720,11 +735,16 @@ def render_markdown(card: dict) -> str:
         "",
     ]
     lines += [f"## Overall: {overall['grade']}{gpa}", ""]
-    # The read sits under the grade line, not above the header — the title
-    # names the run and nothing else, mirroring the PDF's hero block.
-    if card.get("coach_read"):
-        lines += [card["coach_read"], ""]
-    lines += [reference_line(card), ""]
+    # One short paragraph per graded area, under the grade line. The yardstick
+    # is no longer printed as its own sentence — the Expected column states it
+    # per metric, which is where a reader actually checks it.
+    read = card.get("coach_read") or {}
+    if read:
+        from .workout_coach import READ_SECTIONS
+
+        for key, label in READ_SECTIONS:
+            if read.get(key):
+                lines += [f"**{label.title()}** — {read[key]}", ""]
 
     rows = []
     for key, label in _METRIC_LABELS:
@@ -788,6 +808,15 @@ def render_markdown(card: dict) -> str:
 
 # === Persistence ===========================================================
 # Everything above is pure. Everything below reads the DB.
+
+
+def _plus_days(iso_date: str, days: int) -> str:
+    """ISO date shifted by ``days``. Returns the input unchanged if it isn't a
+    parseable date, so a malformed row narrows the window rather than raising."""
+    try:
+        return (_date.fromisoformat(iso_date) + timedelta(days=days)).isoformat()
+    except (TypeError, ValueError):
+        return iso_date
 
 
 def _exact_type(activity_type: str | None):
@@ -918,6 +947,7 @@ def load_report_card_inputs(
     ).fetchall()]
 
     plan_workout = None
+    upcoming_workouts: list[dict] = []
     active = plans.get_active_plan(conn=conn)
     if active:
         same_day = [w for w in active.get("workouts", []) if w.get("date") == activity["date"]]
@@ -925,6 +955,25 @@ def load_report_card_inputs(
             # (plan_id, date, seq) is unique; the lowest seq is the day's
             # primary session when a double-day is prescribed.
             plan_workout = min(same_day, key=lambda w: w.get("seq") or 0)
+        # What this run was setting up for. The coaching read is written with
+        # the card's date in hand, so it can say "you have intervals Thursday"
+        # rather than judging the run in isolation.
+        upcoming_workouts = sorted(
+            (w for w in active.get("workouts", [])
+             if w.get("date") and activity["date"] < w["date"] <= _plus_days(
+                 activity["date"], UPCOMING_WINDOW_DAYS)),
+            key=lambda w: (w["date"], w.get("seq") or 0),
+        )[:MAX_CONTEXT_ACTIVITIES]
+
+    # ...and what led into it, for the same reason in the other direction.
+    recent_activities = [dict(r) for r in conn.execute(
+        "SELECT date, activity_type, activity_name, distance_meters, "
+        "avg_pace_sec_per_km, avg_hr, training_load FROM activities "
+        "WHERE date < ? AND date >= ? AND distance_meters > 0 "
+        "ORDER BY date DESC, start_time DESC LIMIT ?",
+        (activity["date"], _plus_days(activity["date"], -RECENT_WINDOW_DAYS),
+         MAX_CONTEXT_ACTIVITIES),
+    ).fetchall()]
 
     context: dict = {}
     base = conn.execute(
@@ -944,6 +993,8 @@ def load_report_card_inputs(
         "splits": splits,
         "hr_samples": hr_samples,
         "plan_workout": plan_workout,
+        "recent_activities": recent_activities,
+        "upcoming_workouts": upcoming_workouts,
         "reference": rolling_reference(conn, activity),
         "context": context,
         "other_activities_on_date": [

@@ -435,11 +435,27 @@ These are settled — don't redesign without a reason.
     phrases them, it never re-derives them. Timeout is 90s
     (`DEFAULT_TIMEOUT_S`), not `plan_coach`'s 30 — a real card measured 22.2s,
     so 30 silently fell back on any cold start.
-  - **The read must cover all four metrics and NEVER name a letter grade.**
-    The letters print in the table directly below the paragraph; repeating
-    them spends the only words it gets. It is budgeted in WORDS (85), not
-    sentences — a sentence cap produced five sentences long enough to push
-    the HR chart onto a second page.
+  - **The read is FOUR labelled paragraphs, one per graded area** — not one
+    blended paragraph. `READ_SECTIONS` is the contract; the model emits
+    `DISTANCE:` / `PACE:` / `HEART RATE:` / `TRAINING LOAD:` lines and
+    `parse_read` turns them into a typed dict. A generation missing any
+    section raises and falls back to the deterministic template rather than
+    rendering a blank paragraph — and is never cached. Budgeted in WORDS (45
+    per paragraph), not sentences: a sentence cap produced sentences long
+    enough to push the HR chart onto a second page.
+  - **It must NEVER name a letter grade**, since the letters print in the
+    table immediately below it, and it must not discuss CTL/ATL/TSB — that
+    line is printed elsewhere on the card and asking for it bought a freshness
+    lecture in place of a distance verdict.
+  - **It gets hindsight and foresight.** `load_report_card_inputs` supplies
+    the trailing runs and the next 7 days of prescriptions (capped by
+    `MAX_CONTEXT_ACTIVITIES`), so the read can place the run in the week
+    instead of judging it in isolation. Both are prompt-only — like splits and
+    the HR trace, no grade reads either.
+  - **Budget ~70s for the SDK call** (`DEFAULT_TIMEOUT_S` is 180). Four
+    paragraphs is roughly 4x the output of one, and output length dominates
+    latency; 90s left no margin and silently served the template. The disk
+    cache makes every repeat render instant.
   - **A metric's `Expected` column must be the number its grade was actually
     measured against.** HR broke this: it showed the bare rolling median while
     grading against a band edge, so a run at 136 vs a 146 median printed

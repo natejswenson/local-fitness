@@ -179,3 +179,48 @@ the logs of a passing test. The conftest guard now covers Garmin alongside the
 SDK, and there's a bounding-box overflow test for the report card too — the
 coach read is model-generated variable-length prose in a fixed cell, which is
 exactly the shape that caused the 0.24.1 overflow.
+
+---
+
+## Round 4 — four paragraphs instead of one
+
+The single blended paragraph was doing too many jobs. It now breaks into four
+short ones, one per graded area, in smaller type inside the hero: distance,
+pace, heart rate, training load. Each covers only its own metric, so you can
+jump to the one you care about instead of reading a paragraph to find the
+sentence about pace.
+
+Two things came out of the card at the same time. The CTL/ATL/TSB sentence,
+because the training-load model is printed elsewhere and handing it to the
+model bought a freshness lecture in place of a distance verdict — it's now
+explicitly forbidden in the prompt. And the standalone "graded against your
+training plan for this date…" sentence, because the Expected column already
+states each target, which is where a reader actually checks it. The
+plan-vs-median disclosure still has to exist, so it moved onto the meta line:
+`3.40 GPA · 3.06 mi in 28:56 · 9:28/mi · easy (plan)`.
+
+**Hindsight and foresight.** The read now gets the trailing runs and the next
+seven days of prescriptions. It uses them — unprompted, the pace paragraph
+ended "Intervals hit Tuesday" and the load paragraph opened "Two days after a
+412-load session on the 17th, you kept this contained." That's the difference
+between grading a run and coaching one.
+
+### Structure over string
+
+The read is parsed into a typed dict rather than pasted as prose.
+`parse_read` requires all four labelled sections and raises otherwise, so a
+malformed generation falls back to the deterministic template instead of
+rendering a card with a blank paragraph — and, importantly, is never cached.
+The parser tolerates the cosmetics models vary on (bold markers, bullets,
+mixed case, blank lines) because none of those change the content and
+regenerating over a stray asterisk is pure waste.
+
+### The cost
+
+Four paragraphs is about four times the output of one, and output length is
+what drives latency: 22s for the old single paragraph, 67s now. The timeout
+went to 180s, because 90 left no margin and silently served the template on an
+ordinary run. An uncached card takes roughly two minutes end to end. That's
+acceptable for an on-demand report — and the cache makes every repeat
+instant — but it is the one number to watch if this ever moves somewhere
+interactive.

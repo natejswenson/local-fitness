@@ -2745,7 +2745,10 @@ def test_report_card_pdf_states_the_rolling_reference(rc_seeded, reports_tmp):
     assert not err
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "".join(page.extract_text() or "" for page in doc.pages)
-    assert "rolling median" in text
+    # The standalone yardstick sentence was dropped (0.25.0) — Expected states
+    # the target per metric. The disclosure now rides the hero's meta line, so
+    # the page must still say WHICH reference produced the grades.
+    assert "60d median" in text
     assert "**" not in text          # markdown emphasis must not print literally
 
 
@@ -2769,7 +2772,9 @@ def test_report_card_pdf_states_the_plan_reference(rc_seeded, reports_tmp):
     assert payload["intent_source"] == "plan"
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "".join(page.extract_text() or "" for page in doc.pages)
-    assert "training plan" in text
+    # Graded against the plan, and the meta line says so.
+    assert "(plan)" in text
+    assert "60d median" not in text
 
 
 def test_report_card_without_splits_still_grades_and_still_renders(rc_seeded, reports_tmp):
@@ -2896,17 +2901,23 @@ def test_report_card_coach_read_failure_falls_back_and_still_renders(
 
 def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monkeypatch):
     async def _read(*a, **k):
-        return "You left something out there and you know it."
+        return {"distance": "You covered the ground.", "pace": "Too quick.",
+                "hr": "Stayed low.", "load": "Banked what it should."}
 
     monkeypatch.setattr(tools.workout_coach, "generate_read_cached", _read)
     payload, err = call(tools.workout_report_card, {})
     assert not err
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
-    assert "You left something out there" in text
-    # The read sits under the GPA/distance/pace line inside the hero, so the
-    # masthead title is followed by the grade block, not by prose.
-    assert text.index("4.00 GPA") < text.index("You left something out there")
+    # All four paragraphs render, each under its metric label.
+    for label in ("DISTANCE", "PACE", "HEART RATE", "TRAINING LOAD"):
+        assert label in text
+    for para in ("You covered the ground.", "Too quick.", "Stayed low.",
+                 "Banked what it should."):
+        assert para in text
+    # They sit under the GPA/distance/pace line inside the hero, in table order.
+    assert text.index("4.00 GPA") < text.index("You covered the ground.")
+    assert text.index("You covered the ground.") < text.index("Too quick.")
     # The GPA explainer was removed — the number stands on its own.
     assert "weighted 4.0 scale" not in text
 

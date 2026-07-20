@@ -524,6 +524,7 @@ def test_render_report_card_pdf_no_word_paints_past_the_printable_area():
     which is exactly the shape that produced the 0.24.1 overflow — a fixed cell
     fed text whose length nobody controls. Measured, not eyeballed."""
     from local_fitness.agent import report_card as rc
+    from local_fitness.agent import workout_coach
 
     long_read = (
         "You turned a 10:28 easy run into an 8:55 closer and every split says "
@@ -549,7 +550,9 @@ def test_render_report_card_pdf_no_word_paints_past_the_printable_area():
          "median_hr": 146.0, "median_load": 53.0},
         {"ctl": 57.0, "atl": 87.0, "tsb": -30.0},
     )
-    card["coach_read"] = long_read
+    # Every section carries the long paragraph — the worst case the hero cell
+    # can be asked to hold.
+    card["coach_read"] = {key: long_read for key, _ in workout_coach.READ_SECTIONS}
     pdf = visuals.render_report_card_pdf(card, None)
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         margin_pt = 1.5 * 28.35  # @page margin: 1.5cm

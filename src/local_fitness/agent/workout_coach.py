@@ -29,18 +29,20 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 
 from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
 
-# Measured on a real card (2026-07-20): 22.2s end to end, against the 30s
-# plan_coach uses — close enough that an ordinary cold start tipped it into a
-# timeout and silently served the template fallback. The caller is already
-# waiting on a WeasyPrint render and a possible Garmin fetch, so a generous
-# ceiling costs nothing on the happy path and buys real headroom.
-DEFAULT_TIMEOUT_S = 90.0
+# Measured on real cards: 22.2s for the old single paragraph, 66.9s for the
+# four-section read — output length dominates the latency, and this asks for
+# roughly four times as much of it. 90s left almost no margin and fell back to
+# the template on an ordinary run. A ceiling costs nothing on the happy path,
+# the render is on-demand rather than interactive, and the disk cache makes
+# every repeat instant.
+DEFAULT_TIMEOUT_S = 180.0
 
 # Same metric-translation contract as prompts.system_prompt and
 # plan_coach — included unconditionally so the report card honors it whether
@@ -53,20 +55,48 @@ _METRIC_TRANSLATION_BLOCK = (
     "Pair every number with its plain-English meaning."
 )
 
+#: The four paragraphs, in card order. The key is what the model must label
+#: its output with; the label is what the reader sees above each paragraph.
+READ_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("distance", "DISTANCE"),
+    ("pace", "PACE"),
+    ("hr", "HEART RATE"),
+    ("load", "TRAINING LOAD"),
+)
+
 _GRADE_TONE = (
     "The grades are already decided and are not yours to revise — do not "
     "argue with them, soften them, or re-grade the run.\n\n"
-    "Account for ALL FOUR graded metrics — distance, pace, heart rate, and "
-    "training load. Every one of them gets addressed; do not cover two and "
-    "leave the others unmentioned. Metrics that went fine can share a single "
-    "short clause — spend the words on what went wrong.\n\n"
     "NEVER state a letter grade. Do not write \"A\", \"B-\", \"C+\", "
     '"you got a B", or "your pace grade". The letters are printed in the '
-    "table directly below you and repeating them wastes the only sentences "
-    "you get. Instead make the REASON for each one obvious from the numbers: "
-    "say what he was held to, what he actually did, and why that gap does or "
-    "does not matter. A reader should be able to look at your paragraph, then "
-    "at the table, and find the letters unsurprising."
+    "table directly below you and repeating them wastes the only words you "
+    "get. Make the REASON obvious from the numbers instead: what he was held "
+    "to, what he actually did, and whether that gap matters. A reader should "
+    "look at your paragraph, then at the table, and find the letter "
+    "unsurprising.\n\n"
+    "Do NOT discuss CTL, ATL, TSB, fitness base, fatigue score or freshness. "
+    "Those are printed elsewhere and are not what this card is about."
+)
+
+_FORMAT_RULES = (
+    "# Output format — follow exactly\n"
+    "Write FOUR short paragraphs, one per graded area, each on its own line "
+    "and prefixed with its label and a colon:\n\n"
+    "DISTANCE: <paragraph>\n"
+    "PACE: <paragraph>\n"
+    "HEART RATE: <paragraph>\n"
+    "TRAINING LOAD: <paragraph>\n\n"
+    "All four labels must appear, exactly once, in that order. Nothing before "
+    "the first label and nothing after the last paragraph — no heading, no "
+    "summary, no markdown, no bullets, no quotation marks.\n\n"
+    "HARD LIMIT: 45 words per paragraph. This is a budget, not a target. "
+    "Two or three tight sentences each. Cut any clause not carrying a number "
+    "or a verdict.\n\n"
+    "You know the date of this run and what came before and after it. Use "
+    "that where it changes the meaning — a pace that is fine in isolation "
+    "reads differently as the third hard day in a row, and a short run makes "
+    "sense the week of a race. Reach backward or forward only when it "
+    "actually informs THAT paragraph's metric; do not narrate the calendar."
 )
 
 
@@ -87,17 +117,13 @@ def build_prompt(
     """
     system_prompt = (
         "You are Nate's running coach, writing the opening read on a report "
-        "card for ONE run he just finished.\n\n"
-        "HARD LIMIT: 85 words. This is a budget, not a target — going over "
-        "gets the paragraph cut off mid-sentence on the page. A sentence "
-        "count is not the constraint; total words is. Be terse. Cut every "
-        "clause that is not carrying a number or a verdict.\n\n"
+        "card for ONE run he just finished. One short paragraph per graded "
+        "area, each covering only that area.\n\n"
         f"{profile.dials_line}\n\n{profile.persona}\n\n"
         f"{_GRADE_TONE}\n\n{_METRIC_TRANSLATION_BLOCK}\n\n"
-        "Lead with the single thing that actually mattered about this run. "
         "Write in second person, present tense, the way you'd say it to his "
-        "face. Output ONLY the paragraph — no headline, no markdown, no "
-        "bullet points, no quotation marks, no preamble."
+        "face.\n\n"
+        f"{_FORMAT_RULES}"
     )
     if notes_text:
         system_prompt += (
@@ -153,13 +179,53 @@ def build_prompt(
                     f"{r.get('pace_min_per_mi') or '—'}/mi, "
                     f"{r.get('avg_hr') or '—'} bpm")
 
-    ctx = card.get("context") or {}
-    if ctx.get("ctl") is not None:
-        lines.append(
-            f"On this date: fitness (CTL) {ctx['ctl']:.0f}, fatigue (ATL) "
-            f"{ctx['atl']:.0f}, freshness (TSB) {ctx['tsb']:+.0f}.")
+    # No CTL/ATL/TSB block: the training-load model is printed on the card in
+    # its own line and is not what these four paragraphs are about. Handing it
+    # over just invited a freshness lecture in place of a distance verdict.
+
+    recent = card.get("recent_activities") or []
+    if recent:
+        lines.append(f"\nWhat led into this run (most recent first, "
+                     f"{_RECENT_LABEL}):")
+        for r in recent:
+            lines.append("  " + _describe_activity(r))
+
+    upcoming = card.get("upcoming_workouts") or []
+    if upcoming:
+        lines.append("\nWhat this was setting up for (next 7 days, prescribed):")
+        for w in upcoming:
+            lines.append("  " + _describe_prescription(w))
 
     return system_prompt, "\n".join(lines)
+
+
+_RECENT_LABEL = "trailing 14 days"
+
+
+def _describe_activity(row: dict) -> str:
+    from .report_card import _fmt_distance, _fmt_pace
+
+    parts = [f"{row.get('date')}: {row.get('activity_type') or 'activity'}"]
+    if row.get("distance_meters"):
+        parts.append(_fmt_distance(row["distance_meters"]))
+    if row.get("avg_pace_sec_per_km"):
+        parts.append(_fmt_pace(row["avg_pace_sec_per_km"]))
+    if row.get("avg_hr"):
+        parts.append(f"{round(row['avg_hr'])} bpm")
+    if row.get("training_load"):
+        parts.append(f"load {round(row['training_load'])}")
+    return " · ".join(parts)
+
+
+def _describe_prescription(w: dict) -> str:
+    parts = [f"{w.get('date')}: {w.get('type') or 'workout'}"]
+    if w.get("distance_mi") is not None:
+        parts.append(f"{w['distance_mi']} mi")
+    if w.get("pace_min_per_mi"):
+        parts.append(f"@ {w['pace_min_per_mi']}/mi")
+    if w.get("description"):
+        parts.append(str(w["description"]))
+    return " · ".join(parts)
 
 
 def _metric_labels():
@@ -189,6 +255,43 @@ def reference_summary(card: dict) -> str:
     from .report_card import reference_line
 
     return reference_line(card, markdown=False)
+
+
+def parse_read(text: str) -> dict[str, str]:
+    """``LABEL: paragraph`` lines → ``{metric_key: paragraph}``.
+
+    Pure. Raises ``ValueError`` unless all four sections are present and
+    non-empty, so a malformed generation falls back to the deterministic
+    four-paragraph template rather than rendering a card with a missing or
+    half-parsed section. Tolerates the cosmetics a model varies on — leading
+    bullets, bold markers, blank lines between sections, a label in any case —
+    because none of those change the content, and regenerating over a stray
+    asterisk would be wasteful.
+    """
+    if not text:
+        raise ValueError("empty read")
+
+    # Locate each label's span, then take everything up to the next label.
+    positions: list[tuple[int, int, str]] = []
+    for key, label in READ_SECTIONS:
+        m = re.search(
+            rf"^[\s>*\-#]*{re.escape(label)}\s*:", text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if m is None:
+            raise ValueError(f"read is missing the {label} section")
+        positions.append((m.start(), m.end(), key))
+    positions.sort()
+
+    out: dict[str, str] = {}
+    for i, (_, body_start, key) in enumerate(positions):
+        end = positions[i + 1][0] if i + 1 < len(positions) else len(text)
+        body = text[body_start:end].strip().strip("*").strip()
+        if not body:
+            raise ValueError(f"read has an empty {key} section")
+        # Collapse the model's own wrapping; the renderer does the wrapping.
+        out[key] = " ".join(body.split())
+    return out
 
 
 async def generate_read(
@@ -278,8 +381,8 @@ async def generate_read_cached(
     timeout: float = DEFAULT_TIMEOUT_S,
     notes_text: str | None = None,
     cache_path: Path | None = None,
-) -> str:
-    """``generate_read`` behind a single-entry disk cache.
+) -> dict[str, str]:
+    """``generate_read`` behind a single-entry disk cache, parsed into sections.
 
     Same rationale as ``plan_coach.generate_coaching_line_cached``: re-rendering
     the same card is the common case (you look at a run more than once), and
@@ -308,62 +411,55 @@ async def generate_read_cached(
     path = cache_path or _cache_path()
     cached = _read_cache(path, key)
     if cached is not None:
-        _LOG.info("workout_coach cache hit — reusing read")
-        return cached
+        try:
+            sections = parse_read(cached)
+            _LOG.info("workout_coach cache hit — reusing read")
+            return sections
+        except ValueError:
+            # A cached string that no longer parses (an older format, a
+            # truncated write) is a miss, not a failure.
+            _LOG.info("workout_coach cached read no longer parses — regenerating")
     text = await generate_read(
         profile, card, model=model, timeout=timeout, notes_text=notes_text)
+    # Parse BEFORE caching: an unparseable generation must not be stored, or
+    # every later render pays to rediscover that it is unusable.
+    sections = parse_read(text)
     _write_cache(path, key, text)
-    return text
+    return sections
 
 
-def fallback_read(card: dict) -> str:
-    """Deterministic, template-based opening read — used only when
-    ``generate_read`` fails. Pure: identical cards always produce identical
-    text. Never raises.
+def fallback_read(card: dict) -> dict[str, str]:
+    """Deterministic, template-based four-paragraph read — used only when
+    ``generate_read`` fails or its output cannot be parsed. Pure: identical
+    cards always produce identical text. Never raises.
 
     Deliberately flat rather than doing an impression of the coach voice: a
-    template pretending to be a personality reads worse than a template that
-    plainly states the result, and the grades above it carry the verdict
-    regardless.
+    template pretending to be a personality reads worse than one that plainly
+    states the result, and the table below carries the verdict regardless.
     """
-    act = card.get("activity") or {}
-    overall = card.get("overall") or {}
-    grade = overall.get("grade") or "n/a"
+    from .report_card import _delta_text
 
-    parts = []
-    name = act.get("activity_name") or act.get("activity_type") or "This run"
-    dist = (card.get("metrics") or {}).get("distance", {}).get("actual")
-    if dist:
-        from . import units
-
-        parts.append(
-            f"{name}: {units.to_miles(dist):.2f} mi, graded {grade}.")
-    else:
-        parts.append(f"{name}: graded {grade}.")
-
-    # `or ""` rather than a .get default: an ungraded metric carries an
-    # explicit `"grade": None`, so the default never fires and None.startswith
-    # raises. That is exactly the insufficient-history card.
-    def _grade_of(key: str) -> str:
-        return ((card.get("metrics") or {}).get(key) or {}).get("grade") or ""
-
-    weak = [label for key, label in _metric_labels()
-            if _grade_of(key).startswith(("D", "F"))]
-    strong = [label for key, label in _metric_labels()
-              if _grade_of(key).startswith("A")]
-    if weak:
-        parts.append(f"Weakest: {', '.join(weak).lower()}.")
-    if strong:
-        parts.append(f"Strongest: {', '.join(strong).lower()}.")
-
-    drift = (card.get("splits") or {}).get("hr_drift_pct")
-    if drift is not None and drift > 5:
-        parts.append(
-            f"Heart rate climbed {drift:+.1f}% in the back half for the same ground.")
-    return " ".join(parts)
+    out: dict[str, str] = {}
+    for key, label in READ_SECTIONS:
+        m = ((card.get("metrics") or {}).get(key)) or {}
+        actual = _fmt(key, m.get("actual"))
+        if not m.get("grade"):
+            out[key] = f"{actual}. Not enough comparable history to grade this."
+            continue
+        target = _expected_text(key, m)
+        delta = _delta_text(key, m)
+        sentence = f"{actual} against {target}." if target != "—" else f"{actual}."
+        if delta != "—":
+            sentence += f" {delta.capitalize()}."
+        if m.get("note"):
+            sentence += f" {m['note'].capitalize()}."
+        if key == "load" and m.get("spike"):
+            sentence += " More than double your median day."
+        out[key] = sentence
+    return out
 
 
 __all__ = [
     "build_prompt", "generate_read", "generate_read_cached", "fallback_read",
-    "reference_summary",
+    "parse_read", "reference_summary", "READ_SECTIONS",
 ]

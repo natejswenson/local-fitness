@@ -37,10 +37,20 @@ ACTIVITY = {
 }
 
 
+FOUR_SECTIONS = (
+    "DISTANCE: covered the ground.\n"
+    "PACE: too quick.\n"
+    "HEART RATE: stayed low.\n"
+    "TRAINING LOAD: banked what it should."
+)
+
+
 def a_card(activity=None, **kw):
     return rc.build_card({**ACTIVITY, **(activity or {})}, kw.pop("splits", []),
                          kw.pop("plan", None), kw.pop("reference", REF),
-                         kw.pop("context", {}), kw.pop("hr_samples", None))
+                         kw.pop("context", {}), kw.pop("hr_samples", None),
+                         kw.pop("recent_activities", None),
+                         kw.pop("upcoming_workouts", None))
 
 
 # --- build_prompt: what the model is actually told --------------------------
@@ -121,7 +131,7 @@ def test_cache_hit_reuses_text_without_calling_the_generator(tmp_path, monkeypat
 
     async def _gen(*a, **k):
         calls.append(1)
-        return "generated read"
+        return FOUR_SECTIONS
 
     monkeypatch.setattr(workout_coach, "generate_read", _gen)
     card = a_card()
@@ -129,7 +139,8 @@ def test_cache_hit_reuses_text_without_calling_the_generator(tmp_path, monkeypat
         PROFILE, card, cache_path=path))
     second = asyncio.run(workout_coach.generate_read_cached(
         PROFILE, card, cache_path=path))
-    assert first == second == "generated read"
+    assert first == second
+    assert first["pace"] == "too quick."
     assert len(calls) == 1
 
 
@@ -138,15 +149,16 @@ def test_changed_input_misses_the_cache_and_regenerates(tmp_path, monkeypatch):
     calls = []
 
     async def _gen(profile, card, **k):
-        calls.append(card["activity"]["activity_id"])
-        return f"read for {card['activity']['activity_id']}"
+        aid = card["activity"]["activity_id"]
+        calls.append(aid)
+        return FOUR_SECTIONS.replace("too quick.", f"too quick for {aid}.")
 
     monkeypatch.setattr(workout_coach, "generate_read", _gen)
     asyncio.run(workout_coach.generate_read_cached(
         PROFILE, a_card(), cache_path=path))
     out = asyncio.run(workout_coach.generate_read_cached(
         PROFILE, a_card({"activity_id": 2}), cache_path=path))
-    assert out == "read for 2"
+    assert out["pace"] == "too quick for 2."
     assert calls == [1, 2]
 
 
@@ -169,35 +181,42 @@ def test_corrupt_cache_file_is_ignored_not_fatal(tmp_path, monkeypatch):
     path.write_text("{not json", encoding="utf-8")
 
     async def _gen(*a, **k):
-        return "fresh read"
+        return FOUR_SECTIONS
 
     monkeypatch.setattr(workout_coach, "generate_read", _gen)
-    assert asyncio.run(workout_coach.generate_read_cached(
-        PROFILE, a_card(), cache_path=path)) == "fresh read"
-    assert json.loads(path.read_text())["text"] == "fresh read"
+    out = asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=path))
+    assert out["distance"] == "covered the ground."
+    assert json.loads(path.read_text())["text"] == FOUR_SECTIONS
 
 
 def test_cache_write_failure_still_returns_the_generated_text(tmp_path, monkeypatch):
     async def _gen(*a, **k):
-        return "fresh read"
+        return FOUR_SECTIONS
 
     monkeypatch.setattr(workout_coach, "generate_read", _gen)
     # A directory where the cache file should go: write fails, read succeeds.
     bad = tmp_path / "cache.json"
     bad.mkdir()
-    assert asyncio.run(workout_coach.generate_read_cached(
-        PROFILE, a_card(), cache_path=bad)) == "fresh read"
+    out = asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=bad))
+    assert out["hr"] == "stayed low."
 
 
-# --- fallback ---------------------------------------------------------------
+# --- fallback: still four sections, deterministic ---------------------------
 
-def test_fallback_names_the_grade_and_the_weakest_metric():
-    # Distance far under expectation and pace far off → D/F territory.
+def test_fallback_returns_all_four_sections():
     card = a_card({"distance_meters": 4000, "avg_hr": 150})
-    text = workout_coach.fallback_read(card)
-    assert card["overall"]["grade"] in text
-    assert "Morning Run" in text
-    assert "weakest" in text.lower()
+    out = workout_coach.fallback_read(card)
+    assert set(out) == {"distance", "pace", "hr", "load"}
+    assert all(v.strip() for v in out.values())
+
+
+def test_fallback_states_each_metric_actual_and_target():
+    out = workout_coach.fallback_read(a_card())
+    assert "6.21 mi" in out["distance"]
+    assert "/mi" in out["pace"]
+    assert "bpm" in out["hr"]
 
 
 def test_fallback_survives_a_card_with_no_grades_at_all():
@@ -205,8 +224,13 @@ def test_fallback_survives_a_card_with_no_grades_at_all():
     # what made an earlier `.get("grade", "")` default raise AttributeError.
     card = a_card(reference={"mode": "insufficient_data", "n": 1, "pool": "running"})
     assert all(m.get("grade") is None for m in card["metrics"].values())
-    text = workout_coach.fallback_read(card)
-    assert "n/a" in text
+    out = workout_coach.fallback_read(card)
+    assert all("Not enough comparable history" in v for v in out.values())
+
+
+def test_fallback_flags_a_load_spike():
+    out = workout_coach.fallback_read(a_card({"training_load": 500}))
+    assert "double your median day" in out["load"]
 
 
 def test_fallback_is_deterministic():
@@ -214,67 +238,141 @@ def test_fallback_is_deterministic():
     assert workout_coach.fallback_read(card) == workout_coach.fallback_read(card)
 
 
-def test_fallback_mentions_significant_hr_drift():
-    card = a_card()
-    card["splits"] = {"available": True, "unit": "Mile", "rows": [],
-                      "hr_drift_pct": 9.2}
-    assert "9.2%" in workout_coach.fallback_read(card)
+# --- parse_read: four labelled sections or nothing --------------------------
+
+def test_parse_splits_labelled_sections():
+    out = workout_coach.parse_read(FOUR_SECTIONS)
+    assert out == {
+        "distance": "covered the ground.", "pace": "too quick.",
+        "hr": "stayed low.", "load": "banked what it should.",
+    }
 
 
-def test_markdown_card_puts_the_read_under_the_grade_line():
+def test_parse_tolerates_model_cosmetics():
+    # Blank lines, bold markers, bullets and mixed case are all cosmetic — none
+    # change the content, and regenerating over a stray asterisk is wasteful.
+    messy = (
+        "**DISTANCE:** covered the ground.\n\n"
+        "- Pace: too quick.\n\n"
+        "  heart rate: stayed low.\n\n"
+        "TRAINING LOAD: banked what it should.\n"
+    )
+    out = workout_coach.parse_read(messy)
+    assert out["distance"] == "covered the ground."
+    assert out["pace"] == "too quick."
+    assert out["hr"] == "stayed low."
+
+
+def test_parse_collapses_wrapped_paragraphs():
+    wrapped = FOUR_SECTIONS.replace(
+        "PACE: too quick.", "PACE: too quick\nby a full minute\nper mile.")
+    assert workout_coach.parse_read(wrapped)["pace"] == "too quick by a full minute per mile."
+
+
+@pytest.mark.parametrize("bad", [
+    "",
+    "DISTANCE: a. PACE: b. HEART RATE: c.",                    # load missing
+    "DISTANCE: a\nPACE: b\nHEART RATE: c\nTRAINING LOAD:",     # load empty
+])
+def test_parse_rejects_incomplete_reads(bad):
+    # A half-parsed read would render a card with a blank section. Raising
+    # sends the caller to the deterministic template instead.
+    with pytest.raises(ValueError):
+        workout_coach.parse_read(bad)
+
+
+def test_unparseable_generation_is_never_cached(tmp_path, monkeypatch):
+    path = tmp_path / "cache.json"
+
+    async def _gen(*a, **k):
+        return "just some prose with no labels at all"
+
+    monkeypatch.setattr(workout_coach, "generate_read", _gen)
+    with pytest.raises(ValueError):
+        asyncio.run(workout_coach.generate_read_cached(
+            PROFILE, a_card(), cache_path=path))
+    assert not path.exists()
+
+
+def test_cached_text_that_no_longer_parses_is_a_miss_not_a_failure(tmp_path, monkeypatch):
+    """An older-format cache entry must regenerate, not poison every render."""
+    import hashlib
+
+    system, user = workout_coach.build_prompt(PROFILE, a_card())
+    key = hashlib.sha256("\x00".join(
+        [system, user, "default", "1"]).encode("utf-8")).hexdigest()
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps({"key": key, "text": "old single-paragraph read"}))
+
+    async def _gen(*a, **k):
+        return FOUR_SECTIONS
+
+    monkeypatch.setattr(workout_coach, "generate_read", _gen)
+    out = asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=path))
+    assert out["pace"] == "too quick."
+
+
+# --- prompt + rendering -----------------------------------------------------
+
+def test_prompt_demands_four_labelled_sections_and_forbids_letter_grades():
+    system, _ = workout_coach.build_prompt(PROFILE, a_card())
+    for label in ("DISTANCE:", "PACE:", "HEART RATE:", "TRAINING LOAD:"):
+        assert label in system
+    assert "NEVER state a letter grade" in system
+    assert "45 words per paragraph" in system
+
+
+def test_prompt_excludes_the_training_load_model_numbers():
+    """Nate: the CTL/ATL/TSB sentence "doesn't matter". Handing those over just
+    invited a freshness lecture in place of a distance verdict."""
+    card = a_card(context={"ctl": 57.0, "atl": 87.0, "tsb": -30.0})
+    system, user = workout_coach.build_prompt(PROFILE, card)
+    assert "Do NOT discuss CTL" in system
+    assert "57" not in user.split("Metric grades")[0]
+    assert "freshness (TSB) -30" not in user
+
+
+def test_prompt_carries_past_runs_and_upcoming_prescriptions():
+    """Hindsight and foresight: a pace that is fine in isolation reads
+    differently as the third hard day in a row."""
+    card = a_card(
+        recent_activities=[{
+            "date": "2026-07-17", "activity_type": "running",
+            "distance_meters": 8046, "avg_pace_sec_per_km": 300,
+            "avg_hr": 150, "training_load": 95}],
+        upcoming_workouts=[{
+            "date": "2026-07-22", "type": "interval", "distance_mi": 5.0,
+            "pace_min_per_mi": "7:30", "description": "6x800"}],
+    )
+    _, user = workout_coach.build_prompt(PROFILE, card)
+    assert "2026-07-17" in user and "5.00 mi" in user
+    assert "2026-07-22" in user and "interval" in user and "6x800" in user
+
+
+def test_prompt_omits_the_history_blocks_when_there_is_none():
+    _, user = workout_coach.build_prompt(PROFILE, a_card())
+    assert "What led into this run" not in user
+    assert "What this was setting up for" not in user
+
+
+def test_markdown_card_renders_four_labelled_paragraphs():
     card = a_card()
-    card["coach_read"] = "That was a controlled effort and you know it."
+    card["coach_read"] = {
+        "distance": "You covered the ground.", "pace": "Too quick.",
+        "hr": "Stayed low.", "load": "Banked what it should.",
+    }
     md = rc.render_markdown(card)
-    # Title, then the grade line, then the read, then the yardstick — mirroring
-    # the PDF hero, where the masthead carries the run name and nothing else.
-    assert md.index("# Report Card") < md.index("## Overall:")
-    assert md.index("## Overall:") < md.index(card["coach_read"])
-    assert md.index(card["coach_read"]) < md.index("Graded against")
-    # The GPA explainer is gone — the number stands on its own.
-    assert "weighted 4.0 scale" not in md
+    assert md.index("## Overall:") < md.index("You covered the ground.")
+    for label in ("**Distance**", "**Pace**", "**Heart Rate**", "**Training Load**"):
+        assert label in md
+    # Distance's paragraph precedes pace's, matching the table's order.
+    assert md.index("You covered the ground.") < md.index("Too quick.")
+    # The standalone yardstick sentence is gone; Expected states it per metric.
+    assert "Graded against your" not in md
 
 
 def test_markdown_card_without_a_read_opens_on_the_grade():
     md = rc.render_markdown(a_card())
     assert "## Overall:" in md
-    # No stray empty block where the read would have been.
-    assert "\n\n\n" not in md
-
-
-# --- the read must cover every metric and never name a letter ---------------
-
-def test_prompt_demands_all_four_metrics_and_forbids_letter_grades():
-    system, _ = workout_coach.build_prompt(PROFILE, a_card())
-    assert "ALL FOUR" in system
-    assert "NEVER state a letter grade" in system
-    # The letters print in the table right below the paragraph; repeating them
-    # spends the only sentences the read gets.
-    assert "printed in the table" in system
-
-
-def test_prompt_gives_hr_its_band_not_a_bare_midpoint():
-    # The grade is measured against a band edge. Handing the model the median
-    # is how it ends up explaining a heart-rate verdict against a number the
-    # grade was never computed from.
-    _, user = workout_coach.build_prompt(PROFILE, a_card({"avg_hr": 120}))
-    assert "bpm" in user
-    assert "≤" in user or "≥" in user or "–" in user
-
-
-def test_prompt_says_when_hr_sat_inside_the_range():
-    # 130 against a 150 median on a steady day: band is 0.93-1.07 → 140-161,
-    # so 130 is UNDER the floor. Use an easy-intent card instead, where the
-    # band is a ceiling of 0.97 x 150 = 146.
-    card = a_card({"avg_hr": 130, "activity_name": "easy shakeout"})
-    assert card["intent_class"] == "easy"
-    assert card["metrics"]["hr"]["in_band"] is True
-    _, user = workout_coach.build_prompt(PROFILE, card)
-    assert "inside the range" in user
-
-
-def test_prompt_budgets_words_not_sentences():
-    """Sentence counts don't bound length — the model wrote five sentences so
-    long the paragraph pushed the HR chart onto a second page."""
-    system, _ = workout_coach.build_prompt(PROFILE, a_card())
-    assert "85 words" in system
-    assert "total words is" in system
+    assert "**Distance** —" not in md

@@ -2646,6 +2646,7 @@ async def workout_report_card(args: dict) -> dict:
     card = report_card.build_card(
         inputs["activity"], inputs["splits"], inputs["plan_workout"],
         inputs["reference"], inputs["context"], inputs.get("hr_samples"),
+        inputs.get("recent_activities"), inputs.get("upcoming_workouts"),
     )
 
     # The coach's verbal read leads the card. Claude-generated behind the same

@@ -725,17 +725,29 @@ ul.card-notes {{
    the table above them, not the page's subject, and at 100% they out-shouted
    the grades. */
 img.split-chart {{ width: 84%; margin-top: 0.7em; }}
-/* The coach's read sits in the hero's meta cell, matching .reference-line
-   exactly — same serif-italic commentary voice, same measure — so the block
-   under the grade reads as one paragraph of coach, not two competing styles.
-   Ink rather than dim: this is the sentence he actually reads. */
+/* Four short paragraphs in the hero's meta cell, one per graded area. Smaller
+   than the reference line it replaced, because there are now four of them and
+   they have to sit beside the grade letter without pushing the tables down the
+   page. Serif italic is the theme's commentary voice — this is the coach
+   talking, not data. */
 p.coach-read {{
   font-family: {f["serif_stack"]};
   font-style: italic;
   color: {c["ink"]};
-  margin: 0.5em 0 0 0;
-  font-size: 0.95em;
-  line-height: 1.4;
+  margin: 0.45em 0 0 0;
+  font-size: 0.82em;
+  line-height: 1.35;
+}}
+/* The metric label: structure voice, so the eye can jump straight to the
+   paragraph it wants without reading all four. */
+span.coach-label {{
+  font-family: {f["display_stack"]};
+  font-style: normal;
+  font-weight: 800;
+  font-size: 0.82em;
+  letter-spacing: 0.06em;
+  color: {dim};
+  margin-right: 0.5em;
 }}
 """
 
@@ -997,10 +1009,18 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
     gpa = f"{overall['gpa']:.2f} GPA" if overall.get("gpa") is not None else "not graded"
     eyebrow = f"{ident['brand_line']} · REPORT CARD · {act.get('date')}"
 
+    # The yardstick no longer gets its own sentence, but the card must still
+    # disclose it — the same run grades differently under a plan than under the
+    # rolling median. It rides the meta line instead: "· easy (plan)".
+    graded_by = "plan" if any(
+        (m.get("reference") or "").startswith("plan")
+        for m in card["metrics"].values()
+    ) else "60d median"
     subtitle = (
         f"{rc._fmt_distance(act.get('distance_meters'))} in "
         f"{units_mod.format_duration(act.get('duration_seconds')) or '—'} · "
-        f"{rc._fmt_pace(act.get('avg_pace_sec_per_km'))}"
+        f"{rc._fmt_pace(act.get('avg_pace_sec_per_km'))} · "
+        f"{card.get('intent')} ({graded_by})"
     )
 
     notes = [f"{label}: {card['metrics'][key]['note']}"
@@ -1020,13 +1040,17 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
         f'on this date.</p>'
     ) if ctx.get("ctl") is not None else ""
 
-    # The read lives inside the hero's meta cell, directly under the
-    # GPA/distance/pace line and in the same voice as the reference line below
-    # it — the masthead title names the run and carries nothing else. Omitted
-    # entirely when absent rather than left as an empty block.
-    coach_html = (
-        f'<p class="coach-read">{html.escape(card["coach_read"])}</p>'
-        if card.get("coach_read") else ""
+    # Four short paragraphs in the hero's meta cell, one per graded area,
+    # directly under the GPA/distance/pace line. The masthead title names the
+    # run and carries nothing else. Omitted entirely when absent rather than
+    # left as an empty block.
+    from .workout_coach import READ_SECTIONS
+
+    read = card.get("coach_read") or {}
+    coach_html = "".join(
+        f'<p class="coach-read"><span class="coach-label">'
+        f'{html.escape(label)}</span>{html.escape(read[key])}</p>'
+        for key, label in READ_SECTIONS if read.get(key)
     )
 
     return f"""<!doctype html>
@@ -1046,7 +1070,6 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
     <td class="grade-meta">
       <span class="grade-gpa">{html.escape(gpa)} · {html.escape(subtitle)}</span>
       {coach_html}
-      <p class="reference-line">{html.escape(rc.reference_line(card, markdown=False))}</p>
     </td>
   </tr></table>
 
