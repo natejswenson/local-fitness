@@ -2056,18 +2056,18 @@ def test_generate_chart_reports_dir_error_is_clean(seeded, monkeypatch):
     assert not tools.subprocess.run.called
 
 
-def test_generate_brief_report_excluded_from_all_tools_generate_chart_included():
-    # INV-4 (rewritten per Fix A, 2026-07-10 doc): generate_brief_report
-    # stays local-only (a PDF isn't representable as MCP ImageContent, and
-    # a remote caller has no way to retrieve the file) — but generate_chart
-    # is now IN ALL_TOOLS (reachable over both stdio and the networked
-    # /mcp/ transport) since its inline image content block sidesteps the
-    # no-file-retrieval problem that used to make it local-only too.
+def test_pdf_writing_tools_are_local_only_generate_chart_is_not():
+    # INV-4 (rewritten per Fix A, 2026-07-10 doc; extended for
+    # workout_report_card): a tool that hands back a *filesystem path* is
+    # local-only, because a remote /mcp/ caller gets a container-internal path
+    # with no way to retrieve the file. Both PDF writers qualify. generate_chart
+    # does NOT — its inline ImageContent block sidesteps the retrieval problem,
+    # which is exactly why it moved into ALL_TOOLS.
     all_names = {t.name for t in tools.ALL_TOOLS}
-    assert "generate_brief_report" not in all_names
-    assert "generate_chart" in all_names
     local_only_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
-    assert local_only_names == {"generate_brief_report"}
+    assert local_only_names == {"generate_brief_report", "workout_report_card"}
+    assert all_names.isdisjoint(local_only_names)
+    assert "generate_chart" in all_names
 
 
 # --- 2026-07-09: Training Plan section (_build_plan_section + wiring) ------
@@ -2627,3 +2627,225 @@ def test_chart_bar_short_window_stays_daily(seeded):
     text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "bar"})
     assert not err
     assert "weekly" not in text
+
+
+# --- workout_report_card ---------------------------------------------------
+
+@pytest.fixture
+def rc_seeded(tmp_path, monkeypatch):
+    """A DB with enough comparable running history for a real reference.
+
+    The shared `seeded` fixture holds a single activity, which every report
+    card would grade as `insufficient_data` — useful for exactly one test, not
+    for the handler's happy path.
+    """
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i in range(1, 13):
+            d = (today - timedelta(days=i)).isoformat()
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+                "activity_name, duration_seconds, distance_meters, avg_hr, "
+                "avg_pace_sec_per_km, training_load) VALUES "
+                "(?, ?, ?, 'running', 'Run', 3000, 10000, 150, 300, 100)",
+                (100 + i, d, f"{d} 07:00:00"),
+            )
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "activity_name, duration_seconds, distance_meters, avg_hr, "
+            "avg_pace_sec_per_km, training_load) VALUES "
+            "(1, ?, ?, 'running', 'Morning Run', 3000, 10000, 150, 300, 100)",
+            (today.isoformat(), today.isoformat() + " 07:00:00"),
+        )
+        for idx, hr in enumerate((140, 145, 150, 155)):
+            conn.execute(
+                "INSERT INTO activity_splits (activity_id, split_index, distance_meters, "
+                "duration_seconds, avg_hr) VALUES (1, ?, 1609.34, 600, ?)",
+                (idx, hr),
+            )
+    return p
+
+
+def test_report_card_defaults_to_the_most_recent_activity(rc_seeded, reports_tmp):
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert payload["activity_id"] == 1
+    assert payload["date"] == date.today().isoformat()
+    assert payload["markdown"].startswith("# Report Card")
+
+
+def test_report_card_activity_id_overrides_date(rc_seeded, reports_tmp):
+    payload, err = call(tools.workout_report_card, {
+        "activity_id": 105, "date": date.today().isoformat(), "format": "table"})
+    assert not err
+    assert payload["activity_id"] == 105
+
+
+def test_report_card_by_date(rc_seeded, reports_tmp):
+    d = (date.today() - timedelta(days=3)).isoformat()
+    payload, err = call(tools.workout_report_card, {"date": d, "format": "table"})
+    assert not err
+    assert payload["date"] == d
+
+
+def test_report_card_no_matching_activity_is_an_error(rc_seeded, reports_tmp):
+    payload, err = call(tools.workout_report_card, {"date": "1999-01-01"})
+    assert err
+    assert "no matching activity" in payload["error"]
+
+
+def test_report_card_malformed_date_never_touches_the_db(rc_seeded, monkeypatch):
+    """Validation happens before any query, mirroring generate_chart's
+    unknown-metric guard."""
+    def boom(*_a, **_k):
+        raise AssertionError("must not open the DB on a malformed date")
+
+    monkeypatch.setattr(tools.db, "connect", boom)
+    payload, err = call(tools.workout_report_card, {"date": "07-19-2026"})
+    assert err
+    assert "malformed date" in payload["error"]
+
+
+def test_report_card_bad_format_is_an_error(rc_seeded, monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("must not open the DB on a bad format")
+
+    monkeypatch.setattr(tools.db, "connect", boom)
+    payload, err = call(tools.workout_report_card, {"format": "csv"})
+    assert err
+    assert payload["allowed"] == ["both", "pdf", "table"]
+
+
+def test_report_card_table_format_writes_no_file(rc_seeded, reports_tmp):
+    reports_dir, _ = reports_tmp
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert "path" not in payload
+    assert not reports_dir.exists() or list(reports_dir.glob("*.pdf")) == []
+
+
+def test_report_card_writes_a_pdf(rc_seeded, reports_tmp):
+    reports_dir, _ = reports_tmp
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    path = Path(payload["path"])
+    assert path.name == "report-card-1.pdf"
+    assert path.parent == reports_dir
+    assert path.read_bytes()[:5] == b"%PDF-"
+
+
+def test_report_card_pdf_states_the_rolling_reference(rc_seeded, reports_tmp):
+    """The 'which yardstick' requirement is asserted in the rendered page, not
+    merely in the payload."""
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
+        text = "".join(page.extract_text() or "" for page in doc.pages)
+    assert "rolling median" in text
+    assert "**" not in text          # markdown emphasis must not print literally
+
+
+def test_report_card_pdf_states_the_plan_reference(rc_seeded, reports_tmp):
+    today = date.today().isoformat()
+    with db.connect(rc_seeded) as conn:
+        conn.execute(
+            "INSERT INTO training_plans (plan_id, status, goal_type, race_date, "
+            "title, created_at) VALUES (7, 'active', '10k', ?, 'Plan', ?)",
+            ((date.today() + timedelta(days=30)).isoformat(), today),
+        )
+        conn.execute(
+            "INSERT INTO plan_workouts (plan_id, date, seq, week_index, type, "
+            "target_distance_m, target_pace_sec_per_km, description) "
+            "VALUES (7, ?, 1, 1, 'easy', 10000, 330, 'Easy 10k')",
+            (today,),
+        )
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert payload["reference"] == "rolling_60d"     # the HR/load pool
+    assert payload["intent_source"] == "plan"
+    with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
+        text = "".join(page.extract_text() or "" for page in doc.pages)
+    assert "training plan" in text
+
+
+def test_report_card_without_splits_still_grades_and_still_renders(rc_seeded, reports_tmp):
+    """~88% of the history is backfilled and carries no splits — the common
+    case, not an edge case."""
+    with db.connect(rc_seeded) as conn:
+        conn.execute("DELETE FROM activity_splits WHERE activity_id = 1")
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert payload["splits_available"] is False
+    assert payload["overall"]["grade"] != "n/a"      # grades are unaffected
+    assert Path(payload["path"]).read_bytes()[:5] == b"%PDF-"
+    assert "No per-mile splits recorded" in payload["markdown"]
+
+
+def test_report_card_insufficient_history_grades_nothing(seeded, reports_tmp):
+    """The shared fixture's single activity has no comparable history."""
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert payload["reference"] == "insufficient_data"
+    assert payload["overall"]["grade"] == "n/a"
+    assert set(payload["grades"].values()) == {None}
+
+
+def test_report_card_reports_a_double_day(rc_seeded, reports_tmp):
+    with db.connect(rc_seeded) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "duration_seconds, distance_meters) VALUES (555, ?, ?, 'running', 1200, 5000)",
+            (date.today().isoformat(), date.today().isoformat() + " 05:00:00"),
+        )
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert 555 in payload["other_activities_on_date"]
+
+
+def test_report_card_pdf_render_failure_is_an_error(rc_seeded, reports_tmp, monkeypatch):
+    from local_fitness.agent import visuals
+
+    def boom(*_a, **_k):
+        raise RuntimeError("weasyprint exploded")
+
+    monkeypatch.setattr(visuals, "render_report_card_pdf", boom)
+    payload, err = call(tools.workout_report_card, {})
+    assert err
+    assert "PDF render failed" in payload["error"]
+
+
+def test_report_card_split_chart_failure_never_sinks_the_card(
+    rc_seeded, reports_tmp, monkeypatch
+):
+    """One section's problem must never fail the whole report."""
+    from local_fitness.agent import visuals
+
+    def boom(*_a, **_k):
+        raise RuntimeError("matplotlib exploded")
+
+    monkeypatch.setattr(visuals, "render_split_hr_png", boom)
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert Path(payload["path"]).read_bytes()[:5] == b"%PDF-"
+
+
+def test_report_card_path_escape_is_error(rc_seeded, reports_tmp, monkeypatch):
+    def boom(*_a, **_k):
+        raise ValueError("escaped")
+
+    monkeypatch.setattr(tools, "_write_atomic", boom)
+    payload, err = call(tools.workout_report_card, {})
+    assert err
+    assert "escaped reports directory" in payload["error"]
+
+
+def test_report_card_is_local_only():
+    """Regression guard for web/mcp_server.py's transport contract: a
+    PDF-writing tool must never reach the networked /mcp/ surface, which has
+    no way to retrieve a local path."""
+    assert "workout_report_card" in [t.name for t in tools.LOCAL_ONLY_TOOLS]
+    assert "workout_report_card" not in [t.name for t in tools.ALL_TOOLS]
+    assert "mcp__fitness__workout_report_card" not in tools.allowed_tool_names()

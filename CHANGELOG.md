@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-20
+
+### Added
+- **`workout_report_card` — a graded report card for one workout.** The coach
+  could already *describe* a workout (`get_workout_detail`) but nothing
+  *judged* one, so the same run got called "solid" one day and "flat" the
+  next. Grading is now tested Python (`agent/report_card.py`), per the
+  `interpret.py` rule that the LLM phrases a judgment but never derives one
+  code can compute. Four metrics — distance, pace, HR, training load — each
+  reduce to a single non-negative relative deviation passed through ONE
+  shared band table, so the rubric stays testable. Returns a `markdown` card
+  plus a PRESS-themed PDF with a per-mile split table and an HR bar chart.
+  - **Two reference points, always named on the card**: the active plan's
+    prescribed workout for that date (distance + pace only — `plan_workouts`
+    has no HR or load column), else a 60-day rolling *median* of comparable
+    activities. Below 5 comparable activities the card returns n/a and says
+    why rather than grading against noise.
+  - **Direction gating** keeps the rubric honest: an easy run is *supposed*
+    to be slow, so easy/long days are penalized only for running too fast and
+    quality days only for too slow, with each metric's expectation scaled by
+    the workout's intent.
+  - **Comparability is exact `activity_type` first**, widening to the on-foot
+    class only when the pool is too thin. Measured on live data: pooling
+    `running` with `treadmill_running` put median HR at 119 against an
+    outdoor average of 140 and handed a normal easy run a D — an artifact of
+    mixing two HR regimes, not a judgment.
+  - **Splits are presentation-only.** No grade reads `activity_splits`: only
+    87 of 747 activities have them (written by daily sync, never by
+    backfill), so a splits-dependent grade would be silently unavailable on
+    ~88% of history.
+  - **Local-only**, alongside `generate_brief_report` and for the same
+    reason: it hands back a filesystem path, which is meaningless to a
+    remote `/mcp/` caller.
+
 ## [0.24.1] - 2026-07-19
 
 ### Fixed

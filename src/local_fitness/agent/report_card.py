@@ -91,6 +91,10 @@ _GPA_CUTS: tuple[tuple[float, str], ...] = (
 # median; a long day longer. Applied to the rolling reference only — a plan
 # states its own targets and needs no scaling.
 DISTANCE_FACTORS = {"easy": 0.75, "long": 1.40, "quality": 1.00, "steady": 1.00}
+# Training load tracks distance closely enough at a fixed intent that a second,
+# independently-tuned table would be false precision — deliberately the same
+# numbers, named separately so they can diverge if evidence ever says they should.
+LOAD_FACTORS = dict(DISTANCE_FACTORS)
 PACE_FACTORS = {"easy": 1.10, "long": 1.05, "quality": 0.95, "steady": 1.00}
 # (floor, ceiling) as fractions of median HR; None = unbounded on that side.
 # HR is graded on appropriateness to intent, never "lower is better".
@@ -255,13 +259,19 @@ def hr_deviation(hr: float | None, median_hr: float | None, cls: str) -> float |
     return 0.0
 
 
-def load_deviation(load: float | None, median_load: float | None) -> float | None:
-    """One-sided-low against the rolling median. Above median is an A — a big
-    day is not a failure. ``plan_workouts`` has no load column, so this metric
-    never has a plan reference to use."""
-    if not load or not median_load or median_load <= 0:
+def load_deviation(load: float | None, expected_load: float | None) -> float | None:
+    """One-sided-low against the intent-scaled rolling median. Above the
+    expectation is an A — a big day is not a failure.
+
+    ``expected_load`` is intent-scaled by the caller for the same reason pace
+    is direction-gated: an easy day is SUPPOSED to bank less load, and grading
+    it against the unscaled median handed a prescribed 3-mile recovery run a D
+    on live data (2026-07-19). ``plan_workouts`` has no load column, so this
+    metric never has a plan reference to use.
+    """
+    if not load or not expected_load or expected_load <= 0:
         return None
-    return max(0.0, 1.0 - load / median_load)
+    return max(0.0, 1.0 - load / expected_load)
 
 
 def overall_grade(metrics: dict[str, dict]) -> dict:
@@ -424,11 +434,14 @@ def build_card(
         "rolling_60d" if has_rolling else reference.get("mode"))
 
     med_load = reference.get("median_load") if has_rolling else None
-    d = load_deviation(activity.get("training_load"), med_load)
+    expected_load = LOAD_FACTORS[cls] * med_load if med_load else None
+    d = load_deviation(activity.get("training_load"), expected_load)
     load = _metric(
-        grade_from_deviation(d), activity.get("training_load"), med_load, d,
+        grade_from_deviation(d), activity.get("training_load"), expected_load, d,
         "rolling_60d" if has_rolling else reference.get("mode"))
     actual_load = activity.get("training_load")
+    # The spike flag compares against the UNSCALED median: "double your normal
+    # day" is the fact worth printing, regardless of what the day intended.
     if actual_load and med_load and actual_load > LOAD_SPIKE_FACTOR * med_load:
         load["spike"] = True
 
@@ -497,12 +510,18 @@ def _delta_text(key: str, metric: dict) -> str:
     return f"{(actual / expected - 1) * 100:+.0f}%"
 
 
-def reference_line(card: dict) -> str:
+def reference_line(card: dict, *, markdown: bool = True) -> str:
     """One sentence naming the yardstick. The card must never leave this
     ambiguous — the same run grades differently under a plan than under the
-    rolling median, and the reader has to know which happened."""
+    rolling median, and the reader has to know which happened.
+
+    ``markdown=False`` drops the ``**`` emphasis for the PDF, whose HTML is
+    escaped rather than markdown-rendered — otherwise the asterisks print
+    literally on the page.
+    """
     ref = card["reference"]
     mode = ref.get("mode")
+    em = "**" if markdown else ""
     if mode == "insufficient_data":
         return (f"Not enough comparable history to grade — {ref.get('n', 0)} similar "
                 f"activities in the last {REFERENCE_WINDOW_DAYS} days "
@@ -513,11 +532,11 @@ def reference_line(card: dict) -> str:
     widened = (" Pool widened to all on-foot activities — too few of this exact "
                "type to compare against." if ref.get("widened") else "")
     if any((m.get("reference") or "").startswith("plan") for m in card["metrics"].values()):
-        return (f"Graded against your **training plan** for this date "
+        return (f"Graded against your {em}training plan{em} for this date "
                 f"(intent: {card['intent']}, {intent_src}). HR and training load "
                 f"have no plan target, so they use your 60-day median of "
                 f"{ref.get('n', 0)} {pool} activities.{widened}")
-    return (f"Graded against your **60-day rolling median** of {ref.get('n', 0)} "
+    return (f"Graded against your {em}60-day rolling median{em} of {ref.get('n', 0)} "
             f"{pool} activities (intent: {card['intent']}, {intent_src}).{widened}")
 
 

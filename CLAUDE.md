@@ -207,7 +207,11 @@ today", "how's my training load", "what did I run last week"):
   `daily_snapshot`, `training_load_status`, etc. Reach for `run_sql` only when
   no structured tool fits. For "scheduled vs actual" / "am I hitting my plan"
   chart asks, `plan_chart` (0.23.0) is THE tool — never hand-roll matplotlib
-  or ASCII via Bash for that view. **Never shell out to `sqlite3`/Bash for a DB read** —
+  or ASCII via Bash for that view. For "how did that run go / grade my
+  workout / was that good" on a SINGLE session, `workout_report_card`
+  (0.25.0) is THE tool — it returns a preformatted `markdown` card, which you
+  render to the user VERBATIM rather than re-summarizing; don't assemble your
+  own verdict from `get_workout_detail` when a graded one exists. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
 - **`get_training_plan_progress`'s `workouts` list is windowed by default**
@@ -352,14 +356,17 @@ These are settled — don't redesign without a reason.
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
   could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
-- **`generate_brief_report` (PDF) is the only stdio-only tool now —
-  `generate_chart` moved into `ALL_TOOLS` (2026-07-13, MCP-speed-and-UX-01
-  fold-in Fix A).** `generate_chart` renders a standalone matplotlib PNG on
+- **The two PDF-writing tools are stdio-only — `generate_brief_report` and
+  `workout_report_card` (0.25.0); `generate_chart` moved into `ALL_TOOLS`
+  (2026-07-13, MCP-speed-and-UX-01 fold-in Fix A).** The rule that decides
+  membership: a tool that hands back a *filesystem path* is local-only,
+  because a remote `/mcp/` caller gets a container-internal path it cannot
+  retrieve. `generate_chart` renders a standalone matplotlib PNG on
   demand and now returns it as an inline MCP image content block (alongside
   the saved file path as text) — reachable over both `fitness mcp-stdio` and
   the networked `/mcp/` transport, since a client no longer needs the local
   file path to see the chart. `generate_brief_report` (`agent/tools.py`'s
-  `LOCAL_ONLY_TOOLS`, now just this one tool) renders a saved daily brief
+  `LOCAL_ONLY_TOOLS`) renders a saved daily brief
   into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline, reusing the
   `budget` project's validated color theme) and stays stdio-only for the
   same reason as before: a PDF isn't representable as an MCP content block,
@@ -388,6 +395,35 @@ These are settled — don't redesign without a reason.
   Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS Homebrew's
   install isn't on the default dylib search path and needs
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
+- **Workout grading is deterministic Python, not model judgment** (0.25.0).
+  `agent/report_card.py` backs the `workout_report_card` tool and follows the
+  `interpret.py` rule: the LLM phrases a judgment, it never derives one code
+  can compute. Four metrics (distance, pace, HR, training load) each reduce
+  to ONE non-negative relative deviation `d` fed through ONE shared
+  `GRADE_BANDS` table — four small deviation functions, one grader, so the
+  rubric stays testable. Design constraints that are load-bearing, not
+  incidental:
+  - **The card always names its yardstick.** Plan-prescribed (distance and
+    pace only — `plan_workouts` has no HR or load column) or a 60-day rolling
+    *median* of comparable activities. Median, not mean: the history carries
+    real training-load outliers. Under `MIN_REFERENCE_ACTIVITIES` (5) it
+    returns n/a and says so rather than grading against noise.
+  - **Direction gating.** An easy run is *supposed* to be slow — grading
+    `|actual − expected|` would hand every recovery run an F. Easy/long days
+    are penalized only for too FAST, quality days only for too SLOW, and each
+    expectation is intent-scaled (`DISTANCE_FACTORS`/`PACE_FACTORS`/
+    `LOAD_FACTORS`/`HR_BANDS`).
+  - **Comparability is exact `activity_type` first**, widening to the on-foot
+    class only when the pool is too thin. Measured on live data: pooling
+    `running` with `treadmill_running` put median HR at 119 against an
+    outdoor average of 140 and gave a normal easy run a D. Treadmill and road
+    are different HR regimes and must not share a yardstick unless forced to.
+  - **Splits are presentation-only** — no grade reads `activity_splits`. Only
+    87 of 747 activities have them (daily-sync ingest writes them, backfill
+    never does), so a splits-dependent grade would be unavailable on ~88% of
+    history and mean different things on different rows.
+  - The pure section is stdlib-only and unit-testable with plain dicts; DB
+    access lives under a persistence divider, mirroring `plans.py`.
 - **Every generated PDF/PNG is styled by a local-overridable brand theme**
   (2026-07-19). `agent/branding.py` owns the tokens: the checked-in default
   is **PRESS** (Nate's cross-project brand — warm paper #F5F0E6, ink

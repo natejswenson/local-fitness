@@ -718,7 +718,10 @@ ul.card-notes {{
   margin: 0.5em 0 0 0;
   padding-left: 1.1em;
 }}
-img.split-chart {{ width: 100%; margin-top: 0.7em; }}
+/* Deliberately not full-bleed: the per-lap HR bars are supporting evidence for
+   the table above them, not the page's subject, and at 100% they out-shouted
+   the grades. */
+img.split-chart {{ width: 84%; margin-top: 0.7em; }}
 """
 
 
@@ -749,7 +752,7 @@ def render_split_hr_png(card: dict) -> bytes:
     labels = [str(r["index"]) for r in rows]
     colors = [dim if r["partial"] else ink for r in rows]
 
-    fig = Figure(figsize=(8, 2.4), dpi=150, facecolor=paper)
+    fig = Figure(figsize=(8, 1.9), dpi=150, facecolor=paper)
     FigureCanvasAgg(fig)  # explicit non-global canvas attach, never via pyplot
     ax = fig.add_subplot(111)
     ax.set_facecolor(paper)
@@ -926,7 +929,7 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
     <td class="grade-letter {_grade_class(overall["grade"])}">{html.escape(overall["grade"])}</td>
     <td class="grade-meta">
       <span class="grade-gpa">{html.escape(gpa)} · {html.escape(subtitle)}</span>
-      <p class="reference-line">{html.escape(rc.reference_line(card))}</p>
+      <p class="reference-line">{html.escape(rc.reference_line(card, markdown=False))}</p>
     </td>
   </tr></table>
 
