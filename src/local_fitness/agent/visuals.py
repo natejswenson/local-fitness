@@ -72,6 +72,20 @@ def _rgba(hex_color: str, alpha: float) -> str:
 RENDER_LOCK = asyncio.Lock()
 
 
+def value_axis_bounds(values) -> tuple[float, float]:
+    """Padded (ylo, yhi) for a chart's value axis, scaled to the DATA band —
+    never anchored at zero. A level metric like resting HR (48–57 bpm) on a
+    0-based axis renders as a flat sliver with 85% of the canvas empty; the
+    variation is the signal, so the axis hugs it. 8% padding each side;
+    a flat series pads by max(1, 5% of magnitude) so it doesn't collapse to
+    a zero-height axis. Pure — unit-tested directly, sign-agnostic (a
+    negative TSB band pads the same way)."""
+    lo, hi = min(values), max(values)
+    span = hi - lo
+    pad = span * 0.08 if span else max(1.0, abs(hi) * 0.05)
+    return lo - pad, hi + pad
+
+
 def render_chart_png(
     series: Sequence[tuple[str, float]],
     chart_type: str,
@@ -111,9 +125,15 @@ def render_chart_png(
     ax.set_facecolor("white")
     x = np.arange(len(labels))
 
+    ylo, yhi = value_axis_bounds(values)
+
     if chart_type == "line":
         ax.plot(x, values, color=PRIMARY, linewidth=2)
-        ax.fill_between(x, values, color=PRIMARY, alpha=0.08)
+        # Fill down to the padded axis floor, NOT to y=0 — a single-argument
+        # fill_between fills to zero and drags autoscale down with it, which
+        # rendered a 48–57bpm resting-HR band as a sliver atop a 0–57 axis
+        # (Nate, 2026-07-19: autoscale everything; zero-basing is pointless).
+        ax.fill_between(x, values, ylo, color=PRIMARY, alpha=0.08)
     elif chart_type == "bar":
         ax.bar(x, values, color=PRIMARY)
     elif chart_type == "combo":
@@ -126,6 +146,11 @@ def render_chart_png(
             ax.plot(x, np.poly1d(coeffs)(x), color=CRITICAL, linewidth=2)
     else:
         raise ValueError(f"unsupported chart_type '{chart_type}'")
+
+    # Autoscale the value axis to the data band for every chart type — bar
+    # rectangles are still drawn from 0 but clip at the padded floor, the
+    # standard truncated-bar look.
+    ax.set_ylim(ylo, yhi)
 
     ax.grid(axis="y", color=NEUTRAL, linewidth=0.6, alpha=0.7)
     ax.set_axisbelow(True)

@@ -205,7 +205,9 @@ today", "how's my training load", "what did I run last week"):
   everything — `get_training_plan_progress` (graded plan day-by-day),
   `get_training_plan_status`, `query_workouts`, `get_metric_trend`,
   `daily_snapshot`, `training_load_status`, etc. Reach for `run_sql` only when
-  no structured tool fits. **Never shell out to `sqlite3`/Bash for a DB read** —
+  no structured tool fits. For "scheduled vs actual" / "am I hitting my plan"
+  chart asks, `plan_chart` (0.23.0) is THE tool — never hand-roll matplotlib
+  or ASCII via Bash for that view. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
 - **`get_training_plan_progress`'s `workouts` list is windowed by default**
@@ -285,9 +287,13 @@ These are settled — don't redesign without a reason.
   `slope_direction`, etc.) to their payloads instead of leaving the model to
   apply a static legend string by hand. The rule holds project-wide: the LLM
   phrases a judgment, it never derives one that tested Python can compute.
-- **Daily brief job needs a Claude credential in `.env`.** The 06:30
-  launchd job (`com.localfitness.brief` → `fitness brief`) couples pull →
-  recompute-baselines → generate → save atomically. Its *generate* step
+- **Daily brief job needs a Claude credential in `.env`.** The launchd job
+  (`com.localfitness.brief` → `fitness brief --if-missing`) couples pull →
+  recompute-baselines → generate → save atomically, firing at **06:30 with
+  a 09:30 backstop slot** (same command both times; `--if-missing` makes
+  any fire a no-op once today's brief exists, so the backstop only acts
+  when the 06:30 run failed — re-run `ops/install-launchd.sh` after
+  changing the template for it to take effect). Its *generate* step
   spawns a **headless** Claude via the Agent SDK, which authenticates from
   the process env only — `cli.py` `load_dotenv()`s `<repo>/.env`, so the
   token must live there as `CLAUDE_CODE_OAUTH_TOKEN` (Nate's Max token,
@@ -295,18 +301,30 @@ These are settled — don't redesign without a reason.
   `ANTHROPIC_API_KEY` (never expires, bills per brief). A live Claude
   session (like this chat) can compose + `save_brief` fine because it
   already holds a token — but that's **not** the unattended path.
-  **Failure signature** when the token is missing/expired: pull succeeds
-  (`Pull: success` in `logs/brief.launchd.out.log`) but generation returns
-  empty (`chars=0 takeaways_yielded=0`, "no JSON found in agent response"
-  in `logs/brief.launchd.err.log`), so **no brief saves** (orphaned sync —
-  pull ran, brief didn't). There's no single field that surfaces this
-  directly (`BriefContext` carries no data-frontier field, and no
-  `data_through_date` exists anywhere in the schema — an earlier draft of
-  this note claimed otherwise); the mismatch shows up by comparing the
-  saved brief's own `date` against `db.last_known_daily_date()` /
-  the newest daily row on the next MCP query — if the daily data is newer
-  than the brief, the previous night's generation failed. Fix = put/refresh
-  the token in `.env` (gitignored); re-mint on expiry.
+  **Failure signatures — read the log before touching the token** (the
+  2026-07-19 facet review found an earlier draft of this note blamed the
+  credential for what was actually SDK stream instability; following it
+  meant re-minting a healthy token while failures continued):
+  - *Credential missing/expired*: generation fails **before any first
+    message** — no `brief_timing phase=first_message` line in
+    `logs/brief.launchd.err.log`. Fix = put/refresh the token in `.env`
+    (gitignored); re-mint on expiry.
+  - *SDK stream death* (the common one): `ttfm_ms` present (~1–2.5s, so
+    the token is fine), then either the stream idles out empty
+    (`loop_exit reason=normal chars=0`, "produced no output") or the
+    subprocess crashes mid-stream ("Fatal error in message reader",
+    partial chars discarded). Transient — since 0.23.0 the pipeline
+    self-heals: a 120s per-message idle watchdog kills a hung stream and
+    `generate_and_save` makes up to 3 attempts
+    (`LOCAL_FITNESS_BRIEF_IDLE_TIMEOUT_S` / `_BRIEF_MAX_ATTEMPTS` /
+    `_BRIEF_RETRY_DELAY_S`, see `.env.example`). If all attempts fail,
+    `fitness brief` fires a distinct macOS **failure** notification
+    (silence no longer is the only signal) and exits non-zero.
+  Either way the outcome is **no brief saves** (orphaned sync — pull ran,
+  brief didn't). That state is now surfaced: `assemble_status()` (→
+  `get_today_status` / `daily_snapshot`) carries `latest_brief_date` +
+  `brief_stale_days`, and the `fitness://brief/latest` resource leads
+  with a STALE banner when serving a brief older than today.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a
@@ -391,9 +409,14 @@ These are settled — don't redesign without a reason.
   (not shown empty) when there's no active plan or no plan data in the
   window. Today's coaching line comes from a **new `agent/plan_coach.py`
   module** — a Claude Agent SDK call (toolless, single-shot, same
-  `briefing.DEFAULT_MODEL` the real daily brief uses) called fresh on
-  every render, with a deterministic template fallback
-  (`fallback_coaching_line`) if that call fails for any reason (missing
+  `briefing.DEFAULT_MODEL` the real daily brief uses) behind a
+  single-entry disk cache since 0.23.0
+  (`generate_coaching_line_cached`, keyed on the pure `build_prompt`
+  output hash, stored next to the SQLite DB): identical inputs reuse the
+  line without an SDK round-trip (the facet review counted 9 identical
+  calls in one day of repeat renders), any input change regenerates, and
+  failures are never cached. Deterministic template fallback
+  (`fallback_coaching_line`) if the call fails for any reason (missing
   credential, network, timeout) — the PDF still generates either way.
   `plan_coach.py` imports `briefing` lazily, inside the function body,
   not at module scope: `briefing.py` already imports `tools.py` at module

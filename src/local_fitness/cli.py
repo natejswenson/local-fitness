@@ -137,27 +137,57 @@ def recompute_baselines(lookback: int):
     click.echo(f"Recomputed baselines for {n} dates.")
 
 
+def _notify(message: str) -> None:
+    """Best-effort macOS notification (no-op failure on other platforms)."""
+    subprocess.run(
+        [
+            "osascript",
+            "-e",
+            f'display notification "{message}" with title "fitness"',
+        ],
+        check=False,
+    )
+
+
 @main.command()
 @click.option("--no-pull", is_flag=True, help="Skip the pull step")
 @click.option("--no-notify", is_flag=True, help="Skip the macOS notification")
 @click.option("--opus", is_flag=True, help="Use Opus 4.7 instead of Sonnet 4.6")
-def brief(no_pull: bool, no_notify: bool, opus: bool):
+@click.option(
+    "--if-missing", is_flag=True,
+    help="No-op if today's brief already exists (launchd backstop-fire mode)")
+def brief(no_pull: bool, no_notify: bool, opus: bool, if_missing: bool):
     """Pull, recompute baselines, and generate today's briefing."""
+    if if_missing:
+        # Backstop mode: the launchd job fires at 06:30 AND a retry slot
+        # later in the morning; the second fire (or a wake-coalesced pileup)
+        # must not re-pull or burn a second LLM run when the first one
+        # already saved. save_brief writes atomically, so an existing file
+        # for today is a complete brief.
+        from .agent.briefs import DEFAULT_BRIEFINGS_DIR
+
+        today_path = DEFAULT_BRIEFINGS_DIR / f"{Date.today().isoformat()}.json"
+        if today_path.exists():
+            click.echo(f"Brief already exists for today ({today_path}) — skipping.")
+            return
     if not no_pull:
         result = daily_ingest.pull()
         click.echo(f"Pull: {result['status']} ({result['days_pulled']} days)")
     baselines.recompute()
-    path = briefing_mod.generate_and_save(model=OPUS if opus else SONNET)
+    try:
+        path = briefing_mod.generate_and_save(model=OPUS if opus else SONNET)
+    except Exception:
+        # A failed generation used to be signaled only by the ABSENCE of the
+        # success notification — invisible at 06:30. Fire a distinct failure
+        # notification so a missed brief is a signal, not silence, then
+        # re-raise so launchd still records a non-zero exit and the full
+        # traceback still lands in brief.launchd.err.log.
+        if not no_notify:
+            _notify("Brief generation FAILED — check logs/brief.launchd.err.log")
+        raise
     click.echo(f"Brief written to: {path}")
     if not no_notify:
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                'display notification "Today\'s brief is ready" with title "fitness"',
-            ],
-            check=False,
-        )
+        _notify("Today's brief is ready")
 
 
 @main.group()

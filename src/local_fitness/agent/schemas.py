@@ -11,8 +11,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-# Whitelisted metric names — must be queryable via /api/metric/{name} or
-# /api/training-load. Keep this list aligned with the FastAPI _ALLOWED_METRICS.
+# Whitelisted metric names — the columns the chart/metric tools may query
+# (daily_metrics + the baselines CTL/ATL/TSB columns). The /api/* routes and
+# their _ALLOWED_METRICS twin were removed with the UI (2026-07-09); this
+# Literal is now the single source of the metric whitelist.
 MetricName = Literal[
     "rhr",
     "sleep_seconds",
@@ -24,7 +26,7 @@ MetricName = Literal[
     "steps",
     "intensity_minutes_moderate",
     "intensity_minutes_vigorous",
-    # Training-load model — the API exposes these under /api/training-load
+    # Training-load model — served from the baselines table, not daily_metrics
     "ctl",
     "atl",
     "tsb",

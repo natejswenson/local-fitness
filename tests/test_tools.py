@@ -2330,7 +2330,7 @@ def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
 
     async def fake_generate(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        notes_text=None,
+        *, model=None, timeout=30.0, notes_text=None,
     ):
         calls.append((today_workout, adherence_pct, days_to_race, goal_type, notes_text))
         return "Go hit today's easy 4 clean."
@@ -2423,7 +2423,7 @@ def test_generate_brief_report_threads_saved_notes_into_coaching_line(
 
     async def fake_generate(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        notes_text=None,
+        *, model=None, timeout=30.0, notes_text=None,
     ):
         calls.append(notes_text)
         return "Go hit today's easy 4 clean."
@@ -2583,3 +2583,47 @@ def test_get_brief_context_description_names_get_metric_trend():
     tool = next(t for t in tools.ALL_TOOLS if t.name == "get_brief_context")
     assert "get_metric" in tool.description
     assert "get_metric_trend" in tool.description
+
+
+# --- long-window bar/combo weekly bucketing (round-2 facet review) -----------
+
+def test_bucket_weekly_mean_and_sum():
+    dates = ["2026-07-06", "2026-07-07", "2026-07-13"]  # Mon, Tue, next Mon
+    weeks, means = tools._bucket_weekly(dates, [50.0, 54.0, 60.0], cumulative=False)
+    assert weeks == ["2026-07-06", "2026-07-13"]
+    assert means == [52.0, 60.0]
+    _weeks, sums = tools._bucket_weekly(dates, [50.0, 54.0, 60.0], cumulative=True)
+    assert sums == [104.0, 60.0]
+
+
+def test_bucket_weekly_anchors_to_monday():
+    # 2026-07-09 is a Thursday → its week anchors to Monday 2026-07-06.
+    weeks, _ = tools._bucket_weekly(["2026-07-09"], [1.0], cumulative=False)
+    assert weeks == ["2026-07-06"]
+
+
+def test_chart_bar_long_window_buckets_weekly(seeded):
+    text, err = call(tools.chart, {"metric": "rhr", "days": 35, "style": "bar"})
+    assert not err
+    assert "weekly avg" in text
+    # ~6 ISO weeks cover a 35-day window with 40 seeded days — never 35 rows.
+    data_rows = [ln for ln in text.split("\n") if ln and "·" not in ln]
+    assert 4 <= len(data_rows) <= 7
+
+
+def test_chart_bar_long_window_cumulative_metric_sums(seeded):
+    text, err = call(tools.chart, {"metric": "steps", "days": 35, "style": "bar"})
+    assert not err
+    assert "weekly sum" in text
+
+
+def test_chart_combo_long_window_buckets_weekly(seeded):
+    text, err = call(tools.chart, {"metric": "rhr", "days": 35, "style": "combo"})
+    assert not err
+    assert "weekly avg" in text
+
+
+def test_chart_bar_short_window_stays_daily(seeded):
+    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "bar"})
+    assert not err
+    assert "weekly" not in text

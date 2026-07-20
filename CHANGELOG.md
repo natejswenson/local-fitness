@@ -6,6 +6,89 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-19
+
+One consolidated release for the day's facet-review loop: four review
+passes over three weeks of real interaction transcripts and launchd logs
+(accuracy / completeness / efficiency / agent-UX, then focused charts /
+plan-tools / prompt-drift deep-dives), every confirmed finding implemented.
+
+### Fixed
+- **Nightly brief no longer dies on one bad SDK stream.** The Agent SDK
+  stream was observed dying two ways (idle-out with zero output after
+  3–5 minutes; subprocess crash mid-stream) and a single failure cost the
+  whole day's brief — 5 of the 8 mornings before this release had no
+  brief. `generate_and_save` now makes up to 3 attempts, and a
+  per-message idle watchdog (120s) kills a hung stream fast instead of
+  letting it burn minutes producing nothing. Env knobs:
+  `LOCAL_FITNESS_BRIEF_IDLE_TIMEOUT_S` / `_BRIEF_MAX_ATTEMPTS` /
+  `_BRIEF_RETRY_DELAY_S`.
+- **Empty generator output now reports the real cause** ("stream died"
+  diagnostic) instead of falling into the JSON parser as the misleading
+  "no JSON found in agent response".
+- **Grounding invention-rate signal un-saturated.** Matching is now
+  kind-partitioned (percent tokens vs plain magnitudes), killing the
+  cross-unit false positives (HR cap 140 bpm "matching" 147% of step
+  goal) that pinned the brief's only automated accuracy monitor at 1.000.
+- **V1 brief rollback regained plan-awareness.** The brief loop's frozen
+  read-only allow-list never granted `get_training_plan_status` despite
+  the V1 prompt instructing "call it FIRST" — plan-aware briefs were
+  silently dead on the rollback path since the 2026-06-27 V2 cutover.
+- **`type='rest'` re-prescription no longer leaves the old hard-run
+  description** on the rest day (defaults to "Rest day").
+- **`revise_training_plan(goal_type=...)` re-derives `goal_distance_m`**
+  — a 10k→half revision previously kept 10000 m, so the Riegel
+  projection predicted a 10k finish labeled as a half.
+- **PNG charts autoscale the value axis to the data band — never
+  zero-anchored.** A 48–57 bpm resting-HR band rendered as a flat sliver
+  atop a 0–57 axis (line `fill_between` filled to y=0; bars anchored at
+  0). New pure `value_axis_bounds` helper applied to all three PNG chart
+  types (covers `generate_chart` and the PDF's embedded takeaway charts).
+- Flat non-zero ASCII bar charts paint neutral mid-heat instead of
+  "coldest" blue; short-window line charts no longer overflow the
+  footer; stale retired-UI comments/docstrings corrected.
+
+### Added
+- **Brief failure is now a signal, not silence.** `fitness brief` fires a
+  distinct macOS failure notification when generation fails; previously
+  the only failure signal was the absence of the success notification.
+- **Brief staleness is visible from the tool surface.**
+  `assemble_status()` (→ `get_today_status` / `daily_snapshot`) carries
+  `latest_brief_date` + `brief_stale_days`; the `fitness://brief/latest`
+  resource and the `/coach` prompt snapshot both flag a stale brief.
+- **launchd 09:30 backstop fire + `fitness brief --if-missing`** — the
+  plist template fires at 06:30 and 09:30 with the same command: a no-op
+  when today's brief exists, a full retry when the 06:30 run failed.
+  Re-run `ops/install-launchd.sh` to apply.
+- **`plan_chart` MCP tool + `render_plan_vs_actual` renderer** — the
+  scheduled-vs-actual training view (█ = miles run, ░ = shortfall vs
+  plan, verdict glyph per row), daily rows or Monday-anchored weekly
+  buckets for long windows.
+- **Long-window `bar`/`combo` charts weekly-bucket instead of
+  degrading** — a "90-day bar graph" ask is now honorable.
+- **`update_plan_workout` gained `duration_min`** (the graded field for
+  tempo/interval sessions previously had no tool path) **and `seq`**
+  (double-day AM/PM sessions were schema-legal but only the morning row
+  was editable); progress payloads carry `seq`.
+- **Structural (plan_id, date, seq) uniqueness** via a partial unique
+  index backing the validation-time dedup.
+- **PDF coaching line cached per input-set** —
+  `plan_coach.generate_coaching_line_cached` keys a single-entry disk
+  cache on the pure `build_prompt` hash (9 identical same-day SDK calls
+  observed from repeat PDF renders); failures are never cached.
+
+### Changed
+- **Prompt-text drift corrections** (verified via `score_prompt` 11/11
+  before and after + a rendered-prompt differential diff): the chat/coach
+  system prompt no longer claims blanket "read-only access" while
+  instructing note/plan writes (Garmin metrics are read-only; writes go
+  through the dedicated tools); both brief prompts drop the retired-UI
+  "so the UI can render" phrasing.
+- CLAUDE.md's brief failure-signature documentation rewritten to
+  distinguish credential-missing (fails before first message) from SDK
+  stream death (ttfm present, then empty/partial) — the old note blamed
+  the credential for what was stream instability.
+
 ## [0.22.2] - 2026-07-13
 
 ### Fixed

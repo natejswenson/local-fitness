@@ -536,3 +536,197 @@ def test_update_plan_workout_unknown_date(seeded):
 def test_update_plan_workout_is_a_write_tool_not_in_brief(seeded):
     assert "mcp__fitness__update_plan_workout" in tools.allowed_tool_names()
     assert "mcp__fitness__update_plan_workout" not in tools.read_only_tool_names()
+
+
+# --- round-2 facet review fixes ---------------------------------------------
+
+def test_update_plan_workout_duration_min_sets_graded_field(seeded):
+    # MED-1: tempo/interval grade on target_duration_sec — the tool must be
+    # able to set it ("make Thursday's tempo 30 min").
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "type": "tempo", "duration_min": 30})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT type, target_duration_sec FROM plan_workouts WHERE date=?", (d,)
+        ).fetchone()
+    assert row["type"] == "tempo"
+    assert row["target_duration_sec"] == 1800
+
+
+def test_update_plan_workout_rest_defaults_description(seeded):
+    # MED-2: a rest-flip without a new description must not leave the old
+    # hard-run prose on the rest day.
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "description": "Long run 12mi, 3 at goal pace"})
+    assert not err
+    _body, err = call(tools.update_plan_workout, {"date": d, "type": "rest"})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT type, description FROM plan_workouts WHERE date=?", (d,)
+        ).fetchone()
+    assert row["type"] == "rest"
+    assert row["description"] == "Rest day"
+
+
+def test_update_plan_workout_rest_explicit_description_wins(seeded):
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "type": "rest", "description": "Travel day — full rest"})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT description FROM plan_workouts WHERE date=?", (d,)
+        ).fetchone()
+    assert row["description"] == "Travel day — full rest"
+
+
+def test_revise_goal_type_rederives_goal_distance(seeded):
+    # MED-4: revise(goal_type=...) without goal_distance_m must re-derive the
+    # distance, or the Riegel projection predicts the old distance under the
+    # new label.
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]  # 10k draft
+    _body, err = call(tools.revise_training_plan, {"plan_id": pid, "goal_type": "half"})
+    assert not err
+    plan = plans.get_plan(pid)
+    assert plan["goal_type"] == "half"
+    assert plan["goal_distance_m"] == 21097.5
+
+
+def test_revise_goal_type_explicit_distance_wins(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    _body, err = call(tools.revise_training_plan,
+                      {"plan_id": pid, "goal_type": "half", "goal_distance_m": 20000.0})
+    assert not err
+    plan = plans.get_plan(pid)
+    assert plan["goal_distance_m"] == 20000.0
+
+
+def test_get_training_plan_status_is_in_brief_allowlist():
+    # Round-2 prompts finding 1: briefing_prompt (V1) says "call
+    # get_training_plan_status FIRST" — the rollback path's grant must match
+    # its prompt or plan-aware V1 briefs are silently dead.
+    assert "mcp__fitness__get_training_plan_status" in tools.read_only_tool_names()
+
+
+# --- plan_chart (round-2 facet review: two-series scheduled-vs-actual) -------
+
+def test_plan_chart_no_active_plan(seeded):
+    body, err = call(tools.plan_chart, {})
+    assert err and "no active" in body["error"]
+
+
+def _active_plan_today(seeded):
+    """An ACTIVE plan whose single workout is dated today (inside the
+    trailing window anchored at the frontier, which the fixture sets to
+    today)."""
+    args = _args(workouts=[dict(
+        date=date.today().isoformat(), week_index=1, type="easy",
+        target_distance_m=6000.0, description="6km easy")])
+    body, err = call(tools.propose_training_plan, args)
+    assert not err
+    plans.commit_plan(body["plan_id"], now="2026-06-26T00:00:00", db_path=seeded)
+
+
+def test_plan_chart_daily_renders_plan_rows(seeded):
+    _active_plan_today(seeded)
+    text, err = call(tools.plan_chart, {"days": 14})
+    assert not err
+    assert "plan vs actual · last 14d" in text
+    assert f"{date.today().isoformat()[5:]} easy" in text
+    assert "░" in text  # planned distance renders as plan cells
+    assert "█ run vs ░ short of plan" in text  # legend present
+
+
+def test_plan_chart_weekly_mode(seeded):
+    _active_plan_today(seeded)
+    text, err = call(tools.plan_chart, {"days": 14, "weekly": True})
+    assert not err
+    assert "weekly" in text
+    assert "wk " in text
+
+
+def test_plan_chart_auto_weekly_past_threshold(seeded):
+    _active_plan_today(seeded)
+    text, err = call(tools.plan_chart, {"days": 30})
+    assert not err
+    assert "weekly" in text
+
+
+def test_plan_chart_registered_but_not_in_brief_allowlist():
+    assert "plan_chart" in {t.name for t in tools.ALL_TOOLS}
+    assert "mcp__fitness__plan_chart" not in tools.read_only_tool_names()
+
+
+# --- round-2 backlog: seq (double-day) support + structural dedup ------------
+
+def _active_double_day(seeded):
+    """ACTIVE plan with an AM easy run + PM interval on the same date."""
+    d = (date.today() + timedelta(days=1)).isoformat()
+    args = _args(workouts=[
+        dict(date=d, seq=1, week_index=1, type="easy",
+             target_distance_m=5000.0, description="AM easy 5k"),
+        dict(date=d, seq=2, week_index=1, type="interval",
+             target_duration_sec=1800, description="PM intervals 30min"),
+    ])
+    body, err = call(tools.propose_training_plan, args)
+    assert not err
+    plans.commit_plan(body["plan_id"], now="2026-06-26T00:00:00", db_path=seeded)
+    return d
+
+
+def test_update_plan_workout_seq_targets_second_session(seeded):
+    d = _active_double_day(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "seq": 2, "duration_min": 40})
+    assert not err
+    with db.connect(seeded) as conn:
+        rows = conn.execute(
+            "SELECT seq, type, target_duration_sec, target_distance_m "
+            "FROM plan_workouts WHERE date=? ORDER BY seq", (d,)).fetchall()
+    # PM session updated to 40 min; AM session untouched.
+    assert rows[1]["seq"] == 2 and rows[1]["target_duration_sec"] == 2400
+    assert rows[0]["seq"] == 1 and rows[0]["target_distance_m"] == 5000.0
+
+
+def test_update_plan_workout_seq_defaults_to_first_session(seeded):
+    d = _active_double_day(seeded)
+    _body, err = call(tools.update_plan_workout, {"date": d, "distance_mi": 4.0})
+    assert not err
+    with db.connect(seeded) as conn:
+        rows = conn.execute(
+            "SELECT seq, target_distance_m, target_duration_sec "
+            "FROM plan_workouts WHERE date=? ORDER BY seq", (d,)).fetchall()
+    assert abs(rows[0]["target_distance_m"] - 4 * 1609.344) < 1
+    assert rows[1]["target_duration_sec"] == 1800  # PM untouched
+
+
+def test_update_plan_workout_rejects_bad_seq(seeded):
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": d, "type": "easy", "seq": 0})
+    assert err and "seq" in body["error"]
+
+
+def test_progress_projection_carries_seq(seeded):
+    d = _active_double_day(seeded)
+    body, err = call(tools.get_training_plan_progress, {"full": True})
+    assert not err
+    same_day = [w for w in body["workouts"] if w["date"] == d]
+    assert sorted(w["seq"] for w in same_day) == [1, 2]
+
+
+def test_plan_workouts_duplicate_day_rejected_by_db(seeded):
+    # LOW-2: the (plan_id, date, seq) invariant is structural now, not just
+    # validation-time — a direct duplicate insert fails loudly.
+    import sqlite3
+    body, _ = call(tools.propose_training_plan, _args())
+    pid = body["plan_id"]
+    d = (date.today() + timedelta(days=1)).isoformat()  # _args seeds this day
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.connect(seeded) as conn:
+            conn.execute(
+                "INSERT INTO plan_workouts (plan_id, date, seq, week_index, type, description) "
+                "VALUES (?, ?, 1, 1, 'easy', 'dupe')", (pid, d))

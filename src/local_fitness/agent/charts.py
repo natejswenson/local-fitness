@@ -31,7 +31,7 @@ from datetime import date, timedelta
 
 __all__ = [
     "render_bar_chart", "render_combo_chart", "render_sparkline", "render_calendar",
-    "render_line",
+    "render_line", "render_plan_vs_actual",
 ]
 
 # Low→high "heat" ramp. Neutral magnitude, NOT good/bad — a metric where high is
@@ -110,9 +110,79 @@ def render_bar_chart(
         else:
             frac = (v / denom) if zero_based else ((v - lo) / span)
         n = max(0, round(frac * width))
-        rel = (v - lo) / span
+        # A flat series has no within-window relative position — paint it the
+        # neutral mid-heat instead of (v-lo)/span==0's "coldest" blue, which
+        # made full-width bars read as "low".
+        rel = 0.5 if flat else (v - lo) / span
         bar = _heat(rel) * n
         lines.append(f"{lab:<{label_w}} {bar} {value_fmt(v)}")
+    return "\n".join(lines)
+
+
+# Verdict → glyph for the plan-vs-actual chart. All five are double-width
+# emoji so every row's bar starts in the same column (the calendar renderer's
+# uniform-emoji-width discipline — a narrow ▫ for pending would shift its row
+# by one cell). Color rides on the glyph, never ANSI (module docstring).
+_VERDICT_GLYPH = {
+    "done": "🟩", "partial": "🟨", "missed": "🟥",
+    "compliant": "🟦", "rest": "🟦", "pending": "⬜",
+}
+
+
+def render_plan_vs_actual(
+    rows: Sequence[dict],
+    *,
+    value_fmt: Callable[[float], str] = lambda v: f"{v:.1f}",
+    width: int = 20,
+    title: str | None = None,
+    legend: str | None = None,
+) -> str:
+    """Two-series planned-vs-actual bars, one row per entry — the scheduled/
+    actual training-plan view the single-series renderers can't express.
+
+    Each row dict: ``label`` (str, already composed by the caller — e.g.
+    "07-08 tempo" or "wk 05-04"), ``verdict`` (done|partial|missed|
+    compliant|rest|pending|None), ``planned`` (float miles | None),
+    ``actual`` (float miles | None), ``rest`` (bool).
+
+    Bar semantics (fill style, not grouped bars — more legible in mono):
+    ``█`` cells are miles actually run, ``░`` cells pad out to the planned
+    length — the ░ tail IS the shortfall. actual ≥ planned renders a longer
+    all-█ bar (overachievement). A pending day renders its plan as all-░.
+    A rest row renders ``—`` and no bar; a duration-prescribed day (no
+    planned distance) renders its actual (if any) tagged ``(by time)``.
+    Pure presentation: no DB, no unit conversion, no grading — callers hand
+    over already-graded, already-converted rows.
+    """
+    if not rows:
+        return f"{title}\n{_NO_DATA}" if title else _NO_DATA
+    header = [ln for ln in (title, legend) if ln]
+    maxv = max(
+        (max(r.get("planned") or 0.0, r.get("actual") or 0.0) for r in rows),
+        default=0.0,
+    )
+    cell = (maxv / width) if maxv > 0 else 0.0
+    label_w = max(len(r.get("label", "")) for r in rows)
+    lines = list(header)
+    for r in rows:
+        label = f"{r.get('label', ''):<{label_w}}"
+        glyph = _VERDICT_GLYPH.get(r.get("verdict") or "", "⬜")
+        if r.get("rest"):
+            lines.append(f"{label} 🟦 —")
+            continue
+        planned, actual = r.get("planned"), r.get("actual")
+        if planned is None:
+            # Duration-prescribed session (tempo/interval by time): no
+            # distance bar to scale — show the actual, tagged, or a dash.
+            shown = f"{value_fmt(actual)} mi (by time)" if actual is not None else "— (by time)"
+            lines.append(f"{label} {glyph} {shown}")
+            continue
+        planned_cells = round(planned / cell) if cell else 0
+        actual_cells = round((actual or 0.0) / cell) if cell else 0
+        bar = "█" * actual_cells + "░" * max(0, planned_cells - actual_cells)
+        bar = f"{bar:<{width}}"
+        shown_actual = value_fmt(actual) if actual is not None else "—"
+        lines.append(f"{label} {glyph} {bar} {shown_actual} /{value_fmt(planned):>5}")
     return "\n".join(lines)
 
 
@@ -322,6 +392,12 @@ def render_line(
         lab = f"{value_fmt(v_at):>{axis_w}}" if yi in (0, rows // 2, rows) else " " * axis_w
         out.append(f"{lab} ┤{''.join(grid[yi])}")
     out.append(f"{' ' * axis_w} └{'─' * n}")
-    pad = max(1, n - len(labels[0]) - len(labels[-1]))
-    out.append(f"{' ' * axis_w}  {labels[0]}{' ' * pad}{labels[-1]}")
+    # Both endpoint labels only when they fit under the chart width — a short
+    # window would otherwise overflow the canvas by up to a full label.
+    l0, l1 = labels[0], labels[-1]
+    if n >= len(l0) + len(l1) + 1:
+        pad = n - len(l0) - len(l1)
+        out.append(f"{' ' * axis_w}  {l0}{' ' * pad}{l1}")
+    else:
+        out.append(f"{' ' * axis_w}  {l0}")
     return "\n".join(out)

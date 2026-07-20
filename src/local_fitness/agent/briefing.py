@@ -83,6 +83,85 @@ def _brief_effort() -> str:
     return token if token in _VALID_EFFORTS else _DEFAULT_BRIEF_EFFORT
 
 
+# Stream-resilience knobs. The 2026-07-19 facet review found the nightly brief
+# failing ~half its runs on Agent SDK stream deaths — an idle stream that never
+# ends (4+ min burned, zero output) or a subprocess crash mid-stream — with no
+# retry, so a transient failure cost the whole day's brief. All three knobs are
+# env-tunable; the defaults are what the launchd job uses. Successful briefs
+# complete in 47–110s total, so a 120s gap between consecutive stream messages
+# is unambiguous death, not thinking latency.
+_DEFAULT_STREAM_IDLE_TIMEOUT_S = 120.0
+_DEFAULT_MAX_ATTEMPTS = 3
+_DEFAULT_RETRY_DELAY_S = 20.0
+
+
+def _stream_idle_timeout_s() -> float:
+    """Max seconds between consecutive SDK stream messages before the run is
+    declared dead (``LOCAL_FITNESS_BRIEF_IDLE_TIMEOUT_S``). ``0`` disables."""
+    raw = os.environ.get("LOCAL_FITNESS_BRIEF_IDLE_TIMEOUT_S")
+    try:
+        return float(raw) if raw else _DEFAULT_STREAM_IDLE_TIMEOUT_S
+    except ValueError:
+        return _DEFAULT_STREAM_IDLE_TIMEOUT_S
+
+
+def _brief_max_attempts() -> int:
+    """Total generation attempts per ``generate_and_save`` call
+    (``LOCAL_FITNESS_BRIEF_MAX_ATTEMPTS``), floor 1."""
+    raw = os.environ.get("LOCAL_FITNESS_BRIEF_MAX_ATTEMPTS")
+    try:
+        return max(1, int(raw)) if raw else _DEFAULT_MAX_ATTEMPTS
+    except ValueError:
+        return _DEFAULT_MAX_ATTEMPTS
+
+
+def _brief_retry_delay_s() -> float:
+    """Pause between attempts (``LOCAL_FITNESS_BRIEF_RETRY_DELAY_S``) — long
+    enough for a post-wake network to settle, short enough that three attempts
+    still finish well before the morning run."""
+    raw = os.environ.get("LOCAL_FITNESS_BRIEF_RETRY_DELAY_S")
+    try:
+        return max(0.0, float(raw)) if raw else _DEFAULT_RETRY_DELAY_S
+    except ValueError:
+        return _DEFAULT_RETRY_DELAY_S
+
+
+class BriefStreamIdleTimeout(RuntimeError):
+    """The SDK stream went silent past the idle timeout — the run is dead."""
+
+
+async def _iter_with_idle_timeout(source, timeout_s: float):
+    """Yield from ``source``, raising :class:`BriefStreamIdleTimeout` when the
+    gap between consecutive messages exceeds ``timeout_s``.
+
+    Bounds the failure that used to burn 3–5 minutes per dead run: the SDK
+    stream stops delivering messages but never terminates, so a bare
+    ``async for`` waits until the SDK gives up on its own schedule.
+    ``timeout_s <= 0`` disables the watchdog (plain passthrough)."""
+    it = source.__aiter__()
+    try:
+        while True:
+            try:
+                if timeout_s > 0:
+                    msg = await asyncio.wait_for(it.__anext__(), timeout=timeout_s)
+                else:
+                    msg = await it.__anext__()
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                raise BriefStreamIdleTimeout(
+                    f"no stream message for {timeout_s:.0f}s — SDK stream is dead"
+                ) from None
+            yield msg
+    finally:
+        aclose = getattr(it, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 — best-effort teardown of a dead stream
+                pass
+
+
 # Agent/code-separation composer. ON by default (cut over 2026-06-27 after
 # shadow-run parity held on all 6 fixtures): the deterministic brief_planner
 # assembles a BriefContext and a single TOOLLESS generator writes the prose from
@@ -460,6 +539,22 @@ async def _finalize_brief(raw: str, user_name: str, save: bool, brief_context):
     in exactly one place — any quality difference between models is
     attributable to the model, not to divergently-implemented post-processing.
     """
+    if not raw.strip():
+        # Empty output is a DIED-STREAM signature (SDK idle timeout, subprocess
+        # crash, or credential failure at spawn), never a JSON-formatting
+        # problem. Routing it into the parser used to produce the misleading
+        # "no JSON found in agent response:" error that pointed operators at
+        # the parser — and at re-minting a healthy token — instead of at the
+        # stream (2026-07-19 facet review, AUX-1).
+        msg = (
+            "brief generator produced no output (0 chars) — the Claude SDK "
+            "stream died before emitting anything (idle timeout, subprocess "
+            "crash, or credential failure at spawn). Not a JSON problem; "
+            "see logs for the stream error and retry."
+        )
+        LOG.error("Brief generation empty: %s", msg)
+        yield {"type": "error", "message": msg}
+        return
     try:
         payload = _extract_json(raw)
     except ValueError as e:
@@ -690,9 +785,9 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             len(recent_briefs),
         )
     try:
-        async for message in query(
-            prompt=prompt_text,
-            options=options,
+        async for message in _iter_with_idle_timeout(
+            query(prompt=prompt_text, options=options),
+            _stream_idle_timeout_s(),
         ):
             now = time.perf_counter()
             _u = getattr(message, "usage", None)
@@ -851,8 +946,12 @@ def generate_and_save(model: str = DEFAULT_MODEL) -> Path:
     """CLI / non-streaming entry. Runs the composer with ``save=True`` so the
     brief is persisted exactly once, through ``briefs.save_brief`` (inside
     ``generate_streaming``). Returns the path ``save_brief`` wrote so
-    ``cli.py``'s "Brief written to: {path}" echo keeps working."""
-    last_path: str | None = None
+    ``cli.py``'s "Brief written to: {path}" echo keeps working.
+
+    Retries up to ``_brief_max_attempts()`` times: the observed failure modes
+    (SDK stream idle-out, subprocess crash mid-stream) are transient — a fresh
+    attempt minutes later routinely succeeds — so one bad stream must not cost
+    the whole day's brief. Raises the final attempt's error when all fail."""
     last_brief: dict | None = None
 
     async def _run() -> None:
@@ -863,10 +962,21 @@ def generate_and_save(model: str = DEFAULT_MODEL) -> Path:
             elif evt["type"] == "error":
                 raise ValueError(evt["message"])
 
-    asyncio.run(_run())
-    if last_brief is None:
-        raise ValueError("Brief generation completed without a done event")
+    attempts = _brief_max_attempts()
+    for attempt in range(1, attempts + 1):
+        last_brief = None
+        try:
+            asyncio.run(_run())
+            if last_brief is None:
+                raise ValueError("Brief generation completed without a done event")
+        except Exception as e:
+            LOG.warning(
+                "brief_attempt attempt=%d/%d failed: %s", attempt, attempts, e)
+            if attempt == attempts:
+                raise
+            time.sleep(_brief_retry_delay_s())
+            continue
+        break
     # The save path wrote briefings/<date>.json; reconstruct the same path the
     # gate produced (date is server-stamped to today inside save_brief).
-    last_path = str(DEFAULT_BRIEFINGS_DIR / f"{last_brief['date']}.json")
-    return Path(last_path)
+    return Path(DEFAULT_BRIEFINGS_DIR / f"{last_brief['date']}.json")

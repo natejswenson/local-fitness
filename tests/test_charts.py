@@ -342,3 +342,99 @@ def test_line_handles_negative_series():
 def test_line_single_point():
     out = charts.render_line(["2026-06-03"], [52.0], value_fmt=_ints)
     assert "─" in out
+
+
+# --- render_plan_vs_actual (round-2 facet review: two-series gap) ------------
+
+def _rows():
+    # maxv = 4.0 → cell = 0.2 at width 20 → cells = miles × 5.
+    return [
+        {"label": "07-06 easy",  "verdict": "done",    "planned": 4.0, "actual": 4.0, "rest": False},
+        {"label": "07-07 rest",  "verdict": "rest",    "planned": None, "actual": None, "rest": True},
+        {"label": "07-08 tempo", "verdict": "partial", "planned": 4.0, "actual": 2.0, "rest": False},
+        {"label": "07-09 long",  "verdict": "missed",  "planned": 3.0, "actual": None, "rest": False},
+        {"label": "07-10 int",   "verdict": "done",    "planned": None, "actual": 3.0, "rest": False},
+        {"label": "07-11 easy",  "verdict": "pending", "planned": 2.0, "actual": None, "rest": False},
+    ]
+
+
+def test_plan_vs_actual_bar_semantics_exact():
+    out = charts.render_plan_vs_actual(_rows(), title="T", legend="L")
+    lines = out.split("\n")
+    assert lines[0] == "T" and lines[1] == "L"
+    # done at plan: full-█ bar, no shortfall tail (20 cells for 4.0/4.0)
+    assert "🟩 " + "█" * 20 in lines[2]
+    # partial: half █ (2.0→10 cells), half ░ shortfall (4.0 planned→20 cells)
+    assert "🟨 " + "█" * 10 + "░" * 10 in lines[4]
+    # missed: zero actual → all-░ to planned length (3.0 → 15 cells)
+    assert "🟥 " + "░" * 15 in lines[5]
+    assert "— /  3.0" in lines[5]
+    # pending: plan-only ░ bar (2.0 → 10 cells), white glyph, actual dash
+    assert "⬜ " + "░" * 10 in lines[7]
+    # rest: dash, no bar glyphs at all
+    assert lines[3].rstrip().endswith("🟦 —")
+    assert "█" not in lines[3] and "░" not in lines[3]
+    # duration-only: tagged, no bar
+    assert "(by time)" in lines[6] and "3.0 mi" in lines[6]
+    assert "░" not in lines[6]
+
+
+def test_plan_vs_actual_overachievement_longer_bar_no_tail():
+    rows = [
+        {"label": "a", "verdict": "done", "planned": 4.0, "actual": 5.0, "rest": False},
+        {"label": "b", "verdict": "done", "planned": 4.0, "actual": 4.0, "rest": False},
+    ]
+    out = charts.render_plan_vs_actual(rows, width=20)
+    l1, l2 = out.split("\n")
+    # maxv=5.0 → cell 0.25: actual 5.0 → 20 █; planned-only equivalent is 16.
+    assert "█" * 20 in l1 and "░" not in l1
+    assert "█" * 16 in l2 and "█" * 17 not in l2
+
+
+def test_plan_vs_actual_empty_rows_no_data():
+    assert charts.render_plan_vs_actual([], title="T") == "T\n(no data in window)"
+    assert charts.render_plan_vs_actual([]) == "(no data in window)"
+
+
+def test_plan_vs_actual_bars_start_in_same_column():
+    # Every glyph is double-width emoji, labels are padded — each row's bar
+    # (or dash) must start at the same column so the chart reads as a chart.
+    out = charts.render_plan_vs_actual(_rows())
+    starts = set()
+    for line in out.split("\n"):
+        for g in ("🟩", "🟨", "🟥", "🟦", "⬜"):
+            i = line.find(g)
+            if i >= 0:
+                starts.add(i)
+    assert len(starts) == 1
+
+
+# --- round-2 backlog: cosmetic fixes ----------------------------------------
+
+def test_bar_chart_flat_nonzero_series_paints_neutral_midheat():
+    # D2: a flat [5,5] series renders full-width bars; painting them the
+    # "coldest" blue read as "low". Flat now paints the neutral mid-heat.
+    out = charts.render_bar_chart(["a", "b"], [5.0, 5.0])
+    for line in out.split("\n"):
+        assert "🟨" in line and "🟦" not in line
+    neg = charts.render_bar_chart(["a", "b"], [-5.0, -5.0])
+    for line in neg.split("\n"):
+        assert "🟨" in line
+
+
+def test_line_chart_short_window_footer_fits_canvas():
+    # D3: two MM-DD labels are 10 chars — under a <12-column chart the footer
+    # used to overflow the canvas. Short windows now show the start label only.
+    dates = [f"2026-06-{d:02d}" for d in range(1, 7)]
+    out = charts.render_line(dates, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    footer = out.split("\n")[-1]
+    assert "06-01" in footer and "06-06" not in footer
+    axis_line = out.split("\n")[-2]  # the └──── baseline
+    assert len(footer) <= len(axis_line)
+
+
+def test_line_chart_long_window_footer_keeps_both_labels():
+    dates = [f"2026-06-{d:02d}" for d in range(1, 29)]
+    out = charts.render_line(dates, [float(d % 7) for d in range(28)])
+    footer = out.split("\n")[-1]
+    assert "06-01" in footer and "06-28" in footer
