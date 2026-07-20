@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-07-19
+
+Round 2 of the facet review: three focused reviewers (charts, plan-lifecycle
+tools, prompt/instruction drift) over the same evidence base, findings
+implemented.
+
+### Added
+- **`plan_chart` MCP tool + `render_plan_vs_actual` renderer** — the
+  scheduled-vs-actual training view a real session had to hand-roll in
+  matplotlib because every existing renderer is single-series. One bar per
+  day (█ = miles run, ░ = shortfall vs plan, verdict glyph per row), with
+  Monday-anchored weekly buckets for long windows (auto past 21 days, or
+  `weekly: true`). Actual-mileage suppression for pending/compliant days
+  matches `weekly_rollup`, so chart and PDF agree.
+- **Long-window `bar`/`combo` charts now weekly-bucket instead of
+  degrading.** A "90-day bar graph" ask previously couldn't be honored
+  (one row per day; combo drew a wrapping 90-column canvas) — past 21
+  days both styles now aggregate to Monday-anchored weeks (sum for
+  cumulative metrics, mean otherwise), labeled "· weekly avg/sum".
+- **`update_plan_workout` gained `duration_min`** — tempo/interval
+  sessions are *graded* on target duration, but the tool previously
+  couldn't set it, so "make Thursday's tempo 30 min" had no tool path.
+- **launchd 09:30 backstop fire + `fitness brief --if-missing`** — the
+  plist template now fires at 06:30 and 09:30 with the same
+  `brief --if-missing` command: a no-op when today's brief exists, a full
+  retry when the 06:30 run failed. Re-run `ops/install-launchd.sh` to
+  apply.
+- **`/coach` prompt snapshot surfaces brief staleness** — `_render_status`
+  appends a warning line when `brief_stale_days` > 0 (the brief resource
+  already bannered this; the coach path now matches).
+
+### Fixed
+- **V1 brief rollback regained plan-awareness.** `briefing_prompt` (V1)
+  instructs "call `get_training_plan_status` FIRST", but the brief loop's
+  frozen read-only allow-list never included that tool — since the
+  2026-06-27 V2 cutover, a rollback (`LOCAL_FITNESS_BRIEF_V2=0`) silently
+  lost plan-driven briefs. The allow-list now matches the prompt.
+- **`type='rest'` re-prescription no longer leaves the old hard-run
+  description** on the rest day (defaults to "Rest day" unless a new
+  description is passed) — the stale prose surfaced in every plan payload
+  and the PDF table.
+- **`revise_training_plan(goal_type=...)` re-derives `goal_distance_m`**
+  when no explicit distance is passed — previously a 10k→half revision
+  kept `goal_distance_m=10000`, so the Riegel projection predicted a 10k
+  finish labeled as a half.
+- Stale comments/docstrings referencing the retired `/api/*` routes and
+  React frontend corrected (prompts.py module docstring, schemas.py).
+
 ## [0.23.0] - 2026-07-19
 
 Driven by a four-facet review (accuracy / completeness / efficiency /

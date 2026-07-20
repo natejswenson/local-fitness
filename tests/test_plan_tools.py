@@ -536,3 +536,126 @@ def test_update_plan_workout_unknown_date(seeded):
 def test_update_plan_workout_is_a_write_tool_not_in_brief(seeded):
     assert "mcp__fitness__update_plan_workout" in tools.allowed_tool_names()
     assert "mcp__fitness__update_plan_workout" not in tools.read_only_tool_names()
+
+
+# --- round-2 facet review fixes ---------------------------------------------
+
+def test_update_plan_workout_duration_min_sets_graded_field(seeded):
+    # MED-1: tempo/interval grade on target_duration_sec — the tool must be
+    # able to set it ("make Thursday's tempo 30 min").
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "type": "tempo", "duration_min": 30})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT type, target_duration_sec FROM plan_workouts WHERE date=?", (d,)
+        ).fetchone()
+    assert row["type"] == "tempo"
+    assert row["target_duration_sec"] == 1800
+
+
+def test_update_plan_workout_rest_defaults_description(seeded):
+    # MED-2: a rest-flip without a new description must not leave the old
+    # hard-run prose on the rest day.
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "description": "Long run 12mi, 3 at goal pace"})
+    assert not err
+    _body, err = call(tools.update_plan_workout, {"date": d, "type": "rest"})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT type, description FROM plan_workouts WHERE date=?", (d,)
+        ).fetchone()
+    assert row["type"] == "rest"
+    assert row["description"] == "Rest day"
+
+
+def test_update_plan_workout_rest_explicit_description_wins(seeded):
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout,
+                      {"date": d, "type": "rest", "description": "Travel day — full rest"})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT description FROM plan_workouts WHERE date=?", (d,)
+        ).fetchone()
+    assert row["description"] == "Travel day — full rest"
+
+
+def test_revise_goal_type_rederives_goal_distance(seeded):
+    # MED-4: revise(goal_type=...) without goal_distance_m must re-derive the
+    # distance, or the Riegel projection predicts the old distance under the
+    # new label.
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]  # 10k draft
+    _body, err = call(tools.revise_training_plan, {"plan_id": pid, "goal_type": "half"})
+    assert not err
+    plan = plans.get_plan(pid)
+    assert plan["goal_type"] == "half"
+    assert plan["goal_distance_m"] == 21097.5
+
+
+def test_revise_goal_type_explicit_distance_wins(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    _body, err = call(tools.revise_training_plan,
+                      {"plan_id": pid, "goal_type": "half", "goal_distance_m": 20000.0})
+    assert not err
+    plan = plans.get_plan(pid)
+    assert plan["goal_distance_m"] == 20000.0
+
+
+def test_get_training_plan_status_is_in_brief_allowlist():
+    # Round-2 prompts finding 1: briefing_prompt (V1) says "call
+    # get_training_plan_status FIRST" — the rollback path's grant must match
+    # its prompt or plan-aware V1 briefs are silently dead.
+    assert "mcp__fitness__get_training_plan_status" in tools.read_only_tool_names()
+
+
+# --- plan_chart (round-2 facet review: two-series scheduled-vs-actual) -------
+
+def test_plan_chart_no_active_plan(seeded):
+    body, err = call(tools.plan_chart, {})
+    assert err and "no active" in body["error"]
+
+
+def _active_plan_today(seeded):
+    """An ACTIVE plan whose single workout is dated today (inside the
+    trailing window anchored at the frontier, which the fixture sets to
+    today)."""
+    args = _args(workouts=[dict(
+        date=date.today().isoformat(), week_index=1, type="easy",
+        target_distance_m=6000.0, description="6km easy")])
+    body, err = call(tools.propose_training_plan, args)
+    assert not err
+    plans.commit_plan(body["plan_id"], now="2026-06-26T00:00:00", db_path=seeded)
+
+
+def test_plan_chart_daily_renders_plan_rows(seeded):
+    _active_plan_today(seeded)
+    text, err = call(tools.plan_chart, {"days": 14})
+    assert not err
+    assert "plan vs actual · last 14d" in text
+    assert f"{date.today().isoformat()[5:]} easy" in text
+    assert "░" in text  # planned distance renders as plan cells
+    assert "█ run vs ░ short of plan" in text  # legend present
+
+
+def test_plan_chart_weekly_mode(seeded):
+    _active_plan_today(seeded)
+    text, err = call(tools.plan_chart, {"days": 14, "weekly": True})
+    assert not err
+    assert "weekly" in text
+    assert "wk " in text
+
+
+def test_plan_chart_auto_weekly_past_threshold(seeded):
+    _active_plan_today(seeded)
+    text, err = call(tools.plan_chart, {"days": 30})
+    assert not err
+    assert "weekly" in text
+
+
+def test_plan_chart_registered_but_not_in_brief_allowlist():
+    assert "plan_chart" in {t.name for t in tools.ALL_TOOLS}
+    assert "mcp__fitness__plan_chart" not in tools.read_only_tool_names()

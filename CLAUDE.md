@@ -205,7 +205,9 @@ today", "how's my training load", "what did I run last week"):
   everything — `get_training_plan_progress` (graded plan day-by-day),
   `get_training_plan_status`, `query_workouts`, `get_metric_trend`,
   `daily_snapshot`, `training_load_status`, etc. Reach for `run_sql` only when
-  no structured tool fits. **Never shell out to `sqlite3`/Bash for a DB read** —
+  no structured tool fits. For "scheduled vs actual" / "am I hitting my plan"
+  chart asks, `plan_chart` (0.24.0) is THE tool — never hand-roll matplotlib
+  or ASCII via Bash for that view. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
 - **`get_training_plan_progress`'s `workouts` list is windowed by default**
@@ -285,9 +287,13 @@ These are settled — don't redesign without a reason.
   `slope_direction`, etc.) to their payloads instead of leaving the model to
   apply a static legend string by hand. The rule holds project-wide: the LLM
   phrases a judgment, it never derives one that tested Python can compute.
-- **Daily brief job needs a Claude credential in `.env`.** The 06:30
-  launchd job (`com.localfitness.brief` → `fitness brief`) couples pull →
-  recompute-baselines → generate → save atomically. Its *generate* step
+- **Daily brief job needs a Claude credential in `.env`.** The launchd job
+  (`com.localfitness.brief` → `fitness brief --if-missing`) couples pull →
+  recompute-baselines → generate → save atomically, firing at **06:30 with
+  a 09:30 backstop slot** (same command both times; `--if-missing` makes
+  any fire a no-op once today's brief exists, so the backstop only acts
+  when the 06:30 run failed — re-run `ops/install-launchd.sh` after
+  changing the template for it to take effect). Its *generate* step
   spawns a **headless** Claude via the Agent SDK, which authenticates from
   the process env only — `cli.py` `load_dotenv()`s `<repo>/.env`, so the
   token must live there as `CLAUDE_CODE_OAUTH_TOKEN` (Nate's Max token,

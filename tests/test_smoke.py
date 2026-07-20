@@ -44,7 +44,8 @@ def test_tool_schemas_well_formed():
     # +generate_chart (Fix A, 2026-07-10 doc: promoted out of
     # LOCAL_ONLY_TOOLS once it returns an inline image content block,
     # sidestepping the no-file-retrieval problem that made it local-only)
-    assert len(agent_tools.ALL_TOOLS) == 34
+    # +plan_chart (round-2 facet review: two-series scheduled-vs-actual)
+    assert len(agent_tools.ALL_TOOLS) == 35
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

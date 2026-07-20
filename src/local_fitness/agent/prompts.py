@@ -1,8 +1,10 @@
 """System prompt and grounding rules for the local fitness agent.
 
 The system prompt is shared by the briefing and the chat. The briefing
-prompt asks for structured JSON (a list of Takeaways) which the
-frontend renders as expandable cards with embedded charts. The chat
+prompt asks for structured JSON (a list of Takeaways) which the brief's
+consumers — the WeasyPrint PDF (`visuals.py`) and the markdown renderer
+(`mcp_server._render_brief`) — render per-takeaway; the retired React UI
+was the original consumer and the JSON contract outlived it. The chat
 remains free-form prose.
 """
 from .. import notes as user_notes_mod

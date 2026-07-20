@@ -397,7 +397,33 @@ def _fetch_metric_series(metric: str, days: int) -> tuple[list[str], list[float]
     return dates, values
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, best ≤2wk), combo (2D bars + trend line, handles negatives), spark (one-liner). Reproduce the full output in a fenced code block in your reply, then add the coach read — never leave it only in the collapsed tool call.", _CHART_SCHEMA)
+# Past this many points, one-row/one-column-per-day styles (bar, combo) stop
+# fitting a terminal — bucket to Monday-anchored weeks instead of degrading
+# (round-2 facet review: a "90-day bar graph" ask couldn't be honored).
+_LONG_WINDOW_BAR_DAYS = 21
+
+
+def _bucket_weekly(
+    dates: list[str], values: list[float], cumulative: bool
+) -> tuple[list[str], list[float]]:
+    """Aggregate a daily series into Monday-anchored ISO weeks — SUM for
+    cumulative metrics (steps, intensity minutes), mean of present days
+    otherwise. Returns (week_start_iso_dates, aggregated_values), weeks in
+    chronological order. Same cumulative rule the calendar renderer uses."""
+    buckets: dict[str, list[float]] = {}
+    for d, v in zip(dates, values):
+        day = date.fromisoformat(d)
+        week_start = (day - timedelta(days=day.weekday())).isoformat()
+        buckets.setdefault(week_start, []).append(v)
+    weeks = sorted(buckets)
+    agg = [
+        sum(buckets[w]) if cumulative else sum(buckets[w]) / len(buckets[w])
+        for w in weeks
+    ]
+    return weeks, agg
+
+
+@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, weekly-bucketed past ~3wk), combo (2D bars + trend line, handles negatives, weekly-bucketed past ~3wk), spark (one-liner). Reproduce the full output in a fenced code block in your reply, then add the coach read — never leave it only in the collapsed tool call.", _CHART_SCHEMA)
 async def chart(args: dict) -> dict:
     metric = args["metric"]
     if metric not in _CHART_METRICS:
@@ -417,6 +443,15 @@ async def chart(args: dict) -> dict:
     fmt = _chart_value_fmt(metric)
     title = f"{metric} · last {days}d · n={len(values)}"
 
+    # bar/combo scale one row/column per point — past ~3 weeks, bucket to
+    # weekly aggregates so a long-window "bar graph" ask is honored instead
+    # of degrading into a wall of rows (or a wrapping 90-column canvas).
+    if style in ("bar", "combo") and len(values) > _LONG_WINDOW_BAR_DAYS:
+        cumulative = metric in _CHART_CUMULATIVE_METRICS
+        week_dates, values = _bucket_weekly(dates, values, cumulative)
+        labels = [d[5:] for d in week_dates]
+        title += " · weekly sum" if cumulative else " · weekly avg"
+
     if style == "spark":
         body = f"{title}\n{charts.render_sparkline(values)}  {fmt(min(values))}..{fmt(max(values))}"
     elif style == "line":
@@ -431,6 +466,136 @@ async def chart(args: dict) -> dict:
             cumulative=metric in _CHART_CUMULATIVE_METRICS,
         )
     return _text(body)
+
+
+_PLAN_CHART_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "days": {
+            "type": "integer",
+            "description": "Trailing window in days, ending at the data frontier (default 14)",
+        },
+        "weekly": {
+            "type": "boolean",
+            "description": "Force weekly buckets; default auto (daily rows ≤21 days, weekly above)",
+        },
+    },
+    "required": [],
+}
+
+
+def _plan_chart_rows(graded: list[dict]) -> list[dict]:
+    """Daily renderer rows from graded plan workouts. Actual mileage is
+    suppressed for pending/compliant days — the same verdict-conditional
+    rule ``weekly_rollup`` applies, so the chart and the PDF table agree."""
+    rows: list[dict] = []
+    for w in graded:
+        verdict = w.get("verdict")
+        is_rest = w["type"] == "rest" or verdict == "compliant"
+        target_m = w.get("target_distance_m")
+        actual_m = w.get("actual_distance_m")
+        actual = (
+            units.to_miles(actual_m)
+            if actual_m and verdict not in ("pending", "compliant") else None
+        )
+        rows.append({
+            "label": f"{w['date'][5:]} {w['type']}",
+            "verdict": "rest" if is_rest else verdict,
+            "planned": units.to_miles(target_m) if target_m else None,
+            "actual": actual,
+            "rest": is_rest,
+        })
+    return rows
+
+
+def _plan_chart_weekly_rows(graded: list[dict]) -> list[dict]:
+    """Monday-anchored weekly renderer rows: planned/actual mileage totals
+    per week, verdict colored by completion ratio (≥90% done, 70–89%
+    partial, <70% missed; no planned mileage → rest row)."""
+    buckets: dict[str, dict[str, float]] = {}
+    for w in graded:
+        day = date.fromisoformat(w["date"])
+        week_start = (day - timedelta(days=day.weekday())).isoformat()
+        b = buckets.setdefault(week_start, {"planned": 0.0, "actual": 0.0})
+        target_m = w.get("target_distance_m")
+        actual_m = w.get("actual_distance_m")
+        if target_m and w.get("verdict") != "pending":
+            b["planned"] += units.to_miles(target_m) or 0.0
+        if actual_m and w.get("verdict") not in ("pending", "compliant"):
+            b["actual"] += units.to_miles(actual_m) or 0.0
+    rows: list[dict] = []
+    for week_start in sorted(buckets):
+        b = buckets[week_start]
+        planned, actual = round(b["planned"], 1), round(b["actual"], 1)
+        if planned == 0 and actual == 0:
+            verdict, rest = "rest", True
+        else:
+            ratio = (actual / planned) if planned else 1.0
+            verdict = "done" if ratio >= 0.9 else ("partial" if ratio >= 0.7 else "missed")
+            rest = False
+        rows.append({
+            "label": f"wk {week_start[5:]}",
+            "verdict": verdict,
+            "planned": planned if planned else None,
+            "actual": actual if actual else None,
+            "rest": rest,
+        })
+    return rows
+
+
+@tool(
+    "plan_chart",
+    "Render a scheduled-vs-actual training-plan chart (ASCII/emoji): one bar "
+    "per day (or per week for long windows) — █ = miles run, ░ = shortfall vs "
+    "plan, verdict glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
+    "THE tool for 'planned vs actual' / 'am I hitting my plan' asks — don't "
+    "hand-roll a chart. Reproduce the full output in a fenced code block in "
+    "your reply, then add the coach read — never leave it only in the "
+    "collapsed tool call.",
+    _PLAN_CHART_SCHEMA,
+)
+async def plan_chart(args: dict) -> dict:
+    days = args.get("days") or 14
+    err = _validate_days(days)
+    if err:
+        return _err(err)
+
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+        if active is None:
+            return _err("no active training plan")
+        frontier = db.last_known_daily_date(conn=conn)
+        plan_dates = [w["date"] for w in active["workouts"]]
+        anchor = frontier or date.today().isoformat()
+        start = min(plan_dates) if plan_dates else anchor
+        end = max([anchor, *plan_dates])
+        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        cfg = plans.resolve_grading_config(conn=conn)
+    detail = plans.build_plan_detail(active, frontier, activities_by_date, cfg=cfg)
+
+    window_start = (date.fromisoformat(anchor) - timedelta(days=days - 1)).isoformat()
+    graded = [w for w in detail["workouts"] if window_start <= w["date"] <= anchor]
+    if not graded:
+        return _err("no plan workouts in window", days=days,
+                    hint="the active plan has no prescribed days in this trailing window")
+
+    weekly = args.get("weekly")
+    if weekly is None:
+        weekly = days > _LONG_WINDOW_BAR_DAYS
+    adherence = detail.get("adherence_pct")
+    adh = f" · adherence {adherence}%" if adherence is not None else ""
+
+    if weekly:
+        rows = _plan_chart_weekly_rows(graded)
+        title = f"plan vs actual · last {days}d · weekly · {len(rows)} wks{adh}"
+        legend = "█ actual vs ░ planned mi · 🟩≥90% 🟨70–89% 🟥<70% of plan · 🟦rest wk"
+    else:
+        rows = _plan_chart_rows(graded)
+        n_runs = sum(1 for r in rows if not r["rest"])
+        title = f"plan vs actual · last {days}d · {n_runs} runs{adh}"
+        legend = "█ run vs ░ short of plan (mi) · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
+
+    return _text(charts.render_plan_vs_actual(rows, title=title, legend=legend))
 
 
 _QUERY_WORKOUTS_SCHEMA = {
@@ -1494,6 +1659,15 @@ async def revise_training_plan(args: dict) -> dict:
     fields = {k: args[k] for k in _EDITABLE_TOOL_FIELDS if k in args}
     workouts = args.get("workouts")
 
+    # A goal_type change without an explicit goal_distance_m re-derives the
+    # distance the same way propose does — otherwise revise(goal_type="half")
+    # on a 10k draft leaves goal_distance_m=10000 and the Riegel projection
+    # predicts a 10k finish labeled as a half (round-2 facet review, MED-4).
+    if "goal_type" in fields and "goal_distance_m" not in fields:
+        derived = plans.GOAL_DISTANCE_M.get(fields["goal_type"])
+        if derived is not None:
+            fields["goal_distance_m"] = derived
+
     if workouts is not None:
         current = plans.get_plan(plan_id)
         if current is None:
@@ -1522,6 +1696,7 @@ _UPDATE_WORKOUT_SCHEMA = {
         "type": {"type": "string", "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"]},
         "distance_mi": {"type": "number", "description": "target distance in miles (omit for rest / by-feel)"},
         "pace_min_per_mi": {"type": "number", "description": "target pace in min/mi, e.g. 9.65 for 9:39/mi"},
+        "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
         "description": {"type": "string", "description": "prose prescription for the day"},
     },
     "required": ["date"],
@@ -1531,9 +1706,11 @@ _UPDATE_WORKOUT_SCHEMA = {
 @tool(
     "update_plan_workout",
     "Re-prescribe ONE day on the ACTIVE training plan. Pass the date plus any "
-    "of type/distance_mi/pace_min_per_mi/description — use it to move a long "
-    "run, swap days, or adjust a session. type='rest' clears distance & pace. "
-    "Edits the prescription only; it cannot re-key or restructure the plan.",
+    "of type/distance_mi/pace_min_per_mi/duration_min/description — use it to "
+    "move a long run, swap days, or adjust a session (tempo/interval sessions "
+    "are graded on duration_min). type='rest' clears distance/pace/duration "
+    "and defaults the description to 'Rest day' unless you pass one. Edits "
+    "the prescription only; it cannot re-key or restructure the plan.",
     _UPDATE_WORKOUT_SCHEMA,
 )
 async def update_plan_workout(args: dict) -> dict:
@@ -1554,16 +1731,24 @@ async def update_plan_workout(args: dict) -> dict:
     if args.get("pace_min_per_mi") is not None:
         # min/mi → sec/km: minutes*60 sec/mi, then /1.609344 km-per-mile.
         fields["target_pace_sec_per_km"] = float(args["pace_min_per_mi"]) * 60.0 / 1.609344
+    if args.get("duration_min") is not None:
+        fields["target_duration_sec"] = round(float(args["duration_min"]) * 60)
     if args.get("description") is not None:
         fields["description"] = args["description"]
     # A rest day carries no distance/pace/duration — clear them so a stale
-    # prescription can't linger when a session becomes a rest.
+    # prescription can't linger when a session becomes a rest. The description
+    # column is NOT NULL and surfaces in every plan payload + the PDF, so a
+    # rest-flip without a new description must not leave the old hard-run
+    # prose attached to a rest day (round-2 facet review, plan-tools MED-2).
     if fields.get("type") == "rest":
         fields["target_distance_m"] = None
         fields["target_pace_sec_per_km"] = None
         fields["target_duration_sec"] = None
+        if args.get("description") is None:
+            fields["description"] = "Rest day"
     if not fields:
-        return _err("nothing to update — pass type / distance_mi / pace_min_per_mi / description")
+        return _err("nothing to update — pass type / distance_mi / "
+                    "pace_min_per_mi / duration_min / description")
 
     try:
         row = plans.update_active_workout(date_str, fields)
@@ -2396,6 +2581,7 @@ ALL_TOOLS = [
     get_metric,
     get_metric_trend,
     chart,
+    plan_chart,
     query_workouts,
     get_workout_detail,
     compare_periods,
@@ -2460,6 +2646,11 @@ def allowed_tool_names() -> list[str]:
 # tool set is identical to before this issue.
 _READ_ONLY_TOOL_NAMES = (
     "get_today_status",
+    # briefing_prompt (V1) instructs "call get_training_plan_status FIRST" —
+    # this entry keeps the rollback path's tool grant matching its prompt.
+    # Missing here 2026-06-27→2026-07-19: a V1 rollback silently lost
+    # plan-aware briefs (round-2 facet review, prompts finding 1).
+    "get_training_plan_status",
     "get_metric",
     "get_metric_trend",
     "query_workouts",
