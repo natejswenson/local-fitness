@@ -612,3 +612,344 @@ def render_brief_pdf(
 
     doc = _build_html(brief, charts, plan_section)
     return weasyprint.HTML(string=doc, url_fetcher=_report_url_fetcher()).write_pdf()
+
+
+# --- workout report card ---------------------------------------------------
+# Same PRESS grammar as the brief report: flat paper, ink rules, no rounded
+# corners / shadows / gradients, accent reserved for the failing grades.
+
+def _report_card_css(theme: dict) -> str:
+    """Report-card-specific styles, appended to the shared `_build_css` sheet.
+
+    The grade block is the whole point of the page, so it is set enormous in
+    the display voice — the one place in either report where type does the
+    work a colored badge would do elsewhere. Only D and F take the accent;
+    everything at C or better stays ink, per the theme's rule that the accent
+    means "look at this, it went wrong."
+
+    Every table here is `table-layout: fixed` with an explicit colgroup at the
+    markup level, for the reason the 0.24.1 overflow fix established: percentage
+    widths plus cell padding must sum under 100% or WeasyPrint paints past the
+    @page margin.
+    """
+    c = theme["colors"]
+    f = theme["fonts"]
+    dim, accent, rule = c["dim"], c["accent"], c["rule"]
+    _, mono = _font_face_css(theme)
+    return f"""
+table.grade-hero {{
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  margin: 0 0 1.1em 0;
+}}
+table.grade-hero td {{ vertical-align: middle; padding: 0; }}
+td.grade-letter {{
+  font-size: 5.2em;
+  font-weight: 900;
+  letter-spacing: -0.05em;
+  line-height: 0.85;
+  width: 22%;
+}}
+td.grade-meta {{ width: 74%; padding-left: 0.6em; }}
+span.grade-gpa {{
+  font-family: {mono};
+  font-size: 0.78em;
+  letter-spacing: 0.06em;
+  color: {dim};
+  display: block;
+}}
+p.reference-line {{
+  font-family: {f["serif_stack"]};
+  font-style: italic;
+  color: {dim};
+  margin: 0.2em 0 0 0;
+  font-size: 0.95em;
+  overflow-wrap: break-word;
+}}
+h2.card-heading {{
+  font-size: 0.78em;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  border-bottom: 2px solid {rule};
+  padding-bottom: 0.28em;
+  margin: 1.5em 0 0.6em 0;
+}}
+table.metric-table, table.split-table {{
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-family: {mono};
+  font-size: 0.8em;
+}}
+table.metric-table th, table.split-table th {{
+  text-align: left;
+  font-size: 0.86em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: {dim};
+  border-bottom: 1px solid {rule};
+  padding: 0.3em 0.35em;
+}}
+table.metric-table td, table.split-table td {{
+  padding: 0.34em 0.35em;
+  border-bottom: 1px solid rgba(110,103,92,0.28);
+  overflow-wrap: break-word;
+}}
+td.metric-name {{ font-family: {f["display_stack"]}; font-weight: 800; }}
+td.metric-grade {{ text-align: right; font-weight: 900; font-size: 1.15em; }}
+/* The accent's whole job: the grades that went wrong. */
+.grade-D, .grade-F {{ color: {accent}; }}
+.grade-na {{ color: {dim}; font-weight: 400; }}
+tr.split-partial td {{ color: {dim}; font-style: italic; }}
+p.no-splits, p.drift-line, p.load-context {{
+  font-family: {f["serif_stack"]};
+  font-style: italic;
+  color: {dim};
+  font-size: 0.9em;
+  margin: 0.5em 0 0 0;
+}}
+ul.card-notes {{
+  font-family: {f["serif_stack"]};
+  font-style: italic;
+  color: {dim};
+  font-size: 0.9em;
+  margin: 0.5em 0 0 0;
+  padding-left: 1.1em;
+}}
+img.split-chart {{ width: 100%; margin-top: 0.7em; }}
+"""
+
+
+def _grade_class(grade: str | None) -> str:
+    """CSS class from a grade, keyed on the BASE letter so "D-" and "F" both
+    take the accent and "B+" does not."""
+    if not grade or grade == "n/a":
+        return "grade-na"
+    return f"grade-{grade[0]}"
+
+
+def render_split_hr_png(card: dict) -> bytes:
+    """Per-lap HR bar chart. Presentation only — nothing on the card is graded
+    from splits. Partial laps are drawn dim so a 90-meter fragment doesn't read
+    as a real data point next to full miles."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import numpy as np
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    theme = branding.load_theme()
+    paper, ink, dim = (
+        theme["colors"]["paper"], theme["colors"]["ink"], theme["colors"]["dim"])
+    rows = card["splits"]["rows"]
+    values = [r["avg_hr"] or 0 for r in rows]
+    labels = [str(r["index"]) for r in rows]
+    colors = [dim if r["partial"] else ink for r in rows]
+
+    fig = Figure(figsize=(8, 2.4), dpi=150, facecolor=paper)
+    FigureCanvasAgg(fig)  # explicit non-global canvas attach, never via pyplot
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(paper)
+    x = np.arange(len(labels))
+    ax.bar(x, values, color=colors)
+    ylo, yhi = value_axis_bounds([v for v in values if v] or [0, 1])
+    ax.set_ylim(max(0, ylo), yhi)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_xlabel(card["splits"]["unit"], fontsize=8, color=dim)
+    ax.tick_params(colors=dim, labelsize=8)
+    ax.grid(axis="y", color=dim, linewidth=0.6, alpha=0.35)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color(dim)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    return buf.getvalue()
+
+
+def _render_metric_table_html(card: dict) -> str:
+    from . import report_card as rc
+
+    rows = ""
+    for key, label in rc._METRIC_LABELS:
+        m = card["metrics"][key]
+        fmt = rc._FORMATTERS[key]
+        expected = fmt(m["expected"]) if m.get("expected") is not None else "—"
+        grade = m.get("grade") or "n/a"
+        rows += f"""
+        <tr>
+          <td class="metric-name">{html.escape(label)}</td>
+          <td>{html.escape(fmt(m.get("actual")))}</td>
+          <td>{html.escape(expected)}</td>
+          <td>{html.escape(rc._delta_text(key, m))}</td>
+          <td class="metric-grade {_grade_class(grade)}">{html.escape(grade)}</td>
+        </tr>
+        """
+    return f"""
+    <table class="metric-table">
+      <colgroup>
+        <col style="width:26%"><col style="width:19%"><col style="width:19%">
+        <col style="width:22%"><col style="width:12%">
+      </colgroup>
+      <thead><tr>
+        <th>Metric</th><th>Actual</th><th>Expected</th><th>Delta</th><th>Grade</th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    """
+
+
+def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
+    """The per-mile section, or the honest one-liner when the activity has no
+    splits — which is the common case (~88% of the history is backfilled and
+    carries none). Never a blank section."""
+    splits = card["splits"]
+    if not splits["available"]:
+        return """
+        <section>
+          <h2 class="card-heading">Per-mile breakdown</h2>
+          <p class="no-splits">No per-mile splits recorded for this activity.
+          Splits are captured only by the daily sync path — backfilled
+          activities have none.</p>
+        </section>
+        """
+    unit = splits["unit"]
+    avg_hr = card["activity"].get("avg_hr")
+    body = ""
+    for r in splits["rows"]:
+        label = (f"{unit} {r['index']}" if not r["partial"]
+                 else f"final {r['distance_mi']:.2f} mi")
+        hr = r.get("avg_hr")
+        elev = r.get("elevation_gain_meters")
+        pace = f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—"
+        body += f"""
+        <tr class="{'split-partial' if r['partial'] else ''}">
+          <td>{html.escape(label)}</td>
+          <td>{f"{r['distance_mi']:.2f} mi" if r["distance_mi"] is not None else "—"}</td>
+          <td>{html.escape(pace)}</td>
+          <td>{f"{hr} bpm" if hr else "—"}</td>
+          <td>{f"{hr - avg_hr:+d}" if hr and avg_hr else "—"}</td>
+          <td>{f"{elev:.0f} m" if elev is not None else "—"}</td>
+        </tr>
+        """
+    chart_img = (
+        f'<img class="split-chart" src="{_data_uri(split_chart)}" alt="per-lap heart rate">'
+        if split_chart else ""
+    )
+    drift = splits.get("hr_drift_pct")
+    drift_html = (
+        f'<p class="drift-line">HR drift, back half vs front half: {drift:+.1f}%.</p>'
+        if drift is not None else ""
+    )
+    return f"""
+    <section>
+      <h2 class="card-heading">Per-{html.escape(unit.lower())} breakdown</h2>
+      <table class="split-table">
+        <colgroup>
+          <col style="width:20%"><col style="width:16%"><col style="width:18%">
+          <col style="width:16%"><col style="width:13%"><col style="width:13%">
+        </colgroup>
+        <thead><tr>
+          <th>{html.escape(unit)}</th><th>Distance</th><th>Pace</th>
+          <th>Avg HR</th><th>vs run</th><th>Elev</th>
+        </tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+      {chart_img}
+      {drift_html}
+    </section>
+    """
+
+
+def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str:
+    """Assemble the report-card HTML. Separated from `render_report_card_pdf`
+    for the same reason `_build_html` is — layout is testable with plain string
+    assertions instead of introspecting WeasyPrint's output.
+
+    Every interpolated value is `html.escape`d: `activity_name` and the plan
+    `description` are free text that reached the DB from Garmin and from the
+    model respectively, and there is no templating engine's autoescape
+    underneath these f-strings.
+    """
+    from . import report_card as rc
+    from . import units as units_mod
+
+    theme = branding.load_theme()
+    ident = theme["identity"]
+    act = card["activity"]
+    name = act.get("activity_name") or act.get("activity_type") or "Workout"
+    overall = card["overall"]
+    gpa = f"{overall['gpa']:.2f} GPA" if overall.get("gpa") is not None else "not graded"
+    eyebrow = f"{ident['brand_line']} · REPORT CARD · {act.get('date')}"
+
+    subtitle = (
+        f"{rc._fmt_distance(act.get('distance_meters'))} in "
+        f"{units_mod.format_duration(act.get('duration_seconds')) or '—'} · "
+        f"{rc._fmt_pace(act.get('avg_pace_sec_per_km'))}"
+    )
+
+    notes = [f"{label}: {card['metrics'][key]['note']}"
+             for key, label in rc._METRIC_LABELS if card["metrics"][key].get("note")]
+    if card["metrics"]["load"].get("spike"):
+        notes.append("Training Load: spike — more than double your median day.")
+    notes_html = (
+        '<ul class="card-notes">'
+        + "".join(f"<li>{html.escape(n)}</li>" for n in notes)
+        + "</ul>"
+    ) if notes else ""
+
+    ctx = card.get("context") or {}
+    ctx_html = (
+        f'<p class="load-context">Fitness (CTL) {ctx["ctl"]:.0f} · '
+        f'fatigue (ATL) {ctx["atl"]:.0f} · freshness (TSB) {ctx["tsb"]:+.0f} '
+        f'on this date.</p>'
+    ) if ctx.get("ctl") is not None else ""
+
+    return f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>{_build_css(theme)}{_report_card_css(theme)}</style></head>
+<body>
+  <div class="masthead">
+    <table class="masthead-row"><tr>
+      <td><span class="stamp">{html.escape(ident["stamp"])}</span><span class="eyebrow">{html.escape(eyebrow)}</span></td>
+      <td class="byline">{html.escape(ident["byline"])}</td>
+    </tr></table>
+    <h1>{html.escape(str(name))}</h1>
+  </div>
+
+  <table class="grade-hero"><tr>
+    <td class="grade-letter {_grade_class(overall["grade"])}">{html.escape(overall["grade"])}</td>
+    <td class="grade-meta">
+      <span class="grade-gpa">{html.escape(gpa)} · {html.escape(subtitle)}</span>
+      <p class="reference-line">{html.escape(rc.reference_line(card))}</p>
+    </td>
+  </tr></table>
+
+  <section>
+    <h2 class="card-heading">Grades</h2>
+    {_render_metric_table_html(card)}
+    {notes_html}
+    {ctx_html}
+  </section>
+
+  {_render_splits_html(card, split_chart)}
+</body>
+</html>"""
+
+
+def render_report_card_pdf(card: dict, split_chart: bytes | None = None) -> bytes:
+    """Render a built report card into a PDF.
+
+    Takes the already-built card dict and pre-rendered chart bytes rather than
+    querying or grading anything itself — the same separation `render_brief_pdf`
+    keeps, so the table and the PDF can never report different grades.
+    """
+    import weasyprint
+
+    doc = _build_report_card_html(card, split_chart)
+    return weasyprint.HTML(string=doc, url_fetcher=_report_url_fetcher()).write_pdf()

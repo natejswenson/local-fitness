@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
-from . import briefs, charts, coach, interpret, plan_coach, units
+from . import briefs, charts, coach, interpret, plan_coach, report_card, units
 from .schemas import Brief
 
 LOG = logging.getLogger(__name__)
@@ -2583,6 +2583,122 @@ async def generate_chart(args: dict) -> dict:
     }
 
 
+_REPORT_CARD_FORMATS = frozenset({"both", "table", "pdf"})
+
+_REPORT_CARD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "activity_id": {
+            "type": "integer",
+            "description": "Grade this exact activity. Overrides `date`.",
+        },
+        "date": {
+            "type": "string",
+            "description": "YYYY-MM-DD. Grades that day's primary session.",
+        },
+        "format": {
+            "type": "string",
+            "enum": ["both", "table", "pdf"],
+            "description": "Output format, default 'both'.",
+        },
+    },
+    "required": [],
+}
+
+
+@tool(
+    "workout_report_card",
+    "Graded report card for ONE workout — distance, pace, HR (broken down by "
+    "mile) and training load, each given a letter grade, plus an overall "
+    "grade. Defaults to the most recent logged activity; pass activity_id or "
+    "date to grade a specific one. Grades against the active training plan's "
+    "prescribed workout when one exists for that date, otherwise against a "
+    "60-day rolling median of comparable activities — the card always says "
+    "which. Returns a `markdown` field (render it to the user VERBATIM, it is "
+    "already formatted) and, unless format='table', a `path` to a PDF. "
+    "Local-only: reachable via stdio MCP clients on this machine, never over "
+    "the network.",
+    _REPORT_CARD_SCHEMA,
+)
+async def workout_report_card(args: dict) -> dict:
+    target_date = args.get("date")
+    if target_date is not None and not _DATE_RE.match(str(target_date)):
+        return _err(f"malformed date '{target_date}', expected YYYY-MM-DD")
+    fmt = args.get("format") or "both"
+    if fmt not in _REPORT_CARD_FORMATS:
+        return _err(f"unknown format '{fmt}'", allowed=sorted(_REPORT_CARD_FORMATS))
+    activity_id = args.get("activity_id")
+
+    with db.connect() as conn:
+        inputs = report_card.load_report_card_inputs(
+            conn, activity_id=activity_id, target_date=target_date
+        )
+    if inputs is None:
+        return _err(
+            "no matching activity found", activity_id=activity_id, date=target_date)
+
+    card = report_card.build_card(
+        inputs["activity"], inputs["splits"], inputs["plan_workout"],
+        inputs["reference"], inputs["context"],
+    )
+    payload = {
+        "markdown": report_card.render_markdown(card),
+        "activity_id": inputs["activity"]["activity_id"],
+        "date": inputs["activity"].get("date"),
+        "overall": card["overall"],
+        "grades": {k: v.get("grade") for k, v in card["metrics"].items()},
+        "reference": card["reference"].get("mode"),
+        "intent": card["intent"],
+        "intent_source": card["intent_source"],
+        "splits_available": card["splits"]["available"],
+    }
+    if inputs["other_activities_on_date"]:
+        # A double-day shouldn't silently hide its second session.
+        payload["other_activities_on_date"] = inputs["other_activities_on_date"]
+    if fmt == "table":
+        return _text(payload)
+
+    from . import visuals  # lazy: defers matplotlib/weasyprint import cost
+
+    split_chart: bytes | None = None
+    if card["splits"]["available"] and any(r.get("avg_hr") for r in card["splits"]["rows"]):
+        try:
+            async with visuals.RENDER_LOCK:
+                split_chart = await asyncio.to_thread(visuals.render_split_hr_png, card)
+        except Exception:
+            # A chart problem must never sink the card — the same "one
+            # section's problem never fails the report" precedent as
+            # generate_brief_report's per-takeaway chart loop above.
+            LOG.warning(
+                "split chart render skipped for activity %s",
+                inputs["activity"]["activity_id"], exc_info=True,
+            )
+
+    try:
+        async with visuals.RENDER_LOCK:
+            pdf_bytes = await asyncio.to_thread(
+                visuals.render_report_card_pdf, card, split_chart
+            )
+    except Exception as e:
+        return _err(f"PDF render failed: {e}")
+
+    try:
+        reports_dir = await asyncio.to_thread(_default_reports_dir)
+    except OSError as e:
+        return _err(f"could not prepare reports directory: {e}")
+    try:
+        final_path = _write_atomic(
+            reports_dir,
+            f"report-card-{inputs['activity']['activity_id']}.pdf",
+            pdf_bytes,
+        )
+    except ValueError:
+        return _err("resolved path escaped reports directory")
+    await _auto_open(final_path)
+    payload["path"] = str(final_path)
+    return _text(payload)
+
+
 ALL_TOOLS = [
     get_today_status,
     get_brief_context,
@@ -2633,7 +2749,13 @@ ALL_TOOLS = [
 # ALL_TOOLS above. Only the heavy `import matplotlib`/`import weasyprint`
 # statements (inside generate_brief_report's body and visuals.py's own module
 # body) are deferred, not this list.
-LOCAL_ONLY_TOOLS = [generate_brief_report]
+# workout_report_card joins it for the same reason: it writes a PDF, and its
+# markdown table rides along in the same payload so the table and the PDF can
+# never report different grades. That does put a transport-safe table behind
+# the stdio boundary; splitting it into an ALL_TOOLS table-only sibling is a
+# ~15-line addition calling the same report_card.build_card() if that's ever
+# wanted — not shipped speculatively.
+LOCAL_ONLY_TOOLS = [generate_brief_report, workout_report_card]
 
 
 def make_server(extra_tools: list | None = None):
