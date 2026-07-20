@@ -278,10 +278,14 @@ div.masthead h1 {{
    via pdfplumber word bounding boxes, not by eyeballing a render). Table
    layout is the one primitive that reliably holds a real 2-column split
    here, so the whole-page structure reuses it too. */
+/* Cell width percentages + their em paddings must sum ≤ 100% of the
+   table, or fixed layout paints the right rail past the @page margin
+   (measured: up to 14pt of overflow at 56%+44%+1.8em). 54+42=96% leaves
+   ~4% ≈ the two 0.9em paddings. */
 table.page-layout {{ width: 100%; table-layout: fixed; border-collapse: collapse; }}
 table.page-layout > tr > td {{ vertical-align: top; padding: 0; }}
-td.col-signals {{ width: 56%; padding-right: 0.9em; }}
-td.col-plan {{ width: 44%; padding-left: 0.9em; border-left: 2px solid {rule}; }}
+td.col-signals {{ width: 54%; padding-right: 0.9em; }}
+td.col-plan {{ width: 42%; padding-left: 0.9em; border-left: 2px solid {rule}; }}
 /* No active plan: signals run the full page width, no second rail. */
 div.col-signals-full {{ width: 100%; }}
 
@@ -358,6 +362,7 @@ div.today-callout {{
   padding: 0.55em 0.7em;
   margin-bottom: 0.7em;
   page-break-inside: avoid;
+  overflow-wrap: break-word;
 }}
 div.today-callout .eyebrow {{
   font-family: {mono};
@@ -376,20 +381,30 @@ div.today-callout p.coaching-line {{
   color: {ink};
   font-size: 0.95em;
 }}
-table.week-table {{ width: 100%; border-collapse: collapse; font-family: {mono}; font-size: 0.8em; }}
+/* table-layout: fixed — the mono data voice must never paint past the
+   44% rail (measured 14pt of VERDICT-column overflow without it); dates
+   render MM-DD (the year is noise in a 7-day window). Column widths sum
+   to 100%: date/type/planned/actual/verdict. */
+table.week-table {{ width: 100%; table-layout: fixed; border-collapse: collapse; font-family: {mono}; font-size: 0.74em; }}
+table.week-table col.c-date {{ width: 17%; }}
+table.week-table col.c-type {{ width: 19%; }}
+table.week-table col.c-mi {{ width: 21%; }}
+table.week-table col.c-verdict {{ width: 22%; }}
 table.week-table th {{
   text-align: left;
   font-size: 0.68em;
-  letter-spacing: 0.09em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
   color: {ink};
-  padding: 0 0.4em 0.3em 0;
+  padding: 0 0.3em 0.3em 0;
   border-bottom: 2px solid {rule};
+  overflow: hidden;
 }}
 table.week-table td {{
-  padding: 0.3em 0.4em 0.3em 0;
+  padding: 0.3em 0.3em 0.3em 0;
   border-bottom: 1px solid {dim};
   color: {ink};
+  overflow: hidden;
 }}
 table.week-table tr:last-child td {{ border-bottom: none; }}
 /* Verdicts are typographic (PRESS-strict): done = ink, partial/scheduled =
@@ -477,7 +492,7 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
     rows = "".join(
         f"""
         <tr>
-          <td>{html.escape(day["date"])}</td>
+          <td>{html.escape(day["date"][5:])}</td>
           <td>{html.escape(day["type"])}</td>
           <td>{_fmt_mi(day.get("planned_mi"))}</td>
           <td>{_fmt_mi(day.get("actual_mi"))}</td>
@@ -489,6 +504,10 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
     table_html = (
         f"""
         <table class="week-table">
+          <colgroup>
+            <col class="c-date"><col class="c-type"><col class="c-mi">
+            <col class="c-mi"><col class="c-verdict">
+          </colgroup>
           <thead>
             <tr><th>Date</th><th>Type</th><th>Planned</th><th>Actual</th><th>Verdict</th></tr>
           </thead>
