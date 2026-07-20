@@ -67,6 +67,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a reference line. Falls back to the per-lap chart whenever no trace is
   available, so an offline render or an activity Garmin has no details for
   behaves exactly as before.
+- **Pace is overlaid on that chart as a line on its own right-hand axis.**
+  Per tenth of a mile, measured as elapsed time over ground covered (not an
+  average of instantaneous speeds, which would weight a stopped second like a
+  moving one). The axis is **inverted so faster is up** — pace is
+  seconds-per-mile, so on a natural axis a surge would dive while the HR bars
+  it caused rose beside it, and the two series would read as disagreeing — and
+  ticks render as `m:ss`, since minutes per mile is base 60. The time channel
+  is `sumDuration`, the one the activity summary's average pace comes from, so
+  the chart can't contradict the pace printed in the table above it. Bins with
+  no usable time are gaps in the line rather than invented paces; the HR bars
+  render regardless.
 - **Per-mile table drops its Distance column** as duplicative — the row label
   already is the distance, so it printed "1.00 mi" beside a column headed
   "Mile".

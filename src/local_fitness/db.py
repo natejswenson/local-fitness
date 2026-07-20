@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS activity_hr_samples (
     sample_index     INTEGER NOT NULL,
     distance_meters  REAL,
     hr               INTEGER,
+    elapsed_seconds  REAL,
     PRIMARY KEY (activity_id, sample_index)
 );
 
@@ -271,6 +272,15 @@ def init_schema(db_path: Path | None = None) -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(activities)")}
         if "source" not in cols:
             conn.execute("ALTER TABLE activities ADD COLUMN source TEXT DEFAULT 'garmin'")
+        # Same guard, same reason: `activity_hr_samples` shipped without
+        # `elapsed_seconds`, which the per-tenth-mile PACE line needs. A DB
+        # created before that column existed gets it added rather than
+        # silently serving HR-only traces forever.
+        hr_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(activity_hr_samples)")}
+        if hr_cols and "elapsed_seconds" not in hr_cols:
+            conn.execute(
+                "ALTER TABLE activity_hr_samples ADD COLUMN elapsed_seconds REAL")
 
 
 def last_known_daily_date(

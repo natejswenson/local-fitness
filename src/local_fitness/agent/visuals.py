@@ -776,6 +776,11 @@ def hr_chart_series(card: dict) -> dict | None:
     trace = card.get("hr_trace") or []
     if trace:
         bin_mi = rc.HR_TRACE_BIN_MI
+        # The pace overlay only exists when the trace carried a time channel.
+        # Bins without one are None, which the renderer leaves as gaps rather
+        # than interpolating a pace nobody ran.
+        paced = [(r["start_mi"] + bin_mi / 2, r["pace_sec_per_mi"])
+                 for r in trace if r.get("pace_sec_per_mi")]
         return {
             "source": "trace",
             # Bars sit at their true start distance, so the x-axis is miles —
@@ -787,14 +792,22 @@ def hr_chart_series(card: dict) -> dict | None:
             "xlabel": "Distance (miles)",
             # The label states the resolution actually binned, read from the
             # binner's own constant so it can never overstate it.
-            "title": f"Heart rate every {bin_mi:g} mi",
+            "title": f"Heart rate and pace every {bin_mi:g} mi",
             "xmax": max(r["end_mi"] for r in trace),
+            # Plotted at bin CENTRES: a bar spans its bucket, but a line point
+            # is an instant, and hanging it off the bucket's left edge would
+            # read half a bin early.
+            "pace_x": [x for x, _ in paced],
+            "pace_sec_per_mi": [p for _, p in paced],
         }
 
     rows = card.get("splits", {}).get("rows") or []
     if not rows:
         return None
     unit = card["splits"]["unit"]
+    # Per-lap fallback: splits carry pace too, so the overlay survives here.
+    paced = [(r["index"] - 0.5, r["avg_pace_sec_per_km"] * rc.MILE_M / 1000.0)
+             for r in rows if r.get("avg_pace_sec_per_km")]
     return {
         "source": "splits",
         "positions": [r["index"] - 1 for r in rows],
@@ -802,8 +815,10 @@ def hr_chart_series(card: dict) -> dict | None:
         "partials": [bool(r["partial"]) for r in rows],
         "width": 0.9,
         "xlabel": unit,
-        "title": f"Heart rate by {unit.lower()}",
+        "title": f"Heart rate and pace by {unit.lower()}",
         "xmax": len(rows),
+        "pace_x": [x for x, _ in paced],
+        "pace_sec_per_mi": [p for _, p in paced],
     }
 
 
@@ -853,18 +868,19 @@ def render_split_hr_png(card: dict) -> bytes:
         ax.set_xticklabels([str(i + 1) for i in range(len(values))], fontsize=8)
 
     # The run's own average, so each bar reads as above or below the day's
-    # effort instead of against a bare axis. Accent is the theme's "look here"
-    # color and this is the one reference the reader needs.
+    # effort instead of against a bare axis. Dim dashed rather than accent: it
+    # is a reference, and the accent now belongs to the pace line, which is the
+    # series the reader is meant to trace.
     avg_hr = card.get("activity", {}).get("avg_hr")
     if avg_hr:
-        ax.axhline(avg_hr, color=accent, linewidth=1.0, linestyle="--", zorder=3)
         # A paper-colored backing box, because the label sits over the bars and
         # the reference line runs near the middle of the data by construction —
         # there is no corner of this chart guaranteed to be empty.
+        ax.axhline(avg_hr, color=dim, linewidth=0.8, linestyle="--", zorder=3)
         ax.annotate(
             f"run avg {avg_hr} bpm", xy=(0.998, avg_hr),
             xycoords=("axes fraction", "data"), ha="right", va="bottom",
-            fontsize=7, color=accent, zorder=5,
+            fontsize=6.5, color=dim, zorder=5,
             bbox={"facecolor": paper, "edgecolor": "none", "pad": 1.5})
 
     ax.set_xlabel(series["xlabel"], fontsize=8, color=dim)
@@ -877,9 +893,59 @@ def render_split_hr_png(card: dict) -> bytes:
         ax.spines[spine].set_visible(False)
     for spine in ("left", "bottom"):
         ax.spines[spine].set_color(dim)
+
+    _overlay_pace_axis(ax, series, accent, paper)
+
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
     return buf.getvalue()
+
+
+def _fmt_pace_tick(seconds: float, _pos=None) -> str:
+    """A pace-axis tick as m:ss. Minutes per mile is base 60, so a decimal tick
+    ("9.5") names a different pace than the one it appears to."""
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _overlay_pace_axis(ax, series: dict, accent: str, paper: str) -> None:
+    """Draw the pace line on a twinned right-hand axis.
+
+    Two decisions worth stating, because both are easy to get backwards:
+
+    - **The pace axis is inverted, so faster is UP.** Pace is seconds per mile,
+      where a smaller number is the better run. On a natural axis a surge would
+      dive toward the floor while the HR bars it caused rose beside it, and the
+      two series would look like they disagreed. Inverted, effort and pace move
+      together and a divergence means something.
+    - **Accent, solid, drawn last.** The theme allows exactly one accent, and
+      it belongs to the series the reader is meant to trace — which is why the
+      HR average was demoted to a dim dashed reference when this arrived.
+
+    Bins with no usable time are simply absent from the series, so the line has
+    gaps rather than interpolated paces nobody ran.
+    """
+    xs, ys = series.get("pace_x") or [], series.get("pace_sec_per_mi") or []
+    if len(xs) < 2:
+        # One point is not a line, and a lone marker on a second axis costs
+        # more explaining than it earns.
+        return
+
+    from matplotlib.ticker import FuncFormatter
+
+    ax2 = ax.twinx()
+    ax2.plot(xs, ys, color=accent, linewidth=1.3, zorder=4,
+             solid_capstyle="round")
+    ax2.invert_yaxis()
+    ax2.set_ylabel("Pace (min/mi, faster ↑)", fontsize=8, color=accent)
+    ax2.tick_params(axis="y", colors=accent, labelsize=7)
+    ax2.yaxis.set_major_formatter(FuncFormatter(_fmt_pace_tick))
+    ax2.grid(False)  # one set of horizontals; two is noise
+    ax2.set_facecolor(paper)
+    ax2.patch.set_alpha(0)
+    for spine in ("top", "left", "bottom"):
+        ax2.spines[spine].set_visible(False)
+    ax2.spines["right"].set_color(accent)
 
 
 def _render_metric_table_html(card: dict) -> str:

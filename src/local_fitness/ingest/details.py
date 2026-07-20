@@ -21,8 +21,22 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from typing import NamedTuple
 
 LOG = logging.getLogger(__name__)
+
+
+class HrSample(NamedTuple):
+    """One point on an activity's trace.
+
+    A NamedTuple rather than a dict so it stays cheap and tuple-comparable at
+    ~1700 per activity, while `s.elapsed_s` beats `s[2]` at the call sites that
+    compute pace. `elapsed_s` is None on a payload with no duration channel —
+    the HR bars still render, only the pace line drops out.
+    """
+    distance_m: float
+    hr: int
+    elapsed_s: float | None
 
 # Garmin caps its own chart resolution; 2000 covers a marathon at ~8s spacing
 # and is the library's default. Named here so the intent is explicit rather
@@ -35,16 +49,23 @@ MAX_CHART_SAMPLES = 2000
 # index would silently read cadence as heart rate on some other watch.
 _HR_KEY = "directHeartRate"
 _DISTANCE_KEY = "sumDistance"
+# Preference order for the time channel behind the pace line. `sumDuration`
+# first because it is what the activity summary's average pace is computed
+# from — the chart must not contradict the "9:28/mi" printed in the table
+# above it. `sumMovingDuration` excludes pauses and would read faster.
+_DURATION_KEYS = ("sumDuration", "sumElapsedDuration", "sumMovingDuration")
 
 
-def parse_hr_samples(details: dict) -> list[tuple[float, int]]:
-    """`(cumulative_distance_m, hr)` pairs from a Garmin activity-details
-    payload, in order, skipping samples missing either channel.
+def parse_hr_samples(details: dict) -> list[HrSample]:
+    """`HrSample`s from a Garmin activity-details payload, in order, skipping
+    samples missing distance or HR.
 
     Pure — no I/O, no SDK, unit-testable with a hand-built dict. Returns an
-    empty list for any payload shape that doesn't carry both channels (an
-    indoor activity with no distance, a device with no optical HR, or a
-    truncated response), which the caller treats as "no trace available".
+    empty list for any payload shape that doesn't carry both required channels
+    (an indoor activity with no distance, a device with no optical HR, or a
+    truncated response), which the caller treats as "no trace available". The
+    duration channel is OPTIONAL: without it every sample carries
+    `elapsed_s=None` and the chart drops its pace line but keeps the HR bars.
     """
     descriptors = details.get("metricDescriptors") or []
     index_of: dict[str, int] = {}
@@ -56,11 +77,13 @@ def parse_hr_samples(details: dict) -> list[tuple[float, int]]:
     hr_i, dist_i = index_of.get(_HR_KEY), index_of.get(_DISTANCE_KEY)
     if hr_i is None or dist_i is None:
         return []
+    dur_i = next((index_of[k] for k in _DURATION_KEYS if k in index_of), None)
 
-    out: list[tuple[float, int]] = []
+    needed = max(i for i in (hr_i, dist_i, dur_i) if i is not None)
+    out: list[HrSample] = []
     for sample in details.get("activityDetailMetrics") or []:
         metrics = sample.get("metrics") or []
-        if len(metrics) <= max(hr_i, dist_i):
+        if len(metrics) <= needed:
             continue
         hr, dist = metrics[hr_i], metrics[dist_i]
         # A zero HR is Garmin's "no reading", not a real heartbeat; a null
@@ -68,13 +91,15 @@ def parse_hr_samples(details: dict) -> list[tuple[float, int]]:
         # rather than plotted as a dip to zero.
         if hr is None or dist is None or hr <= 0:
             continue
-        out.append((float(dist), int(hr)))
+        t = None if dur_i is None else metrics[dur_i]
+        out.append(HrSample(float(dist), int(hr),
+                            None if t is None else float(t)))
     return out
 
 
 def load_cached_hr_samples(
     conn: sqlite3.Connection, activity_id: int
-) -> list[tuple[float, int]]:
+) -> list[HrSample]:
     """Previously-fetched samples for this activity, or `[]` if none stored.
 
     A missing `activity_hr_samples` table returns `[]` rather than raising:
@@ -84,7 +109,7 @@ def load_cached_hr_samples(
     """
     try:
         rows = conn.execute(
-            "SELECT distance_meters, hr FROM activity_hr_samples "
+            "SELECT distance_meters, hr, elapsed_seconds FROM activity_hr_samples "
             "WHERE activity_id = ? ORDER BY sample_index",
             (activity_id,),
         ).fetchall()
@@ -93,25 +118,30 @@ def load_cached_hr_samples(
                     "create it; falling back to per-lap splits", exc_info=True)
         return []
     return [
-        (float(r["distance_meters"]), int(r["hr"]))
+        HrSample(
+            float(r["distance_meters"]), int(r["hr"]),
+            None if r["elapsed_seconds"] is None else float(r["elapsed_seconds"]),
+        )
         for r in rows
         if r["distance_meters"] is not None and r["hr"] is not None
     ]
 
 
 def store_hr_samples(
-    conn: sqlite3.Connection, activity_id: int, samples: list[tuple[float, int]]
+    conn: sqlite3.Connection, activity_id: int, samples: list[HrSample]
 ) -> None:
     """Persist a fetched trace. `INSERT OR REPLACE` so a re-fetch is idempotent
     rather than a duplicate-key failure."""
     conn.executemany(
         "INSERT OR REPLACE INTO activity_hr_samples "
-        "(activity_id, sample_index, distance_meters, hr) VALUES (?,?,?,?)",
-        [(activity_id, i, d, hr) for i, (d, hr) in enumerate(samples)],
+        "(activity_id, sample_index, distance_meters, hr, elapsed_seconds) "
+        "VALUES (?,?,?,?,?)",
+        [(activity_id, i, s.distance_m, s.hr, s.elapsed_s)
+         for i, s in enumerate(samples)],
     )
 
 
-def fetch_hr_samples(activity_id: int) -> list[tuple[float, int]]:
+def fetch_hr_samples(activity_id: int) -> list[HrSample]:
     """Fetch one activity's HR trace from Garmin. Best-effort: returns `[]` on
     any failure (no credential, expired token, offline, malformed payload).
 
@@ -136,7 +166,7 @@ def fetch_hr_samples(activity_id: int) -> list[tuple[float, int]]:
 
 def get_hr_samples(
     conn: sqlite3.Connection, activity_id: int, *, allow_fetch: bool = True
-) -> list[tuple[float, int]]:
+) -> list[HrSample]:
     """Cached-then-fetched HR trace for one activity.
 
     Cache hit returns immediately with no network call. On a miss, fetches once
@@ -149,7 +179,7 @@ def get_hr_samples(
     if cached or not allow_fetch:
         return cached
 
-    samples = fetch_hr_samples(activity_id)
+    samples: list[HrSample] = fetch_hr_samples(activity_id)
     if samples:
         try:
             store_hr_samples(conn, activity_id, samples)
@@ -161,6 +191,6 @@ def get_hr_samples(
 
 
 __all__ = [
-    "parse_hr_samples", "load_cached_hr_samples", "store_hr_samples",
+    "HrSample", "parse_hr_samples", "load_cached_hr_samples", "store_hr_samples",
     "fetch_hr_samples", "get_hr_samples", "MAX_CHART_SAMPLES",
 ]

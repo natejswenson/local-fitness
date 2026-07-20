@@ -2871,8 +2871,10 @@ def test_report_card_pdf_resolves_the_hr_trace(rc_seeded, reports_tmp, monkeypat
 
     def _fetch(activity_id):
         calls.append(activity_id)
-        # ~0.3 mi of samples: enough for three tenth-mile buckets.
-        return [(float(i) * 40.0, 120 + i) for i in range(13)]
+        # ~0.3 mi of samples at a steady 40m per 15s: enough for three
+        # tenth-mile buckets, each with a computable pace.
+        return [details.HrSample(float(i) * 40.0, 120 + i, float(i) * 15.0)
+                for i in range(13)]
 
     monkeypatch.setattr(details, "fetch_hr_samples", _fetch)
     payload, err = call(tools.workout_report_card, {})

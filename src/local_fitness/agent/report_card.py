@@ -443,20 +443,21 @@ def bin_hr_trace(
         return []
 
     bin_m = bin_mi * MILE_M
-    buckets: dict[int, list[int]] = {}
-    for distance_m, hr in samples:
+    buckets: dict[int, list] = {}
+    for sample in samples:
+        distance_m = sample[0]
         if distance_m is None or distance_m < 0:
             continue
-        buckets.setdefault(int(distance_m // bin_m), []).append(hr)
+        buckets.setdefault(int(distance_m // bin_m), []).append(sample)
     if not buckets:
         return []
 
-    total_m = max(d for d, _ in samples)
+    total_m = max(s[0] for s in samples)
     last = max(buckets)
     rows: list[dict] = []
     for idx in range(last + 1):
-        hrs = buckets.get(idx)
-        if not hrs:
+        bucket = buckets.get(idx)
+        if not bucket:
             # A gap (GPS dropout, paused watch) — skip rather than plot a zero.
             continue
         start_mi = idx * bin_mi
@@ -466,11 +467,37 @@ def bin_hr_trace(
             "index": idx + 1,
             "start_mi": round(start_mi, 3),
             "end_mi": round(end_mi, 3),
-            "avg_hr": round(sum(hrs) / len(hrs)),
-            "samples": len(hrs),
+            "avg_hr": round(sum(s[1] for s in bucket) / len(bucket)),
+            "pace_sec_per_mi": _bucket_pace(bucket),
+            "samples": len(bucket),
             "partial": (end_mi - start_mi) < bin_mi * (1 - MILE_TOLERANCE),
         })
     return rows
+
+
+def _bucket_pace(bucket: list) -> float | None:
+    """Seconds per mile across one distance bucket, or None when the trace
+    carries no usable time.
+
+    Measured as elapsed-time-over-ground-covered between the bucket's first and
+    last sample — NOT an average of instantaneous speeds, which would weight a
+    stopped second the same as a moving one. Sampling is time-based and dense
+    (~56 samples per tenth of a mile on a real run), so first-to-last spans
+    essentially the whole bucket.
+
+    Returns None for a bucket that can't support the arithmetic: a single
+    sample, no duration channel, or a non-advancing clock or odometer. A
+    missing point is a gap in the pace line, which is honest; a fabricated one
+    is a lie about how fast he ran.
+    """
+    timed = [s for s in bucket if len(s) > 2 and s[2] is not None]
+    if len(timed) < 2:
+        return None
+    d_m = timed[-1][0] - timed[0][0]
+    d_t = timed[-1][2] - timed[0][2]
+    if d_m <= 0 or d_t <= 0:
+        return None
+    return (d_t / d_m) * MILE_M
 
 
 def hr_drift_pct(full_rows: list[dict]) -> float | None:

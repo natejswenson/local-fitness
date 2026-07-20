@@ -224,3 +224,44 @@ ordinary run. An uncached card takes roughly two minutes end to end. That's
 acceptable for an on-demand report — and the cache makes every repeat
 instant — but it is the one number to watch if this ever moves somewhere
 interactive.
+
+---
+
+## Round 5 — pace on the HR chart
+
+The HR bars showed *where* the effort went up. They couldn't show whether the
+pace went with it. Pace now overlays as a line on its own right-hand axis, per
+tenth of a mile.
+
+Three details that were each easy to get wrong:
+
+**The time wasn't there.** The trace stored distance and HR only. Pace needs a
+clock, so `HrSample` gained `elapsed_s` and the table gained a column — added
+via the same idempotent ALTER guard `activities.source` uses, since the table
+had already shipped. The channel is `sumDuration` rather than
+`sumMovingDuration`, deliberately: moving time excludes pauses and would render
+a chart that reads faster than the "9:28/mi" printed in the table directly
+above it.
+
+**The axis is inverted.** Pace is seconds-per-mile — smaller is the better run.
+On a natural axis a surge dives toward the floor while the HR bars it caused
+rise beside it, and the two series look like they disagree. Inverted, effort
+and pace move together, and a divergence actually means something. Ticks
+render `m:ss`, because minutes-per-mile is base 60 and a "9.5" tick names a
+different pace than the one it appears to.
+
+**Pace per bin is time over ground, not an average of speeds.** Averaging
+instantaneous speed weights a stopped second exactly as much as a moving one.
+First-sample-to-last-sample across the bucket is the honest measure, and with
+~56 samples per tenth it spans essentially the whole bucket. Buckets that
+can't support the arithmetic — one sample, no clock, a non-advancing odometer
+— produce a gap in the line rather than a number. A gap is honest; a
+fabricated point is a lie about how fast he ran.
+
+The accent moved to the pace line, since that's now the series the eye should
+trace, and the run-average HR line demoted to a dim dashed reference. One
+accent, as the brand requires.
+
+On the real card the line ramps steadily across all three miles, which is
+exactly what the pace paragraph had already said in words: "You didn't settle,
+you ramped."
