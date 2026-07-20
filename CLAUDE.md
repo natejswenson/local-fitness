@@ -388,6 +388,22 @@ These are settled — don't redesign without a reason.
   Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS Homebrew's
   install isn't on the default dylib search path and needs
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
+- **Every generated PDF/PNG is styled by a local-overridable brand theme**
+  (2026-07-19). `agent/branding.py` owns the tokens: the checked-in default
+  is **PRESS** (Nate's cross-project brand — warm paper #F5F0E6, ink
+  #181510, dim #6E675C, ONE accent #E8501F, ink rules, no rounded
+  corners/shadows/gradients; sans 800–900 structure voice, serif-italic
+  commentary, mono data). Tones/verdicts are **typographic** (PRESS-strict):
+  done/positive = ink, partial/caution = dim italic, rest = dim, MISSED/
+  critical = the accent — zero orange on a good day is on-brand.
+  `LOCAL_FITNESS_BRAND_FILE` (JSON, deep-merges over the default; see
+  `.env.example`) lets any clone swap colors/fonts/identity without
+  touching tracked code; a broken brand file never breaks a render.
+  `fonts.mono_file` loads a real TTF via a data:-URI @font-face (Nate's
+  `data/brand.json` points at his devlog IBM Plex Mono). `visuals.py`
+  consumes the theme for BOTH the WeasyPrint report CSS (`_build_css`)
+  and the matplotlib chart styles — the ASCII `chart` tool keeps its
+  emoji heat ramp (PRESS is the *print* brand).
 - **The brief PDF (`generate_brief_report`) has a 2-column signal-card grid
   and a Training Plan section** (2026-07-09 redesign). `visuals.py`'s
   signal cards (formerly one stacked column) reflow into a flexbox grid
