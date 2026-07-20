@@ -6,7 +6,7 @@ Continuation of the morning's four-facet review (see
 `2026-07-19-facet-review-brief-resilience.md` / 0.23.0). Round 2 ran three
 *focused* reviewers instead of generic dimensions — charts deep-dive,
 plan-lifecycle tool audit, prompts/instructions drift audit — over the same
-evidence pack, and shipped the confirmed findings as 0.24.0.
+evidence pack, and shipped the confirmed findings (released together with round 1 as 0.23.0).
 
 ## Findings → what shipped
 

@@ -206,7 +206,7 @@ today", "how's my training load", "what did I run last week"):
   `get_training_plan_status`, `query_workouts`, `get_metric_trend`,
   `daily_snapshot`, `training_load_status`, etc. Reach for `run_sql` only when
   no structured tool fits. For "scheduled vs actual" / "am I hitting my plan"
-  chart asks, `plan_chart` (0.24.0) is THE tool — never hand-roll matplotlib
+  chart asks, `plan_chart` (0.23.0) is THE tool — never hand-roll matplotlib
   or ASCII via Bash for that view. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
