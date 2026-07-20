@@ -314,13 +314,13 @@ def test_render_brief_pdf_plan_section_table_rows_and_verdicts():
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
     pdf = visuals.render_brief_pdf(brief, {}, _PLAN_SECTION)
     text = _pdf_text(pdf)
-    assert "2026-07-08 easy 4.0 mi 3.0 mi partial" in text  # 2.96mi displays as 3.0 (1dp)
-    assert "2026-07-07 rest — — rest" in text  # compliant -> "rest" label, no mileage
-    assert "2026-07-06 tempo 3.0 mi 3.0 mi done" in text
+    assert "07-08 easy 4.0 mi 3.0 mi partial" in text  # 2.96mi displays as 3.0 (1dp)
+    assert "07-07 rest — — rest" in text  # compliant -> "rest" label, no mileage
+    assert "07-06 tempo 3.0 mi 3.0 mi done" in text
     # missed shows actual 0.0 (not "—") and renders CAPS in the accent —
     # the one loud verdict under PRESS-strict.
-    assert "2026-07-03 long 6.0 mi 0.0 mi MISSED" in text
-    assert "2026-07-09 easy 4.0 mi — scheduled" in text  # pending -> no actual shown
+    assert "07-03 long 6.0 mi 0.0 mi MISSED" in text
+    assert "07-09 easy 4.0 mi — scheduled" in text  # pending -> no actual shown
 
 
 def test_render_brief_pdf_plan_section_without_today_omits_callout():
@@ -490,3 +490,29 @@ def test_render_chart_png_uses_theme_paper_background(monkeypatch):
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     import matplotlib.colors as mcolors
     assert mcolors.to_hex(captured["ax"].get_facecolor()).upper() == "#F5F0E6"
+
+
+def test_render_brief_pdf_no_word_paints_past_the_printable_area():
+    # Regression net for the 2026-07-19 overflow: the mono week table's
+    # VERDICT column painted up to 14pt past the right content edge (and
+    # the coaching line 4pt) — table-layout: fixed + MM-DD dates + wrap
+    # hints keep every word inside @page margins. Measured, not eyeballed.
+    long_line = ("You hit yesterday's session clean. Today: easy 3.0 mi @ "
+                 "10:28/mi. Recovery 3mi. Keep HR under 140. 61 days to your 10k.")
+    plan = dict(_PLAN_SECTION)
+    plan["today"] = dict(plan["today"], coaching_line=long_line)
+    brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
+    pdf = visuals.render_brief_pdf(brief, {}, plan)
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        page = doc.pages[0]
+        margin_pt = 1.5 * 28.35  # @page margin: 1.5cm
+        right_edge = page.width - margin_pt
+        offenders = [
+            (w["text"], round(w["x1"] - right_edge, 1))
+            for w in page.extract_words() if w["x1"] > right_edge + 0.5
+        ]
+    assert offenders == []
+    # And the week table renders MM-DD, not the full ISO date.
+    text = _pdf_text(pdf)
+    assert "07-08 easy" in text
+    assert "2026-07-08 easy" not in text
