@@ -6,19 +6,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.24.1] - 2026-07-19
-
-### Fixed
-- **PRESS report content no longer paints past the printable area.** The
-  page-layout cells' width percentages plus their em paddings summed past
-  100%, pushing the plan rail's mono week table up to 14pt beyond the
-  @page margin (and the coaching line 4pt). Cell widths now account for
-  the padding (54+42+~4%), the week table is `table-layout: fixed` with
-  explicit column widths and MM-DD dates (year dropped — noise in a
-  7-day window), and a bounding-box regression test measures every
-  rendered word against the printable edge so overflow can't silently
-  return.
-
 ## [0.24.0] - 2026-07-19
 
 ### Added
