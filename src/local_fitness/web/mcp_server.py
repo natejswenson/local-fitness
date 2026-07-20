@@ -125,6 +125,18 @@ def _render_status(status: dict[str, Any]) -> str:
             lines.append(f"- {' · '.join(parts)}")
     lines.append("")
 
+    # Brief freshness — surface a failing nightly generation in the coach's
+    # own snapshot (the brief resource already banners it; this covers the
+    # /coach prompt path). Only rendered when there's something to flag.
+    stale_days = status.get("brief_stale_days")
+    if stale_days is not None and stale_days > 0:
+        lines.append(
+            f"⚠ Morning brief is {stale_days} day(s) stale (newest: "
+            f"{status.get('latest_brief_date')}) — the nightly generation has "
+            "likely been failing. Worth mentioning to the runner."
+        )
+        lines.append("")
+
     return "\n".join(lines)
 
 

@@ -30,21 +30,35 @@
         <string>__REPO_ROOT__</string>
         <string>fitness</string>
         <string>brief</string>
+        <string>--if-missing</string>
     </array>
 
     <key>WorkingDirectory</key>
     <string>__REPO_ROOT__</string>
 
-    <!-- Daily at 06:30 local. If the Mac is asleep at 06:30, launchd runs
-         the missed job once at the next wake — the catch-up the design
-         relies on for a laptop that isn't always on. -->
+    <!-- Daily at 06:30 local, with a 09:30 backstop fire (2026-07-19 facet
+         review: the 06:30 run failed ~half the mornings on transient SDK
+         stream deaths — in-process retry helps, but a second launchd slot
+         catches the runs where all attempts failed). Both fires run the
+         same `brief --if-missing` command: if 06:30 saved today's brief,
+         09:30 is a no-op; if not, it's a full retry. If the Mac is asleep
+         at a fire time, launchd runs the missed job once at the next wake —
+         a wake-coalesced pileup is also de-duplicated by --if-missing. -->
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>6</integer>
-        <key>Minute</key>
-        <integer>30</integer>
-    </dict>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>6</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+    </array>
 
     <!-- Don't fire on install/load; wait for the scheduled hour. -->
     <key>RunAtLoad</key>

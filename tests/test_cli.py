@@ -390,3 +390,39 @@ def test_brief_failure_with_no_notify_stays_silent(runner, monkeypatch):
     result = runner.invoke(cli.main, ["brief", "--no-pull", "--no-notify"])
     assert result.exit_code != 0
     assert notified == []
+
+
+def test_brief_if_missing_skips_when_todays_brief_exists(runner, monkeypatch, tmp_path):
+    # Backstop-fire mode: today's brief on disk → no pull, no generation,
+    # no notification, exit 0.
+    from local_fitness.agent import briefs
+    from datetime import date as _date
+    bdir = tmp_path / "briefings"
+    bdir.mkdir()
+    (bdir / f"{_date.today().isoformat()}.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", bdir)
+
+    def explode(*a, **k):
+        raise AssertionError("must not run in skip mode")
+
+    monkeypatch.setattr(cli.daily_ingest, "pull", explode)
+    monkeypatch.setattr(cli.baselines, "recompute", explode)
+    monkeypatch.setattr(cli.briefing_mod, "generate_and_save", explode)
+    monkeypatch.setattr(cli.subprocess, "run", explode)
+
+    result = runner.invoke(cli.main, ["brief", "--if-missing"])
+    assert result.exit_code == 0
+    assert "already exists" in result.output
+
+
+def test_brief_if_missing_generates_when_absent(runner, monkeypatch, tmp_path):
+    from local_fitness.agent import briefs
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", tmp_path / "briefings")
+    monkeypatch.setattr(cli.baselines, "recompute", lambda: 0)
+    called = {}
+    monkeypatch.setattr(
+        cli.briefing_mod, "generate_and_save",
+        lambda *, model: called.setdefault("gen", True) or Path("/tmp/b.json"))
+    result = runner.invoke(cli.main, ["brief", "--if-missing", "--no-pull", "--no-notify"])
+    assert result.exit_code == 0
+    assert called.get("gen") is True
