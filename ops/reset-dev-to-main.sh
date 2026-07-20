@@ -65,10 +65,22 @@ build_body() {
   }' "$snapshot"
 }
 
-# Always restore protection, even if the force-update fails midway.
+# Always restore protection, even if the force-update fails midway. The
+# restore PUT itself retries: a single transient API failure here (two live
+# HTTP 503s on 2026-07-20) used to leave the protected branch force-pushable
+# until someone noticed by hand.
 restore() {
   echo "Restoring ${TARGET} protection (allow_force_pushes=false)"
-  build_body 0 | gh api -X PUT "$PROT_PATH" --input - > /dev/null
+  for attempt in 1 2 3 4 5; do
+    if build_body 0 | gh api -X PUT "$PROT_PATH" --input - > /dev/null; then
+      return 0
+    fi
+    echo "protection restore failed (attempt ${attempt}/5) — retrying in 15s" >&2
+    sleep 15
+  done
+  echo "✗ FAILED to restore ${TARGET} protection after 5 attempts —" >&2
+  echo "  allow_force_pushes may still be ON; re-run this script or PUT ${PROT_PATH} manually." >&2
+  return 1
 }
 trap restore EXIT
 

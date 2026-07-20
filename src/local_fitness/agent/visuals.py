@@ -18,34 +18,19 @@ import asyncio
 import base64
 import html
 import io
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Sequence
 
 if TYPE_CHECKING:
     from .schemas import Brief
 
-# Reused verbatim from the sibling `budget` project's validated PDF-report
-# theme — brand consistency across the two "glossy" reporting surfaces takes
-# priority over consistency with the plain-text ASCII chart tool's own heat
-# ramp. Single source of truth for both the WeasyPrint report CSS below and
-# the matplotlib chart stylesheet in render_chart_png.
-PRIMARY = "#2a78d6"
-GOOD = "#0ca30c"
-WARNING = "#fab219"
-CRITICAL = "#d03b3b"
-NEUTRAL = "#e1e0d9"
-# Text greys — previously inline literals in _CSS below; named so the 2026-07-09
-# Training Plan section reuses the exact same three shades rather than
-# introducing a new one (see design doc INV-5).
-INK = "#1a1a1a"
-INK_MUTED = "#444"
-INK_FAINT = "#666"
-
-_TONE_COLOR = {
-    "positive": GOOD,
-    "caution": WARNING,
-    "critical": CRITICAL,
-    "neutral": PRIMARY,
-}
+# All colors/fonts/identity come from the brand theme (agent/branding.py):
+# the PRESS editorial system by default (warm paper, ink rules, one accent),
+# local-overridable via LOCAL_FITNESS_BRAND_FILE. The theme is the single
+# source of truth for both the WeasyPrint report CSS and the matplotlib
+# chart stylesheet in render_chart_png — the ASCII chart tool keeps its own
+# emoji heat ramp (PRESS is the *print* brand).
+from . import branding
 
 _VERDICT_LABEL = {
     "done": "done",
@@ -54,15 +39,6 @@ _VERDICT_LABEL = {
     "compliant": "rest",
     "pending": "scheduled",
 }
-
-
-def _rgba(hex_color: str, alpha: float) -> str:
-    """Alpha-tinted variant of an existing named color — never a new hue,
-    just a lighter wash of PRIMARY/GOOD/WARNING/CRITICAL for card/tile
-    backgrounds (design doc INV-5: no new color literals introduced)."""
-    h = hex_color.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return f"rgba({r}, {g}, {b}, {alpha})"
 
 # Serializes every chart/PDF render within this process. Closes the "is
 # WeasyPrint's write_pdf() safe to call concurrently from two threads"
@@ -115,35 +91,42 @@ def render_chart_png(
     from matplotlib.figure import Figure
     from matplotlib.ticker import FuncFormatter
 
+    theme = branding.load_theme()
+    paper = theme["colors"]["paper"]
+    ink = theme["colors"]["ink"]
+    dim = theme["colors"]["dim"]
+    accent = theme["colors"]["accent"]
+
     dates = [d for d, _ in series]
     values = [v for _, v in series]
     labels = [d[5:] for d in dates]  # MM-DD, matching the ASCII chart tool
 
-    fig = Figure(figsize=(8, 4.5), dpi=150, facecolor="white")
+    fig = Figure(figsize=(8, 4.5), dpi=150, facecolor=paper)
     FigureCanvasAgg(fig)  # explicit non-global canvas attach, never via pyplot
     ax = fig.add_subplot(111)
-    ax.set_facecolor("white")
+    ax.set_facecolor(paper)
     x = np.arange(len(labels))
 
     ylo, yhi = value_axis_bounds(values)
 
     if chart_type == "line":
-        ax.plot(x, values, color=PRIMARY, linewidth=2)
+        ax.plot(x, values, color=ink, linewidth=2)
         # Fill down to the padded axis floor, NOT to y=0 — a single-argument
         # fill_between fills to zero and drags autoscale down with it, which
         # rendered a 48–57bpm resting-HR band as a sliver atop a 0–57 axis
         # (Nate, 2026-07-19: autoscale everything; zero-basing is pointless).
-        ax.fill_between(x, values, ylo, color=PRIMARY, alpha=0.08)
+        ax.fill_between(x, values, ylo, color=ink, alpha=0.06)
     elif chart_type == "bar":
-        ax.bar(x, values, color=PRIMARY)
+        ax.bar(x, values, color=ink)
     elif chart_type == "combo":
         # Matches agent/charts.py's render_combo_chart: bars + a
         # least-squares trend line of the SAME single metric — one series,
         # one axis, not a second-metric dual-axis chart (see design doc).
-        ax.bar(x, values, color=PRIMARY, alpha=0.55)
+        # The trend line is the chart's ONE accent (PRESS signature law).
+        ax.bar(x, values, color=ink, alpha=0.55)
         if len(values) >= 2:
             coeffs = np.polyfit(x, values, 1)
-            ax.plot(x, np.poly1d(coeffs)(x), color=CRITICAL, linewidth=2)
+            ax.plot(x, np.poly1d(coeffs)(x), color=accent, linewidth=2)
     else:
         raise ValueError(f"unsupported chart_type '{chart_type}'")
 
@@ -152,12 +135,13 @@ def render_chart_png(
     # standard truncated-bar look.
     ax.set_ylim(ylo, yhi)
 
-    ax.grid(axis="y", color=NEUTRAL, linewidth=0.6, alpha=0.7)
+    ax.grid(axis="y", color=dim, linewidth=0.6, alpha=0.35)
     ax.set_axisbelow(True)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
-    ax.spines["left"].set_color(NEUTRAL)
-    ax.spines["bottom"].set_color(NEUTRAL)
+    ax.spines["left"].set_color(dim)
+    ax.spines["bottom"].set_color(dim)
+    ax.tick_params(colors=ink)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: value_fmt(v)))
 
     # Thin x labels for long windows so they stay readable, same idea as the
@@ -194,46 +178,94 @@ def _report_url_fetcher():
     return weasyprint.URLFetcher(allowed_protocols=["data"])
 
 
-_CSS = f"""
-@page {{ size: A4; margin: 1.6cm; }}
+def _font_face_css(theme: dict) -> tuple[str, str]:
+    """(optional @font-face block, mono font-family stack) for the theme.
+
+    When ``fonts.mono_file`` names a real TTF, embed it as a data: URI —
+    ``_report_url_fetcher`` rejects every scheme except ``data:``, so a
+    file:// reference would be blocked at fetch time — and prepend the
+    ``BrandMono`` family to the stack. Missing/unreadable file → system
+    stack only, never an error."""
+    mono_stack = theme["fonts"]["mono_stack"]
+    mono_file = theme["fonts"].get("mono_file")
+    if not mono_file:
+        return "", mono_stack
+    try:
+        font_bytes = Path(mono_file).read_bytes()
+    except OSError:
+        return "", mono_stack
+    uri = "data:font/ttf;base64," + base64.b64encode(font_bytes).decode("ascii")
+    face = f"@font-face {{ font-family: 'BrandMono'; src: url('{uri}'); }}"
+    return face, f"'BrandMono', {mono_stack}"
+
+
+def _build_css(theme: dict) -> str:
+    """The report stylesheet, built from the brand theme.
+
+    PRESS grammar (the default theme's rules, kept even under color
+    overrides): flat paper canvas, ink rules for all structure, NO rounded
+    corners / shadows / gradients, sans 800–900 tight-tracked for
+    structure, serif italic for commentary, mono for data. Tones and
+    verdicts are typographic — the accent appears only on critical/missed
+    (and the stamp)."""
+    c = theme["colors"]
+    f = theme["fonts"]
+    paper, ink, dim, accent, rule = (
+        c["paper"], c["ink"], c["dim"], c["accent"], c["rule"])
+    font_face, mono = _font_face_css(theme)
+    return f"""
+{font_face}
+@page {{ size: A4; margin: 1.5cm; }}
+html {{ background: {paper}; }}
 body {{
-  font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
-  color: {INK};
+  font-family: {f["display_stack"]};
+  color: {ink};
   font-size: 11.3pt;
   line-height: 1.42;
   margin: 0;
 }}
 
-/* Header: full-width banner above the 2-column body — a colored rule +
-   pill date badge instead of a plain heading, so the report opens with
-   some personality rather than a bare title line. */
-div.header {{
-  display: table;
-  width: 100%;
-  border-bottom: 2.5px solid {PRIMARY};
-  padding-bottom: 0.5em;
-  margin-bottom: 0.9em;
+/* Masthead: heavy ink rule, rotated accent stamp, tracked-caps eyebrow in
+   the mono data voice, dim byline right. The editorial opening — no pills,
+   no banner fills. */
+div.masthead {{
+  border-top: 8px solid {rule};
+  padding-top: 0.55em;
+  margin-bottom: 1.1em;
 }}
-div.header h1 {{
-  display: table-cell;
-  font-size: 1.55em;
-  font-weight: 800;
-  margin: 0;
-  vertical-align: middle;
-}}
-div.header .date-pill {{
-  display: table-cell;
-  text-align: right;
-  vertical-align: middle;
-}}
-div.header .date-pill span {{
+table.masthead-row {{ width: 100%; border-collapse: collapse; }}
+table.masthead-row td {{ vertical-align: middle; padding: 0; }}
+span.stamp {{
   display: inline-block;
-  background: {_rgba(PRIMARY, 0.12)};
-  color: {PRIMARY};
+  border: 2.5px solid {accent};
+  color: {accent};
+  font-weight: 900;
+  font-size: 0.8em;
+  letter-spacing: 0.02em;
+  padding: 0.22em 0.34em;
+  transform: rotate(-4deg);
+}}
+span.eyebrow {{
+  font-family: {mono};
+  font-size: 0.72em;
   font-weight: 700;
-  font-size: 0.82em;
-  padding: 0.3em 0.8em;
-  border-radius: 100px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: {ink};
+  padding-left: 0.9em;
+}}
+td.byline {{
+  text-align: right;
+  font-family: {mono};
+  font-size: 0.66em;
+  letter-spacing: 0.05em;
+  color: {dim};
+}}
+div.masthead h1 {{
+  font-size: 1.7em;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  margin: 0.35em 0 0 0;
 }}
 
 /* Whole-page 2-column layout: signal cards (left) run in parallel with
@@ -246,112 +278,143 @@ div.header .date-pill span {{
    via pdfplumber word bounding boxes, not by eyeballing a render). Table
    layout is the one primitive that reliably holds a real 2-column split
    here, so the whole-page structure reuses it too. */
+/* Cell width percentages + their em paddings must sum ≤ 100% of the
+   table, or fixed layout paints the right rail past the @page margin
+   (measured: up to 14pt of overflow at 56%+44%+1.8em). 54+42=96% leaves
+   ~4% ≈ the two 0.9em paddings. */
 table.page-layout {{ width: 100%; table-layout: fixed; border-collapse: collapse; }}
 table.page-layout > tr > td {{ vertical-align: top; padding: 0; }}
-td.col-signals {{ width: 56%; padding-right: 0.9em; }}
-td.col-plan {{ width: 44%; padding-left: 0.9em; border-left: 1px solid {NEUTRAL}; }}
+td.col-signals {{ width: 54%; padding-right: 0.9em; }}
+td.col-plan {{ width: 42%; padding-left: 0.9em; border-left: 2px solid {rule}; }}
 /* No active plan: signals run the full page width, no second rail. */
 div.col-signals-full {{ width: 100%; }}
 
-/* Signal cards: stacked single-column within the left rail. Tone-tinted
-   background wash (not just a border) + rounded corners so each card
-   reads as a distinct, colorful tile rather than a plain ruled list. */
+/* Signal cards → ruled editorial sections: structure from ink rules and
+   whitespace, never fills or radii. Headline = display voice (900, tight
+   tracking); summary = serif-italic standfirst in dim. Tone is
+   typographic — only critical earns the accent. */
 section.signal-card {{
-  border-left: 5px solid {PRIMARY};
-  border-radius: 0 8px 8px 0;
-  padding: 0.65em 0.9em;
-  margin-bottom: 0.8em;
+  border-top: 2px solid {rule};
+  padding: 0.55em 0 0.35em 0;
+  margin-bottom: 0.75em;
   page-break-inside: avoid;
-  background: {_rgba(PRIMARY, 0.05)};
 }}
-section.tone-positive {{ border-left-color: {GOOD}; background: {_rgba(GOOD, 0.06)}; }}
-section.tone-caution {{ border-left-color: {WARNING}; background: {_rgba(WARNING, 0.10)}; }}
-section.tone-critical {{ border-left-color: {CRITICAL}; background: {_rgba(CRITICAL, 0.07)}; }}
-section.tone-neutral {{ border-left-color: {PRIMARY}; background: {_rgba(PRIMARY, 0.05)}; }}
-h2 {{ font-size: 1.02em; margin: 0 0 0.15em 0; }}
-p.summary {{ color: {INK_MUTED}; margin: 0 0 0.35em 0; }}
+section.signal-card h2 {{
+  font-size: 1.06em;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.15em 0;
+}}
+section.tone-critical {{ border-top-color: {accent}; }}
+section.tone-critical h2 {{ color: {accent}; }}
+section.tone-caution h2 {{ color: {dim}; font-style: italic; }}
+p.summary {{
+  font-family: {f["serif_stack"]};
+  font-style: italic;
+  color: {dim};
+  margin: 0 0 0.35em 0;
+}}
 img.chart {{ max-width: 100%; margin: 0.3em 0; }}
 div.details {{ font-size: 0.93em; }}
 div.details p {{ margin: 0; }}
-div.details table {{ border-collapse: collapse; margin: 0.4em 0; }}
-div.details th, div.details td {{
-  border: 1px solid {NEUTRAL};
+div.details table {{ border-collapse: collapse; margin: 0.4em 0; font-family: {mono}; font-size: 0.9em; }}
+div.details th {{
+  border-bottom: 2px solid {rule};
+  padding: 0.25em 0.5em;
+  text-align: left;
+  font-size: 0.85em;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}}
+div.details td {{
+  border-bottom: 1px solid {dim};
   padding: 0.25em 0.5em;
   text-align: left;
 }}
 
 /* Training Plan (right rail). */
 h2.plan-heading {{
-  font-size: 0.78em;
+  font-family: {mono};
+  font-size: 0.72em;
   font-weight: 700;
-  letter-spacing: 0.07em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: {INK_FAINT};
-  border-bottom: 1px solid {NEUTRAL};
+  color: {ink};
+  border-bottom: 2px solid {rule};
   padding-bottom: 0.3em;
   margin: 0 0 0.6em 0;
 }}
-table.stat-strip {{ width: 100%; border-collapse: separate; border-spacing: 0.4em; margin: -0.4em -0.4em 0.5em -0.4em; table-layout: fixed; }}
-td.stat-tile {{
-  background: {_rgba(PRIMARY, 0.08)};
-  border-radius: 6px;
-  padding: 0.5em 0.3em;
-  text-align: center;
-}}
-td.stat-tile .value {{ font-size: 1.1em; font-weight: 800; color: {PRIMARY}; }}
+/* Stat strip → PRESS numerals: no fills, no radii — big 900 ink numerals
+   over tiny tracked-caps dim labels, ruled above. */
+table.stat-strip {{ width: 100%; border-collapse: collapse; margin: 0 0 0.6em 0; table-layout: fixed; }}
+td.stat-tile {{ padding: 0.4em 0.3em 0.45em 0; text-align: left; border-bottom: 1px solid {dim}; }}
+td.stat-tile .value {{ font-size: 1.25em; font-weight: 900; letter-spacing: -0.02em; color: {ink}; }}
 td.stat-tile .label {{
   margin-top: 0.15em;
-  font-size: 0.6em;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: {INK_FAINT};
-}}
-div.today-callout {{
-  border-left: 4px solid {PRIMARY};
-  background: {_rgba(PRIMARY, 0.08)};
-  padding: 0.55em 0.7em;
-  border-radius: 0 6px 6px 0;
-  margin-bottom: 0.7em;
-  page-break-inside: avoid;
-}}
-div.today-callout .eyebrow {{
-  font-size: 0.65em;
-  font-weight: 700;
+  font-family: {mono};
+  font-size: 0.58em;
   letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: {PRIMARY};
+  color: {dim};
+}}
+div.today-callout {{
+  border: 2px solid {rule};
+  padding: 0.55em 0.7em;
+  margin-bottom: 0.7em;
+  page-break-inside: avoid;
+  overflow-wrap: break-word;
+}}
+div.today-callout .eyebrow {{
+  font-family: {mono};
+  font-size: 0.62em;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: {ink};
   margin: 0 0 0.25em 0;
 }}
-div.today-callout .rx {{ font-weight: 700; margin: 0 0 0.25em 0; }}
-div.today-callout p.coaching-line {{ margin: 0; color: {INK}; font-size: 0.95em; }}
-table.week-table {{ width: 100%; border-collapse: collapse; font-size: 0.85em; }}
+div.today-callout .rx {{ font-family: {mono}; font-weight: 700; margin: 0 0 0.25em 0; }}
+div.today-callout p.coaching-line {{
+  font-family: {f["serif_stack"]};
+  font-style: italic;
+  margin: 0;
+  color: {ink};
+  font-size: 0.95em;
+}}
+/* table-layout: fixed — the mono data voice must never paint past the
+   44% rail (measured 14pt of VERDICT-column overflow without it); dates
+   render MM-DD (the year is noise in a 7-day window). Column widths sum
+   to 100%: date/type/planned/actual/verdict. */
+table.week-table {{ width: 100%; table-layout: fixed; border-collapse: collapse; font-family: {mono}; font-size: 0.74em; }}
+table.week-table col.c-date {{ width: 17%; }}
+table.week-table col.c-type {{ width: 19%; }}
+table.week-table col.c-mi {{ width: 21%; }}
+table.week-table col.c-verdict {{ width: 22%; }}
 table.week-table th {{
   text-align: left;
-  font-size: 0.62em;
-  letter-spacing: 0.05em;
+  font-size: 0.68em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: {INK_FAINT};
-  padding: 0 0.4em 0.3em 0;
-  border-bottom: 1px solid {NEUTRAL};
+  color: {ink};
+  padding: 0 0.3em 0.3em 0;
+  border-bottom: 2px solid {rule};
+  overflow: hidden;
 }}
 table.week-table td {{
-  padding: 0.3em 0.4em 0.3em 0;
-  border-bottom: 1px solid {NEUTRAL};
-  color: {INK_MUTED};
+  padding: 0.3em 0.3em 0.3em 0;
+  border-bottom: 1px solid {dim};
+  color: {ink};
+  overflow: hidden;
 }}
 table.week-table tr:last-child td {{ border-bottom: none; }}
-span.verdict {{
-  display: inline-block;
-  font-size: 0.76em;
-  font-weight: 600;
-  padding: 0.1em 0.5em;
-  border-radius: 100px;
-}}
-span.verdict-done {{ background: {_rgba(GOOD, 0.14)}; color: {GOOD}; }}
-span.verdict-partial {{ background: {_rgba(WARNING, 0.22)}; color: {INK}; }}
-span.verdict-missed {{ background: {_rgba(CRITICAL, 0.12)}; color: {CRITICAL}; }}
-span.verdict-compliant {{ background: {NEUTRAL}; color: {INK_MUTED}; }}
-span.verdict-pending {{ color: {INK_FAINT}; font-style: italic; }}
+/* Verdicts are typographic (PRESS-strict): done = ink, partial/scheduled =
+   dim italic, rest = dim, MISSED = the one accent, caps. No pills. */
+span.verdict {{ font-size: 0.9em; }}
+span.verdict-done {{ color: {ink}; font-weight: 700; }}
+span.verdict-partial {{ color: {dim}; font-style: italic; }}
+span.verdict-missed {{ color: {accent}; font-weight: 900; text-transform: uppercase; letter-spacing: 0.04em; }}
+span.verdict-compliant {{ color: {dim}; }}
+span.verdict-pending {{ color: {dim}; font-style: italic; }}
 """
 
 
@@ -429,7 +492,7 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
     rows = "".join(
         f"""
         <tr>
-          <td>{html.escape(day["date"])}</td>
+          <td>{html.escape(day["date"][5:])}</td>
           <td>{html.escape(day["type"])}</td>
           <td>{_fmt_mi(day.get("planned_mi"))}</td>
           <td>{_fmt_mi(day.get("actual_mi"))}</td>
@@ -441,6 +504,10 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
     table_html = (
         f"""
         <table class="week-table">
+          <colgroup>
+            <col class="c-date"><col class="c-type"><col class="c-mi">
+            <col class="c-mi"><col class="c-verdict">
+          </colgroup>
           <thead>
             <tr><th>Date</th><th>Type</th><th>Planned</th><th>Actual</th><th>Verdict</th></tr>
           </thead>
@@ -505,13 +572,19 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
         else f'<div class="col-signals col-signals-full">{signals_html}</div>'
     )
 
+    theme = branding.load_theme()
+    ident = theme["identity"]
+    eyebrow = f"{ident['brand_line']} · MORNING BRIEF · {brief.date}"
     return f"""<!doctype html>
 <html>
-<head><meta charset="utf-8"><style>{_CSS}</style></head>
+<head><meta charset="utf-8"><style>{_build_css(theme)}</style></head>
 <body>
-  <div class="header">
+  <div class="masthead">
+    <table class="masthead-row"><tr>
+      <td><span class="stamp">{html.escape(ident["stamp"])}</span><span class="eyebrow">{html.escape(eyebrow)}</span></td>
+      <td class="byline">{html.escape(ident["byline"])}</td>
+    </tr></table>
     <h1>{html.escape(brief.user_name)}'s Brief</h1>
-    <div class="date-pill"><span>{html.escape(brief.date)}</span></div>
   </div>
   {body_html}
 </body>

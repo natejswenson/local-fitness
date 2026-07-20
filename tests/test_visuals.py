@@ -99,7 +99,9 @@ def test_render_brief_pdf_markdown_table_renders_as_real_table():
     # raw pipe/dash markup; a disabled extension would leave literal
     # "| a | b |" in the output instead.
     assert "|" not in text
-    assert "a" in text and "b" in text and "1" in text and "2" in text
+    # Headers render uppercased (PRESS table-header treatment) — assert
+    # case-insensitively; the cells stay verbatim.
+    assert "A" in text and "B" in text and "1" in text and "2" in text
 
 
 def test_render_brief_pdf_blocks_external_image_network_fetch():
@@ -181,7 +183,10 @@ def test_build_html_cards_stack_single_column_not_paired(n):
     brief = _brief(_takeaways(n))
     html_out = visuals._build_html(brief, {}, None)
     assert html_out.count('class="signal-card') == n
-    assert "<tr>" not in html_out
+    # Exactly ONE <tr> — the masthead's identity row. No per-pair card
+    # wrapping rows exist (the original regression this test pins).
+    assert html_out.count("<tr>") == 1
+    assert html_out.index("<tr>") < html_out.index('class="signal-card')
     assert "colspan" not in html_out
 
 
@@ -309,11 +314,13 @@ def test_render_brief_pdf_plan_section_table_rows_and_verdicts():
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
     pdf = visuals.render_brief_pdf(brief, {}, _PLAN_SECTION)
     text = _pdf_text(pdf)
-    assert "2026-07-08 easy 4.0 mi 3.0 mi partial" in text  # 2.96mi displays as 3.0 (1dp)
-    assert "2026-07-07 rest — — rest" in text  # compliant -> "rest" label, no mileage
-    assert "2026-07-06 tempo 3.0 mi 3.0 mi done" in text
-    assert "2026-07-03 long 6.0 mi 0.0 mi missed" in text  # missed shows actual 0.0, not "—"
-    assert "2026-07-09 easy 4.0 mi — scheduled" in text  # pending -> no actual shown
+    assert "07-08 easy 4.0 mi 3.0 mi partial" in text  # 2.96mi displays as 3.0 (1dp)
+    assert "07-07 rest — — rest" in text  # compliant -> "rest" label, no mileage
+    assert "07-06 tempo 3.0 mi 3.0 mi done" in text
+    # missed shows actual 0.0 (not "—") and renders CAPS in the accent —
+    # the one loud verdict under PRESS-strict.
+    assert "07-03 long 6.0 mi 0.0 mi MISSED" in text
+    assert "07-09 easy 4.0 mi — scheduled" in text  # pending -> no actual shown
 
 
 def test_render_brief_pdf_plan_section_without_today_omits_callout():
@@ -396,3 +403,116 @@ def test_render_chart_png_line_axis_not_zero_anchored():
     assert ylo == pytest.approx(exp_lo)
     assert yhi == pytest.approx(exp_hi)
     assert ylo > 40
+
+
+# --- PRESS theme (2026-07-19: brand-driven PDF styling) ----------------------
+
+def test_build_css_carries_press_tokens_and_no_legacy_blue(monkeypatch):
+    # Pin to the repo-default theme: cli.py's load_dotenv() (imported by other
+    # test modules) loads the developer's .env process-wide, which may set
+    # LOCAL_FITNESS_BRAND_FILE to a personal brand file.
+    monkeypatch.delenv("LOCAL_FITNESS_BRAND_FILE", raising=False)
+    from local_fitness.agent import branding
+    css = visuals._build_css(branding.load_theme())
+    assert "#F5F0E6" in css and "#181510" in css and "#E8501F" in css
+    assert "#2a78d6" not in css  # the retired budget-project blue
+    # PRESS "never do": no rounded corners anywhere in the report.
+    assert "border-radius" not in css
+
+
+def test_build_css_press_strict_verdict_treatments(monkeypatch):
+    monkeypatch.delenv("LOCAL_FITNESS_BRAND_FILE", raising=False)
+    from local_fitness.agent import branding
+    css = visuals._build_css(branding.load_theme())
+    # missed = the one accent, caps; done = ink weight; partial = dim italic.
+    missed = css.split("span.verdict-missed")[1].split("}")[0]
+    assert "#E8501F" in missed and "uppercase" in missed
+    done = css.split("span.verdict-done")[1].split("}")[0]
+    assert "#181510" in done
+    partial = css.split("span.verdict-partial")[1].split("}")[0]
+    assert "#6E675C" in partial and "italic" in partial
+
+
+def test_build_css_custom_theme_accent_flows_through():
+    from local_fitness.agent import branding
+    theme = branding._deep_merge(branding.DEFAULT_THEME, {"colors": {"accent": "#0055FF"}})
+    css = visuals._build_css(theme)
+    assert "#0055FF" in css and "#E8501F" not in css
+
+
+def test_build_html_masthead_carries_identity(monkeypatch):
+    monkeypatch.delenv("LOCAL_FITNESS_BRAND_FILE", raising=False)
+    brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
+    out = visuals._build_html(brief, {}, None)
+    assert '<span class="stamp">NS</span>' in out
+    assert "LOCAL FITNESS · MORNING BRIEF · 2026-07-08" in out
+    assert "linkedin.com/in/natejswenson" in out
+    assert "date-pill" not in out  # old header banner is gone
+
+
+def test_font_face_emitted_only_for_real_mono_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOCAL_FITNESS_BRAND_FILE", raising=False)
+    from local_fitness.agent import branding
+    theme = branding.load_theme()
+    face, stack = visuals._font_face_css(theme)
+    assert face == "" and "BrandMono" not in stack
+
+    font = tmp_path / "font.ttf"
+    font.write_bytes(b"\x00\x01\x00\x00fakefont")
+    theme["fonts"]["mono_file"] = str(font)
+    face, stack = visuals._font_face_css(theme)
+    assert "@font-face" in face and "data:font/ttf;base64," in face
+    assert stack.startswith("'BrandMono'")
+
+    theme["fonts"]["mono_file"] = str(tmp_path / "gone.ttf")
+    face, stack = visuals._font_face_css(theme)
+    assert face == "" and "BrandMono" not in stack
+
+
+def test_render_chart_png_uses_theme_paper_background(monkeypatch):
+    monkeypatch.delenv("LOCAL_FITNESS_BRAND_FILE", raising=False)
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    captured = {}
+    orig = Figure.add_subplot
+
+    def spy(self, *a, **k):
+        ax = orig(self, *a, **k)
+        captured["ax"] = ax
+        return ax
+
+    Figure.add_subplot = spy
+    try:
+        png = visuals.render_chart_png(_SERIES, "line", _fmt)
+    finally:
+        Figure.add_subplot = orig
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    import matplotlib.colors as mcolors
+    assert mcolors.to_hex(captured["ax"].get_facecolor()).upper() == "#F5F0E6"
+
+
+def test_render_brief_pdf_no_word_paints_past_the_printable_area():
+    # Regression net for the 2026-07-19 overflow: the mono week table's
+    # VERDICT column painted up to 14pt past the right content edge (and
+    # the coaching line 4pt) — table-layout: fixed + MM-DD dates + wrap
+    # hints keep every word inside @page margins. Measured, not eyeballed.
+    long_line = ("You hit yesterday's session clean. Today: easy 3.0 mi @ "
+                 "10:28/mi. Recovery 3mi. Keep HR under 140. 61 days to your 10k.")
+    plan = dict(_PLAN_SECTION)
+    plan["today"] = dict(plan["today"], coaching_line=long_line)
+    brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
+    pdf = visuals.render_brief_pdf(brief, {}, plan)
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        page = doc.pages[0]
+        margin_pt = 1.5 * 28.35  # @page margin: 1.5cm
+        right_edge = page.width - margin_pt
+        offenders = [
+            (w["text"], round(w["x1"] - right_edge, 1))
+            for w in page.extract_words() if w["x1"] > right_edge + 0.5
+        ]
+    assert offenders == []
+    # And the week table renders MM-DD, not the full ISO date.
+    text = _pdf_text(pdf)
+    assert "07-08 easy" in text
+    assert "2026-07-08 easy" not in text
