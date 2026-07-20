@@ -338,3 +338,61 @@ def test_render_plan_section_html_verdict_label_mapping_exhaustive(verdict, labe
     html_out = visuals._render_plan_section_html(section)
     assert f'verdict-{verdict}"' in html_out
     assert f">{label}<" in html_out
+
+
+# --- value_axis_bounds: autoscale, never zero-anchored (2026-07-19) ----------
+
+def test_value_axis_bounds_hugs_the_data_band():
+    # The motivating case: RHR 48..57 must NOT produce a 0-based axis.
+    ylo, yhi = visuals.value_axis_bounds([52.0, 57.0, 48.0, 50.0])
+    span = 57.0 - 48.0
+    assert ylo == pytest.approx(48.0 - span * 0.08)
+    assert yhi == pytest.approx(57.0 + span * 0.08)
+    assert ylo > 40  # nowhere near zero
+
+
+def test_value_axis_bounds_flat_series_gets_nonzero_height():
+    ylo, yhi = visuals.value_axis_bounds([50.0, 50.0, 50.0])
+    assert ylo == pytest.approx(50.0 - 2.5)  # 5% of magnitude
+    assert yhi == pytest.approx(50.0 + 2.5)
+
+
+def test_value_axis_bounds_flat_near_zero_uses_min_pad():
+    ylo, yhi = visuals.value_axis_bounds([0.0, 0.0])
+    assert (ylo, yhi) == (-1.0, 1.0)
+
+
+def test_value_axis_bounds_negative_band_pads_sign_agnostically():
+    # TSB-shaped series: all negative, padding extends both directions.
+    ylo, yhi = visuals.value_axis_bounds([-20.0, -5.0, -12.0])
+    span = 15.0
+    assert ylo == pytest.approx(-20.0 - span * 0.08)
+    assert yhi == pytest.approx(-5.0 + span * 0.08)
+
+
+def test_render_chart_png_line_axis_not_zero_anchored():
+    # Integration: render the RHR-band shape and confirm the figure's y-limits
+    # came from value_axis_bounds, not matplotlib's fill-to-zero autoscale.
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    captured = {}
+    orig = Figure.add_subplot
+
+    def spy(self, *a, **k):
+        ax = orig(self, *a, **k)
+        captured["ax"] = ax
+        return ax
+
+    Figure.add_subplot = spy
+    try:
+        series = [(f"2026-07-{d:02d}", 48.0 + (d % 10)) for d in range(1, 15)]
+        png = visuals.render_chart_png(series, "line", _fmt)
+    finally:
+        Figure.add_subplot = orig
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    ylo, yhi = captured["ax"].get_ylim()
+    exp_lo, exp_hi = visuals.value_axis_bounds([48.0 + (d % 10) for d in range(1, 15)])
+    assert ylo == pytest.approx(exp_lo)
+    assert yhi == pytest.approx(exp_hi)
+    assert ylo > 40

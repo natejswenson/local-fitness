@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-07-19
+
+### Fixed
+- **PNG charts autoscale the value axis to the data band — never
+  zero-anchored.** `generate_chart` (and the PDF's embedded takeaway
+  charts, which share `render_chart_png`) rendered a 48–57 bpm
+  resting-HR band as a flat sliver atop a 0–57 axis: the line chart's
+  `fill_between` filled to y=0 and dragged autoscale down with it, and
+  bar rectangles anchored at 0. New pure `value_axis_bounds` helper (8%
+  padding, flat-series and negative-band safe) applied to all three
+  chart types; the line fill now fills to the padded floor, bars clip at
+  it (standard truncated-bar look).
+
 ## [0.25.0] - 2026-07-19
 
 Facet-review backlog clearance — the deferred round-1/round-2 items.
