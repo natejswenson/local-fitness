@@ -1,9 +1,9 @@
-# Facet-review backlog clearance (0.25.0)
+# Facet-review backlog clearance (released in 0.23.0)
 
 **2026-07-19**
 
 Third and final tranche of the day's facet-review loop (0.23.0 resilience →
-0.24.0 round-2 fixes → this). Cleared every deferred item except the ones
+round-2 fixes → this; all released together as 0.23.0). Cleared every deferred item except the ones
 deliberately closed as no-fix.
 
 ## Shipped
