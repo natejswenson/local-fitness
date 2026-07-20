@@ -119,6 +119,24 @@ CREATE TABLE IF NOT EXISTS activity_splits (
     PRIMARY KEY (activity_id, split_index)
 );
 
+-- Per-sample HR trace, fetched on demand (never by the daily sync) for the
+-- one activity a report card is being rendered for. Garmin's activity-details
+-- endpoint returns ~1700 samples for a 3-mile run, which is why this is NOT
+-- pulled for every activity: 747 activities x ~1700 rows to serve a feature
+-- that reads one activity at a time is a backfill nobody asked for, and the
+-- repeated detail calls are exactly the shape that trips the 429 the token
+-- cache was added to avoid. `distance_meters` is cumulative from the start of
+-- the activity — the binner needs distance, not time, to place a sample in a
+-- tenth-of-a-mile bucket.
+CREATE TABLE IF NOT EXISTS activity_hr_samples (
+    activity_id      INTEGER NOT NULL,
+    sample_index     INTEGER NOT NULL,
+    distance_meters  REAL,
+    hr               INTEGER,
+    elapsed_seconds  REAL,
+    PRIMARY KEY (activity_id, sample_index)
+);
+
 CREATE TABLE IF NOT EXISTS baselines (
     date                          TEXT PRIMARY KEY,
     rhr_60day_mean                REAL,
@@ -254,6 +272,15 @@ def init_schema(db_path: Path | None = None) -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(activities)")}
         if "source" not in cols:
             conn.execute("ALTER TABLE activities ADD COLUMN source TEXT DEFAULT 'garmin'")
+        # Same guard, same reason: `activity_hr_samples` shipped without
+        # `elapsed_seconds`, which the per-tenth-mile PACE line needs. A DB
+        # created before that column existed gets it added rather than
+        # silently serving HR-only traces forever.
+        hr_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(activity_hr_samples)")}
+        if hr_cols and "elapsed_seconds" not in hr_cols:
+            conn.execute(
+                "ALTER TABLE activity_hr_samples ADD COLUMN elapsed_seconds REAL")
 
 
 def last_known_daily_date(

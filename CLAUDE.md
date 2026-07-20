@@ -207,7 +207,11 @@ today", "how's my training load", "what did I run last week"):
   `daily_snapshot`, `training_load_status`, etc. Reach for `run_sql` only when
   no structured tool fits. For "scheduled vs actual" / "am I hitting my plan"
   chart asks, `plan_chart` (0.23.0) is THE tool — never hand-roll matplotlib
-  or ASCII via Bash for that view. **Never shell out to `sqlite3`/Bash for a DB read** —
+  or ASCII via Bash for that view. For "how did that run go / grade my
+  workout / was that good" on a SINGLE session, `workout_report_card`
+  (0.25.0) is THE tool — it returns a preformatted `markdown` card, which you
+  render to the user VERBATIM rather than re-summarizing; don't assemble your
+  own verdict from `get_workout_detail` when a graded one exists. **Never shell out to `sqlite3`/Bash for a DB read** —
   the agent did exactly that once and it dumped `PRAGMA` introspection and SQL
   errors at the user. One tool call when a tool exists.
 - **`get_training_plan_progress`'s `workouts` list is windowed by default**
@@ -352,14 +356,17 @@ These are settled — don't redesign without a reason.
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
   could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
-- **`generate_brief_report` (PDF) is the only stdio-only tool now —
-  `generate_chart` moved into `ALL_TOOLS` (2026-07-13, MCP-speed-and-UX-01
-  fold-in Fix A).** `generate_chart` renders a standalone matplotlib PNG on
+- **The two PDF-writing tools are stdio-only — `generate_brief_report` and
+  `workout_report_card` (0.25.0); `generate_chart` moved into `ALL_TOOLS`
+  (2026-07-13, MCP-speed-and-UX-01 fold-in Fix A).** The rule that decides
+  membership: a tool that hands back a *filesystem path* is local-only,
+  because a remote `/mcp/` caller gets a container-internal path it cannot
+  retrieve. `generate_chart` renders a standalone matplotlib PNG on
   demand and now returns it as an inline MCP image content block (alongside
   the saved file path as text) — reachable over both `fitness mcp-stdio` and
   the networked `/mcp/` transport, since a client no longer needs the local
   file path to see the chart. `generate_brief_report` (`agent/tools.py`'s
-  `LOCAL_ONLY_TOOLS`, now just this one tool) renders a saved daily brief
+  `LOCAL_ONLY_TOOLS`) renders a saved daily brief
   into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline, reusing the
   `budget` project's validated color theme) and stays stdio-only for the
   same reason as before: a PDF isn't representable as an MCP content block,
@@ -388,6 +395,116 @@ These are settled — don't redesign without a reason.
   Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS Homebrew's
   install isn't on the default dylib search path and needs
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
+- **Workout grading is deterministic Python, not model judgment** (0.25.0).
+  `agent/report_card.py` backs the `workout_report_card` tool and follows the
+  `interpret.py` rule: the LLM phrases a judgment, it never derives one code
+  can compute. Four metrics (distance, pace, HR, training load) each reduce
+  to ONE non-negative relative deviation `d` fed through ONE shared
+  `GRADE_BANDS` table — four small deviation functions, one grader, so the
+  rubric stays testable. Design constraints that are load-bearing, not
+  incidental:
+  - **The card always names its yardstick.** Plan-prescribed (distance and
+    pace only — `plan_workouts` has no HR or load column) or a 60-day rolling
+    *median* of comparable activities. Median, not mean: the history carries
+    real training-load outliers. Under `MIN_REFERENCE_ACTIVITIES` (5) it
+    returns n/a and says so rather than grading against noise.
+  - **Direction gating.** An easy run is *supposed* to be slow — grading
+    `|actual − expected|` would hand every recovery run an F. Easy/long days
+    are penalized only for too FAST, quality days only for too SLOW, and each
+    expectation is intent-scaled (`DISTANCE_FACTORS`/`PACE_FACTORS`/
+    `LOAD_FACTORS`/`HR_BANDS`).
+  - **Comparability is exact `activity_type` first**, widening to the on-foot
+    class only when the pool is too thin. Measured on live data: pooling
+    `running` with `treadmill_running` put median HR at 119 against an
+    outdoor average of 140 and gave a normal easy run a D. Treadmill and road
+    are different HR regimes and must not share a yardstick unless forced to.
+  - **Splits are presentation-only** — no grade reads `activity_splits`. Only
+    87 of 747 activities have them (daily-sync ingest writes them, backfill
+    never does), so a splits-dependent grade would be unavailable on ~88% of
+    history and mean different things on different rows.
+  - The pure section is stdlib-only and unit-testable with plain dicts; DB
+    access lives under a persistence divider, mirroring `plans.py`.
+  - **The card's opening verbal read is `agent/workout_coach.py`** — a sibling
+    of `plan_coach.py`, same shape (toolless single-shot SDK call, lazy
+    imports to dodge the `tools -> workout_coach -> briefing -> tools` cycle,
+    single-entry disk cache keyed on the pure `build_prompt` hash **plus
+    `activity_id`**, deterministic `fallback_read`). Separate module because
+    `plan_coach` preps a run not yet done from a prescription while this one
+    judges a run already done from graded results — different inputs, tense,
+    and failure mode. The model is told the grades are not its to revise: it
+    phrases them, it never re-derives them. Timeout is 90s
+    (`DEFAULT_TIMEOUT_S`), not `plan_coach`'s 30 — a real card measured 22.2s,
+    so 30 silently fell back on any cold start.
+  - **The read is FOUR labelled paragraphs, one per graded area** — not one
+    blended paragraph. `READ_SECTIONS` is the contract; the model emits
+    `DISTANCE:` / `PACE:` / `HEART RATE:` / `TRAINING LOAD:` lines and
+    `parse_read` turns them into a typed dict. A generation missing any
+    section raises and falls back to the deterministic template rather than
+    rendering a blank paragraph — and is never cached. Budgeted in WORDS (45
+    per paragraph), not sentences: a sentence cap produced sentences long
+    enough to push the HR chart onto a second page.
+  - **It must NEVER name a letter grade**, since the letters print in the
+    table immediately below it, and it must not discuss CTL/ATL/TSB — that
+    line is printed elsewhere on the card and asking for it bought a freshness
+    lecture in place of a distance verdict.
+  - **It gets hindsight and foresight.** `load_report_card_inputs` supplies
+    the trailing runs and the next 7 days of prescriptions (capped by
+    `MAX_CONTEXT_ACTIVITIES`), so the read can place the run in the week
+    instead of judging it in isolation. Both are prompt-only — like splits and
+    the HR trace, no grade reads either.
+  - **Budget ~70s for the SDK call** (`DEFAULT_TIMEOUT_S` is 180). Four
+    paragraphs is roughly 4x the output of one, and output length dominates
+    latency; 90s left no margin and silently served the template. The disk
+    cache makes every repeat render instant.
+  - **A metric's `Expected` column must be the number its grade was actually
+    measured against.** HR broke this: it showed the bare rolling median while
+    grading against a band edge, so a run at 136 vs a 146 median printed
+    "-7%" next to a B+ when the finding was 6% ABOVE the ceiling that produced
+    the grade. HR is the one metric held to a *range*, so it carries
+    `expected_display` (the band), `band`, and `in_band`; `expected_text()`
+    prefers that display and everything else formats its number.
+  - **Calibrate bands against real data, not intuition.** The original easy-HR
+    ceiling (0.88x median) demanded a number that appeared in 1 of 13 runs in
+    the window — the median is taken over ALL comparable activities, which for
+    a mostly-easy runner already sits near easy HR. That made HR a standing
+    penalty rather than a judgment. Before changing `HR_BANDS`, check the
+    proposed bound against the actual distribution.
+  - **A plan target is an instruction; a rolling median is a reference.**
+    Plan-referenced distance and pace are graded on bands tightened by
+    `PLAN_TIGHTEN` (0.6). Without it both were held to the same tolerance and
+    a prescribed 10:28 easy run executed at 9:28 scored a B-, letting the card
+    print an overall A for a run its own read called "you never ran easy at
+    all". The card must never contradict its own coaching line.
+- **Per-sample HR traces are fetched on demand, never backfilled**
+  (`ingest/details.py`, 0.25.0). `get_activity_details` returns ~1700 samples
+  per run; pulling that for all 747 activities is both a backfill nobody asked
+  for and exactly the repeated-detail-call shape that trips Garmin's 429. So:
+  one call for the one activity being graded, cached forever after in
+  `activity_hr_samples`, and only when the PDF path asks
+  (`load_report_card_inputs(hr_trace=True)` — `format='table'` stays purely
+  local with no network). Every function there is best-effort by contract: a
+  missing credential, an expired token, a payload with no HR channel, or a
+  pre-0.25.0 DB missing the table all return "no samples", and the chart falls
+  back to per-lap. **Read the metric channels BY NAME** via
+  `metricDescriptors[].key` — `activityDetailMetrics[].metrics` is a positional
+  array whose column order varies by device, so a hardcoded index silently
+  reads cadence as heart rate. A failed fetch caches nothing, so a transient
+  outage never pins an empty trace.
+- **Tests must never reach the network — Claude OR Garmin.**
+  `tests/conftest.py` has autouse fixtures blocking `claude_agent_sdk.query`
+  and `ingest.details.fetch_hr_samples`. The first exists
+  because `workout_report_card` generates a read on every render, so the suite
+  silently started making real network calls — 10 seconds became 7 minutes, at
+  real cost, while still passing green. Patching the single SDK choke point
+  (rather than each caller) means a future generator module inherits the
+  protection. Callers all degrade to deterministic fallbacks, so the default
+  test path exercises the offline branch; a test that needs specific generated
+  text patches its own module's generate function. The Garmin guard was added
+  the same way and for the same reason: the report card's PDF path resolves an
+  HR trace, so a test that merely rendered a PDF started calling Garmin's
+  activity-details endpoint for a fixture id — surfacing only as a 404 in the
+  logs of an otherwise-passing test. It returns "no samples" rather than
+  raising, since that IS the documented offline behavior.
 - **Every generated PDF/PNG is styled by a local-overridable brand theme**
   (2026-07-19). `agent/branding.py` owns the tokens: the checked-in default
   is **PRESS** (Nate's cross-project brand — warm paper #F5F0E6, ink

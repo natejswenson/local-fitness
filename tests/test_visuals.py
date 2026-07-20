@@ -516,3 +516,51 @@ def test_render_brief_pdf_no_word_paints_past_the_printable_area():
     text = _pdf_text(pdf)
     assert "07-08 easy" in text
     assert "2026-07-08 easy" not in text
+
+
+def test_render_report_card_pdf_no_word_paints_past_the_printable_area():
+    """Same regression net as the brief's, for the report card. The coach read
+    is model-generated variable-length prose dropped into the hero's meta cell,
+    which is exactly the shape that produced the 0.24.1 overflow — a fixed cell
+    fed text whose length nobody controls. Measured, not eyeballed."""
+    from local_fitness.agent import report_card as rc
+    from local_fitness.agent import workout_coach
+
+    long_read = (
+        "You turned a 10:28 easy run into an 8:55 closer and every split says "
+        "so: 10:10, then 9:24, then 8:55, accelerating the whole way like the "
+        "prescription was a suggestion rather than an instruction you agreed "
+        "to follow. Distance and training load landed on spec. Heart rate "
+        "stayed inside the easy ceiling. Pace missed by a full minute per "
+        "mile and kept getting worse, which is the whole failure mode."
+    )
+    card = rc.build_card(
+        {"activity_id": 1, "date": "2026-07-19",
+         "activity_name": "A Deliberately Long Activity Name For Overflow",
+         "activity_type": "running", "distance_meters": 4925,
+         "duration_seconds": 1736, "avg_pace_sec_per_km": 352,
+         "avg_hr": 136, "training_load": 51},
+        [{"activity_id": 1, "split_index": 0, "distance_meters": 1609.344,
+          "duration_seconds": 570, "avg_hr": 125, "avg_pace_sec_per_km": 354,
+          "elevation_gain_meters": 24}],
+        {"type": "easy", "target_distance_m": 4828,
+         "target_pace_sec_per_km": 390, "seq": 1},
+        {"mode": "rolling_60d", "n": 12, "pool": "running",
+         "median_distance_m": 5000.0, "median_pace_sec_per_km": 360.0,
+         "median_hr": 146.0, "median_load": 53.0},
+        {"ctl": 57.0, "atl": 87.0, "tsb": -30.0},
+    )
+    # Every section carries the long paragraph — the worst case the hero cell
+    # can be asked to hold.
+    card["coach_read"] = {key: long_read for key, _ in workout_coach.READ_SECTIONS}
+    pdf = visuals.render_report_card_pdf(card, None)
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        margin_pt = 1.5 * 28.35  # @page margin: 1.5cm
+        offenders = []
+        for page in doc.pages:
+            right_edge = page.width - margin_pt
+            offenders += [
+                (w["text"], round(w["x1"] - right_edge, 1))
+                for w in page.extract_words() if w["x1"] > right_edge + 0.5
+            ]
+    assert offenders == []
