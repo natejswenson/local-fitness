@@ -438,16 +438,16 @@ def test_mcp_http_transport_excludes_local_only_tools():
 def test_build_server_with_local_only_tools_serves_both():
     # INV-T10: the exact call run_stdio() makes — build_server(extra_tools=
     # agent_tools.LOCAL_ONLY_TOOLS) — serves ALL_TOOLS plus whatever's still
-    # local-only. Post-Fix A, LOCAL_ONLY_TOOLS shrank to just
-    # {generate_brief_report} (generate_chart moved into ALL_TOOLS), so this
-    # union is now idempotent for generate_chart specifically — it no longer
-    # demonstrates local-only reachability for that tool, just that the
-    # union still holds correctly with a smaller LOCAL_ONLY_TOOLS.
+    # local-only — the two PDF writers, generate_brief_report and
+    # workout_report_card. Both are reachable HERE (stdio) and nowhere else;
+    # build_session_manager() calls build_server() argument-free, so the
+    # networked /mcp/ transport structurally cannot serve them.
     server = mcp_server.build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
     handler = server.request_handlers[types.ListToolsRequest]
     res = asyncio.run(handler(types.ListToolsRequest(method="tools/list")))
     served = {t.name for t in res.root.tools}
-    assert served == {t.name for t in agent_tools.ALL_TOOLS} | {"generate_brief_report"}
+    assert served == {t.name for t in agent_tools.ALL_TOOLS} | {
+        "generate_brief_report", "workout_report_card"}
 
 
 def test_spa_catchall_does_not_shadow_mcp():

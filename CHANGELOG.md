@@ -6,6 +6,139 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-20
+
+### Added
+- **`workout_report_card` — a graded report card for one workout.** The coach
+  could already *describe* a workout (`get_workout_detail`) but nothing
+  *judged* one, so the same run got called "solid" one day and "flat" the
+  next. Grading is now tested Python (`agent/report_card.py`), per the
+  `interpret.py` rule that the LLM phrases a judgment but never derives one
+  code can compute. Four metrics — distance, pace, HR, training load — each
+  reduce to a single non-negative relative deviation passed through ONE
+  shared band table, so the rubric stays testable. Returns a `markdown` card
+  plus a PRESS-themed PDF with a per-mile split table and an HR bar chart.
+  - **Two reference points, always named on the card**: the active plan's
+    prescribed workout for that date (distance + pace only — `plan_workouts`
+    has no HR or load column), else a 60-day rolling *median* of comparable
+    activities. Below 5 comparable activities the card returns n/a and says
+    why rather than grading against noise.
+  - **Direction gating** keeps the rubric honest: an easy run is *supposed*
+    to be slow, so easy/long days are penalized only for running too fast and
+    quality days only for too slow, with each metric's expectation scaled by
+    the workout's intent.
+  - **Comparability is exact `activity_type` first**, widening to the on-foot
+    class only when the pool is too thin. Measured on live data: pooling
+    `running` with `treadmill_running` put median HR at 119 against an
+    outdoor average of 140 and handed a normal easy run a D — an artifact of
+    mixing two HR regimes, not a judgment.
+  - **Splits are presentation-only.** No grade reads `activity_splits`: only
+    87 of 747 activities have them (written by daily sync, never by
+    backfill), so a splits-dependent grade would be silently unavailable on
+    ~88% of history.
+  - **Local-only**, alongside `generate_brief_report` and for the same
+    reason: it hands back a filesystem path, which is meaningless to a
+    remote `/mcp/` caller.
+- **The card opens with the coach's read — four short paragraphs, one per
+  graded area.** A new `agent/workout_coach.py` (sibling of `plan_coach.py`)
+  phrases what the already-computed grades MEAN, in the resolved coach voice
+  and honoring saved user notes. Toolless single-shot SDK call behind a
+  single-entry disk cache, with a deterministic four-section template fallback
+  — a missing credential or a dead stream costs the phrasing, never the card.
+  - **It never names a letter grade.** The letters print in the table directly
+    below; repeating them spends the only words the read gets. It makes the
+    reason obvious from the numbers instead.
+  - **Hindsight and foresight.** The read is given the graded day's trailing
+    runs and the next 7 days of prescriptions, so it can say "two days after a
+    412-load session" and "intervals hit Tuesday" rather than judging the run
+    in isolation.
+  - Output is parsed into typed sections (`parse_read`); a generation missing
+    any of the four falls back to the template rather than rendering a card
+    with a blank paragraph, and is never cached.
+  - The training-load model (CTL/ATL/TSB) is deliberately withheld from this
+    prompt — it is printed elsewhere on the card, and handing it over bought a
+    freshness lecture in place of a distance verdict.
+- **Per-tenth-of-a-mile HR chart, fully labeled.** A new
+  `ingest/details.py` fetches one activity's ~1700-sample HR trace on demand
+  (never as a backfill — 747 activities of detail calls is the shape that
+  trips Garmin's 429) and caches it in a new `activity_hr_samples` table.
+  `report_card.bin_hr_trace` averages samples into tenth-mile buckets; the
+  chart carries an axis title, both axis labels, and the run's own average as
+  a reference line. Falls back to the per-lap chart whenever no trace is
+  available, so an offline render or an activity Garmin has no details for
+  behaves exactly as before.
+- **Pace is overlaid on that chart as a line on its own right-hand axis.**
+  Per tenth of a mile, measured as elapsed time over ground covered (not an
+  average of instantaneous speeds, which would weight a stopped second like a
+  moving one). The axis is **inverted so faster is up** — pace is
+  seconds-per-mile, so on a natural axis a surge would dive while the HR bars
+  it caused rose beside it, and the two series would read as disagreeing — and
+  ticks render as `m:ss`, since minutes per mile is base 60. The time channel
+  is `sumDuration`, the one the activity summary's average pace comes from, so
+  the chart can't contradict the pace printed in the table above it. Bins with
+  no usable time are gaps in the line rather than invented paces; the HR bars
+  render regardless.
+- **Per-mile table drops its Distance column** as duplicative — the row label
+  already is the distance, so it printed "1.00 mi" beside a column headed
+  "Mile".
+- **The Grade column is left-aligned** like every other column in both tables.
+- **The standalone "graded against…" sentence is gone.** The Expected column
+  states each metric's target, which is where a reader checks it; the
+  plan-vs-median disclosure now rides the hero's meta line as
+  `easy (plan)` / `easy (60d median)`.
+
+### Fixed
+- **The coaching-read cache key now includes `activity_id`.** Two sessions on
+  the same day with the same name and the same grades — a double day, which
+  the tool already reports via `other_activities_on_date` — hashed identically,
+  so the second card served the first's read.
+- **Heart rate was graded against an unreachable band.** The easy ceiling of
+  0.88x the rolling median asked for a number that appeared in 1 of 13 real
+  runs in the window — the reference median is taken over all comparable
+  activities, which for a mostly-easy runner is itself near easy HR, so
+  demanding 12% below it made the HR grade a standing penalty rather than a
+  judgment. Recalibrated (easy 0.97, long 1.00, quality 1.00, steady
+  0.93-1.07).
+- **The HR row contradicted itself.** It displayed the bare median as
+  "Expected" while grading against the band edge, so an easy run at 136 against
+  a 146 median rendered as "-7%" beside a B+ when the real finding was 6% ABOVE
+  the ceiling that produced the grade. Expected is now the bound the grade was
+  actually measured against, shown as the band ("<= 142 bpm"), and a run inside
+  the band reads "in range" rather than a percentage against one edge.
+- **A missed prescription could still earn an overall A.** Plan targets and
+  rolling medians were held to identical tolerance, so a prescribed 10:28 easy
+  run executed at 9:28 — a full minute per mile fast, the entire failure mode
+  an easy day has — scored a B- and the card printed an overall A for a run its
+  own coaching read called "you never ran easy at all". Plan-referenced
+  distance and pace are now graded on tightened bands (`PLAN_TIGHTEN`), because
+  a plan is an explicit instruction and a median is a fuzzy reference.
+- **Tests no longer make live Garmin calls either.** The PDF path resolves an
+  HR trace, so a test that merely rendered a PDF hit the activity-details
+  endpoint for a fixture id — visible only as a 404 in the logs of a passing
+  test. The conftest guard now covers Garmin alongside the SDK.
+- **The report card's SDK timeout was too tight.** Measured at 22.2s against a
+  30s ceiling, so an ordinary cold start silently served the template fallback.
+  Now 90s.
+- **Tests no longer make live Claude calls.** Every report-card render
+  generates a read, so the suite quietly started making real network calls —
+  10 seconds became 7 minutes, at real cost, while still passing. A conftest
+  autouse fixture now blocks `claude_agent_sdk.query` outright; callers
+  degrade to their deterministic fallbacks, and a test wanting specific
+  generated text patches its own generator.
+
+## [0.24.1] - 2026-07-19
+
+### Fixed
+- **PRESS report content no longer paints past the printable area.** The
+  page-layout cells' width percentages plus their em paddings summed past
+  100%, pushing the plan rail's mono week table up to 14pt beyond the
+  @page margin (and the coaching line 4pt). Cell widths now account for
+  the padding (54+42+~4%), the week table is `table-layout: fixed` with
+  explicit column widths and MM-DD dates (year dropped — noise in a
+  7-day window), and a bounding-box regression test measures every
+  rendered word against the printable edge so overflow can't silently
+  return.
+
 ## [0.24.0] - 2026-07-19
 
 ### Added
