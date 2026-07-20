@@ -432,9 +432,8 @@ These are settled — don't redesign without a reason.
     `plan_coach` preps a run not yet done from a prescription while this one
     judges a run already done from graded results — different inputs, tense,
     and failure mode. The model is told the grades are not its to revise: it
-    phrases them, it never re-derives them. Timeout is 90s
-    (`DEFAULT_TIMEOUT_S`), not `plan_coach`'s 30 — a real card measured 22.2s,
-    so 30 silently fell back on any cold start.
+    phrases them, it never re-derives them. Its timeout is far longer than
+    `plan_coach`'s 30s — see the latency bullet below.
   - **The read is FOUR labelled paragraphs, one per graded area** — not one
     blended paragraph. `READ_SECTIONS` is the contract; the model emits
     `DISTANCE:` / `PACE:` / `HEART RATE:` / `TRAINING LOAD:` lines and
