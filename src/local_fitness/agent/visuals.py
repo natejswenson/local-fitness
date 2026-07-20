@@ -725,24 +725,17 @@ ul.card-notes {{
    the table above them, not the page's subject, and at 100% they out-shouted
    the grades. */
 img.split-chart {{ width: 84%; margin-top: 0.7em; }}
-/* The coach's read: serif italic is the theme's commentary voice, and this is
-   the one block on the page that is a human talking rather than data. */
+/* The coach's read sits in the hero's meta cell, matching .reference-line
+   exactly — same serif-italic commentary voice, same measure — so the block
+   under the grade reads as one paragraph of coach, not two competing styles.
+   Ink rather than dim: this is the sentence he actually reads. */
 p.coach-read {{
   font-family: {f["serif_stack"]};
   font-style: italic;
-  font-size: 1.12em;
-  line-height: 1.45;
   color: {c["ink"]};
-  margin: 0 0 1.2em 0;
-  padding-bottom: 1.0em;
-  border-bottom: 1px solid {rule};
-}}
-p.gpa-explainer {{
-  font-family: {mono};
-  font-size: 0.7em;
-  line-height: 1.5;
-  color: {dim};
-  margin: 0.6em 0 0 0;
+  margin: 0.5em 0 0 0;
+  font-size: 0.95em;
+  line-height: 1.4;
 }}
 """
 
@@ -884,7 +877,9 @@ def _render_metric_table_html(card: dict) -> str:
     for key, label in rc._METRIC_LABELS:
         m = card["metrics"][key]
         fmt = rc._FORMATTERS[key]
-        expected = fmt(m["expected"]) if m.get("expected") is not None else "—"
+        # HR is held to a band, not a point, and supplies its own display —
+        # see rc.expected_text.
+        expected = rc.expected_text(key, m)
         grade = m.get("grade") or "n/a"
         rows += f"""
         <tr>
@@ -1025,16 +1020,13 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
         f'on this date.</p>'
     ) if ctx.get("ctl") is not None else ""
 
-    # The coach's read leads the page, above the grade. Omitted entirely when
-    # absent rather than rendered as an empty block — a card generated with no
-    # credential opens on the grade exactly as it did before this section.
+    # The read lives inside the hero's meta cell, directly under the
+    # GPA/distance/pace line and in the same voice as the reference line below
+    # it — the masthead title names the run and carries nothing else. Omitted
+    # entirely when absent rather than left as an empty block.
     coach_html = (
         f'<p class="coach-read">{html.escape(card["coach_read"])}</p>'
         if card.get("coach_read") else ""
-    )
-    explainer = rc.gpa_explainer(card)
-    gpa_html = (
-        f'<p class="gpa-explainer">{html.escape(explainer)}</p>' if explainer else ""
     )
 
     return f"""<!doctype html>
@@ -1049,12 +1041,11 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
     <h1>{html.escape(str(name))}</h1>
   </div>
 
-  {coach_html}
-
   <table class="grade-hero"><tr>
     <td class="grade-letter {_grade_class(overall["grade"])}">{html.escape(overall["grade"])}</td>
     <td class="grade-meta">
       <span class="grade-gpa">{html.escape(gpa)} · {html.escape(subtitle)}</span>
+      {coach_html}
       <p class="reference-line">{html.escape(rc.reference_line(card, markdown=False))}</p>
     </td>
   </tr></table>
@@ -1063,7 +1054,6 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
     <h2 class="card-heading">Grades</h2>
     {_render_metric_table_html(card)}
     {notes_html}
-    {gpa_html}
     {ctx_html}
   </section>
 

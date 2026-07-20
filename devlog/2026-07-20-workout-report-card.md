@@ -123,3 +123,59 @@ future generator module inherits it without anyone remembering.
 That also exposed the timeout: with the SDK actually reachable, a real card
 took 22.2s against a 30s ceiling. Raised to 90s. Every prior "successful" local
 render had been silently serving the template fallback.
+
+---
+
+## Round 3 — "make sure the grades are meaningful"
+
+Three asks: move the read into the hero, drop the GPA explainer, and make the
+grades actually mean something. The third one found three real bugs.
+
+**The HR row contradicted itself.** It printed `136 bpm | expected 146 | -7% |
+B+`. Read that as a human: you were seven percent *under* expectation and got
+marked down for it. The grade was fine — it came from being 6% above the *easy
+ceiling* of 128 — but the card displayed the median instead of the bound it
+actually graded against. Every other metric's Expected is the number its
+deviation was computed from; HR was the odd one out. It now shows the band
+(`≤ 142 bpm`), and a run inside it reads "in range" rather than a percentage
+against one edge.
+
+**The easy-HR ceiling was unreachable.** 0.88 × the rolling median asked for
+128 bpm. Across 60 days and 13 runs, exactly one came in under that — and its
+HR looks like a sensor fault. The bug is conceptual: the reference median is
+taken over *all* comparable activities, and for a runner whose training is
+mostly easy, that median already sits near easy HR. Demanding 12% below it
+means every ordinary easy run gets marked "too hot," which makes the HR grade a
+standing penalty rather than a judgment. Recalibrated against the actual
+distribution.
+
+**A missed prescription could still earn an overall A.** After the HR fix the
+card printed **A (3.70)** for a run whose own coaching read said "you never ran
+easy at all." Plan targets and rolling medians were held to identical
+tolerance, so a prescribed 10:28 run executed at 9:28 — a full minute per mile
+fast, which is the entire failure mode an easy day has — came out a B−. But a
+plan is an explicit instruction and a median is a fuzzy reference; they should
+not share a scale. `PLAN_TIGHTEN` narrows the bands for plan-referenced
+distance and pace. That run is now a C on pace and a B overall, which is what
+the prose was saying all along.
+
+The rule that falls out of all three: **the card must never contradict itself**
+— not the Expected column against its own grade, not the overall grade against
+the coaching read. There's a test for each now.
+
+### The read
+
+It covers all four metrics and never names a letter, since the letters are
+printed in the table immediately below it. Budgeted in *words* (85), not
+sentences — a sentence cap produced five sentences long enough to push the HR
+chart onto a second page.
+
+### And one more network leak
+
+Same lesson as last round, different provider. The PDF path resolves an HR
+trace, so a test that merely rendered a PDF was calling Garmin's
+activity-details endpoint for a fixture id. It surfaced only as a 404 buried in
+the logs of a passing test. The conftest guard now covers Garmin alongside the
+SDK, and there's a bounding-box overflow test for the report card too — the
+coach read is model-generated variable-length prose in a fixed cell, which is
+exactly the shape that caused the 0.24.1 overflow.

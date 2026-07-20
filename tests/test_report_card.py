@@ -147,14 +147,15 @@ def test_by_feel_plan_day_gets_no_pace_grade():
 # --- HR: appropriateness to intent, never "lower is better" ---------------
 
 def test_easy_run_above_hr_ceiling_is_downgraded():
-    # ceiling 0.88 * 150 = 132
-    assert rc.hr_deviation(132, 150, "easy") == 0.0
+    # ceiling 0.97 * 150 = 145.5 (recalibrated 2026-07-20 — see HR_BANDS; the
+    # old 0.88 ceiling of 132 was below all but one of 13 real runs).
+    assert rc.hr_deviation(145, 150, "easy") == 0.0
     assert rc.hr_deviation(120, 150, "easy") == 0.0   # comfortably under: fine
-    assert rc.hr_deviation(145, 150, "easy") > 0.0
+    assert rc.hr_deviation(160, 150, "easy") > 0.0
 
 
 def test_quality_run_below_hr_floor_is_downgraded():
-    # floor 1.02 * 150 = 153
+    # floor 1.00 * 150 = 150
     assert rc.hr_deviation(160, 150, "quality") == 0.0
     assert rc.hr_deviation(130, 150, "quality") > 0.0
 
@@ -630,3 +631,127 @@ def test_build_card_end_to_end_against_the_db(rc_db):
     assert card["overall"]["grade"] == "A"
     assert card["splits"]["unit"] == "Mile"
     assert "Mile 1" in rc.render_markdown(card)
+
+
+# --- HR is graded against a BAND, and the card must say so -----------------
+
+def test_hr_expected_is_the_bound_the_grade_was_measured_against():
+    """Regression for a card that contradicted itself: an easy run at 136
+    against a 146 median rendered "expected 146, -7%" beside a B+, when the
+    grade actually came from being 6% ABOVE the 0.97x ceiling. Expected must
+    be the number the deviation was computed from, like every other metric."""
+    ref = {**REF, "median_hr": 146.0}
+    card = card_for(
+        {"date": "2026-07-19", "activity_name": "easy shakeout",
+         "distance_meters": 4800, "duration_seconds": 1800,
+         "avg_pace_sec_per_km": 375, "avg_hr": 160, "training_load": 60},
+        reference=ref,
+    )
+    hr = card["metrics"]["hr"]
+    ceiling = 0.97 * 146.0
+    assert card["intent_class"] == "easy"
+    assert hr["expected"] == pytest.approx(ceiling)
+    assert hr["expected"] != 146.0          # NOT the bare median
+    # And the delta agrees with the grade's direction: over the ceiling.
+    assert rc._delta_text("hr", hr).startswith("+")
+
+
+def test_hr_inside_the_band_reads_in_range_not_a_percentage():
+    # An easy run below the ceiling is an A; a percentage against one edge
+    # would imply a miss that did not happen.
+    ref = {**REF, "median_hr": 150.0}
+    card = card_for(
+        {"date": "2026-07-19", "activity_name": "recovery jog",
+         "distance_meters": 4800, "duration_seconds": 1800,
+         "avg_pace_sec_per_km": 375, "avg_hr": 130, "training_load": 60},
+        reference=ref,
+    )
+    hr = card["metrics"]["hr"]
+    assert hr["in_band"] is True
+    assert rc.base_letter(hr["grade"]) == "A"
+    assert rc._delta_text("hr", hr) == "in range"
+
+
+@pytest.mark.parametrize("cls,expected", [
+    ("easy", "≤ 146 bpm"),
+    ("long", "≤ 150 bpm"),
+    ("quality", "≥ 150 bpm"),
+    ("steady", "140–160 bpm"),
+])
+def test_hr_band_renders_as_a_ceiling_floor_or_range(cls, expected):
+    lo, hi = rc.hr_band_bounds(150.0, cls)
+    assert rc._fmt_hr_band(lo, hi) == expected
+
+
+def test_hr_band_bounds_are_none_without_a_median():
+    assert rc.hr_band_bounds(None, "easy") == (None, None)
+    assert rc._fmt_hr_band(None, None) == "—"
+
+
+def test_easy_hr_ceiling_is_actually_reachable():
+    """The calibration guard. The old 0.88 ceiling demanded 12% below the
+    mixed-intent median — a number that appeared in 1 of 13 real runs, so
+    every ordinary easy run was marked too hot and HR was a standing penalty
+    rather than a judgment. An easy run at the median must not be an F."""
+    median_hr = 146.0
+    _, ceiling = rc.hr_band_bounds(median_hr, "easy")
+    # A typical easy run sits a few percent under the all-run median.
+    typical_easy = 0.95 * median_hr
+    assert typical_easy <= ceiling
+    # And a genuinely hot "easy" run still gets marked down.
+    d = rc.hr_deviation(1.10 * median_hr, median_hr, "easy")
+    assert rc.base_letter(rc.grade_from_deviation(d)) in ("B", "C", "D", "F")
+
+
+def test_expected_text_falls_back_to_the_numeric_formatter():
+    # Only HR carries a display string; every other metric formats its number.
+    card = card_for({"date": "2026-07-19", "distance_meters": 10000,
+                     "duration_seconds": 3000, "avg_pace_sec_per_km": 300,
+                     "avg_hr": 150, "training_load": 100})
+    assert rc.expected_text("distance", card["metrics"]["distance"]) == "6.21 mi"
+    assert rc.expected_text("load", {"expected": None}) == "—"
+
+
+# --- a plan target is an instruction, a median is a reference --------------
+
+def test_plan_pace_is_graded_tighter_than_a_rolling_reference():
+    """The same 9.5%-fast miss scores differently depending on whether a plan
+    actually prescribed the pace. Without this, a prescribed 10:28 easy run
+    executed at 9:28 — the entire failure mode an easy day has — took a B- and
+    the card handed the run an overall A."""
+    plan_card = card_for(
+        {"date": "2026-07-19", "distance_meters": 4800, "duration_seconds": 1800,
+         "avg_pace_sec_per_km": 351, "avg_hr": 136, "training_load": 51},
+        plan={"type": "easy", "target_distance_m": 4800,
+              "target_pace_sec_per_km": 388, "seq": 1},
+    )
+    pace = plan_card["metrics"]["pace"]
+    assert pace["reference"] == "plan"
+    # ~9.5% fast: a C against a prescription, where the untightened bands said B.
+    assert rc.base_letter(pace["grade"]) == "C"
+
+
+def test_running_the_prescribed_pace_still_earns_an_A():
+    # The tightening must not make a well-executed plan day unachievable:
+    # within 3% of target is still an A.
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 4800, "duration_seconds": 1800,
+         "avg_pace_sec_per_km": 380, "avg_hr": 136, "training_load": 51},
+        plan={"type": "easy", "target_distance_m": 4800,
+              "target_pace_sec_per_km": 388, "seq": 1},
+    )
+    assert rc.base_letter(card["metrics"]["pace"]["grade"]) == "A"
+    assert rc.base_letter(card["metrics"]["distance"]["grade"]) == "A"
+
+
+def test_overall_grade_cannot_be_an_A_when_the_prescription_was_missed():
+    """The self-consistency check: a card whose coaching read says the easy day
+    was run at tempo must not print an overall A."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 4925, "duration_seconds": 1736,
+         "avg_pace_sec_per_km": 352, "avg_hr": 136, "training_load": 51},
+        plan={"type": "easy", "target_distance_m": 4828,
+              "target_pace_sec_per_km": 390, "seq": 1},
+        reference={**REF, "median_hr": 146.0, "median_load": 53.0},
+    )
+    assert card["overall"]["grade"] != "A"

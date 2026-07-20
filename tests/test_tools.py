@@ -2904,8 +2904,11 @@ def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monke
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
     assert "You left something out there" in text
-    # And the GPA is reconstructible from the page, not an oracle.
-    assert "weighted 4.0 scale" in text
+    # The read sits under the GPA/distance/pace line inside the hero, so the
+    # masthead title is followed by the grade block, not by prose.
+    assert text.index("4.00 GPA") < text.index("You left something out there")
+    # The GPA explainer was removed — the number stands on its own.
+    assert "weighted 4.0 scale" not in text
 
 
 def test_report_card_pdf_splits_table_has_no_distance_column(rc_seeded, reports_tmp):

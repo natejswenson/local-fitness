@@ -55,9 +55,18 @@ _METRIC_TRANSLATION_BLOCK = (
 
 _GRADE_TONE = (
     "The grades are already decided and are not yours to revise — do not "
-    "argue with them, soften them, or re-grade the run. Your job is to say "
-    "what they MEAN in plain language: what actually happened out there, and "
-    "what it says about where he is."
+    "argue with them, soften them, or re-grade the run.\n\n"
+    "Account for ALL FOUR graded metrics — distance, pace, heart rate, and "
+    "training load. Every one of them gets addressed; do not cover two and "
+    "leave the others unmentioned. Metrics that went fine can share a single "
+    "short clause — spend the words on what went wrong.\n\n"
+    "NEVER state a letter grade. Do not write \"A\", \"B-\", \"C+\", "
+    '"you got a B", or "your pace grade". The letters are printed in the '
+    "table directly below you and repeating them wastes the only sentences "
+    "you get. Instead make the REASON for each one obvious from the numbers: "
+    "say what he was held to, what he actually did, and why that gap does or "
+    "does not matter. A reader should be able to look at your paragraph, then "
+    "at the table, and find the letters unsurprising."
 )
 
 
@@ -78,7 +87,11 @@ def build_prompt(
     """
     system_prompt = (
         "You are Nate's running coach, writing the opening read on a report "
-        "card for ONE run he just finished. Two to four sentences, no more.\n\n"
+        "card for ONE run he just finished.\n\n"
+        "HARD LIMIT: 85 words. This is a budget, not a target — going over "
+        "gets the paragraph cut off mid-sentence on the page. A sentence "
+        "count is not the constraint; total words is. Be terse. Cut every "
+        "clause that is not carrying a number or a verdict.\n\n"
         f"{profile.dials_line}\n\n{profile.persona}\n\n"
         f"{_GRADE_TONE}\n\n{_METRIC_TRANSLATION_BLOCK}\n\n"
         "Lead with the single thing that actually mattered about this run. "
@@ -110,8 +123,14 @@ def build_prompt(
             lines.append(f"  {label}: n/a — not enough to grade.")
             continue
         line = f"  {label}: {m['grade']} — actual {_fmt(key, m.get('actual'))}"
-        if m.get("expected") is not None:
-            line += f" vs expected {_fmt(key, m['expected'])}"
+        # expected_text, not the raw number: HR is held to a BAND, and handing
+        # the model a bare midpoint is how it ends up explaining a heart-rate
+        # verdict against a number the grade was never measured against.
+        expected = _expected_text(key, m)
+        if expected != "—":
+            line += f" vs target {expected}"
+        if m.get("in_band"):
+            line += " (inside the range for this intent)"
         lines.append(line + ".")
         if m.get("note"):
             lines.append(f"    note: {m['note']}")
@@ -153,6 +172,12 @@ def _fmt(key: str, value) -> str:
     from .report_card import _FORMATTERS
 
     return _FORMATTERS[key](value)
+
+
+def _expected_text(key: str, metric: dict) -> str:
+    from .report_card import expected_text
+
+    return expected_text(key, metric)
 
 
 def reference_summary(card: dict) -> str:

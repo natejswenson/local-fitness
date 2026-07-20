@@ -435,11 +435,30 @@ These are settled — don't redesign without a reason.
     phrases them, it never re-derives them. Timeout is 90s
     (`DEFAULT_TIMEOUT_S`), not `plan_coach`'s 30 — a real card measured 22.2s,
     so 30 silently fell back on any cold start.
-  - **`gpa_explainer()` must keep the printed GPA reconstructible.** It lists
-    the weights ACTUALLY used (an n/a metric drops out and the rest
-    renormalize; the last share absorbs the rounding remainder so they total
-    100) and states that +/- marks band position without moving the number.
-    If the weighting ever changes, that line changes with it.
+  - **The read must cover all four metrics and NEVER name a letter grade.**
+    The letters print in the table directly below the paragraph; repeating
+    them spends the only words it gets. It is budgeted in WORDS (85), not
+    sentences — a sentence cap produced five sentences long enough to push
+    the HR chart onto a second page.
+  - **A metric's `Expected` column must be the number its grade was actually
+    measured against.** HR broke this: it showed the bare rolling median while
+    grading against a band edge, so a run at 136 vs a 146 median printed
+    "-7%" next to a B+ when the finding was 6% ABOVE the ceiling that produced
+    the grade. HR is the one metric held to a *range*, so it carries
+    `expected_display` (the band), `band`, and `in_band`; `expected_text()`
+    prefers that display and everything else formats its number.
+  - **Calibrate bands against real data, not intuition.** The original easy-HR
+    ceiling (0.88x median) demanded a number that appeared in 1 of 13 runs in
+    the window — the median is taken over ALL comparable activities, which for
+    a mostly-easy runner already sits near easy HR. That made HR a standing
+    penalty rather than a judgment. Before changing `HR_BANDS`, check the
+    proposed bound against the actual distribution.
+  - **A plan target is an instruction; a rolling median is a reference.**
+    Plan-referenced distance and pace are graded on bands tightened by
+    `PLAN_TIGHTEN` (0.6). Without it both were held to the same tolerance and
+    a prescribed 10:28 easy run executed at 9:28 scored a B-, letting the card
+    print an overall A for a run its own read called "you never ran easy at
+    all". The card must never contradict its own coaching line.
 - **Per-sample HR traces are fetched on demand, never backfilled**
   (`ingest/details.py`, 0.25.0). `get_activity_details` returns ~1700 samples
   per run; pulling that for all 747 activities is both a backfill nobody asked
@@ -455,15 +474,21 @@ These are settled — don't redesign without a reason.
   array whose column order varies by device, so a hardcoded index silently
   reads cadence as heart rate. A failed fetch caches nothing, so a transient
   outage never pins an empty trace.
-- **Tests must never make a live Claude call.** `tests/conftest.py` has an
-  autouse fixture that blocks `claude_agent_sdk.query` outright. It exists
+- **Tests must never reach the network — Claude OR Garmin.**
+  `tests/conftest.py` has autouse fixtures blocking `claude_agent_sdk.query`
+  and `ingest.details.fetch_hr_samples`. The first exists
   because `workout_report_card` generates a read on every render, so the suite
   silently started making real network calls — 10 seconds became 7 minutes, at
   real cost, while still passing green. Patching the single SDK choke point
   (rather than each caller) means a future generator module inherits the
   protection. Callers all degrade to deterministic fallbacks, so the default
   test path exercises the offline branch; a test that needs specific generated
-  text patches its own module's generate function.
+  text patches its own module's generate function. The Garmin guard was added
+  the same way and for the same reason: the report card's PDF path resolves an
+  HR trace, so a test that merely rendered a PDF started calling Garmin's
+  activity-details endpoint for a fixture id — surfacing only as a 404 in the
+  logs of an otherwise-passing test. It returns "no samples" rather than
+  raising, since that IS the documented offline behavior.
 - **Every generated PDF/PNG is styled by a local-overridable brand theme**
   (2026-07-19). `agent/branding.py` owns the tokens: the checked-in default
   is **PRESS** (Nate's cross-project brand — warm paper #F5F0E6, ink

@@ -55,11 +55,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a reference line. Falls back to the per-lap chart whenever no trace is
   available, so an offline render or an activity Garmin has no details for
   behaves exactly as before.
-- **GPA is now explained on the card.** A `gpa_explainer()` line states the
-  weighted-4.0 arithmetic with the weights ACTUALLY used (an n/a metric drops
-  out and the rest renormalize), so the printed number is reconstructible
-  rather than an oracle. It also says plainly that +/- modifiers mark position
-  within a band and do not move the number.
 - **Per-mile table drops its Distance column** as duplicative — the row label
   already is the distance, so it printed "1.00 mi" beside a column headed
   "Mile".
@@ -70,9 +65,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the same day with the same name and the same grades — a double day, which
   the tool already reports via `other_activities_on_date` — hashed identically,
   so the second card served the first's read.
-- **GPA explainer weights no longer sum to 99%.** Independently-rounded shares
-  drifted off 100; the last share now absorbs the remainder, which matters in
-  a line whose entire job is letting the reader reproduce the number.
+- **Heart rate was graded against an unreachable band.** The easy ceiling of
+  0.88x the rolling median asked for a number that appeared in 1 of 13 real
+  runs in the window — the reference median is taken over all comparable
+  activities, which for a mostly-easy runner is itself near easy HR, so
+  demanding 12% below it made the HR grade a standing penalty rather than a
+  judgment. Recalibrated (easy 0.97, long 1.00, quality 1.00, steady
+  0.93-1.07).
+- **The HR row contradicted itself.** It displayed the bare median as
+  "Expected" while grading against the band edge, so an easy run at 136 against
+  a 146 median rendered as "-7%" beside a B+ when the real finding was 6% ABOVE
+  the ceiling that produced the grade. Expected is now the bound the grade was
+  actually measured against, shown as the band ("<= 142 bpm"), and a run inside
+  the band reads "in range" rather than a percentage against one edge.
+- **A missed prescription could still earn an overall A.** Plan targets and
+  rolling medians were held to identical tolerance, so a prescribed 10:28 easy
+  run executed at 9:28 — a full minute per mile fast, the entire failure mode
+  an easy day has — scored a B- and the card printed an overall A for a run its
+  own coaching read called "you never ran easy at all". Plan-referenced
+  distance and pace are now graded on tightened bands (`PLAN_TIGHTEN`), because
+  a plan is an explicit instruction and a median is a fuzzy reference.
+- **Tests no longer make live Garmin calls either.** The PDF path resolves an
+  HR trace, so a test that merely rendered a PDF hit the activity-details
+  endpoint for a fixture id — visible only as a 404 in the logs of a passing
+  test. The conftest guard now covers Garmin alongside the SDK.
 - **The report card's SDK timeout was too tight.** Measured at 22.2s against a
   30s ceiling, so an ordinary cold start silently served the template fallback.
   Now 90s.

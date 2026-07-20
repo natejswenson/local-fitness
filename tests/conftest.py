@@ -47,3 +47,23 @@ def _no_live_sdk_calls(monkeypatch):
         )
 
     monkeypatch.setattr(claude_agent_sdk, "query", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_garmin_calls(monkeypatch):
+    """Hard-block live Garmin API calls for the whole suite.
+
+    Same lesson as the SDK guard above, learned the same way: the report card's
+    PDF path resolves an HR trace, so a test that merely rendered a PDF started
+    hitting Garmin's activity-details endpoint for a fixture activity id. It
+    surfaced only as a 404 in the logs of an otherwise-passing test.
+
+    Returns "no samples" rather than raising, because that IS the module's
+    documented offline behavior — the card falls back to its per-lap chart, so
+    the default test path exercises the degraded branch. A test that wants a
+    trace patches `details.fetch_hr_samples` itself, which runs after this and
+    therefore wins.
+    """
+    from local_fitness.ingest import details
+
+    monkeypatch.setattr(details, "fetch_hr_samples", lambda *a, **k: [])

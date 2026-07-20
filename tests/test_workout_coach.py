@@ -1,5 +1,4 @@
-"""The report card's verbal read: prompt assembly, caching, fallback, and the
-GPA explainer that has to reconstruct the printed number.
+"""The report card's verbal read: prompt assembly, caching, and fallback.
 
 `build_prompt` is pure and is also the cache key, so its content is pinned
 here rather than smoke-tested — a change to what the model is told is a change
@@ -222,54 +221,17 @@ def test_fallback_mentions_significant_hr_drift():
     assert "9.2%" in workout_coach.fallback_read(card)
 
 
-# --- gpa_explainer: the printed number must be reconstructible --------------
-
-def test_explainer_arithmetic_reproduces_the_printed_gpa():
-    card = a_card()
-    text = rc.gpa_explainer(card)
-    gpa = card["overall"]["gpa"]
-    assert f"= {gpa:.2f}" in text
-    assert f"→ {card['overall']['grade']}" in text
-    # Every graded metric is listed with the weight actually applied.
-    for label in ("Distance", "Pace", "Avg HR", "Training Load"):
-        assert label in text
-    assert "30%" in text and "25%" in text and "15%" in text
-
-
-def test_explainer_states_that_plus_minus_does_not_move_the_number():
-    # The card shows B- and B+ next to a GPA that scores both as 3.0; without
-    # saying so, a reader doing the arithmetic cannot reproduce the number.
-    text = rc.gpa_explainer(a_card())
-    assert "does not move the number" in text
-
-
-def test_explainer_renormalizes_weights_when_a_metric_is_na():
-    # Load ungraded → the remaining three must be rescaled to sum to 100%,
-    # not printed as the static 30/30/25 that would sum to 85%.
-    card = a_card()
-    card["metrics"]["load"]["grade"] = None
-    card["overall"] = rc.overall_grade(card["metrics"])
-    text = rc.gpa_explainer(card)
-    assert "Training Load" not in text
-    assert "rescaled to 100%" in text
-    pcts = [int(p.rstrip("%")) for p in text.split() if p.endswith("%") and p[0].isdigit()]
-    assert sum(pcts) == 100
-
-
-def test_explainer_is_empty_when_nothing_was_graded():
-    card = a_card(reference={"mode": "insufficient_data", "n": 1, "pool": "running"})
-    assert rc.gpa_explainer(card) == ""
-
-
-def test_markdown_card_leads_with_the_read_then_the_grade():
+def test_markdown_card_puts_the_read_under_the_grade_line():
     card = a_card()
     card["coach_read"] = "That was a controlled effort and you know it."
     md = rc.render_markdown(card)
-    assert card["coach_read"] in md
-    # The read comes before the grade heading — a person wants to be told how
-    # it went before being shown the table that proves it.
-    assert md.index(card["coach_read"]) < md.index("## Overall:")
-    assert "GPA is a weighted 4.0 scale" in md
+    # Title, then the grade line, then the read, then the yardstick — mirroring
+    # the PDF hero, where the masthead carries the run name and nothing else.
+    assert md.index("# Report Card") < md.index("## Overall:")
+    assert md.index("## Overall:") < md.index(card["coach_read"])
+    assert md.index(card["coach_read"]) < md.index("Graded against")
+    # The GPA explainer is gone — the number stands on its own.
+    assert "weighted 4.0 scale" not in md
 
 
 def test_markdown_card_without_a_read_opens_on_the_grade():
@@ -277,3 +239,42 @@ def test_markdown_card_without_a_read_opens_on_the_grade():
     assert "## Overall:" in md
     # No stray empty block where the read would have been.
     assert "\n\n\n" not in md
+
+
+# --- the read must cover every metric and never name a letter ---------------
+
+def test_prompt_demands_all_four_metrics_and_forbids_letter_grades():
+    system, _ = workout_coach.build_prompt(PROFILE, a_card())
+    assert "ALL FOUR" in system
+    assert "NEVER state a letter grade" in system
+    # The letters print in the table right below the paragraph; repeating them
+    # spends the only sentences the read gets.
+    assert "printed in the table" in system
+
+
+def test_prompt_gives_hr_its_band_not_a_bare_midpoint():
+    # The grade is measured against a band edge. Handing the model the median
+    # is how it ends up explaining a heart-rate verdict against a number the
+    # grade was never computed from.
+    _, user = workout_coach.build_prompt(PROFILE, a_card({"avg_hr": 120}))
+    assert "bpm" in user
+    assert "≤" in user or "≥" in user or "–" in user
+
+
+def test_prompt_says_when_hr_sat_inside_the_range():
+    # 130 against a 150 median on a steady day: band is 0.93-1.07 → 140-161,
+    # so 130 is UNDER the floor. Use an easy-intent card instead, where the
+    # band is a ceiling of 0.97 x 150 = 146.
+    card = a_card({"avg_hr": 130, "activity_name": "easy shakeout"})
+    assert card["intent_class"] == "easy"
+    assert card["metrics"]["hr"]["in_band"] is True
+    _, user = workout_coach.build_prompt(PROFILE, card)
+    assert "inside the range" in user
+
+
+def test_prompt_budgets_words_not_sentences():
+    """Sentence counts don't bound length — the model wrote five sentences so
+    long the paragraph pushed the HR chart onto a second page."""
+    system, _ = workout_coach.build_prompt(PROFILE, a_card())
+    assert "85 words" in system
+    assert "total words is" in system

@@ -59,7 +59,8 @@ __all__ = [
     "grade_from_deviation", "intent_class", "infer_intent", "resolve_intent",
     "distance_deviation", "pace_deviation", "hr_deviation", "load_deviation",
     "overall_grade", "label_splits", "hr_drift_pct", "build_card",
-    "render_markdown", "reference_line", "gpa_explainer", "bin_hr_trace",
+    "render_markdown", "reference_line", "bin_hr_trace", "expected_text",
+    "hr_band_bounds", "hr_expectation",
     "load_report_card_inputs", "rolling_reference",
 ]
 
@@ -100,17 +101,36 @@ DISTANCE_FACTORS = {"easy": 0.75, "long": 1.40, "quality": 1.00, "steady": 1.00}
 # numbers, named separately so they can diverge if evidence ever says they should.
 LOAD_FACTORS = dict(DISTANCE_FACTORS)
 PACE_FACTORS = {"easy": 1.10, "long": 1.05, "quality": 0.95, "steady": 1.00}
-# (floor, ceiling) as fractions of median HR; None = unbounded on that side.
-# HR is graded on appropriateness to intent, never "lower is better".
+# (floor, ceiling) as fractions of the rolling median HR; None = unbounded on
+# that side. HR is graded on appropriateness to intent, never "lower is better".
+#
+# Recalibrated 2026-07-20 against live data, because the original values were
+# not reachable. The reference median is taken over ALL comparable activities,
+# which for a runner whose training is mostly easy is itself close to easy HR —
+# so demanding 12% below it (the old easy ceiling of 0.88) asked for a number
+# that appeared in 1 of 13 runs in the window, and only in the one whose HR
+# looks like a sensor fault. Every ordinary easy run was therefore marked "too
+# hot" and the HR grade was a standing penalty rather than a judgment.
+#
+# These express the defensible generic claim instead: against a mixed-intent
+# median, an easy run should sit a little below it, a long run about at it, and
+# a quality run at or above it.
 HR_BANDS: dict[str, tuple[float | None, float | None]] = {
-    "easy": (None, 0.88),
-    "long": (None, 0.93),
-    "quality": (1.02, None),
-    "steady": (0.95, 1.05),
+    "easy": (None, 0.97),
+    "long": (None, 1.00),
+    "quality": (1.00, None),
+    "steady": (0.93, 1.07),
 }
 # A steady/unknown-intent run has no stated target, so its two-sided pace
 # bands are widened rather than held to prescription-grade tolerance.
 STEADY_WIDEN = 1.5
+# ...and the converse: a PLAN target is an explicit instruction, not a fuzzy
+# reference, so it is held tighter. Without this the two were graded on the
+# same scale, and a prescribed 10:28 easy run executed at 9:28 — a full minute
+# per mile fast, which is the entire failure mode an easy day has — scored a
+# B- and let the card hand an overall A to a run its own coaching read called
+# "you never ran easy at all". Bands become A<=3%, B<=6%, C<=12%, D<=21%.
+PLAN_TIGHTEN = 0.6
 
 # plan_workouts.type (plans.WORKOUT_TYPES) and inferred intents, collapsed to
 # the four classes the factor/band tables are keyed by.
@@ -246,6 +266,45 @@ def pace_deviation(
     if cls == "quality":
         return max(0.0, (actual_sec_per_km - expected_sec_per_km) / expected_sec_per_km)
     return abs(actual_sec_per_km / expected_sec_per_km - 1.0)
+
+
+def hr_band_bounds(
+    median_hr: float | None, cls: str
+) -> tuple[float | None, float | None]:
+    """The intent's HR band in BPM, as ``(floor, ceiling)``; either may be None.
+
+    Exists so the card can state the number it actually graded against. HR is
+    the one metric judged against a *range* rather than a point, and displaying
+    the bare median as "expected" made the row contradict itself: an easy run
+    at 136 against a 146 median rendered as "-7%" next to a B+, when the real
+    finding was 6% ABOVE the 128 ceiling that produced the grade.
+    """
+    if not median_hr:
+        return (None, None)
+    floor_f, ceiling_f = HR_BANDS.get(cls, HR_BANDS["steady"])
+    return (
+        floor_f * median_hr if floor_f is not None else None,
+        ceiling_f * median_hr if ceiling_f is not None else None,
+    )
+
+
+def hr_expectation(hr: float | None, median_hr: float | None, cls: str) -> float | None:
+    """The single bound the HR grade was measured against — the ceiling when
+    the run ran hot, the floor when it ran cold, and the bound it is being held
+    to when it sat inside the band.
+
+    Returning the *governing* bound (rather than the median) is what lets
+    ``_delta_text`` state a delta the grade can be checked against.
+    """
+    lo, hi = hr_band_bounds(median_hr, cls)
+    if hr is None:
+        return hi if hi is not None else lo
+    if hi is not None and hr > hi:
+        return hi
+    if lo is not None and hr < lo:
+        return lo
+    # Inside the band: report the edge it is closest to being judged on.
+    return hi if hi is not None else lo
 
 
 def hr_deviation(hr: float | None, median_hr: float | None, cls: str) -> float | None:
@@ -460,7 +519,8 @@ def build_card(
         target = plan_workout["target_distance_m"]
         d = distance_deviation(activity.get("distance_meters"), target, two_sided=True)
         distance = _metric(
-            grade_from_deviation(d), activity.get("distance_meters"), target, d, "plan")
+            grade_from_deviation(d, PLAN_TIGHTEN), activity.get("distance_meters"),
+            target, d, "plan")
     elif has_rolling:
         expected = DISTANCE_FACTORS[cls] * (reference.get("median_distance_m") or 0)
         d = distance_deviation(activity.get("distance_meters"), expected, two_sided=False)
@@ -474,7 +534,7 @@ def build_card(
     # -- pace
     if plan_usable and plan_workout.get("target_pace_sec_per_km"):
         expected_pace = plan_workout["target_pace_sec_per_km"]
-        pace_ref, widen = "plan", 1.0
+        pace_ref, widen = "plan", PLAN_TIGHTEN
     elif plan_usable and plan_workout.get("target_distance_m"):
         # A prescribed distance with no pace is an explicit by-feel day. It
         # earns no pace grade at all, and its 30% weight redistributes.
@@ -493,10 +553,21 @@ def build_card(
 
     # -- HR and load: always rolling. plan_workouts has neither column.
     med_hr = reference.get("median_hr") if has_rolling else None
-    d = hr_deviation(activity.get("avg_hr"), med_hr, cls)
+    actual_hr = activity.get("avg_hr")
+    d = hr_deviation(actual_hr, med_hr, cls)
+    # Expected is the BOUND that governed the grade, not the median — see
+    # hr_expectation. The band itself is carried for display so the reader can
+    # see the range rather than infer it from one edge.
+    hr_lo, hr_hi = hr_band_bounds(med_hr, cls)
     hr = _metric(
-        grade_from_deviation(d), activity.get("avg_hr"), med_hr, d,
+        grade_from_deviation(d), actual_hr,
+        hr_expectation(actual_hr, med_hr, cls), d,
         "rolling_60d" if has_rolling else reference.get("mode"))
+    if med_hr:
+        hr["band"] = {"floor": hr_lo, "ceiling": hr_hi}
+        hr["in_band"] = d == 0.0
+        hr["median_hr"] = med_hr
+        hr["expected_display"] = _fmt_hr_band(hr_lo, hr_hi)
 
     med_load = reference.get("median_load") if has_rolling else None
     expected_load = LOAD_FACTORS[cls] * med_load if med_load else None
@@ -560,6 +631,30 @@ _FORMATTERS = {
 }
 
 
+def _fmt_hr_band(lo: float | None, hi: float | None) -> str:
+    """The HR band as the reader should see it: a ceiling, a floor, or a range."""
+    if lo is not None and hi is not None:
+        return f"{round(lo)}–{round(hi)} bpm"
+    if hi is not None:
+        return f"≤ {round(hi)} bpm"
+    if lo is not None:
+        return f"≥ {round(lo)} bpm"
+    return "—"
+
+
+def expected_text(key: str, metric: dict) -> str:
+    """What the run was held to, as the reader should see it.
+
+    HR carries a band rather than a point, so it supplies its own display
+    string; every other metric formats its numeric expectation.
+    """
+    display = metric.get("expected_display")
+    if display:
+        return display
+    expected = metric.get("expected")
+    return _FORMATTERS[key](expected) if expected is not None else "—"
+
+
 def _delta_text(key: str, metric: dict) -> str:
     """Signed, human delta between actual and expected — the granularity a
     bare letter loses."""
@@ -571,51 +666,13 @@ def _delta_text(key: str, metric: dict) -> str:
         if abs(diff) < 1:
             return "on target"
         return f"{abs(diff)}s/mi {'slower' if diff > 0 else 'faster'}"
+    if key == "hr" and metric.get("in_band"):
+        # Inside the band IS the A. A percentage against one edge would imply
+        # a miss that did not happen.
+        return "in range"
     if not expected:
         return "—"
     return f"{(actual / expected - 1) * 100:+.0f}%"
-
-
-def gpa_explainer(card: dict) -> str:
-    """One line stating how the overall GPA was actually computed.
-
-    The card shows a number to two decimals; that number has to be
-    reconstructible from the letters printed above it, or it reads as an
-    oracle. Lists only the metrics that were actually graded, with the weights
-    ACTUALLY used — an n/a metric drops out and the rest renormalize, so the
-    static 30/30/25/15 table would be a lie on a card with a missing metric.
-
-    States plainly that +/- modifiers don't move the number: they are a
-    within-band position cue, and a reader doing the arithmetic with B- as 2.7
-    would not reproduce the printed GPA.
-    """
-    overall = card["overall"]
-    if overall.get("gpa") is None:
-        return ""
-
-    graded = [(k, label) for k, label in _METRIC_LABELS
-              if card["metrics"][k].get("grade") and k in METRIC_WEIGHTS]
-    if not graded:
-        return ""
-    total_w = sum(METRIC_WEIGHTS[k] for k, _ in graded)
-    # Independently-rounded shares sum to 99% or 101% often enough to matter in
-    # a line whose whole job is letting the reader reproduce the number. The
-    # last share absorbs the rounding remainder so they always total 100.
-    pcts = [round(100 * METRIC_WEIGHTS[k] / total_w) for k, _ in graded]
-    pcts[-1] = 100 - sum(pcts[:-1])
-    parts = []
-    for (key, label), pct in zip(graded, pcts):
-        letter = base_letter(card["metrics"][key]["grade"])
-        parts.append(f"{label} {letter} ({GRADE_POINTS[letter]:.0f}) x {pct}%")
-
-    tail = ""
-    if len(graded) < len(METRIC_WEIGHTS):
-        tail = (f" {len(METRIC_WEIGHTS) - len(graded)} metric(s) were n/a, so the "
-                "remaining weights were rescaled to 100%.")
-    return (f"GPA is a weighted 4.0 scale (A=4, B=3, C=2, D=1, F=0): "
-            f"{' + '.join(parts)} = {overall['gpa']:.2f} → {overall['grade']}. "
-            f"Plus/minus marks position inside a band and does not move the "
-            f"number.{tail}")
 
 
 def reference_line(card: dict, *, markdown: bool = True) -> str:
@@ -662,30 +719,20 @@ def render_markdown(card: dict) -> str:
         f"{_fmt_pace(act.get('avg_pace_sec_per_km'))}",
         "",
     ]
-    # The coach's read leads, above the grades — a person wants to be told how
-    # the run went before being shown the table that proves it. Absent when
-    # the caller didn't generate one (format='table', or a failed SDK call
-    # with no fallback), in which case the card opens on the grade as before.
+    lines += [f"## Overall: {overall['grade']}{gpa}", ""]
+    # The read sits under the grade line, not above the header — the title
+    # names the run and nothing else, mirroring the PDF's hero block.
     if card.get("coach_read"):
         lines += [card["coach_read"], ""]
-    lines += [
-        f"## Overall: {overall['grade']}{gpa}",
-        "",
-        reference_line(card),
-        "",
-    ]
-    explainer = gpa_explainer(card)
-    if explainer:
-        lines += [f"_{explainer}_", ""]
+    lines += [reference_line(card), ""]
 
     rows = []
     for key, label in _METRIC_LABELS:
         m = card["metrics"][key]
-        fmt = _FORMATTERS[key]
         rows.append([
             label,
-            fmt(m.get("actual")),
-            fmt(m.get("expected")) if m.get("expected") is not None else "—",
+            _FORMATTERS[key](m.get("actual")),
+            expected_text(key, m),
             _delta_text(key, m),
             m.get("grade") or "n/a",
         ])
