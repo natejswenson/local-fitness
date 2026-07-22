@@ -2485,6 +2485,7 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
                 notes_text=notes.render_for_prompt(),
+                user_name=config.user_name(),
             )
         except Exception:
             LOG.warning(
@@ -2726,7 +2727,8 @@ async def workout_report_card(args: dict) -> dict:
     profile = coach.resolve_coach_profile()
     try:
         card["coach_read"] = await workout_coach.generate_read_cached(
-            profile, card, notes_text=notes.render_for_prompt())
+            profile, card, notes_text=notes.render_for_prompt(),
+            user_name=config.user_name())
     except Exception:
         LOG.warning(
             "workout read generation failed for activity %s, using fallback",

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
-from .. import db
+from .. import config, db
 from . import interpret
 from . import status as status_mod
 from . import units
@@ -687,7 +687,10 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
     nothing consumes this in production — the prompt is still authoritative."""
     today = today or date.today().isoformat()
     with db.connect(db_path) as conn:
-        user_name = db.get_setting("user_name", "Nate", db_path=db_path, conn=conn) or "Nate"
+        # config.user_name(), not a bare get_setting with its own default:
+        # this line used to default to a real name while every other caller
+        # defaulted to the generic one, so a fresh clone was greeted by name.
+        user_name = config.user_name(db_path=db_path, conn=conn)
         try:
             step_goal = int(db.get_setting(
                 "daily_step_goal", "10000", db_path=db_path, conn=conn) or "10000")

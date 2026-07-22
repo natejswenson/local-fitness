@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 )
 from pydantic import ValidationError
 
-from .. import db
+from .. import config, db
 from .. import notes
 from . import brief_planner
 from . import briefs
@@ -613,7 +613,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     ``/api/brief`` returns the new brief immediately. Set ``save=False`` for
     evaluation/scoring callers that don't want to clobber the live brief.
     """
-    user_name = db.get_setting("user_name", prompts.DEFAULT_USER_NAME)
+    user_name = config.user_name()
     try:
         daily_step_goal = int(db.get_setting("daily_step_goal", "10000") or "10000")
     except ValueError:

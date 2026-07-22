@@ -32,6 +32,8 @@ import logging
 import re
 from pathlib import Path
 
+from .. import config
+from . import prompts
 from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
@@ -134,6 +136,7 @@ def build_prompt(
     profile: CoachProfile,
     card: dict,
     notes_text: str | None = None,
+    user_name: str = config.DEFAULT_USER_NAME,
 ) -> tuple[str, str]:
     """Assemble the ``(system_prompt, user_prompt)`` pair for the verbal read.
 
@@ -146,20 +149,18 @@ def build_prompt(
     is honored here exactly as it is in chat and the brief.
     """
     system_prompt = (
-        "You are Nate's running coach, writing the opening read on a report "
-        "card for ONE run he just finished. One short paragraph per graded "
-        "area, each covering only that area.\n\n"
-        f"{profile.dials_line}\n\n{profile.persona}\n\n"
+        f"You are {user_name}'s running coach, writing the opening read on a "
+        "report card for ONE run he just finished. One short paragraph per "
+        "graded area, each covering only that area.\n\n"
+        f"{prompts.coach_voice_block(user_name, profile)}\n\n"
         f"{_GRADE_TONE}\n\n{_METRIC_TRANSLATION_BLOCK}\n\n"
         "Write in second person, present tense, the way you'd say it to his "
         "face.\n\n"
         f"{_FORMAT_RULES}"
     )
-    if notes_text:
-        system_prompt += (
-            "\n\n# What Nate has told you (most recent first — prefer the "
-            f"newer note when two conflict)\n{notes_text}"
-        )
+    notes_section = prompts.user_notes_block(user_name, notes_text)
+    if notes_section:
+        system_prompt += f"\n\n{notes_section}"
 
     act = card.get("activity") or {}
     overall = card.get("overall") or {}
@@ -342,6 +343,7 @@ async def generate_read(
     model: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
     notes_text: str | None = None,
+    user_name: str = config.DEFAULT_USER_NAME,
 ) -> str:
     """Claude-generated opening read for the report card.
 
@@ -355,7 +357,8 @@ async def generate_read(
     if model is None:
         model = DEFAULT_MODEL
 
-    system_prompt, user_prompt = build_prompt(profile, card, notes_text=notes_text)
+    system_prompt, user_prompt = build_prompt(
+        profile, card, notes_text=notes_text, user_name=user_name)
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
@@ -423,6 +426,7 @@ async def generate_read_cached(
     model: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
     notes_text: str | None = None,
+    user_name: str = config.DEFAULT_USER_NAME,
     cache_path: Path | None = None,
 ) -> dict[str, str]:
     """``generate_read`` behind a single-entry disk cache, parsed into sections.
@@ -439,7 +443,8 @@ async def generate_read_cached(
     activities re-generates each time, which is the accepted cost of not
     building a cache manager for a personal tool.
     """
-    system_prompt, user_prompt = build_prompt(profile, card, notes_text=notes_text)
+    system_prompt, user_prompt = build_prompt(
+        profile, card, notes_text=notes_text, user_name=user_name)
     # activity_id is part of the key even though it is deliberately absent from
     # the prompt (a bare row id is noise to the model). Without it, two
     # sessions on the same day with the same name and the same grades — a
@@ -463,7 +468,8 @@ async def generate_read_cached(
             # truncated write) is a miss, not a failure.
             _LOG.info("workout_coach cached read no longer parses — regenerating")
     text = await generate_read(
-        profile, card, model=model, timeout=timeout, notes_text=notes_text)
+        profile, card, model=model, timeout=timeout, notes_text=notes_text,
+        user_name=user_name)
     # Parse BEFORE caching: an unparseable generation must not be stored, or
     # every later render pays to rediscover that it is unusable.
     sections = parse_read(text)

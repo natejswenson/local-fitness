@@ -25,6 +25,10 @@ DEFAULT_PARTIAL_FRACTION = 0.40
 DEFAULT_COUNT_WALKS_EASY = True
 DEFAULT_COUNT_WALKS_MILEAGE = False
 DEFAULT_RIEGEL_LOOKBACK_DAYS = 120
+#: Display name when nothing is configured. Deliberately generic — a real name
+#: must never be a default in tracked code (CLAUDE.md's env-driven rule), and
+#: this is the constant ``prompts.DEFAULT_USER_NAME`` aliases.
+DEFAULT_USER_NAME = "the user"
 _RIEGEL_LOOKBACK_MAX_DAYS = 3650  # ~10 years; guards against nonsense windows
 
 _BOOL_TRUE = {"1", "true", "yes", "on"}
@@ -96,6 +100,29 @@ def coach_profile(db_path=None, conn: sqlite3.Connection | None = None) -> str:
     unchanged when omitted."""
     return _resolve("coach_profile", "LOCAL_FITNESS_COACH_PROFILE",
                     "adaptive", _as_profile_name, db_path, conn=conn)
+
+
+def _as_user_name(s) -> str:
+    """Collapse whitespace on a display name; a blank falls through to the
+    default via ``_coerce``'s ``_blank`` check."""
+    return " ".join(str(s).split())
+
+
+def user_name(db_path=None, conn: sqlite3.Connection | None = None) -> str:
+    """Who the coach is talking to (DB > env > default 'the user').
+
+    The single resolver for the display name, mirroring ``coach_profile``
+    above. It exists because there wasn't one: ``briefing.py`` and
+    ``web/mcp_server.py`` each called ``db.get_setting("user_name", ...)``
+    directly with one default, ``brief_planner`` called it with a DIFFERENT
+    default, and ``plan_coach``/``workout_coach`` hardcoded a name into their
+    prompt text outright. Same setting, four behaviors — and the hardcoded one
+    meant a stranger's clone was told it was Nate's coach.
+
+    Defaulting to a generic ``the user`` (never a real name) is what keeps
+    tracked code free of personal data, per CLAUDE.md's env-driven rule."""
+    return _resolve("user_name", "LOCAL_FITNESS_USER_NAME",
+                    DEFAULT_USER_NAME, _as_user_name, db_path, conn=conn)
 
 
 def riegel_lookback_days(db_path=None, conn: sqlite3.Connection | None = None) -> int:

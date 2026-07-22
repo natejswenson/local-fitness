@@ -24,7 +24,7 @@ from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .. import db
+from .. import config, db
 from ..agent import brief_planner, briefs, coach, prompts
 from ..agent import tools as agent_tools
 from ..agent.render import render_table
@@ -51,8 +51,8 @@ def allowed_hosts() -> list[str]:
 
 
 def _user_name() -> str:
-    """Source user_name exactly like briefing.py does (settings → fallback)."""
-    return db.get_setting("user_name", prompts.DEFAULT_USER_NAME)
+    """The single resolver (DB > env > default) — see ``config.user_name``."""
+    return config.user_name()
 
 
 def _render_status(status: dict[str, Any]) -> str:
