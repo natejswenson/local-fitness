@@ -139,12 +139,22 @@ def _ran(activity: dict, cfg: GradingConfig = GradingConfig()) -> bool:
 
     Both directions matter: this excludes a labelled-``running`` walk AND
     includes a genuinely-fast row that the label got wrong the other way.
+
+    ON-FOOT IS CHECKED FIRST, and that ordering is load-bearing. The pace gate
+    answers "run or walk", not "on foot or not" — a 30km bike ride has a pace
+    of about 2:00/mi, so gating on pace alone counted it as 30km of *running*
+    distance (shipped in 0.27.0, caught here). The label is unreliable about
+    run-vs-walk but perfectly reliable about foot-vs-wheel: nothing logs a bike
+    ride as ``treadmill_running``.
     """
+    at = activity.get("activity_type")
+    if not _is_on_foot(at):
+        return False
     if cfg.pace_gated_locomotion:
         mode = interpret.is_running_effort(activity.get("avg_pace_sec_per_km"))
         if mode is not None:
             return mode
-    return _is_running(activity.get("activity_type"))
+    return _is_running(at)
 
 
 def _parse_iso(value: str) -> _date | None:
@@ -873,10 +883,9 @@ def _adherence_pct(graded_workouts: list[dict]) -> int | None:
 
 
 def _workout_actuals(
-    day_activities: list[dict],
-) -> tuple[float, float | None, list[str]]:
-    """Foot-based actual distance (m), aggregate pace (sec/km), and the day's
-    normalized activity classes — surfaced so a recovery walk is visible.
+    day_activities: list[dict], cfg: GradingConfig = GradingConfig()
+) -> tuple[float, float, float, float | None, list[str]]:
+    """``(foot_m, run_m, walk_m, pace_sec_per_km, activity_types)`` for one day.
 
     Distance and pace cover on-foot activity (running + walking), so on a
     walk-only day ``pace`` is *walking* pace: this is the actual pace of what was
@@ -884,11 +893,26 @@ def _workout_actuals(
     deduped, sorted set of activity classes for the day (``running``/``walking``/
     ``other``). Surfacing is foot-based on every day regardless of workout type;
     the verdict's type-awareness lives in ``classify_workout``, not here.
+
+    ONE pass, returning all three distances, because the caller needs all of
+    them: computing them as three separate helper calls walked each day's
+    activity list four times and cost a **15.4% regression** on
+    ``get_training_plan_progress`` against the 15% CI gate (measured
+    2026-07-22). ``_ran`` is evaluated at most once per activity here.
     """
-    dist = _foot_distance(day_activities)
-    dur = _foot_duration(day_activities)
-    pace = (dur / (dist / 1000.0)) if dist > 0 else None
-    return dist, pace, _normalize_activity_types(day_activities)
+    foot = run = walk = dur = 0.0
+    for a in day_activities:
+        if not _is_on_foot(a.get("activity_type")):
+            continue
+        d = a.get("distance_meters") or 0.0
+        foot += d
+        dur += a.get("duration_seconds") or 0.0
+        if _ran(a, cfg):
+            run += d
+        else:
+            walk += d
+    pace = (dur / (foot / 1000.0)) if foot > 0 else None
+    return foot, run, walk, pace, _normalize_activity_types(day_activities)
 
 
 def build_plan_detail(
@@ -906,7 +930,7 @@ def build_plan_detail(
     graded = []
     for w in plan["workouts"]:
         day = activities_by_date.get(w["date"], [])
-        actual_dist, actual_pace, actual_types = _workout_actuals(day)
+        actual_dist, run_m, walk_m, actual_pace, actual_types = _workout_actuals(day, cfg)
         graded.append({
             **w,
             "verdict": grade_workout(w, day, frontier, cfg),
@@ -915,8 +939,8 @@ def build_plan_detail(
             # needs run volume (the PDF's weekly strip, weekly_rollup) never has
             # to re-derive it from the label — and so run + walk always
             # reconciles back to actual_distance_m.
-            "actual_run_distance_m": _running_distance(day, cfg),
-            "actual_walk_distance_m": _walking_distance(day, cfg),
+            "actual_run_distance_m": run_m,
+            "actual_walk_distance_m": walk_m,
             "actual_pace_sec_per_km": actual_pace,
             "actual_activity_types": actual_types,
         })

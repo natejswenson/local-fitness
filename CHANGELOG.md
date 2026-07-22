@@ -9,6 +9,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.28.0] - 2026-07-22
 
 ### Fixed
+- **A bike ride counted as running distance.** 0.27.0's pace gate answered
+  "run or walk" but was asked "on foot or not": a 30km ride paces at about
+  2:00/mi, so `_ran` returned True and `_running_distance` counted all 30km as
+  run mileage. `_ran` now checks `_is_on_foot` FIRST — the label is unreliable
+  about run-vs-walk but perfectly reliable about foot-vs-wheel, since nothing
+  logs a bike ride as `treadmill_running`. Caught while investigating the perf
+  gate, not by the tests; it has one now.
+- **`build_plan_detail` walked each day's activities four times.** Splitting
+  foot/run/walk across three helper calls on top of `_workout_actuals` cost a
+  **15.4% regression** on `get_training_plan_progress` against CI's 15% gate.
+  `_workout_actuals` now returns `(foot, run, walk, pace, types)` from ONE
+  pass, evaluating `_ran` at most once per activity.
 - **The brief's "fitness sliding" mandate overrode the coach profile on every
   voice.** The steps mandate was correctly gated on
   `profile.includes_harsh_block`, but the conditioning mandate hardcoded
