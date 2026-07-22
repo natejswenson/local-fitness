@@ -29,16 +29,33 @@ average 140, which handed a normal outdoor easy run a D on heart rate. That
 was an artifact of mixing two HR regimes, not a judgment — treadmill and road
 are different modalities and must not share a yardstick unless forced to.
 
+Comparability is ALSO gated on locomotion, measured rather than labelled, because
+``activity_type`` is not trustworthy: a walking-desk session logs as
+``treadmill_running``, and both the exact-type filter and ``plans._is_running``
+(a substring match on "running") pass it straight through. See
+``RUN_PACE_CEILING_SEC_PER_MI`` — on live data this was distorting 40% of the
+composite.
+
 Direction gating is what keeps the rubric honest. An easy run is *supposed*
 to be slow — grading |actual − expected| would hand every recovery run an F.
 So easy/long days are penalized only for running too FAST, quality days only
 for running too SLOW, and each metric's expectation is scaled by the workout's
 intent (from the plan when present, inferred otherwise).
 
-Splits are presentation-only. No grade reads ``activity_splits`` — only 87 of
-747 activities have them (they are written by the daily-sync ingest path,
-never by backfill), so a splits-dependent grade would be unavailable on ~88%
-of the history and would silently mean different things on different rows.
+Splits are presentation-only, with exactly one documented exception. No grade
+reads ``activity_splits`` — only 87 of 747 activities have them (they are
+written by the daily-sync ingest path, never by backfill), so a splits-dependent
+grade would be unavailable on ~88% of the history and would silently mean
+different things on different rows.
+
+The exception is **quality-day pace against a prescribed rep target**, and it
+exists because the alternative was not a strict grade but a broken one: a plan's
+interval pace describes the reps, while ``avg_pace_sec_per_km`` averages in the
+warmup, the recovery jogs and the cooldown, so that comparison returns F for
+every correctly-executed interval session. The fastest full split is the only
+available number that can answer "did you hit the reps". Where splits are
+missing the metric returns n/a with a stated reason and its weight
+redistributes — it never falls back to the average-vs-rep comparison.
 
 The pure section below is import-light (stdlib + ``render``/``units``) and
 unit-testable with plain dicts; DB access lives under the persistence divider,
@@ -60,7 +77,8 @@ __all__ = [
     "distance_deviation", "pace_deviation", "hr_deviation", "load_deviation",
     "overall_grade", "label_splits", "hr_drift_pct", "build_card",
     "render_markdown", "reference_line", "bin_hr_trace", "expected_text",
-    "hr_band_bounds", "hr_expectation",
+    "actual_text", "hr_band_bounds", "hr_expectation",
+    "is_running_effort", "fastest_full_split_pace",
     "load_report_card_inputs", "rolling_reference",
 ]
 
@@ -74,6 +92,22 @@ MILE_TOLERANCE = 0.03
 # Grading against noise is worse than not grading — return n/a and say so.
 MIN_REFERENCE_ACTIVITIES = 5
 REFERENCE_WINDOW_DAYS = 60
+# The run/walk boundary, in seconds per MILE. A brisk walker reaches a 13:00
+# mile; sustained running essentially never falls below it.
+#
+# This exists because ``activity_type`` is Garmin's label, not a measurement:
+# a walking-desk session logs as ``treadmill_running``, and both the exact-type
+# filter and ``plans._is_running`` (a substring match on "running") pass it
+# through. Measured on live data (2026-07-21), the 60-day ``treadmill_running``
+# pool held 46 activities that were cleanly bimodal — 16 real runs at
+# 8:40–11:46/mi, HR 114–172, and 30 walking-pad sessions at 14:08–84:20/mi,
+# HR 76–120. The resulting "median comparable activity" was a 15:50/mi walk at
+# 116 bpm and 22 training load, which handed a genuine interval session an A+ on
+# both heart rate and load for clearing a bar set by walking.
+#
+# The live gap runs 11:46 -> 14:08, so 13:00 sits with roughly two minutes of
+# margin on either side.
+RUN_PACE_CEILING_SEC_PER_MI = 13 * 60
 # Advisory only: a 2x-median load day is a fact worth printing, not an F.
 LOAD_SPIKE_FACTOR = 2.0
 # Bucket width for the per-sample HR trace chart. A tenth of a mile is fine
@@ -96,10 +130,31 @@ GRADE_BANDS: tuple[tuple[float, str], ...] = (
     (0.05, "A"), (0.10, "B"), (0.20, "C"), (0.35, "D"),
 )
 GRADE_POINTS = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "F": 0.0}
+# Weights are per intent class, because the metric a workout exists to satisfy
+# differs by workout. Running easy IS the easy day; hitting rep pace IS the
+# quality day; covering the distance IS the long run.
+#
+# Flat weights (the previous distance .30 / pace .30 / hr .25 / load .15 for
+# every intent) let the two lowest-information metrics outvote the point of the
+# session. Measured 2026-07-21: a prescribed 10:28 easy run executed at 9:28 —
+# a full minute per mile too hot, which is the *only* way an easy day fails —
+# scored an overall B (3.40), because HR and load together carried 40% and both
+# landed A. The card's own read called it "not recovery, that's a race finish".
 METRIC_WEIGHTS = {"distance": 0.30, "pace": 0.30, "hr": 0.25, "load": 0.15}
+INTENT_METRIC_WEIGHTS: dict[str, dict[str, float]] = {
+    "easy": {"distance": 0.20, "pace": 0.45, "hr": 0.25, "load": 0.10},
+    "quality": {"distance": 0.20, "pace": 0.45, "hr": 0.25, "load": 0.10},
+    "long": {"distance": 0.45, "pace": 0.20, "hr": 0.20, "load": 0.15},
+    # No stated intent means no metric can claim to be the point of the day —
+    # keep the neutral split.
+    "steady": METRIC_WEIGHTS,
+}
 _GPA_CUTS: tuple[tuple[float, str], ...] = (
     (3.5, "A"), (2.5, "B"), (1.5, "C"), (0.5, "D"),
 )
+# An F anywhere caps the overall here. A card that prints "Overall: A" above a
+# row reading F is not reporting a grade, it is averaging away the finding.
+_F_FLOOR_GRADE = "C"
 
 # Intent scaling. An easy day is EXPECTED to be shorter and slower than the
 # median; a long day longer. Applied to the rolling reference only — a plan
@@ -124,6 +179,17 @@ PACE_FACTORS = {"easy": 1.10, "long": 1.05, "quality": 0.95, "steady": 1.00}
 # These express the defensible generic claim instead: against a mixed-intent
 # median, an easy run should sit a little below it, a long run about at it, and
 # a quality run at or above it.
+#
+# Re-verified 2026-07-21 after RUN_PACE_CEILING_SEC_PER_MI cleaned the pools,
+# and deliberately left unchanged. The 0.97 easy ceiling was tuned against the
+# `running` (outdoor) distribution, which was never contaminated — its 60-day
+# median HR is 144.5. Excluding walking-pad sessions moves the
+# `treadmill_running` median from 116 to 145, so the two pools now agree and the
+# same constants describe both. At a 145 median the easy ceiling is 141 bpm
+# (reachable: 4 of 12 outdoor runs in the window sit at or below it) and the
+# quality floor is 145 bpm (reachable: 8 of 16 treadmill runs clear it). Both
+# bounds are attainable rather than aspirational, which is the property the
+# 2026-07-20 recalibration was after.
 HR_BANDS: dict[str, tuple[float | None, float | None]] = {
     "easy": (None, 0.97),
     "long": (None, 1.00),
@@ -200,6 +266,22 @@ def base_letter(grade: str | None) -> str | None:
     """Strip the +/- modifier. GPA math runs on base letters so the weights
     stay the approved ones and a modifier can never move an overall grade."""
     return grade[0] if grade else None
+
+
+def is_running_effort(pace_sec_per_km: float | None) -> bool | None:
+    """Was this activity run or walked, judged by pace rather than by label?
+
+    ``None`` when there is no usable pace — the mode is genuinely unknown, and
+    the caller must exclude the row rather than guess a side. Returning a
+    third state (instead of defaulting to False) is what keeps a paceless row
+    out of BOTH pools: ``None == True`` and ``None == False`` are each False,
+    so an equality filter drops it without a special case.
+
+    See ``RUN_PACE_CEILING_SEC_PER_MI`` for why this is measured, not labelled.
+    """
+    if not pace_sec_per_km or pace_sec_per_km <= 0:
+        return None
+    return pace_sec_per_km * (MILE_M / 1000) <= RUN_PACE_CEILING_SEC_PER_MI
 
 
 def intent_class(intent: str | None) -> str:
@@ -332,8 +414,21 @@ def hr_deviation(hr: float | None, median_hr: float | None, cls: str) -> float |
 
 
 def load_deviation(load: float | None, expected_load: float | None) -> float | None:
-    """One-sided-low against the intent-scaled rolling median. Above the
-    expectation is an A — a big day is not a failure.
+    """Deviation from the intent-scaled rolling median, penalized in BOTH
+    directions — but only once an overshoot becomes a spike.
+
+    Undershooting costs you. Overshooting is free up to ``LOAD_SPIKE_FACTOR``,
+    because a big day is not a failure; past it, the penalty grows with the
+    excess.
+
+    That ceiling exists because the one-sided-low version contradicted the card
+    it printed on. Measured 2026-07-21: a day at 81 load against a 22
+    expectation scored **A+** on the row directly above the note "Training Load:
+    **spike** — more than double your median day", while the coaching read
+    called it "stacking debt before the week's hardest ask". A grade that means
+    "this is a red flag" is not a grade. The threshold is deliberately the same
+    constant the flag uses, so the letter and the prose can never disagree
+    again.
 
     ``expected_load`` is intent-scaled by the caller for the same reason pace
     is direction-gated: an easy day is SUPPOSED to bank less load, and grading
@@ -343,21 +438,35 @@ def load_deviation(load: float | None, expected_load: float | None) -> float | N
     """
     if not load or not expected_load or expected_load <= 0:
         return None
-    return max(0.0, 1.0 - load / expected_load)
+    ratio = load / expected_load
+    if ratio > LOAD_SPIKE_FACTOR:
+        # Measured from the spike threshold, not from the expectation: landing
+        # exactly on the threshold is still a clean A.
+        return (ratio - LOAD_SPIKE_FACTOR) / LOAD_SPIKE_FACTOR
+    return max(0.0, 1.0 - ratio)
 
 
-def overall_grade(metrics: dict[str, dict]) -> dict:
-    """Weighted GPA over gradeable metrics only.
+def overall_grade(metrics: dict[str, dict], cls: str = "steady") -> dict:
+    """Intent-weighted GPA over gradeable metrics only.
+
+    ``cls`` selects the weight table — see ``INTENT_METRIC_WEIGHTS`` for why the
+    weights aren't flat. It defaults to the neutral split so an older caller
+    passing only ``metrics`` keeps the previous behavior.
 
     An ``n/a`` metric drops out and its weight redistributes proportionally,
     so a by-feel plan day with no pace target isn't silently scored as if pace
     were worth 30% of nothing. Zero gradeable metrics yields "n/a" — never
     "F", which would read as a judgment we did not actually make.
+
+    Finally, an F on any single metric caps the overall at ``_F_FLOOR_GRADE``.
+    Redistribution plus generous weighting can otherwise let three good metrics
+    average an outright failure up into a passing letter.
     """
+    weights = INTENT_METRIC_WEIGHTS.get(cls, METRIC_WEIGHTS)
     pairs = [
-        (METRIC_WEIGHTS[k], GRADE_POINTS[base_letter(m["grade"])])
+        (weights[k], GRADE_POINTS[base_letter(m["grade"])])
         for k, m in metrics.items()
-        if m.get("grade") and k in METRIC_WEIGHTS
+        if m.get("grade") and k in weights
     ]
     if not pairs:
         return {"grade": "n/a", "gpa": None, "graded_metrics": 0}
@@ -368,7 +477,14 @@ def overall_grade(metrics: dict[str, dict]) -> dict:
         if gpa >= cut:
             letter = candidate
             break
-    return {"grade": letter, "gpa": round(gpa, 2), "graded_metrics": len(pairs)}
+    out = {"grade": letter, "gpa": round(gpa, 2), "graded_metrics": len(pairs)}
+    if any(base_letter(m.get("grade")) == "F" for m in metrics.values()):
+        # Report the cap rather than quietly rewriting the letter — the GPA
+        # stays honest and the card can say why the two disagree.
+        if GRADE_POINTS[letter] > GRADE_POINTS[_F_FLOOR_GRADE]:
+            out["grade"] = _F_FLOOR_GRADE
+            out["capped_by"] = "F"
+    return out
 
 
 # --- splits (presentation only — no grade reads these) ---------------------
@@ -416,6 +532,22 @@ def label_splits(splits: list[dict]) -> dict:
         "rows": rows,
         "hr_drift_pct": hr_drift_pct(mile_like),
     }
+
+
+def fastest_full_split_pace(labelled: dict) -> float | None:
+    """The fastest full split's pace in sec/km, or ``None`` when there isn't one.
+
+    Partial splits are excluded for the same reason ``hr_drift_pct`` excludes
+    them: a 90-metre trailing fragment can post an absurdly fast pace and would
+    win this comparison every time.
+
+    This is the one place a *grade* is allowed to read splits — see the quality
+    branch of ``build_card`` for why, and the module docstring for the rule it
+    is an exception to.
+    """
+    paces = [r["avg_pace_sec_per_km"] for r in (labelled.get("rows") or [])
+             if not r.get("partial") and r.get("avg_pace_sec_per_km")]
+    return min(paces) if paces else None
 
 
 def bin_hr_trace(
@@ -548,6 +680,9 @@ def build_card(
     intent, intent_source = resolve_intent(activity, plan_workout, reference)
     cls = intent_class(intent)
     has_rolling = reference.get("mode") == "rolling_60d"
+    # Hoisted: the quality-pace branch below needs the normalized splits, and
+    # labelling them twice would be the only alternative.
+    labelled_splits = label_splits(splits)
     # A rest-day prescription carries null targets; it is an intent signal
     # only, so distance/pace fall through to the rolling reference.
     plan_usable = bool(plan_workout) and (plan_workout or {}).get("type") != "rest"
@@ -570,9 +705,41 @@ def build_card(
             None, activity.get("distance_meters"), None, None, reference.get("mode"))
 
     # -- pace
+    avg_pace = activity.get("avg_pace_sec_per_km")
+    # What gets graded. Normally the run average; on a quality day with a
+    # prescribed rep pace it is the fastest split instead (see below).
+    graded_pace, pace_note, pace_display = avg_pace, None, None
     if plan_usable and plan_workout.get("target_pace_sec_per_km"):
         expected_pace = plan_workout["target_pace_sec_per_km"]
         pace_ref, widen = "plan", PLAN_TIGHTEN
+        if cls == "quality":
+            # A quality day's plan pace is a REP target, but avg_pace_sec_per_km
+            # is a whole-run average that bakes in the warmup, the recovery jogs
+            # and the cooldown. Grading one against the other isn't a hard
+            # rubric, it's an arithmetic guarantee of an F — every correctly
+            # executed interval session averages far slower than its rep pace.
+            # Measured 2026-07-21: a prescribed 6:58/mi interval day averaged
+            # 10:42/mi and scored F, while its 4th mile ran 9:25 at 164 bpm.
+            #
+            # The fastest full split is the only number available that can answer
+            # "did you hit the reps", so quality pace — and ONLY quality pace —
+            # reads splits. Everything else keeps the no-splits-in-grades rule.
+            graded_pace = fastest_full_split_pace(labelled_splits)
+            if graded_pace is None:
+                # Backfilled activities carry no splits at all. Show the average
+                # so the number isn't lost, but refuse to grade it against a rep
+                # target — pace's weight redistributes instead.
+                pace_display = f"{_fmt_pace(avg_pace)} avg" if avg_pace else None
+                pace_note = ("interval day, no splits recorded — average pace "
+                             "can't be graded against a rep target")
+            else:
+                # No note in the success case: "9:25/mi best mile" against a
+                # "6:58/mi" target already states exactly what was compared, and
+                # the PDF's one-page budget is real — this bullet alone pushed a
+                # 6-split card onto a second page. A note earns its row only
+                # when the reader could not otherwise infer the reason.
+                unit = labelled_splits["unit"].lower()
+                pace_display = f"{_fmt_pace(graded_pace)} best {unit}"
     elif plan_usable and plan_workout.get("target_distance_m"):
         # A prescribed distance with no pace is an explicit by-feel day. It
         # earns no pace grade at all, and its 30% weight redistributes.
@@ -583,11 +750,18 @@ def build_card(
         widen = STEADY_WIDEN if cls == "steady" else 1.0
     else:
         expected_pace, pace_ref, widen = None, reference.get("mode"), 1.0
-    d = pace_deviation(activity.get("avg_pace_sec_per_km"), expected_pace, cls)
+    if pace_ref == "plan (by feel)":
+        pace_note = "by-feel day — no pace target"
+    d = pace_deviation(graded_pace, expected_pace, cls)
     pace = _metric(
-        grade_from_deviation(d, widen), activity.get("avg_pace_sec_per_km"),
-        expected_pace, d, pace_ref,
-        note="by-feel day — no pace target" if pace_ref == "plan (by feel)" else None)
+        grade_from_deviation(d, widen),
+        # `actual` stays the number the grade was measured against, so the Delta
+        # column can never compare two different quantities. When that isn't the
+        # run average, `actual_display` says which number it is.
+        graded_pace if graded_pace is not None else avg_pace,
+        expected_pace, d, pace_ref, note=pace_note)
+    if pace_display:
+        pace["actual_display"] = pace_display
 
     # -- HR and load: always rolling. plan_workouts has neither column.
     med_hr = reference.get("median_hr") if has_rolling else None
@@ -628,8 +802,8 @@ def build_card(
         "reference": reference,
         "plan_workout": plan_workout,
         "metrics": metrics,
-        "overall": overall_grade(metrics),
-        "splits": label_splits(splits),
+        "overall": overall_grade(metrics, cls),
+        "splits": labelled_splits,
         "hr_trace": bin_hr_trace(hr_samples or []),
         # Prompt-only, like splits and the trace: no grade reads either, so a
         # card grades identically with or without them.
@@ -697,11 +871,32 @@ def expected_text(key: str, metric: dict) -> str:
     return _FORMATTERS[key](expected) if expected is not None else "—"
 
 
+def actual_text(key: str, metric: dict) -> str:
+    """What the run actually did, as the reader should see it.
+
+    The mirror of ``expected_text``. Quality-day pace is graded on the fastest
+    split rather than the run average, and a bare "9:25/mi" beside a rep target
+    would silently imply the whole run was run at that pace — so that branch
+    supplies its own label.
+    """
+    display = metric.get("actual_display")
+    if display:
+        return display
+    actual = metric.get("actual")
+    return _FORMATTERS[key](actual) if actual is not None else "—"
+
+
 def _delta_text(key: str, metric: dict) -> str:
     """Signed, human delta between actual and expected — the granularity a
     bare letter loses."""
     actual, expected = metric.get("actual"), metric.get("expected")
     if actual is None or expected is None or not isinstance(expected, (int, float)):
+        return "—"
+    if not metric.get("grade"):
+        # An ungraded metric has no gap worth stating: the two numbers weren't
+        # comparable, which is precisely why it wasn't graded. Printing
+        # "224s/mi slower" beside an n/a re-makes the comparison the n/a exists
+        # to refuse.
         return "—"
     if key == "pace":
         diff = round((actual - expected) * 1.609344)
@@ -738,6 +933,16 @@ def reference_line(card: dict, *, markdown: bool = True) -> str:
     pool = ref.get("pool", "")
     widened = (" Pool widened to all on-foot activities — too few of this exact "
                "type to compare against." if ref.get("widened") else "")
+    # The locomotion filter is invisible in the numbers, so it has to be stated:
+    # a reader comparing against Garmin's own app would otherwise see a different
+    # median and have no way to account for the gap.
+    n_excluded = ref.get("excluded_other_mode") or 0
+    other = "walking" if ref.get("mode_label") == "running" else "running"
+    excluded = (f" {n_excluded} same-window {other}-effort "
+                f"{'activity' if n_excluded == 1 else 'activities'} excluded — "
+                f"Garmin labels them the same, the pace says otherwise."
+                if n_excluded else "")
+    widened += excluded
     if any((m.get("reference") or "").startswith("plan") for m in card["metrics"].values()):
         return (f"Graded against your {em}training plan{em} for this date "
                 f"(intent: {card['intent']}, {intent_src}). HR and training load "
@@ -778,7 +983,7 @@ def render_markdown(card: dict) -> str:
         m = card["metrics"][key]
         rows.append([
             label,
-            _FORMATTERS[key](m.get("actual")),
+            actual_text(key, m),
             expected_text(key, m),
             _delta_text(key, m),
             m.get("grade") or "n/a",
@@ -790,8 +995,17 @@ def render_markdown(card: dict) -> str:
              for key, label in _METRIC_LABELS if card["metrics"][key].get("note")]
     if card["metrics"]["load"].get("spike"):
         notes.append("- Training Load: **spike** — more than double your median day.")
+    if card["overall"].get("capped_by") == "F":
+        notes.append(
+            f"- Overall: capped at {card['overall']['grade']} — a metric graded F.")
     if notes:
         lines += ["", *notes]
+
+    # The yardstick. Dropped when the Expected column landed, restored now that
+    # the pool stops being "every activity Garmin filed under this type" —
+    # which median a run is measured against is a real decision the card makes,
+    # and the reader can't reconstruct it from the numbers.
+    lines += ["", f"_{reference_line(card)}_"]
 
     lines += ["", f"## Per-{card['splits']['unit'].lower()} breakdown", ""]
     if not card["splits"]["available"]:
@@ -894,7 +1108,31 @@ def rolling_reference(conn: sqlite3.Connection, activity: dict) -> dict:
     ).fetchall()]
     raw = [r for r in raw if r["activity_id"] != activity.get("activity_id")]
 
+    # Partition on the DATA before partitioning on the label. A run is only ever
+    # compared against running-effort activities and a walk against walking-effort
+    # ones, because `activity_type` cannot tell them apart — see
+    # RUN_PACE_CEILING_SEC_PER_MI. This runs BEFORE the type filters so the
+    # widened on-foot pool is mode-clean too; widening is what would otherwise
+    # pull the whole walking-pad corpus into a thin running pool.
     atype = activity.get("activity_type")
+    mode = is_running_effort(activity.get("avg_pace_sec_per_km"))
+    excluded_other_mode = 0
+    mode_label = {True: "running", False: "walking", None: None}[mode]
+    if mode is not None:
+        # A paceless row has an unknown mode and matches neither side.
+        in_mode = [r for r in raw if is_running_effort(r["avg_pace_sec_per_km"]) is mode]
+        # Count only rows this pool could actually have drawn from, so the
+        # card's "Garmin labels them the same" claim is true of every one of
+        # them. A genuinely-typed `walking` row was never a candidate and
+        # counting it would overstate the mislabelling.
+        candidate = _class_type(atype)
+        excluded_other_mode = sum(
+            1 for r in raw
+            if r not in in_mode and candidate(r["activity_type"]))
+        raw = in_mode
+    # else: the graded activity has no pace of its own, so its mode is unknowable.
+    # Fall through to type-only comparison rather than guessing a side.
+
     rows = [r for r in raw if _exact_type(atype)(r["activity_type"])]
     pool, widened = (atype or "").lower() or "comparable", False
     if len(rows) < MIN_REFERENCE_ACTIVITIES:
@@ -904,12 +1142,18 @@ def rolling_reference(conn: sqlite3.Connection, activity: dict) -> dict:
 
     if len(rows) < MIN_REFERENCE_ACTIVITIES:
         return {"mode": "insufficient_data", "n": len(rows),
-                "pool": pool, "window_days": REFERENCE_WINDOW_DAYS}
+                "pool": pool, "window_days": REFERENCE_WINDOW_DAYS,
+                "excluded_other_mode": excluded_other_mode}
     return {
         "mode": "rolling_60d",
         "n": len(rows),
         "pool": pool,
         "widened": widened,
+        # How many in-window activities were dropped as the other locomotion
+        # mode. Surfaced on the card: "compared against 16 runs, 30 walking-pad
+        # sessions excluded" is the reader's only clue that this filter ran.
+        "excluded_other_mode": excluded_other_mode,
+        "mode_label": mode_label,
         "window_days": REFERENCE_WINDOW_DAYS,
         "window_start": start.isoformat(),
         "window_end": end.isoformat(),

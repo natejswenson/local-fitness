@@ -220,11 +220,17 @@ today", "how's my training load", "what did I run last week"):
   than 14 days needs the complete list, so pass `full=true` to get it; the
   rollups (`adherence_pct`, `days_to_race`, `goal_gap`, `this_week`, …) are
   always whole-plan regardless of the `workouts` window.
-- **The agent owns the entire plan lifecycle — there is no UI.** When the user
-  wants to change their plan (move a long run, swap days, adjust a session),
-  edit it with `update_plan_workout(date, type/distance_mi/pace_min_per_mi/description)`
-  — it re-prescribes one day on the *active* plan (`type='rest'` clears
-  distance/pace). Structure changes (whole new plan) go through
+- **The agent owns the entire plan lifecycle — there is no UI.** To adjust a
+  session, `update_plan_workout(date, type/distance_mi/pace_min_per_mi/duration_min/description)`
+  re-prescribes ONE day on the *active* plan. `type='rest'` clears distance,
+  pace **and** duration, and overwrites `description` with `"Rest day"`.
+  **It cannot move or add a day.** `date` is the `UPDATE`'s key, not an editable
+  column (`plans._EDITABLE_WORKOUT_COLS` = `type`, `target_distance_m`,
+  `target_pace_sec_per_km`, `target_duration_sec`, `description`), and a date
+  with no existing prescription errors rather than inserting. So "move Saturday's
+  long run to Sunday" is **two calls** — rest the old day, prescribe the new one
+  — and only works if the new day already exists on the plan. Structure changes
+  (whole new plan) go through
   `propose_training_plan`/`revise_training_plan` (drafts), and the rest of the
   lifecycle — activating a draft, dropping a draft, or abandoning the active
   plan outright — is `commit_training_plan`/`discard_training_plan_draft`/
@@ -418,10 +424,45 @@ These are settled — don't redesign without a reason.
     `running` with `treadmill_running` put median HR at 119 against an
     outdoor average of 140 and gave a normal easy run a D. Treadmill and road
     are different HR regimes and must not share a yardstick unless forced to.
-  - **Splits are presentation-only** — no grade reads `activity_splits`. Only
-    87 of 747 activities have them (daily-sync ingest writes them, backfill
-    never does), so a splits-dependent grade would be unavailable on ~88% of
-    history and mean different things on different rows.
+  - **Comparability is ALSO gated on locomotion, measured not labelled**
+    (2026-07-21, `RUN_PACE_CEILING_SEC_PER_MI` = a 13:00 mile). `activity_type`
+    is Garmin's label and it lies: Nate's walking-desk sessions log as
+    `treadmill_running`, and both the exact-type filter and `plans._is_running`
+    (a substring match on "running") passed all of them through. On live data
+    that 60-day pool held 46 activities split 16 real runs (8:40–11:46/mi, HR
+    114–172) against 30 walking-pad sessions (14:08–84:20/mi, HR 76–120), so
+    the "median comparable activity" was a 15:50/mi walk at 116 bpm and 22
+    load — which handed a genuine interval session an A+ on **both** HR and
+    load, 40% of the composite, for clearing a walking bar. A run now compares
+    only against running-effort activities and a walk only against walking
+    ones; a paceless row has an unknown mode and joins neither pool. The filter
+    runs BEFORE widening, since widening is what would otherwise drag the whole
+    walking corpus into a thin running pool. `reference_line` states the
+    exclusion count on the card — it is invisible in the numbers otherwise.
+  - **Splits are presentation-only, with exactly ONE documented exception** —
+    no grade reads `activity_splits`. Only 87 of 747 activities have them
+    (daily-sync ingest writes them, backfill never does), so a splits-dependent
+    grade would be unavailable on ~88% of history and mean different things on
+    different rows. The exception is **quality-day pace against a prescribed
+    rep target**, and it exists because the alternative wasn't a strict grade
+    but a broken one: a plan's interval pace describes the *reps*, while
+    `avg_pace_sec_per_km` averages in the warmup, recovery jogs and cooldown,
+    so that comparison returns F for every correctly-executed interval session
+    (measured 2026-07-21: a 6:58/mi prescription averaged 10:42/mi → F, while
+    its 4th mile ran 9:25 at 164 bpm). `fastest_full_split_pace` is the only
+    number that can answer "did you hit the reps". With no splits the metric
+    returns n/a **with a stated reason** and its weight redistributes — it
+    never falls back to the average-vs-rep comparison.
+  - **A grade must never contradict the prose beside it.** Two live cases fixed
+    2026-07-21: `load_deviation` was one-sided-low and uncapped, so a day at 81
+    load against a 22 expectation printed **A+** directly above its own
+    "**spike** — more than double your median day" note; it is now two-sided
+    past `LOAD_SPIKE_FACTOR` (at or under the threshold is still a clean A).
+    And `overall_grade` is now **intent-weighted** (`INTENT_METRIC_WEIGHTS`) —
+    flat weights let HR + load (40%) outvote the one metric the session existed
+    to satisfy, scoring a prescribed 10:28 easy run executed at 9:28 an overall
+    B on a card whose own read called it "a race finish". An F on any metric
+    also caps the overall at C (`capped_by`), stated in the notes.
   - The pure section is stdlib-only and unit-testable with plain dicts; DB
     access lives under a persistence divider, mirroring `plans.py`.
   - **The card's opening verbal read is `agent/workout_coach.py`** — a sibling
@@ -432,9 +473,8 @@ These are settled — don't redesign without a reason.
     `plan_coach` preps a run not yet done from a prescription while this one
     judges a run already done from graded results — different inputs, tense,
     and failure mode. The model is told the grades are not its to revise: it
-    phrases them, it never re-derives them. Timeout is 90s
-    (`DEFAULT_TIMEOUT_S`), not `plan_coach`'s 30 — a real card measured 22.2s,
-    so 30 silently fell back on any cold start.
+    phrases them, it never re-derives them. Its timeout is far longer than
+    `plan_coach`'s 30s — see the latency bullet below.
   - **The read is FOUR labelled paragraphs, one per graded area** — not one
     blended paragraph. `READ_SECTIONS` is the contract; the model emits
     `DISTANCE:` / `PACE:` / `HEART RATE:` / `TRAINING LOAD:` lines and
@@ -452,10 +492,41 @@ These are settled — don't redesign without a reason.
     `MAX_CONTEXT_ACTIVITIES`), so the read can place the run in the week
     instead of judging it in isolation. Both are prompt-only — like splits and
     the HR trace, no grade reads either.
-  - **Budget ~70s for the SDK call** (`DEFAULT_TIMEOUT_S` is 180). Four
-    paragraphs is roughly 4x the output of one, and output length dominates
-    latency; 90s left no margin and silently served the template. The disk
-    cache makes every repeat render instant.
+  - **`workout_coach` owns its own model constant** (2026-07-21) — it does NOT
+    follow `briefing.DEFAULT_MODEL`. That constant also drives the daily brief
+    generator, where a model change is a prompt change that has to clear the
+    scorer and a cross-model A/B first, so the coupling meant this call could
+    not be tuned at all. The two share a vendor and nothing else: the brief
+    reasons over a whole day of data, while this one phrases four 45-word
+    paragraphs from grades `report_card.py` already computed and the prompt
+    explicitly forbids it from re-deriving. Sized to that job: Sonnet tier
+    (`DEFAULT_MODEL`), because nothing here is intelligence-bound — but not
+    Haiku, since the four-section `READ_SECTIONS` contract is load-bearing (a
+    missing section raises and drops the card to the deterministic template).
+    **`effort` and `thinking` are set explicitly and are load-bearing, not
+    polish**: current Sonnet runs adaptive thinking whenever `thinking` is
+    unset, so moving the model ID forward without `effort="low"` +
+    `thinking={"type": "disabled"}` would have made an already-67s call
+    *slower*. Any change here gets the measured A/B (latency, `parse_read`
+    success, word-budget compliance), never an eyeball — cost is not the
+    deciding axis, latency and format compliance are.
+  - **Budget ~10s for the SDK call** (`DEFAULT_TIMEOUT_S` is 90). Measured
+    2026-07-21 over 12 generations on 2 real cards: the old config
+    (sonnet-4-6, no effort, adaptive thinking) ran a **median 142.9s / max
+    165.6s** — 15s inside its own 180s ceiling, where a timeout silently swaps
+    the coach's voice for the template — while `effort="low"` + thinking off on
+    current Sonnet runs a **median 10.0s / max 10.8s**. Same A/B: `effort`
+    `medium` bought no latency back and more than doubled 45-word-budget
+    overruns (10/24 paragraphs vs 4/24), and it leaked what `_GRADE_TONE`
+    forbids outright — "F is F." and "B+ on paper". Haiku failed every call.
+    The disk cache makes every repeat render instant.
+  - **A split-heavy card is 2 PDF pages and always has been.** 6+ splits plus a
+    four-paragraph read overflows; measured 2026-07-21, the pre-0.26.0 layout
+    does the same, so this is a layout limitation rather than a content
+    regression. It sits right on the boundary — read word count is the swing
+    factor, which is why the 45-word budget is real. Any card content added
+    here should be measured against `len(HTML(...).render().pages)` on
+    `activity_id` 23685126977 (6 splits) before shipping.
   - **A metric's `Expected` column must be the number its grade was actually
     measured against.** HR broke this: it showed the bare rolling median while
     grading against a band edge, so a run at 136 vs a 146 median printed

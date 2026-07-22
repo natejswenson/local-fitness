@@ -36,13 +36,43 @@ from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
 
-# Measured on real cards: 22.2s for the old single paragraph, 66.9s for the
-# four-section read — output length dominates the latency, and this asks for
-# roughly four times as much of it. 90s left almost no margin and fell back to
-# the template on an ordinary run. A ceiling costs nothing on the happy path,
-# the render is on-demand rather than interactive, and the disk cache makes
-# every repeat instant.
-DEFAULT_TIMEOUT_S = 180.0
+# Measured on real cards, 2026-07-21, 12 generations across 2 cards:
+#
+#   sonnet-4-6, no effort, adaptive thinking   median 142.9s   max 165.6s
+#   sonnet-5,   effort=low, thinking off       median  10.0s   max  10.8s
+#
+# The old 180s ceiling was sized for the first row and was closer to firing
+# than its own comment admitted — a 165s run leaves 15s of margin, and a
+# fallback here silently swaps the coach's voice for a template.
+#
+# 90s is ~8x the measured max for the shipped config, which is generous for a
+# transient slow stream while still failing over promptly when the stream is
+# genuinely dead (a documented failure mode — see CLAUDE.md's brief-job notes).
+# A ceiling costs nothing on the happy path: the render is on-demand rather
+# than interactive, and the disk cache makes every repeat instant.
+DEFAULT_TIMEOUT_S = 90.0
+
+#: This module's model, deliberately NOT ``briefing.DEFAULT_MODEL``.
+#:
+#: That constant also drives the daily brief generator, where a model change is
+#: a prompt change and has to clear the scorer and a cross-model A/B first. The
+#: two calls have nothing in common but a vendor: the brief reasons over a whole
+#: day of data, while this one phrases four 45-word paragraphs from grades
+#: ``report_card.py`` already computed and the prompt explicitly forbids it from
+#: re-deriving. Coupling them meant this call could not be tuned at all.
+#:
+#: Sized to that job. Sonnet tier, not Opus — nothing here is intelligence-bound.
+#: Not Haiku either: the four-section ``READ_SECTIONS`` contract is load-bearing
+#: (a missing section raises and drops the card to the deterministic template),
+#: and the coach voice is the feature.
+DEFAULT_MODEL = "claude-sonnet-5"
+
+#: Low effort and thinking off, and these are load-bearing rather than polish.
+#: Sonnet 5 runs adaptive thinking whenever ``thinking`` is unset, so moving the
+#: model ID forward *without* these would have made an already-67s call slower.
+#: There is nothing for the model to reason about: every judgment on the card
+#: was decided in Python before this prompt was built.
+DEFAULT_EFFORT = "low"
 
 # Same metric-translation contract as prompts.system_prompt and
 # plan_coach — included unconditionally so the report card honors it whether
@@ -146,9 +176,14 @@ def build_prompt(
     for key, label in _metric_labels():
         m = (card.get("metrics") or {}).get(key) or {}
         if not m.get("grade"):
-            lines.append(f"  {label}: n/a — not enough to grade.")
+            # Prefer the metric's own reason. "not enough to grade" is true of a
+            # thin reference pool but wrong for an interval day with no splits,
+            # and the model will happily invent the difference.
+            lines.append(f"  {label}: n/a — {m.get('note') or 'not enough to grade'}.")
             continue
-        line = f"  {label}: {m['grade']} — actual {_fmt(key, m.get('actual'))}"
+        # actual_text, not the raw number: quality pace is graded on the fastest
+        # split, and a bare "9:25/mi" would read as the whole run's average.
+        line = f"  {label}: {m['grade']} — actual {_actual_text(key, m)}"
         # expected_text, not the raw number: HR is held to a BAND, and handing
         # the model a bare midpoint is how it ends up explaining a heart-rate
         # verdict against a number the grade was never measured against.
@@ -246,6 +281,12 @@ def _expected_text(key: str, metric: dict) -> str:
     return expected_text(key, metric)
 
 
+def _actual_text(key: str, metric: dict) -> str:
+    from .report_card import actual_text
+
+    return actual_text(key, metric)
+
+
 def reference_summary(card: dict) -> str:
     """The yardstick, stated for the prompt rather than the page.
 
@@ -306,15 +347,13 @@ async def generate_read(
 
     Raises on any failure (missing/expired credential, network, timeout, empty
     response) — the caller falls back to ``fallback_read``. ``model=None``
-    resolves to ``briefing.DEFAULT_MODEL`` at call time, so this follows that
-    constant rather than duplicating a literal that could drift.
+    resolves to this module's own ``DEFAULT_MODEL``; see that constant for why
+    it is no longer ``briefing.DEFAULT_MODEL``.
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 
-    from . import briefing
-
     if model is None:
-        model = briefing.DEFAULT_MODEL
+        model = DEFAULT_MODEL
 
     system_prompt, user_prompt = build_prompt(profile, card, notes_text=notes_text)
     options = ClaudeAgentOptions(
@@ -322,6 +361,10 @@ async def generate_read(
         model=model,
         permission_mode="bypassPermissions",
         max_turns=1,
+        # See DEFAULT_EFFORT: without these, a newer model ID would be a
+        # latency regression rather than an improvement.
+        effort=DEFAULT_EFFORT,
+        thinking={"type": "disabled"},
     )
 
     async def _run() -> str:
@@ -442,9 +485,10 @@ def fallback_read(card: dict) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, label in READ_SECTIONS:
         m = ((card.get("metrics") or {}).get(key)) or {}
-        actual = _fmt(key, m.get("actual"))
+        actual = _actual_text(key, m)
         if not m.get("grade"):
-            out[key] = f"{actual}. Not enough comparable history to grade this."
+            reason = m.get("note") or "not enough comparable history to grade this"
+            out[key] = f"{actual}. {reason[0].upper()}{reason[1:]}."
             continue
         target = _expected_text(key, m)
         delta = _delta_text(key, m)
@@ -462,4 +506,5 @@ def fallback_read(card: dict) -> dict[str, str]:
 __all__ = [
     "build_prompt", "generate_read", "generate_read_cached", "fallback_read",
     "parse_read", "reference_summary", "READ_SECTIONS",
+    "DEFAULT_MODEL", "DEFAULT_EFFORT", "DEFAULT_TIMEOUT_S",
 ]
