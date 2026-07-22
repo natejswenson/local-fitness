@@ -62,6 +62,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   median from 116 to 145, which now agrees with the never-contaminated outdoor
   median of 144.5, so the constants describe both pools.
 
+### Documentation
+- **New: [`docs/mcp/`](docs/mcp/) — a reference page for every MCP tool.** One
+  file per tool (37), each with parameters, the real return shape, a worked
+  example, and the gotchas that only show up in the handler. Plus an index that
+  groups them by area, states the stdio-vs-HTTP availability split and the rule
+  behind it, and carries the training-plan state machine as a diagram.
+- **README corrected.** It advertised **33 tools**; the real surface is 37 over
+  stdio and 35 over HTTP. Six tools were missing from its list entirely
+  (`plan_chart`, `generate_chart`, `sync_garmin_data`, `get_brief_context`,
+  `workout_report_card`, `generate_brief_report`), `activity_hr_samples` was
+  missing from the table list, and the project layout predated `plans.py`,
+  `interpret.py`, `report_card.py`, `workout_coach.py`, `visuals.py` and
+  `branding.py`. The tool list now summarizes by area and links to `docs/mcp/`
+  rather than duplicating it — duplication is why it went stale.
+- The audit surfaced defects beyond documentation; filed as #131 (`run_sql`
+  silently truncates at 500 rows and reports a post-truncation `count`), #132
+  (`update_user_note`/`delete_user_note` address notes by unstable line index
+  and can silently hit the wrong one), and #133 (a dozen smaller
+  description-vs-handler mismatches).
+
+### Fixed (documentation-adjacent)
+- `chart`'s `style` schema described `line` as a "colored value-line (heat emoji
+  on an invisible canvas), weekly-averaged past ~5 weeks". It is none of those:
+  `charts.render_line` draws a **monochrome box-drawing curve**, and only `bar`
+  and `combo` are weekly-averaged (past 21 days, not ~5 weeks). The model was
+  being told the wrong thing about a tool it picks a style for.
+- `visuals.py`'s module docstring still filed `generate_chart` under
+  `LOCAL_ONLY_TOOLS`; it moved into `ALL_TOOLS` on 2026-07-13.
+- CLAUDE.md's plan-lifecycle bullet was stale on `update_plan_workout`: it
+  omitted `duration_min`, and implied the tool can move or add a day. `date` is
+  the `UPDATE`'s key rather than an editable column, and a day with no existing
+  prescription errors rather than inserting — so "move Saturday's long run to
+  Sunday" is two calls, not one.
+
 ## [0.25.0] - 2026-07-20
 
 ### Added

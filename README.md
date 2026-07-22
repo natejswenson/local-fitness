@@ -50,6 +50,18 @@ of metrics the agent reads when you ask it something or it writes a brief.
   resource, and `generate_brief_report` renders it to a polished PDF on
   demand. The composer is restricted to read-only tools, so an automated run
   can never mutate your data.
+- **Graded workout report cards.** `workout_report_card` *judges* one session
+  rather than describing it: distance, pace, HR and training load each reduce to
+  a single relative deviation passed through one shared band table, so the same
+  run always grades the same way. Graded against your training plan when one
+  prescribes that day, otherwise a 60-day rolling median of comparable
+  activities — and the card always says which. Renders as Markdown plus a
+  PRESS-themed PDF with per-mile splits and an HR/pace chart.
+- **Deterministic interpretation, not model opinion.** Every classifier the
+  coach needs — training-load zone, trend direction, effect size, standard
+  deviations from baseline — is tested Python in `agent/interpret.py`, and the
+  analysis tools attach those fields to their payloads. The model phrases a
+  judgment; it never derives one code can compute.
 - **Runner-facing units:** distances and pace render in miles / min-per-mile by
   default (`LOCAL_FITNESS_DISPLAY_UNITS`); raw metric values are always present.
 - **Privacy by default:** the database, briefings, and logs stay on your
@@ -157,8 +169,9 @@ that mounts the MCP endpoint at `/mcp/` and a `/health` liveness probe. It
 runs **no Claude inference** — it's a transport, not a conversation surface.
 There is no browsable UI; every fitness tool, prompt, and resource is reached
 through an MCP client (see [MCP](#mcp--talk-to-your-data-from-claude-directly)
-below) — `fitness mcp-stdio` for a local stdio connection, or `/mcp/` for a
-networked client behind a token.
+below, and the per-tool reference in [`docs/mcp/`](docs/mcp/)) —
+`fitness mcp-stdio` for a local stdio connection, or `/mcp/` for a networked
+client behind a token.
 
 ### Authentication
 
@@ -204,7 +217,12 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **33 tools**, **2 prompts**, and **2 resources**:
+Once connected you get **37 tools over stdio** (35 over HTTP — two are
+local-only, see below), **2 prompts**, and **2 resources**.
+
+📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool
+with parameters, return shapes, worked examples, and gotchas. The summary below
+is a map; that directory is the documentation.
 
 - **Prompts**
   - **`coach`** — assembles your full daily snapshot (metrics vs. baseline,
@@ -213,26 +231,43 @@ Once connected you get **33 tools**, **2 prompts**, and **2 resources**:
     follow-ups. This is the everyday "talk to my coach" entry point.
   - **`brief`** — composes a fresh structured daily brief from the same
     snapshot and persists it via `save_brief`.
-- **Read tools** — `daily_snapshot` (one-call status), `get_today_status`,
-  `get_metric` / `get_metric_trend`, `chart` (render a metric to an image),
-  `query_workouts` / `get_workout_detail`, `compare_periods`, `correlate`,
-  `find_anomalies`, `recovery_pattern`, `training_load_status`, and `run_sql`
-  (**read-only**, enforced at the SQLite engine — any write/DDL fails regardless
-  of phrasing).
-- **Write tools** — `save_brief` (write today's brief); the training-plan
-  tools `propose_training_plan` / `revise_training_plan` (draft structure),
+- **Status** — `daily_snapshot` (one-call "how am I doing"), `get_today_status`,
+  `get_brief_context` (the deterministic planner's full typed output).
+- **Metrics & analysis** — `get_metric` / `get_metric_trend`,
+  `training_load_status`, `compare_periods`, `correlate`, `find_anomalies`,
+  `recovery_pattern`. Each attaches deterministic interpretation (`tsb_zone`,
+  `trend_direction`, `effect_size`, …) computed in `agent/interpret.py`, rather
+  than leaving the model to apply a legend by hand.
+- **Workouts** — `query_workouts`, `get_workout_detail`, and
+  `workout_report_card`, which *grades* one session — distance, pace, HR and
+  training load each get a letter from one shared band table, plus an overall.
+- **Charts** — `chart` (inline ASCII/emoji), `generate_chart` (matplotlib PNG
+  returned as an inline image block), `plan_chart` (**the** scheduled-vs-actual
+  view — don't hand-roll it).
+- **Training plans** — the agent owns the whole lifecycle, because there is no
+  UI: `propose_training_plan` / `revise_training_plan` (draft),
+  `commit_training_plan` / `discard_training_plan_draft` (activate or drop),
   `update_plan_workout` (re-prescribe one day on the active plan),
-  `commit_training_plan` / `discard_training_plan_draft` (activate or drop a
-  draft), `abandon_active_plan` (stop following the active plan entirely, no
-  undo), and `get_training_plan_status` / `get_training_plan_progress`
-  (status reads) — the agent owns the entire plan lifecycle;
-  `log_observation` / `list_observations` / `delete_observation` (RPE,
-  soreness, weight, mood, feeling, injury, notes), `log_manual_workout` /
-  `delete_manual_workout` (non-Garmin sessions that feed the training-load
-  model), and the user-notes tools `save_user_note` / `list_user_notes` /
-  `update_user_note` / `delete_user_note` (durable coaching preferences).
+  `abandon_active_plan` (**no undo**), and `get_training_plan_status` /
+  `get_training_plan_progress`.
+- **Preferences & subjective data** — `save_user_note` / `list_user_notes` /
+  `update_user_note` / `delete_user_note` (durable coaching preferences,
+  injected into the system prompt) and `log_observation` / `list_observations` /
+  `delete_observation` (timestamped RPE, soreness, weight, mood, feeling,
+  injury, notes).
+- **Data & escape hatches** — `sync_garmin_data` (a capped Garmin pull +
+  baseline recompute, so an MCP-only client can freshen the DB without the CLI)
+  and `run_sql` (**read-only**, enforced at the SQLite engine — any write/DDL
+  fails regardless of phrasing; reach for it only when no structured tool fits).
 - **Resources** — `fitness://schema` (queryable columns + read-only SQL guide)
-  and `fitness://brief/latest` (your most recent brief as Markdown).
+  and `fitness://brief/latest` (your most recent brief as Markdown, with a
+  STALE banner when it predates today).
+
+**Two tools are stdio-only:** `generate_brief_report` and
+`workout_report_card`. The rule is that a tool handing back a *filesystem path*
+can't work over the network — a remote caller gets a container-internal path it
+cannot retrieve. `generate_chart` is networked precisely because it returns the
+image inline instead.
 
 The DNS-rebinding guard on the HTTP transport requires the served host to be in
 `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` (defaults to common local hosts; set it to
@@ -277,11 +312,19 @@ block, required env vars, and the token-rotation flow.
 
 SQLite at `./data/fitness.db` (override with `LOCAL_FITNESS_DATA_DIR`). Tables:
 `daily_metrics`, `body_battery_samples`, `stress_samples`, `activities`,
-`activity_hr_zones`, `activity_splits`, `baselines`, `ingest_runs`, `settings`,
-`observations` (manual logs: RPE, soreness, weight, mood…), and
-`training_plans` / `plan_workouts` (goal-driven plans, single-active enforced by
-a partial unique index). Raw Garmin JSON is preserved on every wellness/activity
-row, so new fields can be derived later without re-pulling.
+`activity_hr_zones`, `activity_splits`, `activity_hr_samples` (per-sample HR
+traces, fetched on demand for a report card and cached forever — never
+backfilled), `baselines`, `ingest_runs`, `settings`, `observations` (manual
+logs: RPE, soreness, weight, mood…), and `training_plans` / `plan_workouts`
+(goal-driven plans, single-active enforced by a partial unique index). Raw
+Garmin JSON is preserved on every wellness/activity row, so new fields can be
+derived later without re-pulling.
+
+> **A note on `activity_type`.** It is Garmin's label, not a measurement — a
+> walking-desk session logs as `treadmill_running`, indistinguishable from a
+> real treadmill run by type alone. Anything that needs to tell running from
+> walking must gate on measured pace (see `report_card.RUN_PACE_CEILING_SEC_PER_MI`),
+> not the type string.
 
 ## Privacy & data
 
@@ -298,24 +341,56 @@ row, so new fields can be derived later without re-pulling.
 ```
 src/local_fitness/
 ├── db.py                  # SQLite schema + connection helpers (read-only mode for run_sql)
+├── plans.py               # training-plan persistence + the prescription write boundary
+├── notes.py               # durable user notes (injected into the system prompt)
 ├── ingest/                # Garmin auth, daily pull, backfill, baselines
-├── agent/                 # tools, prompts, brief composer (briefing.py) + brief I/O (briefs.py)
+│   └── details.py         # on-demand per-sample HR traces (never backfilled)
+├── agent/
+│   ├── tools.py           # the MCP tool surface
+│   ├── prompts.py         # coach + brief prompts
+│   ├── briefing.py        # brief composer  ·  briefs.py — brief I/O
+│   ├── brief_planner.py   # deterministic triggers → typed BriefContext (V2 composer)
+│   ├── interpret.py       # pure classifiers: tsb_zone, trend_direction, effect_size…
+│   ├── report_card.py     # single-workout grading rubric
+│   ├── workout_coach.py   # the report card's verbal read  ·  plan_coach.py — plan line
+│   ├── charts.py          # ASCII/emoji charts   ·   visuals.py — matplotlib + PDF
+│   └── branding.py        # PRESS theme tokens (LOCAL_FITNESS_BRAND_FILE overrides)
 ├── web/server.py          # FastAPI app: /mcp/ mount + /health (no Claude inference)
 ├── web/mcp_server.py      # MCP prompts/tools/resources wiring
 └── cli.py                 # `fitness` Click entry point
 ops/                       # macOS launchd plist + installer for the scheduled brief
 scripts/score_prompt.py    # eval that scores agent/prompts.py (gates CI)
 tests/                     # pytest suite (run: uv run pytest)
+devlog/                    # running notes, one entry per meaningful change
+docs/mcp/                  # per-tool MCP reference (one page per tool)
 docs/deployment.md         # container / reverse-proxy deployment
 ```
 
 ## Development
 
 ```bash
-uv run pytest                       # tests + coverage gate
+uv run pytest                       # tests + 85% coverage gate
 uv run ruff check .                 # lint
 uv run python scripts/score_prompt.py  # score the agent prompt
 ```
+
+Two gates run on a separate axis from coverage and are **skipped** on an
+ordinary `pytest` run:
+
+- **Perf benchmarks** (`tests/test_perf_benchmarks.py`) — latency *and*
+  `db.connect()` open-count for the brief/plan hot paths, against a synthetic
+  multi-year fixture. CI opts back in with `--benchmark-only --no-cov` and
+  compares to a committed baseline. That baseline is machine-id matched, so it
+  must be captured on `ubuntu-latest` via the `capture-perf-baseline.yml`
+  workflow — never locally.
+- **Docker build** — compiles the full image (no push) so a base-image or
+  `Dockerfile` change can't break `docker compose up --build` while CI stays
+  green. A green build proves the image *compiles*, not that the container
+  behaves — still smoke-test locally after touching either.
+
+Tests never reach the network. `tests/conftest.py` has autouse fixtures
+blocking both `claude_agent_sdk.query` and Garmin's activity-details endpoint,
+so a new generator or ingest path can't silently start making real calls.
 
 Work flows `feature/* → dev → main`; both `dev` and `main` are protected
 (CI green + a PR required). CI runs all three checks on every push/PR to
