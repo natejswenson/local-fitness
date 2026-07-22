@@ -523,6 +523,22 @@ These are settled — don't redesign without a reason.
     table immediately below it, and it must not discuss CTL/ATL/TSB — that
     line is printed elsewhere on the card and asking for it bought a freshness
     lecture in place of a distance verdict.
+  - **That rule is kept by not showing it the letters** (0.28.1). The user
+    prompt carries `grade_severity()` words ("well off target") where it used
+    to print `Distance: D- — actual 5.95 mi…`, and `_GRADE_TONE` states the ban
+    without spelling out example letters (it used to list `"A"`, `"B-"`,
+    `"C+"`, planting them in the same breath). Measured: 3.1% of paragraphs
+    leaked and a leak **regenerated to the SAME letter**, because the retry saw
+    the same prompt; after, 0 of 96 on the identical protocol with latency
+    unchanged. **Severity, not silence** — deleting the judgment outright would
+    let the read drift out of agreement with the table, since a +19% distance
+    overshoot is a D- only because intent scaling says an interval day is no
+    place for bonus miles, and that is not recoverable from the raw numbers.
+    `find_grade_leak` plus ONE regeneration in `generate_read_cached` is the
+    backstop, not the fix; it is deliberately narrow because a bare "A" is
+    usually the article ("A blown interval session…") and a false positive
+    throws away a clean read. Its specification is the two lists in
+    `tests/test_workout_coach.py` — extend both before touching the pattern.
   - **It gets hindsight and foresight.** `load_report_card_inputs` supplies
     the trailing runs and the next 7 days of prescriptions (capped by
     `MAX_CONTEXT_ACTIVITIES`), so the read can place the run in the week
