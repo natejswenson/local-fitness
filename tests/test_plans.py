@@ -394,3 +394,130 @@ def test_weekly_mileage_dedups_same_date():
     activities_by_date = {"2026-07-01": [_run(5000)]}
     rows = plans.weekly_mileage(workouts, activities_by_date)
     assert rows[0] == {"week": 1, "planned_km": 7.0, "actual_km": 5.0}
+
+
+# --- pace-gated locomotion --------------------------------------------------
+# `activity_type` is Garmin's LABEL and it lies: walking-desk sessions log as
+# `treadmill_running`. Before 2026-07-22 every distance/duration helper here
+# was a substring match on that label, so walks counted as runs.
+
+_REAL_RUN = {"activity_type": "treadmill_running", "distance_meters": 9574.85,
+             "duration_seconds": 3822, "avg_pace_sec_per_km": 399.2}
+_MISLABELLED_WALK = {"activity_type": "treadmill_running", "distance_meters": 5202.75,
+                     "duration_seconds": 5670, "avg_pace_sec_per_km": 1090.5}
+
+
+def test_running_distance_excludes_a_walk_wearing_a_running_label():
+    """The live 2026-07-21 case: an interval day reported 9.18 mi actual when
+    the run was 5.95 mi and the rest was a 29:15/mi walking-pad session."""
+    day = [_REAL_RUN, _MISLABELLED_WALK]
+    assert plans._running_distance(day) == pytest.approx(9574.85)
+    assert plans._foot_distance(day) == pytest.approx(14777.60)
+
+
+def test_walking_distance_is_the_complement_so_the_two_reconcile():
+    day = [_REAL_RUN, _MISLABELLED_WALK]
+    assert (plans._running_distance(day) + plans._walking_distance(day)
+            == pytest.approx(plans._foot_distance(day)))
+
+
+def test_running_duration_excludes_the_mislabelled_walk():
+    """Duration is the GRADED field for tempo/interval, and this walk ran
+    1:34:30 — long enough on its own to satisfy any rep target."""
+    assert plans._running_duration([_REAL_RUN, _MISLABELLED_WALK]) == 3822
+
+
+def test_an_interval_day_is_not_completed_by_a_long_walk():
+    workout = {"type": "interval", "target_duration_sec": 1200}
+    assert plans.classify_workout(workout, [_MISLABELLED_WALK]) == "missed"
+    assert plans.classify_workout(workout, [_REAL_RUN]) == "done"
+
+
+def test_a_long_run_is_not_satisfied_by_walking_miles():
+    workout = {"type": "long", "target_distance_m": 12874.8}
+    # 14.8 km of foot distance, but only 9.6 km of it was run.
+    assert plans.classify_workout(workout, [_REAL_RUN, _MISLABELLED_WALK]) == "partial"
+
+
+def test_an_easy_day_still_counts_a_walk_as_active_recovery():
+    """The gate must not break deliberate walk days: easy/recovery grading is
+    foot-based on purpose, which is what makes a prescribed walk gradeable."""
+    workout = {"type": "easy", "target_distance_m": 4828.0}
+    assert plans.classify_workout(workout, [_MISLABELLED_WALK]) == "done"
+
+
+def test_pace_gate_can_be_turned_off():
+    cfg = plans.GradingConfig(pace_gated_locomotion=False)
+    day = [_REAL_RUN, _MISLABELLED_WALK]
+    assert plans._running_distance(day, cfg) == pytest.approx(14777.60)
+
+
+def test_a_paceless_row_falls_back_to_the_label_rather_than_vanishing():
+    """A manual entry with no pace has an unknowable mode; dropping it from
+    mileage entirely would be worse than trusting the label."""
+    manual = {"activity_type": "running", "distance_meters": 5000.0,
+              "duration_seconds": 1500, "avg_pace_sec_per_km": None}
+    assert plans._running_distance([manual]) == pytest.approx(5000.0)
+
+
+def test_a_genuinely_labelled_walk_that_was_actually_run_counts_as_running():
+    """The gate is symmetric: it corrects the label in both directions."""
+    fast = {"activity_type": "walking", "distance_meters": 5000.0,
+            "duration_seconds": 1500, "avg_pace_sec_per_km": 300.0}
+    assert plans._running_distance([fast]) == pytest.approx(5000.0)
+    assert plans._walking_distance([fast]) == 0.0
+
+
+def test_load_activities_by_date_selects_the_pace_the_gate_needs(tmp_path):
+    """Regression: the gate shipped as a silent no-op because this query did
+    not select avg_pace_sec_per_km, so every row fell back to the label."""
+    import sqlite3
+    from local_fitness import db as db_mod
+
+    path = tmp_path / "t.db"
+    db_mod.init_schema(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "distance_meters, duration_seconds, avg_pace_sec_per_km) "
+            "VALUES (1, '2026-07-21', 'treadmill_running', 5202.75, 5670, 1090.5)")
+    by_date = plans.load_activities_by_date("2026-07-01", "2026-07-31", db_path=path)
+    row = by_date["2026-07-21"][0]
+    assert row["avg_pace_sec_per_km"] == pytest.approx(1090.5)
+    assert plans._running_distance([row]) == 0.0
+
+
+def test_a_bike_ride_is_never_run_distance():
+    """Regression (shipped in 0.27.0, caught by the perf gate's review): the
+    pace gate answers run-vs-walk, not foot-vs-wheel. A 30km ride paces at
+    ~2:00/mi, so gating on pace alone counted it as 30km of RUNNING."""
+    bike = {"activity_type": "cycling", "distance_meters": 30000.0,
+            "duration_seconds": 3600, "avg_pace_sec_per_km": 120.0}
+    assert plans._ran(bike) is False
+    assert plans._running_distance([bike]) == 0.0
+    assert plans._walking_distance([bike]) == 0.0
+    assert plans._foot_distance([bike]) == 0.0
+
+
+def test_a_bike_ride_does_not_satisfy_a_long_run():
+    workout = {"type": "long", "target_distance_m": 12874.8}
+    bike = {"activity_type": "cycling", "distance_meters": 30000.0,
+            "duration_seconds": 3600, "avg_pace_sec_per_km": 120.0}
+    assert plans.classify_workout(workout, [bike]) == "missed"
+
+
+def test_workout_actuals_returns_foot_run_and_walk_in_one_pass():
+    day = [_REAL_RUN, _MISLABELLED_WALK,
+           {"activity_type": "cycling", "distance_meters": 30000.0,
+            "duration_seconds": 3600, "avg_pace_sec_per_km": 120.0}]
+    foot, run, walk, pace, types = plans._workout_actuals(day)
+    assert foot == pytest.approx(14777.60)
+    assert run == pytest.approx(9574.85)
+    assert walk == pytest.approx(5202.75)
+    assert run + walk == pytest.approx(foot)
+    assert pace is not None
+    assert types == ["other", "running"]
+
+
+def test_workout_actuals_pace_is_none_without_foot_distance():
+    assert plans._workout_actuals([])[3] is None

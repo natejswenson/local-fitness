@@ -123,10 +123,19 @@ def test_build_prompt_remains_pure_and_deterministic_with_notes():
 
 def test_fallback_partial_prior_day():
     line = plan_coach.fallback_coaching_line(_TODAY_EASY, _LAST_7_DAYS, 71, "10k")
-    assert line.startswith("Yesterday came up short of the prescription.")
-    assert "Today: easy 4.0 mi @ 9:30/mi." in line
-    assert "keep HR under 140" in line
-    assert "71 days to your 10k." in line
+    assert line == (
+        "Yesterday came up short of the prescription. 71 days to your 10k."
+    )
+
+
+def test_fallback_never_restates_the_prescription_or_description():
+    """The PDF's Today callout prints the prescription and the description
+    directly above this line; repeating either made the same instruction
+    appear three times on one card."""
+    line = plan_coach.fallback_coaching_line(_TODAY_EASY, _LAST_7_DAYS, 71, "10k")
+    assert "4.0 mi" not in line
+    assert "9:30" not in line
+    assert "keep HR under 140" not in line.lower()
 
 
 @pytest.mark.parametrize(
@@ -146,12 +155,12 @@ def test_fallback_verdict_phrases(verdict, expected_prefix):
 def test_fallback_all_pending_history_has_no_verdict_phrase():
     history = [{"date": "2026-07-09", "type": "easy", "planned_mi": 4.0, "actual_mi": None, "verdict": "pending"}]
     line = plan_coach.fallback_coaching_line(_TODAY_EASY, history, 71, "10k")
-    assert line.startswith("Today: easy 4.0 mi @ 9:30/mi.")
+    assert line == "71 days to your 10k."
 
 
 def test_fallback_empty_history_does_not_raise():
     line = plan_coach.fallback_coaching_line(_TODAY_EASY, [], 71, "10k")
-    assert "Today: easy 4.0 mi @ 9:30/mi." in line
+    assert line == "71 days to your 10k."
 
 
 def test_fallback_no_race_date_uses_working_toward_phrasing():
@@ -363,9 +372,13 @@ def _fake_generator(lines):
     counts calls."""
     calls = {"n": 0}
 
+    # **_kw, not an enumerated signature: this double stands in for a real
+    # function whose keyword surface grows (user_name landed 2026-07-22), and a
+    # double that has to be edited for every new kwarg is a double that fails
+    # for reasons unrelated to what the test is checking.
     async def fake(profile, today_workout, last_7_days, adherence_pct,
                    days_to_race, goal_type, *, model=None, timeout=30.0,
-                   notes_text=None):
+                   notes_text=None, **_kw):
         calls["n"] += 1
         result = lines[calls["n"] - 1]
         if isinstance(result, Exception):

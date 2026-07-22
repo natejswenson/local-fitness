@@ -52,6 +52,93 @@ _VERDICT_LABEL = {
 # within one stdio session — renders simply never overlap regardless.
 RENDER_LOCK = asyncio.Lock()
 
+# --- one-page fitting ------------------------------------------------------
+# Both PDFs are single-page documents by contract. They did not used to be:
+# measured 2026-07-22, a 3-takeaway brief rendered 2 pages while ~150pt of
+# page 1 sat empty (an HTML table row cannot fragment gracefully, so a card
+# that won't fit is pushed WHOLE to the next page), and a 6-split report card
+# did the same. Neither renderer had any idea how tall its own output was.
+#
+# The fix is to measure rather than guess: lay the document out, count
+# `len(document.pages)`, and step down a density ladder until it fits. Density
+# is a handful of scalars threaded into the stylesheet, NOT a second
+# stylesheet — one sheet with parameters can't drift from itself.
+#
+# Ordered roomiest-first. `chart_h_pt` is the load-bearing knob: charts are
+# what actually break the page (measured: the same brief fits on one page with
+# its charts removed), so capping their HEIGHT is the only lever that reliably
+# buys vertical room. Type scale alone does not.
+DENSITY_PRESETS: tuple[dict, ...] = (
+    {"name": "roomy",   "body_pt": 11.3, "chart_h_pt": 150.0,
+     "card_gap_em": 0.75, "hero_em": 5.2, "split_chart_pct": 84.0},
+    {"name": "compact", "body_pt": 10.4, "chart_h_pt": 112.0,
+     "card_gap_em": 0.55, "hero_em": 4.4, "split_chart_pct": 76.0},
+    {"name": "dense",   "body_pt": 9.6,  "chart_h_pt": 82.0,
+     "card_gap_em": 0.40, "hero_em": 3.6, "split_chart_pct": 68.0},
+)
+
+
+def fit_one_page(
+    build_html: Callable[[dict], str], presets: Sequence[dict] = DENSITY_PRESETS
+) -> tuple[bytes, int, int]:
+    """Lay `build_html(preset)` out at each density until it fits one page.
+
+    Returns ``(pdf_bytes, page_count, preset_index)``. `page_count` is the
+    count for the preset actually used, so a caller that still gets 2 back
+    knows the ladder was exhausted and it is content, not type size, that has
+    to give — `generate_brief_report` uses exactly that signal to decide
+    whether to drop a takeaway.
+
+    Renderer-agnostic on purpose: it takes a callable, not a Brief or a card,
+    so the brief report and the workout report card share one implementation
+    of "is this one page" rather than each growing their own.
+
+    Costs one layout pass per preset (measured ~65ms each) and writes the PDF
+    from the winning `Document` rather than re-rendering it — `render()` then
+    `write_pdf()` on the same object is the whole reason this doesn't call
+    `HTML.write_pdf()` directly.
+    """
+    import weasyprint
+
+    if not presets:
+        raise ValueError("presets must not be empty")
+
+    doc = None
+    index = 0
+    for index, preset in enumerate(presets):
+        doc = weasyprint.HTML(
+            string=build_html(preset), url_fetcher=_report_url_fetcher()
+        ).render()
+        if len(doc.pages) == 1:
+            break
+    return doc.write_pdf(), len(doc.pages), index
+
+
+def cards_in_left_rail(n_cards: int, has_plan: bool) -> int:
+    """How many signal cards stay in the left rail, the rest going BELOW the
+    Training Plan in the right one.
+
+    Before this existed, every card went left and the region under the plan
+    rail was dead space — on the 2026-07-22 render the entire right rail of
+    page 2 was empty (max word x0=303.5 against a rail starting at x=333)
+    while cards spilled off page 1. Filling it roughly doubles the usable
+    signal area, which is what lets the density ladder stop at a roomier rung
+    and keep the charts legible.
+
+    Measured on the 2026-07-22 render: the plan section runs ~347pt against
+    ~212pt for a signal card, so it is worth ~2 cards. Balancing
+    ``left == right + 2`` gives ``left = (n + 2) / 2``, floored — floored, not
+    rounded up, because the plan is a bit under two full cards and rounding up
+    tips the left rail back into being the taller one (at n=3, left-3 measures
+    3.0 cards against 1.7, while left-2 measures 2.0 against 2.7).
+
+    With no plan section there is no second rail at all and everything stays
+    left.
+    """
+    if not has_plan or n_cards <= 0:
+        return n_cards
+    return min(n_cards, (n_cards + 2) // 2)
+
 
 def value_axis_bounds(values) -> tuple[float, float]:
     """Padded (ylo, yhi) for a chart's value axis, scaled to the DATA band —
@@ -67,10 +154,23 @@ def value_axis_bounds(values) -> tuple[float, float]:
     return lo - pad, hi + pad
 
 
+#: Chart aspect. A wide, short band rather than the old 16:9 (8, 4.5): in a
+#: ~289pt-wide rail a 16:9 figure is ~162pt tall, and three of them are most of
+#: a page — charts were measurably what pushed the brief onto page 2. A band
+#: reads better at this width anyway; the shape of a trend does not need square
+#: inches, and the height that buys is what keeps every takeaway on one page.
+CHART_FIGSIZE = (8.0, 2.8)
+#: Y ticks are pinned so three cards stacked in a rail read as one system
+#: instead of three charts that happen to share a palette.
+CHART_Y_TICKS = 4
+CHART_X_TICKS = 5
+
+
 def render_chart_png(
     series: Sequence[tuple[str, float]],
     chart_type: str,
     value_fmt: Callable[[float], str],
+    window_label: str | None = None,
 ) -> bytes:
     """Render a styled standalone chart PNG for one metric series.
 
@@ -79,6 +179,12 @@ def render_chart_png(
     function never queries the DB or recomputes anything, only formats what
     it's given. `chart_type` is one of "line" | "bar" | "combo" (v1 scope;
     see the design doc for why calendar/spark are excluded).
+
+    `window_label` (e.g. "last 30 days") is captioned on the chart itself.
+    It is not decoration: takeaways choose their own window, so one brief
+    routinely carries a 30-day, a 14-day and a 60-day chart, and before this
+    label existed nothing on the page said which was which — three charts of
+    identical size implying three comparable windows.
 
     Builds its own `Figure()` object (the thread-safe object-oriented API)
     rather than using `pyplot`'s stateful global current-figure functions —
@@ -94,7 +200,7 @@ def render_chart_png(
     import numpy as np
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
-    from matplotlib.ticker import FuncFormatter
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
 
     theme = branding.load_theme()
     paper = theme["colors"]["paper"]
@@ -106,7 +212,7 @@ def render_chart_png(
     values = [v for _, v in series]
     labels = [d[5:] for d in dates]  # MM-DD, matching the ASCII chart tool
 
-    fig = Figure(figsize=(8, 4.5), dpi=150, facecolor=paper)
+    fig = Figure(figsize=CHART_FIGSIZE, dpi=150, facecolor=paper)
     FigureCanvasAgg(fig)  # explicit non-global canvas attach, never via pyplot
     ax = fig.add_subplot(111)
     ax.set_facecolor(paper)
@@ -146,14 +252,26 @@ def render_chart_png(
         ax.spines[spine].set_visible(False)
     ax.spines["left"].set_color(dim)
     ax.spines["bottom"].set_color(dim)
-    ax.tick_params(colors=ink)
+    ax.tick_params(colors=ink, labelsize=8)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: value_fmt(v)))
+    # Pinned tick COUNT, not a pinned step: every card in a brief then carries
+    # the same number of gridlines regardless of its window length, so the
+    # three charts read as one system.
+    ax.yaxis.set_major_locator(MaxNLocator(CHART_Y_TICKS))
 
-    # Thin x labels for long windows so they stay readable, same idea as the
-    # ASCII tool's weekly-averaging for long line charts.
-    step = max(1, len(labels) // 10) if len(labels) > 14 else 1
-    ax.set_xticks(x[::step])
-    ax.set_xticklabels(labels[::step], rotation=45, ha="right", fontsize=8)
+    # Evenly spaced x labels, horizontal. The old `len // 10` step with a 45°
+    # rotation was unreadable once the figure became a band — rotated labels
+    # eat the height the band exists to save, and there is no room to spend.
+    if len(labels) > CHART_X_TICKS:
+        step = max(1, (len(labels) - 1) // (CHART_X_TICKS - 1))
+        idx = list(range(0, len(labels), step))[:CHART_X_TICKS]
+    else:
+        idx = list(range(len(labels)))
+    ax.set_xticks(x[idx])
+    ax.set_xticklabels([labels[i] for i in idx], fontsize=8)
+
+    if window_label:
+        ax.set_title(window_label, loc="left", fontsize=8, color=dim, pad=4)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
@@ -204,15 +322,21 @@ def _font_face_css(theme: dict) -> tuple[str, str]:
     return face, f"'BrandMono', {mono_stack}"
 
 
-def _build_css(theme: dict) -> str:
-    """The report stylesheet, built from the brand theme.
+def _build_css(theme: dict, density: dict | None = None) -> str:
+    """The report stylesheet, built from the brand theme at a given density.
 
     PRESS grammar (the default theme's rules, kept even under color
     overrides): flat paper canvas, ink rules for all structure, NO rounded
     corners / shadows / gradients, sans 800–900 tight-tracked for
     structure, serif italic for commentary, mono for data. Tones and
     verdicts are typographic — the accent appears only on critical/missed
-    (and the stamp)."""
+    (and the stamp).
+
+    `density` is one of `DENSITY_PRESETS` (default: the roomiest). It scales
+    the handful of dimensions that actually decide page count — body type,
+    chart height, inter-card gap — rather than selecting a different sheet,
+    so a rule fixed at one density can never be missing at another."""
+    d = density or DENSITY_PRESETS[0]
     c = theme["colors"]
     f = theme["fonts"]
     paper, ink, dim, accent, rule = (
@@ -225,7 +349,7 @@ html {{ background: {paper}; }}
 body {{
   font-family: {f["display_stack"]};
   color: {ink};
-  font-size: 11.3pt;
+  font-size: {d["body_pt"]}pt;
   line-height: 1.42;
   margin: 0;
 }}
@@ -288,9 +412,24 @@ div.masthead h1 {{
    (measured: up to 14pt of overflow at 56%+44%+1.8em). 54+42=96% leaves
    ~4% ≈ the two 0.9em paddings. */
 table.page-layout {{ width: 100%; table-layout: fixed; border-collapse: collapse; }}
-table.page-layout > tr > td {{ vertical-align: top; padding: 0; }}
-td.col-signals {{ width: 54%; padding-right: 0.9em; }}
-td.col-plan {{ width: 42%; padding-left: 0.9em; border-left: 2px solid {rule}; }}
+/* Descendant selector, NOT `> tr > td`: HTML parsing inserts an implicit
+   <tbody>, so the child combinator never matched and these cells silently kept
+   `vertical-align: middle` — which is why the Training Plan rail floated in
+   the vertical centre of the page with a large void above it while the signals
+   rail started at the top. */
+/* Only the axis that doesn't conflict. `padding: 0` here would WIN against
+   `td.col-plan`'s padding-left (this selector is more specific: one class plus
+   two elements), which stripped the right rail's gutter and printed the plan
+   text hard against the divider rule. Horizontal padding belongs to the
+   column classes alone. */
+table.page-layout td {{ vertical-align: top; padding-top: 0; padding-bottom: 0; }}
+td.col-signals {{ width: 54%; padding-left: 0; padding-right: 0.9em; }}
+td.col-plan {{
+  width: 42%;
+  padding-left: 0.9em;
+  padding-right: 0;
+  border-left: 2px solid {rule};
+}}
 /* No active plan: signals run the full page width, no second rail. */
 div.col-signals-full {{ width: 100%; }}
 
@@ -301,7 +440,7 @@ div.col-signals-full {{ width: 100%; }}
 section.signal-card {{
   border-top: 2px solid {rule};
   padding: 0.55em 0 0.35em 0;
-  margin-bottom: 0.75em;
+  margin-bottom: {d["card_gap_em"]}em;
   page-break-inside: avoid;
 }}
 section.signal-card h2 {{
@@ -319,7 +458,27 @@ p.summary {{
   color: {dim};
   margin: 0 0 0.35em 0;
 }}
-img.chart {{ max-width: 100%; margin: 0.3em 0; }}
+/* Capped by HEIGHT, not just width. `max-width: 100%` alone lets the chart's
+   own aspect ratio decide how much of the page it eats, which is why the
+   density ladder could not previously buy any vertical room — `width: auto`
+   keeps the aspect while `max-height` makes the cap real. */
+img.chart {{
+  max-width: 100%;
+  max-height: {d["chart_h_pt"]}pt;
+  width: auto;
+  margin: 0.3em 0;
+}}
+/* Stated, never silent: when the density ladder bottoms out and takeaways had
+   to be dropped to hold one page, the page says how many. */
+p.omitted-note {{
+  font-family: {mono};
+  font-size: 0.68em;
+  letter-spacing: 0.06em;
+  color: {dim};
+  border-top: 1px solid {dim};
+  padding-top: 0.35em;
+  margin: 0.5em 0 0 0;
+}}
 div.details {{ font-size: 0.93em; }}
 div.details p {{ margin: 0; }}
 div.details table {{ border-collapse: collapse; margin: 0.4em 0; font-family: {mono}; font-size: 0.9em; }}
@@ -351,8 +510,15 @@ h2.plan-heading {{
 }}
 /* Stat strip → PRESS numerals: no fills, no radii — big 900 ink numerals
    over tiny tracked-caps dim labels, ruled above. */
+/* Three narrow tiles on top, one wide tile beneath. NOT a 2x2: "This Week"
+   carries two numbers and a separator ("29.3 mi / 29.5 mi"), which measured
+   ~97pt inside a ~107pt half-rail tile whose neighbour started 10pt later —
+   it rendered as `29.3 mi / 29.5 mi 0`, reading as one number. The three
+   short values (a percentage, a day count, a slip count) share the top row
+   comfortably; the compound value gets the full rail. */
 table.stat-strip {{ width: 100%; border-collapse: collapse; margin: 0 0 0.6em 0; table-layout: fixed; }}
 td.stat-tile {{ padding: 0.4em 0.3em 0.45em 0; text-align: left; border-bottom: 1px solid {dim}; }}
+td.stat-wide {{ padding-right: 0; }}
 td.stat-tile .value {{ font-size: 1.25em; font-weight: 900; letter-spacing: -0.02em; color: {ink}; }}
 td.stat-tile .label {{
   margin-top: 0.15em;
@@ -391,10 +557,17 @@ div.today-callout p.coaching-line {{
    render MM-DD (the year is noise in a 7-day window). Column widths sum
    to 100%: date/type/planned/actual/verdict. */
 table.week-table {{ width: 100%; table-layout: fixed; border-collapse: collapse; font-family: {mono}; font-size: 0.74em; }}
-table.week-table col.c-date {{ width: 17%; }}
-table.week-table col.c-type {{ width: 19%; }}
-table.week-table col.c-mi {{ width: 21%; }}
-table.week-table col.c-verdict {{ width: 22%; }}
+/* Widths are budgeted from the LONGEST string each column can hold at the
+   mono size, not split evenly. The old 19% type column could not hold
+   "interval": measured 2026-07-22, `interval` and `5.0` came back from
+   pdfplumber as the single word `interval5.0` — the columns were touching.
+   Longest values: date "07-22" (5ch), type "interval" (8ch), mileage
+   "4.0 mi" (6ch), verdict "scheduled" (9ch at 0.9em). Sums to 93%, leaving
+   room for the four 0.3em cell gaps. */
+table.week-table col.c-date {{ width: 14%; }}
+table.week-table col.c-type {{ width: 22%; }}
+table.week-table col.c-mi {{ width: 17%; }}
+table.week-table col.c-verdict {{ width: 23%; }}
 table.week-table th {{
   text-align: left;
   font-size: 0.68em;
@@ -445,9 +618,18 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
         tile2_value = html.escape(plan_section["goal_type"])
         tile2_label = "Goal"
 
-    # 2x2, not a 4-across strip: the right rail is roughly 44% of page
-    # width now (2-column page layout), too narrow for 4 tiles side by
-    # side to hold "11.0 mi / 16.0 mi" without wrapping badly.
+    # Walk miles are named, never folded into the run total and never dropped
+    # on the floor: the plan carries deliberate walk days, and a reader has to
+    # be able to reconcile "run miles" against what the watch actually logged.
+    # Kept terse: this label sits under a wide numeral in a ~220pt rail, and
+    # the long form ("· plus 9.3 mi walked") wrapped onto a second line that
+    # collided with the callout below it.
+    walk_mi = plan_section.get("week_walk_mi") or 0
+    walk_suffix = f" · +{walk_mi:.1f} walked" if walk_mi else ""
+
+    # 3-up + 1 wide, not 2x2: the three short values fit a third of the rail
+    # each, while "This Week" is a compound value that overflowed its half-rail
+    # tile and collided with the tile beside it (see the stat-strip CSS note).
     stat_strip = f"""
     <table class="stat-strip">
       <tr>
@@ -459,15 +641,15 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
           <div class="value">{tile2_value}</div>
           <div class="label">{tile2_label}</div>
         </td>
-      </tr>
-      <tr>
-        <td class="stat-tile">
-          <div class="value">{_fmt_mi(plan_section["week_actual_mi"])} / {_fmt_mi(plan_section["week_planned_mi"])}</div>
-          <div class="label">This Week</div>
-        </td>
         <td class="stat-tile">
           <div class="value">{plan_section["slips"]}</div>
           <div class="label">Slips</div>
+        </td>
+      </tr>
+      <tr>
+        <td class="stat-tile stat-wide" colspan="3">
+          <div class="value">{_fmt_mi(plan_section["week_actual_mi"])} / {_fmt_mi(plan_section["week_planned_mi"])}</div>
+          <div class="label">Run mi · actual / planned{walk_suffix}</div>
         </td>
       </tr>
     </table>
@@ -532,11 +714,22 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
     """
 
 
-def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | None) -> str:
+def _build_html(
+    brief: "Brief",
+    charts: dict[str, bytes],
+    plan_section: dict | None,
+    density: dict | None = None,
+    omitted: int = 0,
+) -> str:
     """Assemble the full report HTML string. Separated from `render_brief_pdf`
     so layout/structure (e.g. which row gets `colspan="2"`) is testable via
     plain string assertions, without needing to introspect WeasyPrint's PDF
-    layout output."""
+    layout output.
+
+    `density` is a `DENSITY_PRESETS` entry (default: roomiest) — `fit_one_page`
+    calls this repeatedly with denser presets until the document is one page.
+    `omitted` is how many takeaways the caller dropped to make that happen; a
+    non-zero value is printed on the page, never swallowed."""
     import markdown as md_lib
 
     cards: list[str] = []
@@ -559,22 +752,29 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
         </section>
         """)
 
-    # Stacked single-column, not paired 2-up: the 2-column split now
-    # happens at the whole-page level (signals rail vs. plan rail — see
-    # the `table.page-layout` CSS comment), so each card gets the left
-    # rail's full width rather than half of it again.
-    signals_html = "".join(cards)
     plan_html = _render_plan_section_html(plan_section)
+    omitted_html = (
+        f'<p class="omitted-note">{omitted} further '
+        f'{"signal" if omitted == 1 else "signals"} omitted for space.</p>'
+        if omitted > 0 else ""
+    )
+
+    # Cards that don't fit the left rail continue BELOW the Training Plan in
+    # the right one rather than leaving that region empty — see
+    # `cards_in_left_rail`. Reading order stays left-rail-down, then right.
+    split = cards_in_left_rail(len(cards), bool(plan_html))
+    signals_html = "".join(cards[:split])
+    overflow_html = "".join(cards[split:])
 
     # No plan section → no second rail (no dangling empty column with a
     # divider rule); signals just take the full page width.
     body_html = (
         f'<table class="page-layout"><tr>'
-        f'<td class="col-signals">{signals_html}</td>'
-        f'<td class="col-plan">{plan_html}</td>'
+        f'<td class="col-signals">{signals_html}{omitted_html}</td>'
+        f'<td class="col-plan">{plan_html}{overflow_html}</td>'
         f'</tr></table>'
         if plan_html
-        else f'<div class="col-signals col-signals-full">{signals_html}</div>'
+        else f'<div class="col-signals col-signals-full">{signals_html}{omitted_html}</div>'
     )
 
     theme = branding.load_theme()
@@ -582,7 +782,7 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
     eyebrow = f"{ident['brand_line']} · MORNING BRIEF · {brief.date}"
     return f"""<!doctype html>
 <html>
-<head><meta charset="utf-8"><style>{_build_css(theme)}</style></head>
+<head><meta charset="utf-8"><style>{_build_css(theme, density)}</style></head>
 <body>
   <div class="masthead">
     <table class="masthead-row"><tr>
@@ -597,9 +797,13 @@ def _build_html(brief: "Brief", charts: dict[str, bytes], plan_section: dict | N
 
 
 def render_brief_pdf(
-    brief: "Brief", charts: dict[str, bytes], plan_section: dict | None = None
-) -> bytes:
-    """Render a saved daily brief into a polished PDF report.
+    brief: "Brief",
+    charts: dict[str, bytes],
+    plan_section: dict | None = None,
+    omitted: int = 0,
+    presets: Sequence[dict] = DENSITY_PRESETS,
+) -> tuple[bytes, int]:
+    """Render a saved daily brief into a polished, single-page PDF report.
 
     `charts` is pre-rendered chart PNG bytes keyed by `str(index)` from
     `enumerate(brief.takeaways)` — NOT by metric name (two takeaways can cite
@@ -612,18 +816,24 @@ def render_brief_pdf(
     built fresh from plans.py by the caller at render time — see the design
     doc's plan_section shape. None omits the section entirely, preserving
     the exact pre-2026-07-09 output shape.
-    """
-    import weasyprint
 
-    doc = _build_html(brief, charts, plan_section)
-    return weasyprint.HTML(string=doc, url_fetcher=_report_url_fetcher()).write_pdf()
+    `omitted` is how many takeaways the caller already dropped before calling;
+    it is printed on the page. Returns `(pdf_bytes, page_count)` — a caller
+    that gets 2 back has exhausted the density ladder and must drop content
+    (see `generate_brief_report`), because nothing this function can do to
+    type size will fit what it was handed.
+    """
+    return fit_one_page(
+        lambda preset: _build_html(brief, charts, plan_section, preset, omitted),
+        presets,
+    )[:2]
 
 
 # --- workout report card ---------------------------------------------------
 # Same PRESS grammar as the brief report: flat paper, ink rules, no rounded
 # corners / shadows / gradients, accent reserved for the failing grades.
 
-def _report_card_css(theme: dict) -> str:
+def _report_card_css(theme: dict, density: dict | None = None) -> str:
     """Report-card-specific styles, appended to the shared `_build_css` sheet.
 
     The grade block is the whole point of the page, so it is set enormous in
@@ -637,6 +847,7 @@ def _report_card_css(theme: dict) -> str:
     widths plus cell padding must sum under 100% or WeasyPrint paints past the
     @page margin.
     """
+    d = density or DENSITY_PRESETS[0]
     c = theme["colors"]
     f = theme["fonts"]
     dim, accent, rule = c["dim"], c["accent"], c["rule"]
@@ -650,7 +861,7 @@ table.grade-hero {{
 }}
 table.grade-hero td {{ vertical-align: middle; padding: 0; }}
 td.grade-letter {{
-  font-size: 5.2em;
+  font-size: {d["hero_em"]}em;
   font-weight: 900;
   letter-spacing: -0.05em;
   line-height: 0.85;
@@ -729,7 +940,7 @@ ul.card-notes {{
 /* Deliberately not full-bleed: the per-lap HR bars are supporting evidence for
    the table above them, not the page's subject, and at 100% they out-shouted
    the grades. */
-img.split-chart {{ width: 84%; margin-top: 0.7em; }}
+img.split-chart {{ width: {d["split_chart_pct"]}%; margin-top: 0.7em; }}
 /* Four short paragraphs in the hero's meta cell, one per graded area. Smaller
    than the reference line it replaced, because there are now four of them and
    they have to sit beside the grade letter without pushing the tables down the
@@ -1065,7 +1276,9 @@ def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
     """
 
 
-def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str:
+def _build_report_card_html(
+    card: dict, split_chart: bytes | None = None, density: dict | None = None
+) -> str:
     """Assemble the report-card HTML. Separated from `render_report_card_pdf`
     for the same reason `_build_html` is — layout is testable with plain string
     assertions instead of introspecting WeasyPrint's output.
@@ -1143,7 +1356,7 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
 
     return f"""<!doctype html>
 <html>
-<head><meta charset="utf-8"><style>{_build_css(theme)}{_report_card_css(theme)}</style></head>
+<head><meta charset="utf-8"><style>{_build_css(theme, density)}{_report_card_css(theme, density)}</style></head>
 <body>
   <div class="masthead">
     <table class="masthead-row"><tr>
@@ -1174,13 +1387,17 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
 
 
 def render_report_card_pdf(card: dict, split_chart: bytes | None = None) -> bytes:
-    """Render a built report card into a PDF.
+    """Render a built report card into a single-page PDF.
 
     Takes the already-built card dict and pre-rendered chart bytes rather than
     querying or grading anything itself — the same separation `render_brief_pdf`
     keeps, so the table and the PDF can never report different grades.
-    """
-    import weasyprint
 
-    doc = _build_report_card_html(card, split_chart)
-    return weasyprint.HTML(string=doc, url_fetcher=_report_url_fetcher()).write_pdf()
+    A card with 6+ splits plus the four-paragraph coach read used to overflow
+    onto a second page (measured on activity 23685126977). It now shares the
+    brief's density ladder: the card has no droppable content, so the ladder is
+    the whole mechanism rather than a first stage.
+    """
+    return fit_one_page(
+        lambda preset: _build_report_card_html(card, split_chart, preset)
+    )[0]

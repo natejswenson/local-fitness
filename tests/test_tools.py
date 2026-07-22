@@ -2151,7 +2151,8 @@ def plan_seeded(tmp_path, monkeypatch):
 def test_weekly_rollup_empty_workouts_yields_zero_totals():
     rollup = tools.weekly_rollup([], "2026-07-12")
     assert rollup == {
-        "week_planned_mi": 0.0, "week_actual_mi": 0.0, "slips": 0, "days": [],
+        "week_planned_mi": 0.0, "week_actual_mi": 0.0,
+        "week_run_mi": 0.0, "week_walk_mi": 0.0, "slips": 0, "days": [],
     }
 
 
@@ -2161,12 +2162,17 @@ def test_weekly_rollup_single_workout():
          "target_distance_m": 5000.0, "actual_distance_m": 5100.0},
     ]
     rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    # No actual_run/walk keys on the input, so run_mi falls back to actual_mi
+    # (a pre-pace-gating caller must not silently lose its mileage) and walk
+    # is zero.
     assert rollup["days"] == [
         {"date": "2026-07-12", "verdict": "done", "type": "easy",
-         "planned_mi": 3.11, "actual_mi": 3.17},
+         "planned_mi": 3.11, "actual_mi": 3.17, "run_mi": 3.17, "walk_mi": 0.0},
     ]
     assert rollup["week_planned_mi"] == 3.1
     assert rollup["week_actual_mi"] == 3.2
+    assert rollup["week_run_mi"] == 3.2
+    assert rollup["week_walk_mi"] == 0.0
     assert rollup["slips"] == 0
 
 
@@ -2331,7 +2337,7 @@ def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
 
     async def fake_generate(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        *, model=None, timeout=30.0, notes_text=None,
+        *, model=None, timeout=30.0, notes_text=None, **_kw,
     ):
         calls.append((today_workout, adherence_pct, days_to_race, goal_type, notes_text))
         return "Go hit today's easy 4 clean."
@@ -2387,7 +2393,10 @@ def test_generate_brief_report_coaching_line_failure_falls_back(
     # mistaken for (or masked by) a real space.
     squashed = "".join(plan_text.split())
     # fallback_coaching_line's deterministic phrasing for a partial prior day.
-    assert "".join("Today: easy 2.49 mi @ 9:23/mi.".split()) in squashed
+    # It deliberately does NOT restate the prescription — the Today callout
+    # prints that directly above it (see plan_coach).
+    assert "".join("Yesterday came up short of the prescription.".split()) in squashed
+    assert "".join("Today: easy 2.49 mi @ 9:23/mi.".split()) not in squashed
 
 
 def test_generate_brief_report_no_active_plan_has_no_plan_section(seeded, reports_tmp):
@@ -2424,7 +2433,7 @@ def test_generate_brief_report_threads_saved_notes_into_coaching_line(
 
     async def fake_generate(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        *, model=None, timeout=30.0, notes_text=None,
+        *, model=None, timeout=30.0, notes_text=None, **_kw,
     ):
         calls.append(notes_text)
         return "Go hit today's easy 4 clean."
@@ -2962,3 +2971,86 @@ def test_report_card_is_local_only():
     assert "workout_report_card" in [t.name for t in tools.LOCAL_ONLY_TOOLS]
     assert "workout_report_card" not in [t.name for t in tools.ALL_TOOLS]
     assert "mcp__fitness__workout_report_card" not in tools.allowed_tool_names()
+
+
+# --- the one-page guarantee (end-to-end) ------------------------------------
+# render_brief_pdf shrinks; generate_brief_report shrinks THEN truncates. The
+# guarantee that a saved report is exactly one page lives here, at the tool,
+# because only the tool is allowed to drop content.
+
+_FAT_TAKEAWAY = {
+    "headline": "A headline of the length the generator actually emits daily",
+    "summary": "A standfirst of roughly twenty-five words, which is what the "
+               "brief generator writes in practice, so the measured card "
+               "height is honest rather than optimistic.",
+    "tone": "neutral",
+    "metric": {"metric": "rhr", "days": 14},
+    "details": "Four or five sentences of deep-dive prose. It cites a number, "
+               "explains what that number means against baseline, and then "
+               "says what to do about it today. That is the realistic worst "
+               "case for how tall one signal card gets.",
+}
+
+
+@pytest.mark.parametrize("n_takeaways", [1, 2, 3, 4, 5])
+def test_generate_brief_report_is_always_exactly_one_page(
+    seeded, reports_tmp, n_takeaways, monkeypatch
+):
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [dict(_FAT_TAKEAWAY) for _ in range(n_takeaways)])
+
+    async def fake_line(*a, **k):
+        return "Coaching line."
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line_cached", fake_line)
+
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err, payload
+    with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
+        assert len(doc.pages) == 1
+
+
+def test_generate_brief_report_states_what_it_dropped(seeded, reports_tmp, monkeypatch):
+    """When the density ladder is exhausted the report truncates — and says so
+    on the page. A silently shortened brief is the failure mode this exists to
+    prevent."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [dict(_FAT_TAKEAWAY) for _ in range(5)])
+
+    async def fake_line(*a, **k):
+        return "Coaching line."
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line_cached", fake_line)
+
+    payload, err = call(tools.generate_brief_report, {"date": d})
+    assert not err, payload
+    with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    assert "omitted for space" in text
+    # The count must match reality: headlines present + omitted == 5.
+    stated = int(re.search(r"(\d+) further signals? omitted", text).group(1))
+    assert stated == 5 - text.count("A headline of the length")
+
+
+# --- chart window anchoring -------------------------------------------------
+
+def test_fetch_metric_series_window_ends_on_the_given_date(seeded):
+    """Regression: the window was anchored to date.today() with NO upper
+    bound, so re-rendering an OLD brief drew charts running to today and could
+    show data the brief's own prose never saw."""
+    dates, _values = tools._fetch_metric_series("rhr", 3650, end="2026-07-10")
+    assert dates, "fixture should have rhr rows in range"
+    assert max(dates) <= "2026-07-10"
+
+
+def test_fetch_metric_series_window_starts_days_before_end(seeded):
+    dates, _values = tools._fetch_metric_series("rhr", 7, end="2026-07-10")
+    assert min(dates) >= "2026-07-03"
+    assert max(dates) <= "2026-07-10"
+
+
+def test_fetch_metric_series_defaults_to_today_for_live_callers(seeded):
+    """chart()/generate_chart() must keep their existing behavior."""
+    dated = tools._fetch_metric_series("rhr", 3650, end=date.today().isoformat())
+    default = tools._fetch_metric_series("rhr", 3650)
+    assert dated == default

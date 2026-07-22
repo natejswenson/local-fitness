@@ -368,35 +368,47 @@ def _chart_value_fmt(metric: str):
     return lambda v: f"{int(round(v))}"
 
 
-def _fetch_metric_series(metric: str, days: int) -> tuple[list[str], list[float]]:
+def _fetch_metric_series(
+    metric: str, days: int, end: str | None = None
+) -> tuple[list[str], list[float]]:
     """Shared whitelisted fetch for chart()/generate_chart() — dates + values
-    for `metric` over the last `days` days.
+    for `metric` over the `days` days ending on `end` (default today).
 
     Validates `metric` against `_CHART_METRICS` before building any SQL —
     the check lives inside this helper, not left to each caller to remember;
     both `chart()` and `generate_chart()` inherit it from here. Raises
     ValueError on an unwhitelisted metric so callers translate it into their
     own `_err()` response.
+
+    `end` exists because the window used to be open-ended: it was anchored to
+    ``date.today()`` with no upper bound, so re-rendering a PAST brief drew
+    charts running to today and could show data the brief's prose never saw.
+    ``generate_brief_report`` passes the brief's own date, matching the rule
+    ``_build_plan_section`` already follows. Live callers (``chart``,
+    ``generate_chart``) keep today's behavior via the default.
     """
     if metric not in _CHART_METRICS:
         raise ValueError(f"unknown metric '{metric}'")
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    end_date = date.fromisoformat(end) if end else date.today()
+    cutoff = (end_date - timedelta(days=days)).isoformat()
+    end_iso = end_date.isoformat()
 
     # metric is whitelisted above; the column name interpolated here can only be
     # a frozen-set member, never raw user input — same contract as get_metric.
     if metric in _CHART_BASELINE_METRICS:
         sql = (f"SELECT date, {metric} AS v FROM baselines "
-               f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date")
+               f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date")
     elif metric == "intensity_minutes_weighted":
         sql = ("SELECT date, (intensity_minutes_moderate + 2 * intensity_minutes_vigorous) AS v "
-               "FROM daily_metrics WHERE date >= ? AND intensity_minutes_moderate IS NOT NULL "
+               "FROM daily_metrics WHERE date >= ? AND date <= ? "
+               "AND intensity_minutes_moderate IS NOT NULL "
                "AND intensity_minutes_vigorous IS NOT NULL ORDER BY date")
     else:
         sql = (f"SELECT date, {metric} AS v FROM daily_metrics "
-               f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date")
+               f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date")
 
     with db.connect() as conn:
-        rows = conn.execute(sql, (cutoff,)).fetchall()
+        rows = conn.execute(sql, (cutoff, end_iso)).fetchall()
     dates = [r["date"] for r in rows]       # ISO YYYY-MM-DD
     values = [float(r["v"]) for r in rows]
     return dates, values
@@ -1880,16 +1892,25 @@ def weekly_rollup(workouts: list[dict], target_date: str) -> dict:
         target_m = w.get("target_distance_m")
         planned_mi = units.to_miles(target_m) if target_m is not None else None
         if w["verdict"] in ("pending", "compliant"):
-            actual_mi = None
+            actual_mi = run_mi = walk_mi = None
         else:
             actual_m = w.get("actual_distance_m")
             actual_mi = units.to_miles(actual_m) if actual_m is not None else None
+            # Split by MEASURED locomotion (plans.build_plan_detail), not by
+            # Garmin's label. Before this, a 3.23 mi walking-pad session filed
+            # as `treadmill_running` counted into run mileage, so an interval
+            # day whose run was 5.95 mi reported 9.2 mi actual.
+            run_m, walk_m = w.get("actual_run_distance_m"), w.get("actual_walk_distance_m")
+            run_mi = units.to_miles(run_m) if run_m is not None else actual_mi
+            walk_mi = units.to_miles(walk_m) if walk_m is not None else 0.0
         days.append({
             "date": w["date"],
             "verdict": w["verdict"],
             "type": w["type"],
             "planned_mi": planned_mi,
             "actual_mi": actual_mi,
+            "run_mi": run_mi,
+            "walk_mi": walk_mi,
         })
     week_planned_mi = round(sum(d["planned_mi"] or 0 for d in days), 1)
     week_actual_mi = round(sum(d["actual_mi"] or 0 for d in days), 1)
@@ -1897,6 +1918,10 @@ def weekly_rollup(workouts: list[dict], target_date: str) -> dict:
     return {
         "week_planned_mi": week_planned_mi,
         "week_actual_mi": week_actual_mi,
+        # Run and walk sum back to week_actual_mi by construction, so the
+        # strip's "22.3 / 29.5" and its "7.0 walk" always reconcile.
+        "week_run_mi": round(sum(d["run_mi"] or 0 for d in days), 1),
+        "week_walk_mi": round(sum(d["walk_mi"] or 0 for d in days), 1),
         "slips": slips,
         "days": days,
     }
@@ -2339,7 +2364,8 @@ def _build_plan_section(target_date: str) -> dict | None:
         return None
 
     week_planned_mi = rollup["week_planned_mi"]
-    week_actual_mi = rollup["week_actual_mi"]
+    week_actual_mi = rollup["week_run_mi"]
+    week_walk_mi = rollup["week_walk_mi"]
     slips = rollup["slips"]
     adherence_pct = detail.get("adherence_pct")
     if adherence_pct is None:
@@ -2373,7 +2399,10 @@ def _build_plan_section(target_date: str) -> dict | None:
         "goal_type": detail.get("goal_type") or "goal",
         "days_to_race": days_to_race,
         "week_planned_mi": week_planned_mi,
+        # RUN miles, not foot miles — the strip says so, and week_walk_mi
+        # carries the rest so the two reconcile to what was actually covered.
         "week_actual_mi": week_actual_mi,
+        "week_walk_mi": week_walk_mi,
         "slips": slips,
         "today": today_payload,
         "last_7_days": last_7_days,
@@ -2409,13 +2438,19 @@ async def generate_brief_report(args: dict) -> dict:
         if takeaway.metric is None:
             continue
         try:
-            m_dates, m_values = _fetch_metric_series(takeaway.metric.metric, takeaway.metric.days)
+            # Window ENDS on the brief's date, not today — see _fetch_metric_series.
+            m_dates, m_values = _fetch_metric_series(
+                takeaway.metric.metric, takeaway.metric.days, end=target_date)
             if not m_values:
                 continue
             fmt = _chart_value_fmt(takeaway.metric.metric)
+            # Takeaways pick their own windows, so one brief routinely carries
+            # 14/30/60-day charts at identical size. Caption which is which.
+            label = f"last {takeaway.metric.days} days"
             async with visuals.RENDER_LOCK:
                 png_bytes = await asyncio.to_thread(
-                    visuals.render_chart_png, list(zip(m_dates, m_values)), "line", fmt
+                    visuals.render_chart_png,
+                    list(zip(m_dates, m_values)), "line", fmt, label,
                 )
             charts_by_index[str(index)] = png_bytes
         except Exception:
@@ -2450,6 +2485,7 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
                 notes_text=notes.render_for_prompt(),
+                user_name=config.user_name(),
             )
         except Exception:
             LOG.warning(
@@ -2476,13 +2512,45 @@ async def generate_brief_report(args: dict) -> dict:
         except Exception:  # noqa: BLE001 — an advisory signal must never break the PDF
             LOG.exception("plan_coach_grounding failed (advisory, ignored)")
 
+    # Shrink first, then truncate. The density ladder inside render_brief_pdf
+    # handles the common case; only when even the densest rung still spills do
+    # we start dropping takeaways, lowest-priority first (brief_planner emits
+    # them in priority order, so the tail is the cheapest thing to lose). The
+    # drop is always stated on the page — see `omitted` -> p.omitted-note.
+    #
+    # Retries after the first attempt use the densest preset ONLY: the roomier
+    # rungs already failed with strictly MORE content, so re-walking the whole
+    # ladder each round would just pay for known-losing layouts. Bounds the
+    # worst case at len(PRESETS) + len(takeaways) - 1 layout passes.
+    kept = list(brief.takeaways)
+    omitted = 0
     try:
         async with visuals.RENDER_LOCK:
-            pdf_bytes = await asyncio.to_thread(
-                visuals.render_brief_pdf, brief, charts_by_index, plan_section
-            )
+            while True:
+                trial = (brief if not omitted
+                         else brief.model_copy(update={"takeaways": kept}))
+                trial_charts = {
+                    k: v for k, v in charts_by_index.items() if int(k) < len(kept)
+                }
+                presets = (visuals.DENSITY_PRESETS if not omitted
+                           else visuals.DENSITY_PRESETS[-1:])
+                pdf_bytes, pages = await asyncio.to_thread(
+                    visuals.render_brief_pdf,
+                    trial, trial_charts, plan_section, omitted, presets,
+                )
+                if pages == 1 or len(kept) <= 1:
+                    break
+                kept = kept[:-1]
+                omitted += 1
     except Exception as e:
         return _err(f"PDF render failed: {e}")
+    if pages != 1:
+        # A single takeaway that still overflows is a content bug upstream
+        # (a runaway `details` block), not something to paper over silently.
+        LOG.warning(
+            "brief %s still %d pages at the densest preset with %d takeaway(s)",
+            target_date, pages, len(kept),
+        )
 
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)
@@ -2659,7 +2727,8 @@ async def workout_report_card(args: dict) -> dict:
     profile = coach.resolve_coach_profile()
     try:
         card["coach_read"] = await workout_coach.generate_read_cached(
-            profile, card, notes_text=notes.render_for_prompt())
+            profile, card, notes_text=notes.render_for_prompt(),
+            user_name=config.user_name())
     except Exception:
         LOG.warning(
             "workout read generation failed for activity %s, using fallback",
