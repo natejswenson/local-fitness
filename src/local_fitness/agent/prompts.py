@@ -7,15 +7,74 @@ consumers — the WeasyPrint PDF (`visuals.py`) and the markdown renderer
 was the original consumer and the JSON contract outlived it. The chat
 remains free-form prose.
 """
+from .. import config
 from .. import notes as user_notes_mod
 from . import coach
 
-DEFAULT_USER_NAME = "the user"
+#: Alias of the single resolver's constant — `config.user_name()` is what
+#: actually resolves the name (DB > env > default) for every caller.
+DEFAULT_USER_NAME = config.DEFAULT_USER_NAME
 
 # Default coach profile (today's behavior). Import-safe: coach.load_profile
 # falls back to an in-code constant if adaptive.md is missing/malformed, so
 # building the module constants below never raises.
 ADAPTIVE = coach.load_profile("adaptive")
+
+
+# --- the one voice definition ----------------------------------------------
+# Every prompt surface that speaks to the user composes these two blocks
+# instead of writing its own. They were inlined in four places and had already
+# drifted: the two PDF coach prompts carried `persona` + `dials_line` but not
+# the profile heading, not the notes-precedence rule, and not the user's name
+# at all (they hardcoded one). `tests/test_prompts.py` enumerates every surface
+# and fails if one stops composing these.
+#
+# Both are PURE — `notes_text` is passed in, never read here. That is required,
+# not stylistic: plan_coach and workout_coach key their disk caches on a hash
+# of their assembled prompt, so a builder that did I/O would break caching.
+
+
+def coach_voice_block(
+    user_name: str, profile: coach.CoachProfile, *, compact: bool = False
+) -> str:
+    """The coaching-voice section: which profile is speaking, that saved notes
+    outrank it point-by-point, then the persona and the dials.
+
+    ``compact`` renders the shorter phrasing the V2 brief prompt uses. V2 is
+    deliberately the *shrunk* prompt — the agent/code-separation cutover moved
+    work out of it on purpose — so it must not silently gain tokens here.
+    """
+    if compact:
+        return (
+            f'# Your coaching voice — the "{profile.name}" profile\n'
+            f"This sets HOW you talk to {user_name}. His saved notes REFINE it "
+            f"(a note asking\nfor a softer/harder touch on a point overrides "
+            f"the profile there).\n\n"
+            f"{profile.persona}\n\n{profile.dials_line}"
+        )
+    return (
+        f'# Your coaching voice — the "{profile.name}" profile\n'
+        f"This profile sets HOW you talk to {user_name}; follow it for every line.\n"
+        f"{user_name}'s saved notes (below, if any) REFINE this voice — a note that\n"
+        f"asks for a softer or harder touch on a specific point overrides the profile\n"
+        f"for that point, but the profile is the base tone otherwise.\n\n"
+        f"{profile.persona}\n\n{profile.dials_line}"
+    )
+
+
+def user_notes_block(user_name: str, notes_text: str | None) -> str:
+    """The saved-preferences section, or "" when there are none.
+
+    Returned without surrounding blank lines so each caller can place it where
+    its document needs it — `system_prompt` puts it mid-document, the V2 prompt
+    puts it last, and the two coach prompts append it.
+    """
+    if not notes_text:
+        return ""
+    return (
+        f"# What {user_name} has told you (most recent first — prefer the newer "
+        f"note when two conflict)\n{notes_text}"
+    )
 
 
 def system_prompt(
@@ -25,14 +84,8 @@ def system_prompt(
     # Pull any durable user preferences saved via save_user_note. These
     # shape every brief and chat and are the agent's primary lever for
     # learning how the user wants to be coached.
-    notes_block = user_notes_mod.render_for_prompt()
-    if notes_block:
-        notes_section = (
-            f"\n\n# What {user_name} has told you (most recent first — prefer the newer note when two conflict)\n"
-            f"{notes_block}\n"
-        )
-    else:
-        notes_section = ""
+    notes = user_notes_block(user_name, user_notes_mod.render_for_prompt())
+    notes_section = f"\n\n{notes}\n" if notes else ""
 
     return f"""You are {user_name}'s personal running coach.
 
@@ -68,15 +121,7 @@ cold; he doesn't.
 - **Pair every number with its meaning.** Hours and minutes for sleep
   (not seconds). Plain comparisons, not standard deviations.
 
-# Your coaching voice — the "{profile.name}" profile
-This profile sets HOW you talk to {user_name}; follow it for every line.
-{user_name}'s saved notes (below, if any) REFINE this voice — a note that
-asks for a softer or harder touch on a specific point overrides the profile
-for that point, but the profile is the base tone otherwise.
-
-{profile.persona}
-
-{profile.dials_line}
+{coach_voice_block(user_name, profile)}
 
 # Grounding rules
 1. Every claim cites a specific number + time window.
@@ -191,6 +236,21 @@ def briefing_prompt(
   "Get out and walk." "Move today." "Stop coasting." Cite the actual
   number missed and the gap to goal in plain terms."""
         plan_adherence_voice = 'in his "roast when slipping" voice when he missed it'
+        # Gated for the same reason the steps block above is. This one used to
+        # be UNCONDITIONAL: it told the model to "Override the soft coach
+        # voice. Be harsh." on every profile, so selecting `supportive` still
+        # produced a roast the moment fitness slid. A profile that can be
+        # overridden by the prompt that carries it is not a profile.
+        sliding_fitness_block = f"""- **Fitness clearly sliding AND no recent training** → tone: critical.
+  Override the soft coach voice. Be harsh. {user_name} explicitly
+  asked to be motivated to work out and called out when values are
+  trending the wrong way. Examples:
+  • "CTL down 35% in 30 days and you've put in one workout in two
+    weeks. Today is non-negotiable: get the shoes on, run 30 minutes
+    easy. Doesn't have to be hard. It has to happen."
+  • "Three weeks of nothing. Your fitness line is going down because
+    YOU stopped. The fix is the same thing you keep skipping —
+    a 40-minute run. Go.\""""
     else:
         steps_missed_block = f"""- **Yesterday MISSED goal** → name the actual number, the gap to the
   {daily_step_goal:,} goal, and the next concrete action. The TONE and FRAMING
@@ -200,6 +260,19 @@ def briefing_prompt(
   real number and gap; never invent a shortfall, never paper it over with the
   rolling average — but do NOT roast or shame."""
         plan_adherence_voice = "in your coaching voice (see the profile in the system prompt) when he missed it"
+        # The profile-deferring twin of the harsh block above: same FACTS (the
+        # CTL slide, the gap in training, a concrete session today), no
+        # instruction to override the voice the profile just established.
+        sliding_fitness_block = f"""- **Fitness clearly sliding AND no recent training** → tone: critical.
+  State the trend and the gap plainly, then give ONE concrete session for
+  today. The FRAMING follows your coaching voice (the profile in the system
+  prompt) — a supportive voice makes it an invitation back in, a neutral voice
+  states it as fact. Never roast or shame {user_name}, and never soften the
+  NUMBER. Examples:
+  • "CTL is down 35% over 30 days and there's been one workout in two weeks.
+    Today's the restart: 30 minutes easy. It doesn't have to be hard."
+  • "Three weeks without a run and the fitness line shows it. One 40-minute
+    easy run today puts the first brick back."\""""
 
     if recent_briefs_summary.strip():
         recent_section = f"""
@@ -328,16 +401,7 @@ Tone rules — pick based on what the data actually says:
   • "Easy 30min today. ATL is climbing but CTL is holding — protect
     consistency over intensity for 48 hours."
 
-- **Fitness clearly sliding AND no recent training** → tone: critical.
-  Override the soft coach voice. Be harsh. {user_name} explicitly
-  asked to be motivated to work out and called out when values are
-  trending the wrong way. Examples:
-  • "CTL down 35% in 30 days and you've put in one workout in two
-    weeks. Today is non-negotiable: get the shoes on, run 30 minutes
-    easy. Doesn't have to be hard. It has to happen."
-  • "Three weeks of nothing. Your fitness line is going down because
-    YOU stopped. The fix is the same thing you keep skipping —
-    a 40-minute run. Go."
+{sliding_fitness_block}
 
 - **Genuinely fatigued / red flags in recovery** → tone: caution.
   Recommend rest or a deload. Don't bully someone into hurting
@@ -593,12 +657,8 @@ def brief_v2_system_prompt(
     user_name: str = DEFAULT_USER_NAME,
     profile: coach.CoachProfile = ADAPTIVE,
 ) -> str:
-    notes_block = user_notes_mod.render_for_prompt()
-    notes_section = (
-        f"\n# What {user_name} has told you (most recent first — prefer the newer "
-        f"note when two conflict)\n{notes_block}\n"
-        if notes_block else ""
-    )
+    notes = user_notes_block(user_name, user_notes_mod.render_for_prompt())
+    notes_section = f"\n{notes}\n" if notes else ""
     return f"""You are {user_name}'s personal running coach.
 
 {user_name} runs a Garmin Instinct Solar (no overnight HRV — Body Battery +
@@ -618,13 +678,7 @@ he doesn't.
 - **Pair every number with its meaning.** Sleep in h/m, not seconds; plain
   comparisons, not standard deviations.
 
-# Your coaching voice — the "{profile.name}" profile
-This sets HOW you talk to {user_name}. His saved notes REFINE it (a note asking
-for a softer/harder touch on a point overrides the profile there).
-
-{profile.persona}
-
-{profile.dials_line}
+{coach_voice_block(user_name, profile, compact=True)}
 
 # Grounding rules
 1. Every claim cites a specific number from the provided data + its window.

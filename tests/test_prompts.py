@@ -1,7 +1,13 @@
 """Tests for the agent prompt builders in agent/prompts.py."""
 from __future__ import annotations
 
-from local_fitness.agent import prompts
+import ast
+import pathlib
+
+import pytest
+
+from local_fitness import config
+from local_fitness.agent import coach, plan_coach, prompts, workout_coach
 from local_fitness.agent.schemas import (
     BriefContext,
     CandidateTakeaway,
@@ -195,3 +201,199 @@ def test_system_prompt_is_cache_stable(monkeypatch):
     assert prompts.system_prompt("Dana") == prompts.system_prompt("Dana")
 
 
+
+
+
+# --- the single-voice gate --------------------------------------------------
+# Every prompt surface that speaks to the user must compose the SAME voice
+# definition. They did not: measured 2026-07-22, `plan_coach` and
+# `workout_coach` carried persona + dials but omitted the profile heading and
+# the notes-precedence rule, and hardcoded the user's name into their prompt
+# text instead of taking it. This enumerates the surfaces so a new one cannot
+# quietly skip the voice and an existing one cannot drift back.
+#
+# `briefing_prompt` is deliberately NOT in the voice list: it is the USER
+# message, paired with `system_prompt`, which is where the voice lives. Its
+# profile-sensitivity is the harsh-block gate, tested separately below.
+
+_ALL_PROFILES = sorted(coach.PROFILE_NAMES)
+_NOTES = "[1] a saved preference sentinel"
+
+_TODAY = {"type": "easy", "distance_mi": 4.0, "pace_min_per_mi": "9:30",
+          "description": "keep HR under 140"}
+_WEEK = [{"date": "2026-07-08", "type": "easy", "planned_mi": 4.0,
+          "actual_mi": 2.96, "verdict": "partial"}]
+_CARD = {
+    "activity": {"activity_id": 1, "date": "2026-07-21",
+                 "activity_name": "Run", "activity_type": "running"},
+    "overall": {"grade": "B", "gpa": 3.0},
+    "intent": "easy", "intent_source": "plan",
+    "reference": {"mode": "rolling_60d", "n": 12, "pool": "running"},
+    "metrics": {}, "splits": {"available": False, "unit": "Mile", "rows": []},
+}
+
+
+@pytest.fixture
+def no_saved_notes(monkeypatch):
+    """Isolate the PROMPT text from the user's own saved notes.
+
+    `system_prompt` and `brief_v2_system_prompt` inject `render_for_prompt()`
+    themselves, and a real note legitimately contains the user's name ("When
+    Nate misses goals, be snarky…"). That is user data, not tracked code, and
+    must not be confused with a hardcoded name in the prompt.
+    """
+    from local_fitness import notes as notes_mod
+    monkeypatch.setattr(notes_mod, "render_for_prompt", lambda *a, **k: "")
+
+
+def _voice_surfaces(name: str, notes: str | None = None):
+    """(profile, [(label, system_prompt_text)]) for every voice-bearing surface."""
+    p = coach.load_profile(name)
+    return p, [
+        ("system_prompt", prompts.system_prompt("Alex", p)),
+        ("brief_v2_system_prompt", prompts.brief_v2_system_prompt("Alex", p)),
+        ("plan_coach", plan_coach.build_prompt(
+            p, _TODAY, _WEEK, 75, 71, "10k",
+            notes_text=notes, user_name="Alex")[0]),
+        ("workout_coach", workout_coach.build_prompt(
+            p, _CARD, notes_text=notes, user_name="Alex")[0]),
+    ]
+
+
+@pytest.mark.parametrize("profile_name", _ALL_PROFILES)
+def test_every_voice_surface_carries_the_active_persona_and_dials(
+    profile_name, no_saved_notes
+):
+    profile, surfaces = _voice_surfaces(profile_name)
+    for label, text in surfaces:
+        assert profile.persona in text, f"{label} dropped the persona"
+        assert profile.dials_line in text, f"{label} dropped the dials line"
+        assert profile.name in text, f"{label} never names the active profile"
+
+
+@pytest.mark.parametrize("profile_name", _ALL_PROFILES)
+def test_every_voice_surface_addresses_the_configured_user(
+    profile_name, no_saved_notes
+):
+    _profile, surfaces = _voice_surfaces(profile_name)
+    for label, text in surfaces:
+        assert "Alex" in text, f"{label} ignores the configured user_name"
+
+
+@pytest.mark.parametrize("profile_name", _ALL_PROFILES)
+def test_no_voice_surface_hardcodes_a_personal_name(profile_name, no_saved_notes):
+    """The bug this gate exists for: both PDF coach prompts opened with "You
+    are Nate's running coach" no matter who was configured."""
+    _profile, surfaces = _voice_surfaces(profile_name)
+    for label, text in surfaces:
+        assert "Nate" not in text, f"{label} hardcodes a personal name"
+
+
+@pytest.mark.parametrize("profile_name", _ALL_PROFILES)
+def test_every_voice_surface_says_notes_outrank_the_profile(
+    profile_name, no_saved_notes
+):
+    """A saved note ("stop roasting my steps") must carry the same authority on
+    every surface. Two of them never said so."""
+    _profile, surfaces = _voice_surfaces(profile_name)
+    for label, text in surfaces:
+        assert "REFINE" in text, f"{label} omits the notes-precedence rule"
+
+
+def test_the_two_coach_surfaces_carry_supplied_notes(no_saved_notes):
+    _profile, surfaces = _voice_surfaces("hardass", _NOTES)
+    checked = 0
+    for label, text in surfaces:
+        if label in ("plan_coach", "workout_coach"):
+            assert _NOTES in text, f"{label} dropped the supplied notes"
+            assert "What Alex has told you" in text, f"{label} mislabels the notes"
+            checked += 1
+    assert checked == 2
+
+
+def test_flipping_the_profile_changes_every_voice_surface(no_saved_notes):
+    """Not merely 'a profile is present' — the ACTIVE one has to be the one
+    that lands, on all four."""
+    soft = dict(_voice_surfaces("supportive")[1])
+    hard = dict(_voice_surfaces("hardass")[1])
+    for label in soft:
+        assert soft[label] != hard[label], f"{label} is profile-insensitive"
+
+
+def test_briefing_prompt_is_profile_sensitive_via_the_harsh_gate():
+    """The brief's USER message doesn't restate the persona (that is the paired
+    system prompt's job) — it swaps its goal-miss mandates on
+    `includes_harsh_block`."""
+    hard = prompts.briefing_prompt("Alex", 10000, "", coach.load_profile("hardass"))
+    soft = prompts.briefing_prompt("Alex", 10000, "", coach.load_profile("supportive"))
+    assert hard != soft
+    assert "Be harsh" in hard
+    assert "Be harsh" not in soft
+    assert "Alex" in hard and "Alex" in soft
+
+
+def test_voice_block_compact_variant_is_shorter_but_keeps_the_substance():
+    """The V2 brief prompt is deliberately the shrunk one; its voice block must
+    stay smaller while still carrying persona, dials and the precedence rule."""
+    p = coach.load_profile("hardass")
+    full = prompts.coach_voice_block("Alex", p)
+    compact = prompts.coach_voice_block("Alex", p, compact=True)
+    assert len(compact) < len(full)
+    for block in (full, compact):
+        assert p.persona in block
+        assert p.dials_line in block
+        assert "REFINE" in block
+
+
+def test_user_notes_block_is_empty_without_notes():
+    assert prompts.user_notes_block("Alex", None) == ""
+    assert prompts.user_notes_block("Alex", "") == ""
+
+
+# --- source guard: no personal name in executable prompt text ---------------
+
+_PROMPT_MODULES = (
+    "agent/prompts.py", "agent/plan_coach.py", "agent/workout_coach.py",
+    "agent/brief_planner.py", "agent/briefing.py",
+)
+_SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "local_fitness"
+
+
+def _docstring_nodes(tree: ast.AST) -> set[int]:
+    """id() of every Constant node that is a module/class/function docstring."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef,
+                             ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                out.add(id(body[0].value))
+    return out
+
+
+@pytest.mark.parametrize("rel", _PROMPT_MODULES)
+def test_prompt_modules_carry_no_hardcoded_personal_name(rel):
+    """CLAUDE.md forbids personal data in tracked code, and a name baked into a
+    prompt is exactly that — a stranger's clone was told it was Nate's coach.
+
+    Parsed with `ast` rather than grepped: comments and docstrings may name him
+    (they are documentation), but a string literal that reaches a model may not.
+    """
+    source = (_SRC / rel).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    docstrings = _docstring_nodes(tree)
+    offenders = [
+        (node.lineno, node.value[:70])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and id(node) not in docstrings and "Nate" in node.value
+    ]
+    assert offenders == [], f"{rel} hardcodes a personal name: {offenders}"
+
+
+def test_default_user_name_is_generic():
+    """The default is what a fresh clone gets; it must never be a real name."""
+    assert config.DEFAULT_USER_NAME == "the user"
+    assert prompts.DEFAULT_USER_NAME is config.DEFAULT_USER_NAME

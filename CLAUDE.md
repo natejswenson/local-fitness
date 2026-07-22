@@ -285,6 +285,25 @@ These are settled — don't redesign without a reason.
   V2** — the MCP `mcp__fitness__*` tools and the MCP `_brief_prompt` (chat /
   external-agent path) still use V1's tool-driven approach (a deliberate scope
   choice; `grounding.flag` is the reusable follow-up there).
+- **One coach voice, composed by every prompt surface** (0.28.0). The profile
+  was already resolved everywhere, but what surrounded it had drifted:
+  `plan_coach`/`workout_coach` carried `persona` + `dials_line` yet omitted the
+  profile heading and the notes-precedence rule, and **hardcoded the user's
+  name into their prompt text**. Now: `prompts.coach_voice_block(user_name,
+  profile, compact=)` and `prompts.user_notes_block(user_name, notes_text)` are
+  the single definition, and every surface composes them. Both are **pure** —
+  `notes_text` is passed in, never read — because `plan_coach` and
+  `workout_coach` key their disk caches on a hash of the assembled prompt; a
+  builder that did I/O would break caching. `compact=True` is the V2 brief's
+  shorter variant (V2 is deliberately the shrunk prompt; don't let it grow).
+  `briefing_prompt` is the brief's USER message and deliberately carries no
+  persona — its profile-sensitivity is the `includes_harsh_block` gate.
+  **`config.user_name()` is the ONLY resolver** (DB > env
+  `LOCAL_FITNESS_USER_NAME` > `"the user"`); nothing calls
+  `db.get_setting("user_name", ...)` with its own default any more, and
+  `tests/test_prompts.py` fails the build if a prompt module puts a personal
+  name in a non-docstring string literal. When adding a prompt surface, add it
+  to `_voice_surfaces` in that file — the gate is what keeps this true.
 - **Run-vs-walk is decided by measured pace everywhere, never by
   `activity_type`** (0.27.0). Garmin's label lies — walking-desk sessions log
   as `treadmill_running` — so `plans.GradingConfig.pace_gated_locomotion` (on

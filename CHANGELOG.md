@@ -6,6 +6,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-22
+
+### Fixed
+- **The brief's "fitness sliding" mandate overrode the coach profile on every
+  voice.** The steps mandate was correctly gated on
+  `profile.includes_harsh_block`, but the conditioning mandate hardcoded
+  *"Override the soft coach voice. Be harsh."* unconditionally — so selecting
+  `supportive` or `neutral` still produced a roast the moment fitness slid. A
+  profile that the prompt carrying it can override is not a profile. Now gated,
+  with a profile-deferring twin that keeps every FACT (the CTL slide, the
+  training gap, one concrete session) and drops the override.
+  **Only the two soft profiles' prompts change; `adaptive` and `hardass` render
+  byte-identically**, so the live brief is untouched.
+- **`plan_coach` and `workout_coach` hardcoded the user's name into their
+  prompts.** "You are Nate's running coach" shipped in tracked code, so a
+  stranger's clone was told it was Nate's coach and a changed `user_name`
+  setting was ignored on both PDF surfaces. Both now take `user_name`,
+  threaded from `config.user_name()` by `tools.py`.
+- **`brief_planner` resolved `user_name` with a different default** ("Nate")
+  than every other caller (`"the user"`). Same setting, two behaviors.
+
+### Changed
+- **One voice definition, composed everywhere.** New
+  `prompts.coach_voice_block(user_name, profile, *, compact=False)` and
+  `prompts.user_notes_block(user_name, notes_text)` replace four inlined
+  copies. Both are pure — `notes_text` is a parameter, never read inside —
+  because `plan_coach`/`workout_coach` key their disk caches on a hash of the
+  assembled prompt. The two PDF coach prompts consequently gain what they were
+  missing: the profile heading, the profile name, and the rule that saved notes
+  REFINE (outrank) the profile point-by-point.
+- **New `config.user_name()`** — the single resolver, DB > env
+  (`LOCAL_FITNESS_USER_NAME`) > `config.DEFAULT_USER_NAME` (`"the user"`),
+  mirroring `config.coach_profile`. Documented in `.env.example`.
+
+### Internal
+- `tests/test_prompts.py` gains the enumerating gate: every voice-bearing
+  surface × every profile must carry that profile's persona, dials, name, the
+  configured user name, and the notes-precedence rule — plus an `ast`-based
+  guard that fails the build if a prompt module puts a personal name in a
+  non-docstring string literal. Adding a prompt surface means adding it to
+  `_voice_surfaces`.
+- Report-card prompt A/B (5 generations per arm, activity 23685126977):
+  `parse_read` 0/5 failures both arms, median latency 9.3s → 9.2s,
+  over-budget paragraphs 7/20 → 4/20. The ~10% letter-grade leak rate that
+  `_GRADE_TONE` forbids is present in BOTH arms and predates this change;
+  filed as a follow-up rather than fixed here.
+
 ## [0.27.0] - 2026-07-22
 
 ### Changed

@@ -372,9 +372,13 @@ def _fake_generator(lines):
     counts calls."""
     calls = {"n": 0}
 
+    # **_kw, not an enumerated signature: this double stands in for a real
+    # function whose keyword surface grows (user_name landed 2026-07-22), and a
+    # double that has to be edited for every new kwarg is a double that fails
+    # for reasons unrelated to what the test is checking.
     async def fake(profile, today_workout, last_7_days, adherence_pct,
                    days_to_race, goal_type, *, model=None, timeout=30.0,
-                   notes_text=None):
+                   notes_text=None, **_kw):
         calls["n"] += 1
         result = lines[calls["n"] - 1]
         if isinstance(result, Exception):
