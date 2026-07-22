@@ -268,17 +268,20 @@ def fallback_coaching_line(
 ) -> str:
     """Deterministic, template-based coaching line — used only when
     ``generate_coaching_line`` fails. Pure: identical inputs always
-    produce identical output. Never raises."""
+    produce identical output. Never raises.
+
+    Deliberately restates NEITHER the prescription nor the description: the
+    PDF's Today callout already prints both directly above this line, so
+    including them rendered the same instruction three times over
+    ("easy · 4.0 mi @ 9:39/mi" / "Easy 4mi. Keep HR under 140." / "Today: easy
+    4.0 mi @ 9:39/mi. Easy 4mi. Keep HR under 140."). A coaching line's job is
+    the part the prescription does not already say."""
     prior = next((d for d in last_7_days if d.get("verdict") != "pending"), None)
     parts: list[str] = []
     if prior is not None:
         phrase = _VERDICT_PHRASE.get(prior["verdict"])
         if phrase:
             parts.append(phrase)
-
-    parts.append(f"Today: {_format_prescription(today_workout)}.")
-    if today_workout.get("description"):
-        parts.append(today_workout["description"])
 
     if days_to_race is not None:
         parts.append(f"{days_to_race} days to your {goal_type}.")

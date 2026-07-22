@@ -16,6 +16,7 @@ from datetime import date as _date
 from pathlib import Path
 
 from . import config, db
+from .agent import interpret
 
 # --- constants -------------------------------------------------------------
 
@@ -35,6 +36,13 @@ class GradingConfig:
     partial_fraction: float = PARTIAL_FRACTION
     count_walks_easy: bool = True
     count_walks_mileage: bool = False
+    # Judge run-vs-walk by measured pace instead of by ``activity_type``.
+    # ON by default because the label is wrong often enough to matter: Nate's
+    # walking-desk sessions log as ``treadmill_running``, so before this the
+    # PDF reported "Planned 5.0 mi / Actual 9.2 mi" for an interval day whose
+    # run was 5.95 mi and whose remaining 3.23 mi was a 29:15/mi walk. See
+    # ``agent.interpret.is_running_effort``.
+    pace_gated_locomotion: bool = True
 
 
 def resolve_grading_config(
@@ -120,6 +128,25 @@ def _is_on_foot(activity_type: str | None) -> bool:
     return _is_running(activity_type) or _is_walking(activity_type)
 
 
+def _ran(activity: dict, cfg: GradingConfig = GradingConfig()) -> bool:
+    """Did this activity involve RUNNING, judged by pace where pace exists?
+
+    ``_is_running`` alone is a substring match on Garmin's label, and the label
+    lies — a walking-pad session files as ``treadmill_running``. So when the
+    row carries a usable pace, the measurement decides and the label is
+    ignored; a paceless row (a manual entry, a bad sync) falls back to the
+    label rather than being silently dropped from mileage entirely.
+
+    Both directions matter: this excludes a labelled-``running`` walk AND
+    includes a genuinely-fast row that the label got wrong the other way.
+    """
+    if cfg.pace_gated_locomotion:
+        mode = interpret.is_running_effort(activity.get("avg_pace_sec_per_km"))
+        if mode is not None:
+            return mode
+    return _is_running(activity.get("activity_type"))
+
+
 def _parse_iso(value: str) -> _date | None:
     try:
         return _date.fromisoformat(value)
@@ -127,19 +154,39 @@ def _parse_iso(value: str) -> _date | None:
         return None
 
 
-def _running_distance(activities: list[dict]) -> float:
+def _running_distance(
+    activities: list[dict], cfg: GradingConfig = GradingConfig()
+) -> float:
+    """Distance (m) from RUNNING only — pace-gated, not label-gated (``_ran``).
+
+    Used to grade long/race days, where run specificity is the point: a walk
+    labelled ``treadmill_running`` must not satisfy an 8-mile long run."""
     return sum(
-        (a.get("distance_meters") or 0.0)
-        for a in activities
-        if _is_running(a.get("activity_type"))
+        (a.get("distance_meters") or 0.0) for a in activities if _ran(a, cfg)
     )
 
 
-def _running_duration(activities: list[dict]) -> float:
+def _walking_distance(
+    activities: list[dict], cfg: GradingConfig = GradingConfig()
+) -> float:
+    """The complement of ``_running_distance`` within on-foot activity, so run
+    miles + walk miles always reconcile to foot miles."""
     return sum(
-        (a.get("duration_seconds") or 0.0)
+        (a.get("distance_meters") or 0.0)
         for a in activities
-        if _is_running(a.get("activity_type"))
+        if _is_on_foot(a.get("activity_type")) and not _ran(a, cfg)
+    )
+
+
+def _running_duration(
+    activities: list[dict], cfg: GradingConfig = GradingConfig()
+) -> float:
+    """Duration (s) of RUNNING only — pace-gated for the same reason as
+    ``_running_distance``, and it matters more here: duration is the graded
+    field for tempo/interval days, and a 1:34:30 walking-pad session is long
+    enough on its own to satisfy any rep-session target it is compared to."""
+    return sum(
+        (a.get("duration_seconds") or 0.0) for a in activities if _ran(a, cfg)
     )
 
 
@@ -272,7 +319,7 @@ def classify_workout(
         actual = (
             _foot_distance(day_activities)
             if (wtype == "easy" and cfg.count_walks_easy)
-            else _running_distance(day_activities)
+            else _running_distance(day_activities, cfg)
         )
         if not target:  # null/0 target → "by feel": any qualifying activity counts
             return "done" if actual > 0 else "missed"
@@ -284,7 +331,7 @@ def classify_workout(
         return "missed"
 
     if wtype in _DURATION_TYPES:
-        actual = _running_duration(day_activities)
+        actual = _running_duration(day_activities, cfg)
         if actual <= 0:
             return "missed"
         target = workout.get("target_duration_sec")
@@ -751,20 +798,21 @@ def load_activities_by_date(
     Accepts an already-open ``conn`` to let hot-path callers share one
     connection instead of opening a fresh one per lookup; behavior is
     unchanged when omitted."""
+    # avg_pace_sec_per_km is REQUIRED, not incidental: `_ran` gates run-vs-walk
+    # on measured pace, and without this column every row silently falls back
+    # to the (wrong) activity_type label — which is the bug the gate exists to
+    # fix. Shipping the gate without this column made it a no-op.
+    sql = (
+        "SELECT date, activity_type, distance_meters, duration_seconds, "
+        "avg_pace_sec_per_km "
+        "FROM activities WHERE date >= ? AND date <= ? ORDER BY date"
+    )
     out: dict[str, list[dict]] = {}
     if conn is not None:
-        rows = conn.execute(
-            "SELECT date, activity_type, distance_meters, duration_seconds "
-            "FROM activities WHERE date >= ? AND date <= ? ORDER BY date",
-            (start, end),
-        ).fetchall()
+        rows = conn.execute(sql, (start, end)).fetchall()
     else:
         with db.connect(db_path) as c:
-            rows = c.execute(
-                "SELECT date, activity_type, distance_meters, duration_seconds "
-                "FROM activities WHERE date >= ? AND date <= ? ORDER BY date",
-                (start, end),
-            ).fetchall()
+            rows = c.execute(sql, (start, end)).fetchall()
     for r in rows:
         out.setdefault(r["date"], []).append(dict(r))
     return out
@@ -863,6 +911,12 @@ def build_plan_detail(
             **w,
             "verdict": grade_workout(w, day, frontier, cfg),
             "actual_distance_m": actual_dist,
+            # The foot total split by MEASURED locomotion, so a consumer that
+            # needs run volume (the PDF's weekly strip, weekly_rollup) never has
+            # to re-derive it from the label — and so run + walk always
+            # reconciles back to actual_distance_m.
+            "actual_run_distance_m": _running_distance(day, cfg),
+            "actual_walk_distance_m": _walking_distance(day, cfg),
             "actual_pace_sec_per_km": actual_pace,
             "actual_activity_types": actual_types,
         })

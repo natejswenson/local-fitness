@@ -229,3 +229,38 @@ def sd_position(value: float | None, mean: float | None, sd: float | None) -> di
     sd_distance = (value - mean) / sd
     direction = "above" if value >= mean else "below"
     return {"sd_distance": sd_distance, "direction": direction}
+
+
+# --- locomotion -------------------------------------------------------------
+# The run/walk boundary, in seconds per MILE. A brisk walker reaches a 13:00
+# mile; sustained running essentially never falls below it.
+#
+# This lives here, not in a caller, because ``activity_type`` is Garmin's
+# LABEL and it lies: a walking-desk session logs as ``treadmill_running``, so
+# every substring-on-the-label classifier in the codebase (``plans._is_running``
+# among them) passes walks straight through as runs. Measured on live data
+# (2026-07-21), a 60-day ``treadmill_running`` pool was cleanly bimodal — 16
+# real runs at 8:40-11:46/mi against 30 walking-pad sessions at 14:08-84:20/mi,
+# with nothing at all in between. 13:00 sits in that empty band with roughly
+# two minutes of margin on either side.
+#
+# Both the report card's reference pool and plans.py's mileage rollup gate on
+# this one function, per the module rule: one classifier, one home.
+RUN_PACE_CEILING_SEC_PER_MI = 13 * 60
+_KM_PER_MILE = 1.609344
+
+
+def is_running_effort(pace_sec_per_km: float | None) -> bool | None:
+    """Was this activity run or walked, judged by pace rather than by label?
+
+    ``None`` when there is no usable pace — the mode is genuinely unknown, and
+    the caller must exclude the row rather than guess a side. Returning a
+    third state (instead of defaulting to ``False``) is what keeps a paceless
+    row out of BOTH pools: ``None is True`` and ``None is False`` are each
+    false, so an identity filter drops it without a special case.
+
+    See ``RUN_PACE_CEILING_SEC_PER_MI`` for why this is measured, not labelled.
+    """
+    if not pace_sec_per_km or pace_sec_per_km <= 0:
+        return None
+    return pace_sec_per_km * _KM_PER_MILE <= RUN_PACE_CEILING_SEC_PER_MI
