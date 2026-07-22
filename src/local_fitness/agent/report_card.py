@@ -70,7 +70,7 @@ from datetime import timedelta
 from statistics import median
 
 from .. import plans
-from . import render, units
+from . import interpret, render, units
 
 __all__ = [
     "grade_from_deviation", "intent_class", "infer_intent", "resolve_intent",
@@ -92,22 +92,14 @@ MILE_TOLERANCE = 0.03
 # Grading against noise is worse than not grading — return n/a and say so.
 MIN_REFERENCE_ACTIVITIES = 5
 REFERENCE_WINDOW_DAYS = 60
-# The run/walk boundary, in seconds per MILE. A brisk walker reaches a 13:00
-# mile; sustained running essentially never falls below it.
-#
-# This exists because ``activity_type`` is Garmin's label, not a measurement:
-# a walking-desk session logs as ``treadmill_running``, and both the exact-type
-# filter and ``plans._is_running`` (a substring match on "running") pass it
-# through. Measured on live data (2026-07-21), the 60-day ``treadmill_running``
-# pool held 46 activities that were cleanly bimodal — 16 real runs at
-# 8:40–11:46/mi, HR 114–172, and 30 walking-pad sessions at 14:08–84:20/mi,
-# HR 76–120. The resulting "median comparable activity" was a 15:50/mi walk at
-# 116 bpm and 22 training load, which handed a genuine interval session an A+ on
-# both heart rate and load for clearing a bar set by walking.
-#
-# The live gap runs 11:46 -> 14:08, so 13:00 sits with roughly two minutes of
-# margin on either side.
-RUN_PACE_CEILING_SEC_PER_MI = 13 * 60
+# The run/walk boundary and its classifier moved to ``interpret.py`` (the pure
+# classifier module) on 2026-07-22, so ``plans.py`` can gate its mileage rollup
+# on the same function without a ``plans -> report_card -> plans`` import cycle.
+# Re-exported here because both names are in this module's ``__all__`` and are
+# referenced by tests and by ``rolling_reference`` below. See interpret.py for
+# the measured bimodal distribution that sets the 13:00 ceiling.
+RUN_PACE_CEILING_SEC_PER_MI = interpret.RUN_PACE_CEILING_SEC_PER_MI
+is_running_effort = interpret.is_running_effort
 # Advisory only: a 2x-median load day is a fact worth printing, not an F.
 LOAD_SPIKE_FACTOR = 2.0
 # Bucket width for the per-sample HR trace chart. A tenth of a mile is fine
@@ -266,22 +258,6 @@ def base_letter(grade: str | None) -> str | None:
     """Strip the +/- modifier. GPA math runs on base letters so the weights
     stay the approved ones and a modifier can never move an overall grade."""
     return grade[0] if grade else None
-
-
-def is_running_effort(pace_sec_per_km: float | None) -> bool | None:
-    """Was this activity run or walked, judged by pace rather than by label?
-
-    ``None`` when there is no usable pace — the mode is genuinely unknown, and
-    the caller must exclude the row rather than guess a side. Returning a
-    third state (instead of defaulting to False) is what keeps a paceless row
-    out of BOTH pools: ``None == True`` and ``None == False`` are each False,
-    so an equality filter drops it without a special case.
-
-    See ``RUN_PACE_CEILING_SEC_PER_MI`` for why this is measured, not labelled.
-    """
-    if not pace_sec_per_km or pace_sec_per_km <= 0:
-        return None
-    return pace_sec_per_km * (MILE_M / 1000) <= RUN_PACE_CEILING_SEC_PER_MI
 
 
 def intent_class(intent: str | None) -> str:

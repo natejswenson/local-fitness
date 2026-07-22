@@ -285,6 +285,20 @@ These are settled — don't redesign without a reason.
   V2** — the MCP `mcp__fitness__*` tools and the MCP `_brief_prompt` (chat /
   external-agent path) still use V1's tool-driven approach (a deliberate scope
   choice; `grounding.flag` is the reusable follow-up there).
+- **Run-vs-walk is decided by measured pace everywhere, never by
+  `activity_type`** (0.27.0). Garmin's label lies — walking-desk sessions log
+  as `treadmill_running` — so `plans.GradingConfig.pace_gated_locomotion` (on
+  by default) routes `_running_distance`/`_running_duration` through `_ran`,
+  which delegates to `interpret.is_running_effort`. Measured consequences: an
+  interval day reported 9.2 mi actual when the run was 5.95 mi, and that day's
+  1:34:30 walk was on its own long enough to satisfy any rep-session duration
+  target. **Easy/recovery days still count walking on purpose** — that is what
+  makes a prescribed walk day gradeable, and the plan now has two a week — so
+  do not "fix" `_foot_distance` to be run-only. A paceless row falls back to
+  the label rather than vanishing from mileage. **`load_activities_by_date`
+  MUST select `avg_pace_sec_per_km`**: without it every row falls back to the
+  label and the whole gate is a silent no-op (it shipped that way for one
+  render before a live PDF caught it).
 - **Analysis tools carry deterministic interpretation, not just raw numbers**
   (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
   SDK) housing every classifier the brief path already computed in tested
@@ -425,7 +439,10 @@ These are settled — don't redesign without a reason.
     outdoor average of 140 and gave a normal easy run a D. Treadmill and road
     are different HR regimes and must not share a yardstick unless forced to.
   - **Comparability is ALSO gated on locomotion, measured not labelled**
-    (2026-07-21, `RUN_PACE_CEILING_SEC_PER_MI` = a 13:00 mile). `activity_type`
+    (2026-07-21; since 0.27.0 the constant and `is_running_effort` live in
+    `agent/interpret.py`, re-exported here, so `plans.py` can share them
+    without a `plans → report_card → plans` cycle. `RUN_PACE_CEILING_SEC_PER_MI`
+    = a 13:00 mile). `activity_type`
     is Garmin's label and it lies: Nate's walking-desk sessions log as
     `treadmill_running`, and both the exact-type filter and `plans._is_running`
     (a substring match on "running") passed all of them through. On live data
@@ -520,13 +537,15 @@ These are settled — don't redesign without a reason.
     overruns (10/24 paragraphs vs 4/24), and it leaked what `_GRADE_TONE`
     forbids outright — "F is F." and "B+ on paper". Haiku failed every call.
     The disk cache makes every repeat render instant.
-  - **A split-heavy card is 2 PDF pages and always has been.** 6+ splits plus a
-    four-paragraph read overflows; measured 2026-07-21, the pre-0.26.0 layout
-    does the same, so this is a layout limitation rather than a content
-    regression. It sits right on the boundary — read word count is the swing
-    factor, which is why the 45-word budget is real. Any card content added
-    here should be measured against `len(HTML(...).render().pages)` on
-    `activity_id` 23685126977 (6 splits) before shipping.
+  - **Every generated PDF is exactly ONE page (0.27.0).** A split-heavy card
+    used to be 2 pages; it no longer is. `visuals.fit_one_page` lays the
+    document out, counts `len(document.pages)`, and steps down the three-rung
+    `DENSITY_PRESETS` ladder until it fits. The read's 45-word budget is still
+    real — it is the swing factor in which rung gets used — but overflow is now
+    caught by measurement rather than by a note in this file. Any card content
+    added here should still be measured on `activity_id` 23685126977 (6
+    splits) before shipping; the difference is that the ladder, not you,
+    absorbs it.
   - **A metric's `Expected` column must be the number its grade was actually
     measured against.** HR broke this: it showed the bare rolling median while
     grading against a band edge, so a run at 136 vs a 146 median printed
@@ -592,6 +611,24 @@ These are settled — don't redesign without a reason.
   consumes the theme for BOTH the WeasyPrint report CSS (`_build_css`)
   and the matplotlib chart styles — the ASCII `chart` tool keeps its
   emoji heat ramp (PRESS is the *print* brand).
+- **Both PDFs fit one page, and the fitting is measured, not tuned**
+  (0.27.0). `visuals.fit_one_page(build_html, presets)` is renderer-agnostic:
+  it takes a callable, renders at each `DENSITY_PRESETS` rung (roomy →
+  compact → dense), and returns `(pdf_bytes, page_count, preset_index)` from
+  the first rung that lays out to a single page. `chart_h_pt` is the
+  load-bearing knob — charts are what break the page, so `img.chart` is capped
+  by **height** with `width: auto`; a `max-width`-only cap lets the figure's
+  own aspect decide the page budget and makes the ladder a no-op. Density is
+  scalars threaded into the ONE stylesheet, never a second stylesheet, so a
+  rule fixed at one density can't be missing at another.
+  **`render_brief_pdf` returns `(bytes, page_count)`, not bytes** — a caller
+  that gets 2 back has exhausted the ladder, and content (not type size) has
+  to give. Only `generate_brief_report` may drop content: it truncates
+  lowest-priority takeaways and prints `N further signals omitted for space`.
+  Never let either PDF spill silently, and never hide a takeaway silently.
+  When adding page content, add a case to `test_brief_always_fits...` /
+  `test_generate_brief_report_is_always_exactly_one_page` rather than
+  eyeballing a render.
 - **The brief PDF (`generate_brief_report`) has a 2-column signal-card grid
   and a Training Plan section** (2026-07-09 redesign). `visuals.py`'s
   signal cards (formerly one stacked column) reflow into a flexbox grid

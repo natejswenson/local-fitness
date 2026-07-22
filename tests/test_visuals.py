@@ -47,9 +47,16 @@ def _brief(takeaways: list[Takeaway]) -> Brief:
     return Brief(date="2026-07-08", user_name="Nate", takeaways=takeaways)
 
 
+def _render(*args, **kwargs) -> bytes:
+    """`render_brief_pdf` returns (pdf_bytes, page_count) since the one-page
+    guarantee landed. Most tests here assert on content, not on the count, so
+    they take the bytes; the page-count contract has its own tests below."""
+    return visuals.render_brief_pdf(*args, **kwargs)[0]
+
+
 def test_render_brief_pdf_magic_bytes_and_page_count():
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {})
+    pdf = _render(brief, {})
     assert pdf[:5] == b"%PDF-"
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         assert len(doc.pages) >= 1
@@ -64,7 +71,7 @@ def test_render_brief_pdf_escapes_html_special_chars_in_headline():
     brief = _brief([Takeaway(
         headline="keep effort < 6/10 & recover", summary="s", tone="neutral", details="d",
     )])
-    pdf = visuals.render_brief_pdf(brief, {})
+    pdf = _render(brief, {})
     # The visible extracted text must still read as the original characters.
     text = _pdf_text(pdf)
     assert "keep effort < 6/10 & recover" in text
@@ -85,7 +92,7 @@ def test_render_brief_pdf_headline_html_is_actually_escaped():
     # HTML parser's tag-open recovery, so if escaping were dropped the
     # rendered PDF's extracted text would NOT contain "< b" verbatim).
     brief = _brief([Takeaway(headline=headline, summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {})
+    pdf = _render(brief, {})
     text = _pdf_text(pdf)
     assert "a < b & c > d" in text
 
@@ -93,7 +100,7 @@ def test_render_brief_pdf_headline_html_is_actually_escaped():
 def test_render_brief_pdf_markdown_table_renders_as_real_table():
     table_md = "| a | b |\n| --- | --- |\n| 1 | 2 |\n"
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details=table_md)])
-    pdf = visuals.render_brief_pdf(brief, {})
+    pdf = _render(brief, {})
     text = _pdf_text(pdf)
     # A correctly-enabled table extension renders cell text without the
     # raw pipe/dash markup; a disabled extension would leave literal
@@ -112,7 +119,7 @@ def test_render_brief_pdf_blocks_external_image_network_fetch():
     # Must not raise (the fetcher rejects the URL internally, it doesn't
     # propagate as an unhandled connection error) and must not leak the
     # blocked host into the rendered output.
-    pdf = visuals.render_brief_pdf(brief, {})
+    pdf = _render(brief, {})
     assert pdf[:5] == b"%PDF-"
     text = _pdf_text(pdf)
     assert "example.com" not in text
@@ -148,7 +155,7 @@ def test_render_brief_pdf_chart_keying_places_correct_chart_per_takeaway():
         Takeaway(headline="third", summary="s2", tone="neutral",
                   metric=TakeawayMetric(metric="rhr", days=14), details="d2"),
     ])
-    pdf = visuals.render_brief_pdf(brief, {"0": png_a, "2": png_b})
+    pdf = _render(brief, {"0": png_a, "2": png_b})
 
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         images_per_page = [len(p.images) for p in doc.pages]
@@ -159,7 +166,7 @@ def test_render_brief_pdf_chart_keying_places_correct_chart_per_takeaway():
 
 def test_render_brief_pdf_takeaway_without_chart_renders_without_image():
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {})
+    pdf = _render(brief, {})
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         total_images = sum(len(p.images) for p in doc.pages)
     assert total_images == 0
@@ -211,7 +218,7 @@ def test_render_brief_pdf_cards_stack_in_a_single_column():
         Takeaway(headline=w, summary=f"s{i}", tone="neutral", details=f"d{i}")
         for i, w in enumerate(words)
     ])
-    pdf = visuals.render_brief_pdf(brief, {})
+    pdf = _render(brief, {})
     pos = _heading_positions(pdf, words)
 
     x0s = {pos[w][0] for w in words}
@@ -226,7 +233,7 @@ def test_render_brief_pdf_signals_and_plan_render_as_two_page_columns():
     # rather than stacking sequentially — this is what actually buys back
     # the vertical room to fit a full brief on one page.
     brief = _brief([Takeaway(headline="Alphahead", summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {}, plan_section=_PLAN_SECTION)
+    pdf = _render(brief, {}, plan_section=_PLAN_SECTION)
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         words = {w["text"]: (w["x0"], w["top"]) for w in doc.pages[0].extract_words()}
     assert "Alphahead" in words
@@ -302,7 +309,7 @@ def test_render_brief_pdf_plan_section_appears_in_pdf_text():
     # smoke check — uses unambiguous substrings only (headline uppercase is
     # a real CSS text-transform, not a bug: h2.plan-heading is uppercased).
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {}, _PLAN_SECTION)
+    pdf = _render(brief, {}, _PLAN_SECTION)
     text = _pdf_text(pdf)
     assert "TRAINING PLAN" in text
     assert "easy · 4.0 mi @ 9:30/mi" in text
@@ -312,7 +319,7 @@ def test_render_brief_pdf_plan_section_appears_in_pdf_text():
 
 def test_render_brief_pdf_plan_section_table_rows_and_verdicts():
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {}, _PLAN_SECTION)
+    pdf = _render(brief, {}, _PLAN_SECTION)
     text = _pdf_text(pdf)
     assert "07-08 easy 4.0 mi 3.0 mi partial" in text  # 2.96mi displays as 3.0 (1dp)
     assert "07-07 rest — — rest" in text  # compliant -> "rest" label, no mileage
@@ -326,7 +333,7 @@ def test_render_brief_pdf_plan_section_table_rows_and_verdicts():
 def test_render_brief_pdf_plan_section_without_today_omits_callout():
     section = dict(_PLAN_SECTION, today=None)
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {}, section)
+    pdf = _render(brief, {}, section)
     text = _pdf_text(pdf)
     # Stat strip + table still present, but no coaching-line paragraph.
     assert "TRAINING PLAN" in text
@@ -502,7 +509,7 @@ def test_render_brief_pdf_no_word_paints_past_the_printable_area():
     plan = dict(_PLAN_SECTION)
     plan["today"] = dict(plan["today"], coaching_line=long_line)
     brief = _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")])
-    pdf = visuals.render_brief_pdf(brief, {}, plan)
+    pdf = _render(brief, {}, plan)
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         page = doc.pages[0]
         margin_pt = 1.5 * 28.35  # @page margin: 1.5cm
@@ -564,3 +571,230 @@ def test_render_report_card_pdf_no_word_paints_past_the_printable_area():
                 for w in page.extract_words() if w["x1"] > right_edge + 0.5
             ]
     assert offenders == []
+
+
+# --- the one-page guarantee ------------------------------------------------
+# Both PDFs are single-page documents by contract (2026-07-22). Before that a
+# 3-takeaway brief and a 6-split report card each rendered 2 pages. These are
+# the regression net for that contract, and they measure page count rather
+# than trusting the CSS to still be tuned right.
+
+def _chart_png() -> bytes:
+    """A chart at the real figure geometry, so page-count tests exercise the
+    height a live chart actually costs."""
+    return visuals.render_chart_png(_SERIES, "line", _fmt, "last 14 days")
+
+
+def _realistic_takeaways(n: int) -> list[Takeaway]:
+    return [
+        Takeaway(
+            headline=f"Signal {i} headline that runs to a realistic length",
+            summary="A standfirst of the length the generator actually emits, "
+                    "roughly twenty-five words so the card height is honest "
+                    "rather than optimistic about what fits.",
+            tone="neutral",
+            metric=TakeawayMetric(metric="rhr", days=14),
+            details="Four or five sentences of deep-dive prose, which is what "
+                    "the model writes in practice. It cites a number, explains "
+                    "what the number means, and then says what to do about it "
+                    "today. That is the realistic worst case for card height.",
+        )
+        for i in range(n)
+    ]
+
+
+@pytest.mark.parametrize("n_takeaways", [1, 2, 3])
+@pytest.mark.parametrize("with_plan", [True, False])
+def test_brief_fits_one_page_at_realistic_takeaway_counts(n_takeaways, with_plan):
+    """Up to 3 charted takeaways — the shape briefs actually come in — the
+    density ladder alone holds one page with no content dropped."""
+    png = _chart_png()
+    pdf, pages = visuals.render_brief_pdf(
+        _brief(_realistic_takeaways(n_takeaways)),
+        {str(i): png for i in range(n_takeaways)},
+        _PLAN_SECTION if with_plan else None,
+    )
+    assert pages == 1
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        assert len(doc.pages) == 1
+
+
+@pytest.mark.parametrize("n_takeaways", [4, 5])
+def test_render_reports_overflow_rather_than_silently_spilling(n_takeaways):
+    """At the schema's upper end the ladder can be exhausted. The contract is
+    that `render_brief_pdf` SAYS so (page_count > 1) instead of quietly
+    emitting two pages — that signal is what drives truncation in
+    `generate_brief_report`, which owns the actual one-page guarantee."""
+    png = _chart_png()
+    _pdf, pages = visuals.render_brief_pdf(
+        _brief(_realistic_takeaways(n_takeaways)),
+        {str(i): png for i in range(n_takeaways)},
+        None,
+    )
+    assert pages > 1
+
+
+def test_fit_one_page_steps_down_until_it_fits():
+    """The ladder must actually walk: a document that only fits at a denser
+    rung has to come back on that rung, not on the first one tried."""
+    seen: list[str] = []
+
+    def build(preset):
+        seen.append(preset["name"])
+        # Height scales with the preset's body size, so only the dense rung fits.
+        rows = "".join("<p>line</p>" for _ in range(120))
+        return (f"<html><head><style>@page {{ size: A4; margin: 1.5cm; }}"
+                f"body {{ font-size: {preset['body_pt']}pt; }}"
+                f"p {{ margin: 0; }}</style></head><body>{rows}</body></html>")
+
+    _pdf, pages, index = visuals.fit_one_page(build)
+    assert seen == ["roomy", "compact", "dense"]
+    assert index == 2
+    assert pages > 1  # exhausted the ladder; caller must drop content
+
+
+def test_fit_one_page_stops_at_the_first_rung_that_fits():
+    seen: list[str] = []
+
+    def build(preset):
+        seen.append(preset["name"])
+        return "<html><body><p>short</p></body></html>"
+
+    _pdf, pages, index = visuals.fit_one_page(build)
+    assert seen == ["roomy"]
+    assert (pages, index) == (1, 0)
+
+
+def test_fit_one_page_rejects_an_empty_ladder():
+    with pytest.raises(ValueError, match="presets must not be empty"):
+        visuals.fit_one_page(lambda _p: "<html><body>x</body></html>", [])
+
+
+def test_omitted_takeaways_are_stated_on_the_page():
+    pdf, _pages = visuals.render_brief_pdf(
+        _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")]),
+        {}, _PLAN_SECTION, omitted=2,
+    )
+    assert "2 further signals omitted for space." in _pdf_text(pdf)
+
+
+def test_omitted_note_is_singular_for_one():
+    pdf, _pages = visuals.render_brief_pdf(
+        _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")]),
+        {}, _PLAN_SECTION, omitted=1,
+    )
+    assert "1 further signal omitted for space." in _pdf_text(pdf)
+
+
+def test_no_omitted_note_when_nothing_was_dropped():
+    pdf, _pages = visuals.render_brief_pdf(
+        _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")]),
+        {}, _PLAN_SECTION,
+    )
+    assert "omitted for space" not in _pdf_text(pdf)
+
+
+@pytest.mark.parametrize(
+    "n_cards,has_plan,expected",
+    [
+        (0, True, 0), (1, True, 1), (2, True, 2), (3, True, 2),
+        (4, True, 3), (5, True, 3),
+        (1, False, 1), (3, False, 3), (5, False, 5),
+    ],
+)
+def test_cards_in_left_rail_balances_against_the_plan_block(n_cards, has_plan, expected):
+    assert visuals.cards_in_left_rail(n_cards, has_plan) == expected
+
+
+def test_overflow_cards_render_below_the_plan_not_dropped():
+    """A card pushed into the right rail must still be ON the page — the split
+    moves cards, it never loses them."""
+    takeaways = [
+        Takeaway(headline=f"Headline number {i}", summary="s", tone="neutral",
+                 details="d")
+        for i in range(4)
+    ]
+    pdf, _pages = visuals.render_brief_pdf(_brief(takeaways), {}, _PLAN_SECTION)
+    text = _pdf_text(pdf)
+    for i in range(4):
+        assert f"Headline number {i}" in text
+
+
+# --- table geometry: the two measured collisions ---------------------------
+
+def _words(pdf: bytes) -> list[dict]:
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        return [w for p in doc.pages for w in p.extract_words()]
+
+
+def test_week_table_type_never_touches_the_planned_column():
+    """Regression for 2026-07-22: `interval` and `5.0` extracted as the single
+    word `interval5.0` — the Type and Planned columns had no gap at all."""
+    plan = dict(_PLAN_SECTION)
+    plan["last_7_days"] = [
+        {"date": "2026-07-09", "type": "interval", "planned_mi": 5.0,
+         "actual_mi": 9.18, "verdict": "done"},
+    ]
+    pdf, _pages = visuals.render_brief_pdf(
+        _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")]),
+        {}, plan,
+    )
+    texts = [w["text"] for w in _words(pdf)]
+    assert "interval" in texts, texts
+    assert not any(t.startswith("interval") and len(t) > len("interval") for t in texts)
+
+
+def test_stat_tile_values_never_cross_into_the_next_tile():
+    """Regression for 2026-07-22: the compound "This Week" value overran its
+    half-rail tile and read as one number with the Slips tile beside it."""
+    plan = dict(_PLAN_SECTION)
+    # A deliberately wide compound value — three-digit mileage both sides.
+    plan["week_actual_mi"] = 122.3
+    plan["week_planned_mi"] = 129.5
+    pdf, _pages = visuals.render_brief_pdf(
+        _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")]),
+        {}, plan,
+    )
+    words = _words(pdf)
+    slips = next(w for w in words if w["text"] == "SLIPS")
+    # The wide value lives on its own full-width row BELOW the three short
+    # tiles, so nothing from it may sit on the Slips label's baseline band.
+    band = [w for w in words if abs(w["top"] - slips["top"]) < 2]
+    assert "122.3" not in [w["text"] for w in band]
+
+
+def test_walk_miles_are_named_when_present():
+    plan = dict(_PLAN_SECTION, week_walk_mi=9.3)
+    pdf, _pages = visuals.render_brief_pdf(
+        _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")]),
+        {}, plan,
+    )
+    assert "+9.3 walked" in _pdf_text(pdf).lower()
+
+
+def test_walk_suffix_absent_when_no_walking():
+    pdf, _pages = visuals.render_brief_pdf(
+        _brief([Takeaway(headline="h", summary="s", tone="neutral", details="d")]),
+        {}, dict(_PLAN_SECTION, week_walk_mi=0.0),
+    )
+    assert "walked" not in _pdf_text(pdf).lower()
+
+
+# --- chart consistency -----------------------------------------------------
+
+def test_chart_window_label_is_rendered():
+    png = visuals.render_chart_png(_SERIES, "line", _fmt, "last 30 days")
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    # Same series, different label -> different pixels, so the caption is
+    # genuinely drawn rather than silently dropped.
+    assert png != visuals.render_chart_png(_SERIES, "line", _fmt, "last 14 days")
+
+
+def test_chart_without_a_label_still_renders():
+    assert visuals.render_chart_png(_SERIES, "line", _fmt)[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_chart_is_a_band_not_a_square():
+    """The height cap only buys page room if the figure is wide and short."""
+    w, h = visuals.CHART_FIGSIZE
+    assert w / h > 2.5

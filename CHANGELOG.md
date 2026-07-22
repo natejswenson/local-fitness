@@ -6,6 +6,78 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-22
+
+### Changed
+- **Both generated PDFs are single-page documents now, by contract.** Measured
+  before the change: the 2026-07-22 brief rendered **2 pages** while ~150pt of
+  page 1 sat empty, and the report card for a 6-split activity did the same
+  (the overflow CLAUDE.md previously documented as accepted). Neither renderer
+  had any idea how tall its own output was. `visuals.fit_one_page` now lays the
+  document out, counts `len(document.pages)`, and steps down a three-rung
+  density ladder (roomy → compact → dense) until it fits; `chart_h_pt` is the
+  load-bearing knob, because charts are measurably what broke the page (the
+  same brief fit on one page with its charts removed). Shared by both
+  renderers rather than reimplemented per renderer.
+- **`generate_brief_report` shrinks first, then truncates.** When even the
+  densest rung overflows, the lowest-priority takeaways are dropped and the
+  page **states how many** ("2 further signals omitted for space") — never a
+  silent spill, never a silent hide. Retries after the first attempt use the
+  densest preset only, bounding the worst case at
+  `len(PRESETS) + len(takeaways) - 1` layout passes (~65ms each).
+- **Signal cards now continue below the Training Plan instead of leaving the
+  right rail empty.** `cards_in_left_rail` balances the rails, counting the
+  plan block as ~2 cards (measured: ~347pt against ~212pt for a card). This
+  roughly doubles usable signal area, which is what lets the ladder stop at a
+  roomier rung and keep the charts legible.
+- **Charts are a wide band (`CHART_FIGSIZE` 8.0×2.8), not 16:9**, with a pinned
+  tick count and horizontal x labels. Three cards in a rail now read as one
+  system instead of three charts that happen to share a palette.
+
+### Fixed
+- **Chart windows were open-ended.** `_fetch_metric_series` anchored to
+  `date.today()` with **no upper bound**, so re-rendering a past brief drew
+  charts running to today and could show data the brief's own prose never saw.
+  It now takes `end` and `generate_brief_report` passes the brief's date —
+  the rule `_build_plan_section` already followed. Live callers (`chart`,
+  `generate_chart`) keep today's behavior via the default.
+- **The plan rollup counted walking as run mileage.** `plans._is_running` is a
+  substring match on Garmin's label, and walking-desk sessions log as
+  `treadmill_running` — so 07-21 reported `Planned 5.0 mi / Actual 9.2 mi` for
+  an interval day whose run was 5.95 mi and whose remaining 3.23 mi was a
+  29:15/mi walk. Distance and duration are now gated on **measured pace**
+  (`GradingConfig.pace_gated_locomotion`, on by default) via the shared
+  `interpret.is_running_effort`. This matters most for duration: that walk ran
+  1:34:30, long enough on its own to satisfy any rep-session target. Easy days
+  still count walking as active recovery, so prescribed walk days remain
+  gradeable. The strip now reads run miles with the walk total named beside it
+  (`20.0 mi / 29.5 mi · +9.3 walked`), and the two reconcile by construction.
+  **Adherence changes as a result** — the 2026-07-22 brief moved 94% → 88%.
+- **The Training Plan rail was vertically centred, not top-aligned.**
+  `table.page-layout > tr > td` never matched: HTML parsing inserts an implicit
+  `<tbody>`, so the child combinator silently failed and the cells kept
+  `vertical-align: middle`, floating the plan in the page's vertical centre
+  under a large void.
+- **Two measured table collisions.** The week table's Type and Planned columns
+  had no gap at all (`interval` and `5.0` extracted from the PDF as the single
+  word `interval5.0`); column widths are now budgeted from the longest string
+  each column can hold. The stat strip's compound "This Week" value overran its
+  half-rail tile and read as one number with the Slips tile beside it; the
+  strip is now three narrow tiles over one full-width tile.
+- **The Today callout printed the same instruction three times.**
+  `plan_coach.fallback_coaching_line` restated both the prescription and the
+  description that the callout already prints directly above it.
+
+### Internal
+- `is_running_effort` / `RUN_PACE_CEILING_SEC_PER_MI` moved from
+  `agent/report_card.py` into `agent/interpret.py` (the pure classifier module,
+  per its stated rule) so `plans.py` can share them without a
+  `plans → report_card → plans` import cycle. `report_card` re-exports both.
+- `plans.load_activities_by_date` now selects `avg_pace_sec_per_km`. It is
+  **required, not incidental**: without it the pace gate silently falls back to
+  the label, which is exactly the bug it exists to fix — the gate shipped as a
+  no-op until this was caught on a live render.
+
 ## [0.26.0] - 2026-07-21
 
 ### Fixed
