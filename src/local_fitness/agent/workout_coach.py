@@ -96,16 +96,22 @@ READ_SECTIONS: tuple[tuple[str, str], ...] = (
     ("load", "TRAINING LOAD"),
 )
 
+#: Deliberately states the rule without demonstrating it. The previous version
+#: spelled out the forbidden tokens ("Do not write \"A\", \"B-\", \"C+\"…"),
+#: which put four letter grades into the model's context in the same breath as
+#: the ban. Between that and the per-metric letters the user prompt used to
+#: carry, the read was being shown the thing it was told not to say — and it
+#: leaked at 3.1% of paragraphs, regenerating to the SAME letter on retry.
 _GRADE_TONE = (
-    "The grades are already decided and are not yours to revise — do not "
+    "The verdicts are already decided and are not yours to revise — do not "
     "argue with them, soften them, or re-grade the run.\n\n"
-    "NEVER state a letter grade. Do not write \"A\", \"B-\", \"C+\", "
-    '"you got a B", or "your pace grade". The letters are printed in the '
-    "table directly below you and repeating them wastes the only words you "
-    "get. Make the REASON obvious from the numbers instead: what he was held "
-    "to, what he actually did, and whether that gap matters. A reader should "
-    "look at your paragraph, then at the table, and find the letter "
-    "unsurprising.\n\n"
+    "Write about the NUMBERS, never about a score. The report card prints a "
+    "letter grade for each area in the table directly below you, so a letter "
+    "in your paragraph is a word spent repeating what the reader can already "
+    "see. Do not name one, do not spell one out, and do not invent a grading "
+    "scale of your own. Make the reason obvious instead: what he was held to, "
+    "what he actually did, and whether that gap matters. A reader should look "
+    "at your paragraph, then at the table, and find the letter unsurprising.\n\n"
     "Do NOT discuss CTL, ATL, TSB, fitness base, fatigue score or freshness. "
     "Those are printed elsewhere and are not what this card is about."
 )
@@ -167,12 +173,14 @@ def build_prompt(
     lines = [
         f"Activity: {act.get('activity_name') or act.get('activity_type') or 'run'} "
         f"on {act.get('date')}.",
-        f"Overall grade {overall.get('grade')}"
-        + (f" ({overall['gpa']:.2f} GPA)." if overall.get("gpa") is not None else "."),
+        # Severity, not the letter, and no GPA — see _GRADE_SEVERITY. The read
+        # may not name either, and printing them here is what it echoed.
+        f"Overall, the session was {grade_severity(overall.get('grade'))}.",
         f"Intent: {card.get('intent')} ({card.get('intent_source')}).",
         reference_summary(card),
         "",
-        "Metric grades (already computed — phrase, don't re-derive):",
+        "Per-metric verdicts (already computed — phrase them, never re-derive "
+        "them, and never convert them back into a letter):",
     ]
     for key, label in _metric_labels():
         m = (card.get("metrics") or {}).get(key) or {}
@@ -184,7 +192,7 @@ def build_prompt(
             continue
         # actual_text, not the raw number: quality pace is graded on the fastest
         # split, and a bare "9:25/mi" would read as the whole run's average.
-        line = f"  {label}: {m['grade']} — actual {_actual_text(key, m)}"
+        line = f"  {label}: {grade_severity(m['grade'])} — actual {_actual_text(key, m)}"
         # expected_text, not the raw number: HR is held to a BAND, and handing
         # the model a bare midpoint is how it ends up explaining a heart-rate
         # verdict against a number the grade was never measured against.
@@ -297,6 +305,77 @@ def reference_summary(card: dict) -> str:
     from .report_card import reference_line
 
     return reference_line(card, markdown=False)
+
+
+#: A letter grade named in the prose. ``_GRADE_TONE`` forbids this outright —
+#: the letters are printed in the table directly below the read, so repeating
+#: one spends words the paragraph does not have on information already on the
+#: page. The model obeys most of the time and not always: measured 2026-07-22
+#: over 96 paragraphs on 3 real cards, **3 leaked** (3.1%) — "an F, no rounding
+#: it up", "F-grade pace", "the C+ says so".
+#:
+#: Narrow by construction, because the FALSE POSITIVE is the expensive error: a
+#: bare "A" is nearly always the article ("A blown interval session…"), and
+#: treating it as a grade would throw away a clean read and pay for another
+#: generation. So a bare letter only counts when it is punctuated like a
+#: sentence, preceded by an article, or followed by grade-talk; a letter with a
+#: +/- sign is unambiguous and always counts. Validated against 12 cases (5 real
+#: leaks, 7 lookalikes) in ``tests/test_workout_coach.py`` — extend BOTH lists
+#: there before touching this pattern.
+_GRADE_LEAK = re.compile(
+    r"(?:^|(?<=[\s(]))"
+    r"(?:"
+    r"[A-DF][+-]"                                    # signed: unambiguous
+    r"|[A-DF](?=[.,;:!?]\"?\s)"                      # "F. Target 6:58/mi…"
+    r"|(?:an?\s+)[A-DF](?=[\s.,;:])"                 # "an F", "a B"
+    r"|[A-DF](?=\s+(?:is|on paper|effort|grade))"    # "F is F", "B on paper"
+    r"|[A-DF](?=-grade\b)"                           # "F-grade pace"
+    r")"
+)
+
+
+#: Grade letter → the severity word the PROMPT carries in its place.
+#:
+#: The read is forbidden from naming a letter, and the prompt used to hand it
+#: every letter anyway ("Distance: D- — actual 5.95 mi vs target 5.00 mi"). That
+#: is not a rule the model can follow reliably; it is a token sitting in its
+#: context next to the metric it is being asked to write about, and a leaked
+#: read regenerated to the SAME letter twice in testing (2026-07-22) because the
+#: retry saw the same prompt.
+#:
+#: The severity still has to be present, or the read drifts out of agreement
+#: with the table beside it: a +19% distance overshoot is a D- only because the
+#: intent scaling says an interval day is not the place for extra miles, and
+#: that judgment is not recoverable from the raw numbers. So the band goes in
+#: and the letter stays out.
+_GRADE_SEVERITY = {
+    "A": "on target",
+    "B": "slightly off target",
+    "C": "off target",
+    "D": "well off target",
+    "F": "missed badly",
+}
+
+
+def grade_severity(grade: str | None) -> str:
+    """Severity word for a grade, keyed on the BASE letter so "D-" and "D+"
+    read the same. Unknown/ungraded → "n/a"."""
+    if not grade or grade == "n/a":
+        return "n/a"
+    return _GRADE_SEVERITY.get(grade[0], "n/a")
+
+
+def find_grade_leak(sections: dict[str, str]) -> str | None:
+    """The first letter grade named in a parsed read, or ``None`` if clean.
+
+    Pure, so the decision to regenerate is testable without an SDK call. See
+    ``_GRADE_LEAK`` for why the pattern is deliberately narrow.
+    """
+    for text in sections.values():
+        m = _GRADE_LEAK.search(text or "")
+        if m:
+            return m.group(0).strip()
+    return None
 
 
 def parse_read(text: str) -> dict[str, str]:
@@ -473,6 +552,41 @@ async def generate_read_cached(
     # Parse BEFORE caching: an unparseable generation must not be stored, or
     # every later render pays to rediscover that it is unusable.
     sections = parse_read(text)
+
+    # `_GRADE_TONE` forbids naming a letter grade and the model complies ~97% of
+    # the time (measured: 3 of 96 paragraphs). A prompt cannot make that a
+    # guarantee, so the code checks — the same division of labour that has
+    # `parse_read` enforce the four-section contract rather than trusting it.
+    #
+    # ONE retry, not a loop: sampling is non-deterministic (no temperature is
+    # pinned), so a second draw is a genuinely different read and clears the
+    # leak the overwhelming majority of the time, while a loop would let a
+    # pathological card spend unbounded time and tokens. The retry only wins if
+    # it is actually clean; otherwise the original stands, so a leak can never
+    # cost more than one extra call. It matters more than 3% suggests because
+    # the result is CACHED — a leaked read would otherwise stick until the
+    # card's inputs change.
+    leak = find_grade_leak(sections)
+    if leak:
+        _LOG.info("workout_coach read named a grade (%r) — regenerating once", leak)
+        try:
+            retry_text = await generate_read(
+                profile, card, model=model, timeout=timeout,
+                notes_text=notes_text, user_name=user_name)
+            retry_sections = parse_read(retry_text)
+        except Exception:
+            # A failed retry must never cost the card the read it already has.
+            _LOG.warning("workout_coach retry failed — keeping the first read",
+                         exc_info=True)
+        else:
+            retry_leak = find_grade_leak(retry_sections)
+            if retry_leak is None:
+                text, sections = retry_text, retry_sections
+            else:
+                _LOG.warning(
+                    "workout_coach read named a grade twice (%r, %r) — keeping "
+                    "the first", leak, retry_leak)
+
     _write_cache(path, key, text)
     return sections
 

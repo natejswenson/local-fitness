@@ -61,11 +61,34 @@ def test_prompt_carries_the_computed_grades_and_forbids_re_grading():
     # The persona and dials are threaded in, so the read speaks in his voice.
     assert PROFILE.persona in system
     assert PROFILE.dials_line in system
-    # The grades are stated as decided, and the model is told not to revise.
+    # The verdicts are stated as decided, and the model is told not to revise.
     assert "not yours to revise" in system
-    assert f"Overall grade {card['overall']['grade']}" in user
+    # SEVERITY, not the letter — the prompt must not hand the model the token
+    # it is forbidden to repeat. This is the invariant, not a style choice.
+    assert workout_coach.grade_severity(card["overall"]["grade"]) in user
+    assert f"Overall grade {card['overall']['grade']}" not in user
     for label in ("Distance", "Pace", "Avg HR", "Training Load"):
         assert label in user
+
+
+def test_the_user_prompt_never_contains_a_letter_grade():
+    """The root cause of the leak: the prompt used to print every letter
+    ("Distance: D- — actual 5.95 mi…") in the same context that forbade
+    repeating them, and a leaked read regenerated to the SAME letter."""
+    for card in (a_card(), _card_with_ungraded_pace()):
+        _system, user = workout_coach.build_prompt(PROFILE, card)
+        assert workout_coach.find_grade_leak({"user": user}) is None, user
+
+
+def test_grade_severity_keys_on_the_base_letter():
+    assert workout_coach.grade_severity("D-") == workout_coach.grade_severity("D+")
+    assert workout_coach.grade_severity("A") == "on target"
+    assert workout_coach.grade_severity("F") == "missed badly"
+
+
+def test_grade_severity_handles_ungraded():
+    assert workout_coach.grade_severity(None) == "n/a"
+    assert workout_coach.grade_severity("n/a") == "n/a"
 
 
 def test_prompt_states_the_yardstick_without_markdown_emphasis():
@@ -319,7 +342,11 @@ def test_prompt_demands_four_labelled_sections_and_forbids_letter_grades():
     system, _ = workout_coach.build_prompt(PROFILE, a_card())
     for label in ("DISTANCE:", "PACE:", "HEART RATE:", "TRAINING LOAD:"):
         assert label in system
-    assert "NEVER state a letter grade" in system
+    assert "Do not name one" in system
+    assert "never about a score" in system
+    # The ban must not demonstrate itself: spelling out "A", "B-", "C+" put
+    # four grades into the context alongside the instruction not to say one.
+    assert workout_coach.find_grade_leak({"system": system}) is None
     assert "45 words per paragraph" in system
 
 
@@ -482,3 +509,143 @@ def test_fallback_read_carries_the_metrics_reason_through():
     out = workout_coach.fallback_read(_card_with_ungraded_pace())
     assert out["pace"].startswith("10:42/mi avg.")
     assert "no splits recorded" in out["pace"]
+
+
+# --- the letter-grade guard -------------------------------------------------
+# `_GRADE_TONE` forbids naming a letter grade; the model complies ~97% of the
+# time (measured 2026-07-22: 3 leaks in 96 paragraphs across 3 real cards). The
+# code enforces what the prompt can only ask for.
+#
+# These two lists ARE the specification of `_GRADE_LEAK`. The false-positive
+# list is the important half: a bare "A" is almost always the article, and
+# firing on it would throw away a clean read and pay for another generation.
+# Extend BOTH before touching the pattern.
+
+_REAL_LEAKS = [
+    "F is F. 9:25 best mile against a 6:58 target isn't a miss.",
+    "F. Target 6:58/mi, your best mile was 9:25 — over two minutes slow.",
+    "B+ on paper, but that's the tell.",
+    "You got a B for that.",
+    "That's a D- effort and you know it.",
+    "Combine that with F-grade pace and the session was a write-off.",
+    "2:27 slow, an F, no rounding it up.",
+    "112 bpm against a ceiling — the C+ says so.",
+]
+
+_LOOKALIKES = [
+    "A blown interval session that's also light on load.",
+    "81 against a 105 target — you left work on the table.",
+    "136 bpm average sits under the 145 floor.",
+    "A full minute per mile too hot for a recovery day.",
+    "Mile 3 at 14:49 — you were shuffling, not running.",
+    "An easy day is supposed to be easy.",
+    "Target 6:58/mi, best mile 9:25.",
+    "Your 5K pace is not your 10K pace.",
+    "A solid negative split, front half to back half.",
+]
+
+
+@pytest.mark.parametrize("text", _REAL_LEAKS)
+def test_grade_leak_is_detected(text):
+    assert workout_coach.find_grade_leak({"pace": text}) is not None
+
+
+@pytest.mark.parametrize("text", _LOOKALIKES)
+def test_grade_lookalikes_do_not_fire(text):
+    assert workout_coach.find_grade_leak({"pace": text}) is None
+
+
+def test_find_grade_leak_returns_the_offending_token():
+    assert workout_coach.find_grade_leak({"hr": "the C+ says so"}) == "C+"
+
+
+def test_find_grade_leak_scans_every_section():
+    sections = {"distance": "clean", "pace": "clean",
+                "hr": "clean", "load": "that's a D- effort"}
+    assert workout_coach.find_grade_leak(sections) == "D-"
+
+
+def test_find_grade_leak_clean_read_returns_none():
+    assert workout_coach.find_grade_leak(
+        {k: "All clean prose, no letters here." for k, _ in workout_coach.READ_SECTIONS}
+    ) is None
+
+
+def test_find_grade_leak_tolerates_empty_sections():
+    assert workout_coach.find_grade_leak({"pace": "", "hr": None}) is None
+
+
+# --- retry-once behaviour ---------------------------------------------------
+
+def _read(pace: str) -> str:
+    return (f"DISTANCE: clean\nPACE: {pace}\n"
+            "HEART RATE: clean\nTRAINING LOAD: clean")
+
+
+def _stub_generate(monkeypatch, texts):
+    """Replace generate_read with a scripted sequence; count the calls."""
+    calls = {"n": 0}
+
+    async def fake(*_a, **_k):
+        calls["n"] += 1
+        return texts[min(calls["n"] - 1, len(texts) - 1)]
+
+    monkeypatch.setattr(workout_coach, "generate_read", fake)
+    return calls
+
+
+def test_a_leaked_read_is_regenerated_once(monkeypatch, tmp_path):
+    calls = _stub_generate(monkeypatch, [_read("an F, no rounding it up"),
+                                         _read("2:27 slower than the ask")])
+    sections = asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=tmp_path / "c.json"))
+    assert calls["n"] == 2
+    assert sections["pace"] == "2:27 slower than the ask"
+
+
+def test_a_clean_read_is_not_regenerated(monkeypatch, tmp_path):
+    calls = _stub_generate(monkeypatch, [_read("2:27 slower than the ask")])
+    asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=tmp_path / "c.json"))
+    assert calls["n"] == 1
+
+
+def test_two_leaks_keeps_the_first_and_stops(monkeypatch, tmp_path):
+    """One retry, never a loop — a pathological card must not spend unbounded
+    time, and the first read is no worse than the second."""
+    calls = _stub_generate(monkeypatch, [_read("an F, first"), _read("a D-, second")])
+    sections = asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=tmp_path / "c.json"))
+    assert calls["n"] == 2
+    assert sections["pace"] == "an F, first"
+
+
+def test_a_failed_retry_keeps_the_first_read(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    async def fake(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _read("an F, no rounding it up")
+        raise RuntimeError("SDK down")
+
+    monkeypatch.setattr(workout_coach, "generate_read", fake)
+    sections = asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=tmp_path / "c.json"))
+    assert calls["n"] == 2
+    assert sections["pace"] == "an F, no rounding it up"
+
+
+def test_the_clean_retry_is_what_gets_cached(monkeypatch, tmp_path):
+    """The cache must hold the read that was RETURNED — otherwise the next
+    render replays the leak the retry just paid to remove."""
+    cache = tmp_path / "c.json"
+    _stub_generate(monkeypatch, [_read("an F, no rounding it up"),
+                                 _read("2:27 slower than the ask")])
+    asyncio.run(workout_coach.generate_read_cached(PROFILE, a_card(), cache_path=cache))
+
+    calls = _stub_generate(monkeypatch, [_read("should not be called")])
+    again = asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, a_card(), cache_path=cache))
+    assert calls["n"] == 0, "second render should hit the cache"
+    assert again["pace"] == "2:27 slower than the ask"
