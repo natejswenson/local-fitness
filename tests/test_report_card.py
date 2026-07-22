@@ -201,13 +201,44 @@ def test_load_is_intent_scaled_so_easy_days_dont_fail():
     assert rc.base_letter(card["metrics"]["load"]["grade"]) == "A"
 
 
-def test_load_spike_is_advisory_not_a_downgrade():
+def test_load_spike_downgrades_rather_than_contradicting_its_own_note():
+    """A spike used to score A+ on the row directly above the note calling it a
+    spike. The letter and the prose must agree."""
     card = card_for(
         {"date": "2026-07-19", "distance_meters": 10000, "avg_pace_sec_per_km": 300,
          "avg_hr": 150, "training_load": 250},
     )
-    assert card["metrics"]["load"]["spike"] is True
-    assert rc.base_letter(card["metrics"]["load"]["grade"]) == "A"
+    load = card["metrics"]["load"]
+    assert load["spike"] is True
+    # Steady intent, so expected == the unscaled 100 median. 250/100 = 2.5x,
+    # i.e. 0.5 past the 2.0 spike threshold -> (2.5-2.0)/2.0 = 0.25 deviation,
+    # which lands in the D band (0.20-0.35).
+    assert load["expected"] == pytest.approx(100.0)
+    assert load["deviation"] == pytest.approx(0.25)
+    assert load["grade"] == "D"
+
+
+def test_load_at_the_spike_threshold_is_still_a_clean_a():
+    """The boundary is inclusive: doubling the expectation is a big day, not a
+    failure. Only the excess past it is penalized."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "avg_pace_sec_per_km": 300,
+         "avg_hr": 150, "training_load": 200},
+    )
+    assert card["metrics"]["load"]["deviation"] == pytest.approx(0.0)
+    assert card["metrics"]["load"]["grade"] == "A+"
+    # Exactly 2.0x is not > 2.0x, so no spike flag either.
+    assert "spike" not in card["metrics"]["load"]
+
+
+@pytest.mark.parametrize(("load", "expected_d"), [
+    (100.0, 0.0),    # on the expectation
+    (75.0, 0.25),    # a quarter short
+    (150.0, 0.0),    # over, but under the spike ceiling — still free
+    (300.0, 0.5),    # 3.0x -> (3.0-2.0)/2.0
+])
+def test_load_deviation_is_two_sided_past_the_spike_ceiling(load, expected_d):
+    assert rc.load_deviation(load, 100.0) == pytest.approx(expected_d)
 
 
 def test_load_is_na_when_null():
@@ -755,3 +786,337 @@ def test_overall_grade_cannot_be_an_A_when_the_prescription_was_missed():
         reference={**REF, "median_hr": 146.0, "median_load": 53.0},
     )
     assert card["overall"]["grade"] != "A"
+
+
+# === locomotion gating =====================================================
+# `activity_type` is Garmin's label, not a measurement: a walking-desk session
+# logs as `treadmill_running`. Measured 2026-07-21, that put the "median
+# comparable activity" at a 15:50/mi walk (116 bpm, 22 load) and handed a real
+# interval session an A+ on both HR and load for clearing a walking bar.
+
+@pytest.mark.parametrize(("pace_sec_per_km", "expected"), [
+    (300.0, True),    # 8:03/mi — running
+    (484.0, True),    # 12:59/mi — just inside the ceiling
+    (485.0, False),   # 13:00/mi — the boundary itself is walking
+    (600.0, False),   # 16:05/mi — the walking-desk regime
+    (3127.0, False),  # 83:49/mi — a paused watch
+])
+def test_is_running_effort_splits_on_pace_not_label(pace_sec_per_km, expected):
+    assert rc.is_running_effort(pace_sec_per_km) is expected
+
+
+@pytest.mark.parametrize("pace", [None, 0, 0.0, -1.0])
+def test_is_running_effort_is_none_when_pace_is_unusable(pace):
+    """A third state, not False. `None == True` and `None == False` are both
+    False, so an equality filter drops a paceless row from BOTH pools instead
+    of silently filing it under walking."""
+    assert rc.is_running_effort(pace) is None
+
+
+@pytest.fixture
+def bimodal_db(tmp_path, monkeypatch):
+    """A `treadmill_running` pool shaped like the real one: 8 genuine runs and
+    12 walking-desk sessions, all under the same activity_type.
+
+    The two activities under grading sit at offset 1 and the pool starts at
+    offset 2, because the reference window ends the day *before* the graded
+    activity — same-day peers would silently drop out and make every count in
+    these tests an off-by-one puzzle.
+    """
+    p = tmp_path / "bimodal.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # The graded pair: one run, one walking-desk session, same type.
+        rows = [(1, 1, "treadmill_running", 10000, 150, 400.0, 100.0),
+                (2, 1, "treadmill_running", 5000, 95, 1000.0, 10.0)]
+        # Runs: 10:44/mi, HR 150, load 100.
+        for i in range(8):
+            rows.append((301 + i, i + 2, "treadmill_running", 10000, 150, 400.0, 100.0))
+        # Walking desk: 26:49/mi, HR 95, load 10.
+        for i in range(12):
+            rows.append((401 + i, i + 2, "treadmill_running", 5000, 95, 1000.0, 10.0))
+        for aid, offset, atype, dist, hr, pace, load in rows:
+            d = (today - timedelta(days=offset)).isoformat()
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, start_time, activity_type,"
+                " activity_name, duration_seconds, distance_meters, avg_hr,"
+                " avg_pace_sec_per_km, training_load)"
+                " VALUES (?, ?, ?, ?, 'X', 3000, ?, ?, ?, ?)",
+                (aid, d, f"{d} 07:00:00", atype, dist, hr, pace, load),
+            )
+    return p
+
+
+def _graded(conn, activity_id):
+    return dict(conn.execute(
+        "SELECT * FROM activities WHERE activity_id=?", (activity_id,)).fetchone())
+
+
+def test_a_run_is_graded_against_runs_only(bimodal_db):
+    """The regression that motivated the filter. Without it the median HR is
+    dragged from 150 to ~95 and the median load from 100 to ~10, which is how
+    a genuine interval session scored A+ on both."""
+    with db.connect(bimodal_db) as conn:
+        ref = rc.rolling_reference(conn, _graded(conn, 1))
+    assert ref["n"] == 8
+    assert ref["excluded_other_mode"] == 12
+    assert ref["mode_label"] == "running"
+    assert ref["median_hr"] == pytest.approx(150.0)
+    assert ref["median_load"] == pytest.approx(100.0)
+    assert ref["median_pace_sec_per_km"] == pytest.approx(400.0)
+
+
+def test_a_walk_is_graded_against_walks_only(bimodal_db):
+    """Symmetric: the filter isn't 'drop the walks', it's 'compare like with
+    like'. A walking-desk session must not be measured against running."""
+    with db.connect(bimodal_db) as conn:
+        ref = rc.rolling_reference(conn, _graded(conn, 2))
+    assert ref["n"] == 12
+    assert ref["excluded_other_mode"] == 8
+    assert ref["mode_label"] == "walking"
+    assert ref["median_hr"] == pytest.approx(95.0)
+    assert ref["median_load"] == pytest.approx(10.0)
+
+
+def test_locomotion_filter_runs_before_widening(bimodal_db):
+    """Widening is the dangerous path: an exact pool thinned below the floor
+    would otherwise pull the entire walking corpus in as 'on-foot'."""
+    with db.connect(bimodal_db) as conn:
+        conn.execute("DELETE FROM activities WHERE activity_id BETWEEN 303 AND 308")
+        ref = rc.rolling_reference(conn, _graded(conn, 1))
+    # 2 running peers left, below MIN_REFERENCE_ACTIVITIES, and widening finds
+    # no more runs — so it reports insufficient rather than grading on walks.
+    assert ref["mode"] == "insufficient_data"
+    assert ref["n"] == 2
+
+
+def test_a_paceless_activity_falls_back_to_type_only_comparison(bimodal_db):
+    """Its own mode is unknowable, so the filter is skipped rather than
+    guessing a side and grading against the wrong half."""
+    with db.connect(bimodal_db) as conn:
+        act = _graded(conn, 1)
+        act["avg_pace_sec_per_km"] = None
+        ref = rc.rolling_reference(conn, act)
+    assert ref["excluded_other_mode"] == 0
+    assert ref["n"] == 20                      # every same-type peer, both modes
+    assert ref["mode_label"] is None
+
+
+def test_reference_line_states_the_exclusion(bimodal_db):
+    """The filter is invisible in the numbers — a reader comparing against
+    Garmin's own app would see a different median with no way to account for it."""
+    with db.connect(bimodal_db) as conn:
+        act = _graded(conn, 1)
+        card = rc.build_card(act, [], None, rc.rolling_reference(conn, act))
+    line = rc.reference_line(card)
+    assert "12 same-window walking-effort activities excluded" in line
+    assert "Garmin labels them the same, the pace says otherwise" in line
+
+
+def test_reference_line_says_nothing_when_nothing_was_excluded():
+    card = card_for({"date": "2026-07-19", "distance_meters": 10000,
+                     "avg_pace_sec_per_km": 300, "avg_hr": 150})
+    assert "excluded" not in rc.reference_line(card)
+
+
+# === quality-day pace ======================================================
+# The one documented exception to "no grade reads activity_splits".
+
+def _mile_splits(*paces_sec_per_km):
+    """Full one-mile splits, plus a fast trailing fragment that must be ignored."""
+    rows = [{"split_index": i, "distance_meters": rc.MILE_M, "duration_seconds": 480,
+             "avg_hr": 160, "avg_pace_sec_per_km": p}
+            for i, p in enumerate(paces_sec_per_km)]
+    rows.append({"split_index": len(paces_sec_per_km), "distance_meters": 90.0,
+                 "duration_seconds": 20, "avg_hr": 170,
+                 "avg_pace_sec_per_km": 100.0})
+    return rows
+
+
+def test_fastest_full_split_ignores_the_trailing_fragment():
+    """A 90-metre fragment can post an absurd pace and would win every time."""
+    labelled = rc.label_splits(_mile_splits(360.0, 300.0, 330.0))
+    assert rc.fastest_full_split_pace(labelled) == pytest.approx(300.0)
+
+
+def test_fastest_full_split_is_none_without_splits():
+    assert rc.fastest_full_split_pace(rc.label_splits([])) is None
+
+
+def test_interval_pace_is_graded_on_the_fastest_split():
+    """The headline fix. A whole-run average bakes in the warmup, the recovery
+    jogs and the cooldown, so grading it against a REP target is not a strict
+    rubric — it is an arithmetic guarantee of an F."""
+    card = card_for(
+        # Averages 10:42/mi across the session; best mile is 5:00/km (8:03/mi).
+        {"date": "2026-07-21", "distance_meters": 9575, "duration_seconds": 3822,
+         "avg_pace_sec_per_km": 399.2, "avg_hr": 150, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 300.0, "seq": 1},
+        splits=_mile_splits(420.0, 300.0, 450.0),
+    )
+    pace = card["metrics"]["pace"]
+    assert pace["actual"] == pytest.approx(300.0)          # the fastest split
+    assert pace["actual_display"] == "8:03/mi best mile"
+    assert pace["deviation"] == pytest.approx(0.0)         # hit the rep target
+    assert pace["grade"] == "A+"
+    # No note: "8:03/mi best mile" beside a "5:00/mi" target already says what
+    # was compared, and the PDF's one-page budget is real — this bullet alone
+    # pushed a 6-split card onto a second page.
+    assert pace.get("note") is None
+
+
+def test_interval_pace_still_fails_when_the_reps_were_missed():
+    """The exception must not become a free pass — it changes WHICH number is
+    graded, not whether a missed workout is called out."""
+    card = card_for(
+        {"date": "2026-07-21", "distance_meters": 9575, "duration_seconds": 3822,
+         "avg_pace_sec_per_km": 399.2, "avg_hr": 150, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 260.0, "seq": 1},
+        splits=_mile_splits(420.0, 351.0, 450.0),
+    )
+    pace = card["metrics"]["pace"]
+    # Best mile 351 vs a 260 target: (351-260)/260 = 0.35, and PLAN_TIGHTEN
+    # scales the F boundary to 0.35*0.6 = 0.21.
+    assert pace["deviation"] == pytest.approx(0.35, abs=1e-3)
+    assert pace["grade"] == "F"
+
+
+def test_interval_pace_is_na_without_splits_not_a_fabricated_f():
+    """~88% of history is backfilled and carries no splits. The metric refuses
+    rather than falling back to the comparison it exists to avoid."""
+    card = card_for(
+        {"date": "2026-07-21", "distance_meters": 9575, "duration_seconds": 3822,
+         "avg_pace_sec_per_km": 399.2, "avg_hr": 150, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 300.0, "seq": 1},
+    )
+    pace = card["metrics"]["pace"]
+    assert pace["grade"] is None
+    assert pace["deviation"] is None
+    assert pace["actual"] == pytest.approx(399.2)          # the average is kept
+    assert pace["actual_display"] == "10:42/mi avg"
+    assert "no splits recorded" in pace["note"]
+    # ...and the weight redistributes rather than scoring pace as zero.
+    assert card["overall"]["graded_metrics"] == 3
+
+
+def test_ungraded_metric_prints_no_delta():
+    """A delta beside an n/a re-makes the very comparison the n/a refuses."""
+    card = card_for(
+        {"date": "2026-07-21", "distance_meters": 9575, "duration_seconds": 3822,
+         "avg_pace_sec_per_km": 399.2, "avg_hr": 150, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 300.0, "seq": 1},
+    )
+    assert rc._delta_text("pace", card["metrics"]["pace"]) == "—"
+    assert "224s/mi" not in rc.render_markdown(card)
+
+
+def test_easy_day_pace_is_untouched_by_the_quality_exception():
+    """Scoped to quality intent only — an easy day keeps grading its average,
+    and keeps reading no splits at all."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 4925, "duration_seconds": 1736,
+         "avg_pace_sec_per_km": 352.0, "avg_hr": 136, "training_load": 51},
+        plan={"type": "easy", "target_distance_m": 4828,
+              "target_pace_sec_per_km": 390.0, "seq": 1},
+        splits=_mile_splits(300.0, 310.0, 320.0),
+    )
+    assert card["metrics"]["pace"]["actual"] == pytest.approx(352.0)
+    assert "actual_display" not in card["metrics"]["pace"]
+
+
+def test_actual_text_falls_back_to_the_plain_number():
+    assert rc.actual_text("hr", {"actual": 136.0}) == "136 bpm"
+    assert rc.actual_text("hr", {"actual": None}) == "—"
+
+
+# === intent-weighted composite + the F floor ===============================
+
+def test_intent_weights_let_pace_carry_an_easy_day():
+    """Flat weights let HR and load (40% combined) outvote the one metric an
+    easy day exists to satisfy. Same grades, different intent, different total."""
+    metrics = {
+        "distance": {"grade": "A"}, "pace": {"grade": "D"},
+        "hr": {"grade": "A"}, "load": {"grade": "A"},
+    }
+    easy = rc.overall_grade(metrics, "easy")
+    long_run = rc.overall_grade(metrics, "long")
+    # easy: .20*4 + .45*1 + .25*4 + .10*4 = 2.65
+    assert easy["gpa"] == pytest.approx(2.65)
+    # long: .45*4 + .20*1 + .20*4 + .15*4 = 3.40 — distance is the point there.
+    assert long_run["gpa"] == pytest.approx(3.40)
+    assert easy["grade"] == "B" and long_run["grade"] == "B"
+
+
+def test_steady_intent_keeps_the_neutral_split():
+    """No stated intent means no metric can claim to be the point of the day."""
+    metrics = {
+        "distance": {"grade": "A"}, "pace": {"grade": "D"},
+        "hr": {"grade": "A"}, "load": {"grade": "A"},
+    }
+    # .30*4 + .30*1 + .25*4 + .15*4 = 3.10
+    assert rc.overall_grade(metrics, "steady")["gpa"] == pytest.approx(3.10)
+    assert rc.overall_grade(metrics)["gpa"] == pytest.approx(3.10)  # default
+
+
+def test_an_f_caps_the_overall():
+    """Three strong metrics must not average an outright failure into an A."""
+    metrics = {
+        "distance": {"grade": "A+"}, "pace": {"grade": "F"},
+        "hr": {"grade": "A"}, "load": {"grade": "A"},
+    }
+    out = rc.overall_grade(metrics, "long")
+    # .45*4 + .20*0 + .20*4 + .15*4 = 3.20 -> B, capped to C.
+    assert out["gpa"] == pytest.approx(3.20)
+    assert out["grade"] == "C"
+    assert out["capped_by"] == "F"
+
+
+def test_the_f_cap_never_raises_a_worse_grade():
+    metrics = {"pace": {"grade": "F"}, "hr": {"grade": "F"}}
+    out = rc.overall_grade(metrics, "easy")
+    assert out["grade"] == "F"
+    assert "capped_by" not in out
+
+
+def test_the_f_cap_is_stated_on_the_card():
+    """A long run that nailed distance, HR and load but was run far too slow
+    for its prescription: without the cap the composite reads B over an F."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 20000, "duration_seconds": 9000,
+         "avg_pace_sec_per_km": 200.0, "avg_hr": 150, "training_load": 140},
+        plan={"type": "long", "target_distance_m": 20000,
+              "target_pace_sec_per_km": 300.0, "seq": 1},
+    )
+    assert card["metrics"]["pace"]["grade"] == "F"
+    assert card["overall"]["gpa"] > 2.5          # would have printed a B
+    assert card["overall"]["grade"] == "C"
+    assert card["overall"]["capped_by"] == "F"
+    assert "capped at C" in rc.render_markdown(card)
+
+
+def test_exclusion_count_covers_only_mislabelled_rows(bimodal_db):
+    """The card's sentence claims "Garmin labels them the same". A genuinely
+    typed `walking` row was never a candidate for a running pool, so counting
+    it would overstate the mislabelling the filter exists to undo."""
+    today = date.today()
+    with db.connect(bimodal_db) as conn:
+        for i in range(3):
+            d = (today - timedelta(days=i + 2)).isoformat()
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, start_time,"
+                " activity_type, activity_name, duration_seconds, distance_meters,"
+                " avg_hr, avg_pace_sec_per_km, training_load)"
+                " VALUES (?, ?, ?, 'walking', 'Walk', 3000, 4000, 95, 1000.0, 10.0)",
+                (900 + i, d, f"{d} 12:00:00"),
+            )
+        ref = rc.rolling_reference(conn, _graded(conn, 1))
+    # Still 12 — the 3 honestly-typed walks are excluded from the pool but are
+    # not counted as mislabelled.
+    assert ref["excluded_other_mode"] == 12
+    assert ref["n"] == 8

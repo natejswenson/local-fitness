@@ -368,11 +368,117 @@ def test_markdown_card_renders_four_labelled_paragraphs():
         assert label in md
     # Distance's paragraph precedes pace's, matching the table's order.
     assert md.index("You covered the ground.") < md.index("Too quick.")
-    # The standalone yardstick sentence is gone; Expected states it per metric.
-    assert "Graded against your" not in md
+    # The yardstick is stated once, below the table. It came back when the
+    # reference pool started excluding rows: which median a run is measured
+    # against is now a decision the reader cannot reconstruct from the numbers.
+    assert "Graded against your **60-day rolling median**" in md
+    assert md.index("| Grade |") < md.index("Graded against your")
 
 
 def test_markdown_card_without_a_read_opens_on_the_grade():
     md = rc.render_markdown(a_card())
     assert "## Overall:" in md
     assert "**Distance** —" not in md
+
+
+# === the SDK call's shape ==================================================
+# This module's read is *phrasing*: every judgment on the card was decided in
+# Python before the prompt existed, and the prompt forbids re-deriving them.
+# The options below are what sizes the call to that job.
+
+class _FakeTextBlock:
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeAssistantMessage:
+    def __init__(self, text):
+        self.content = [_FakeTextBlock(text)]
+
+
+_WELL_FORMED = (
+    "DISTANCE: You covered it.\nPACE: Too quick.\n"
+    "HEART RATE: Stayed low.\nTRAINING LOAD: Banked it."
+)
+
+
+@pytest.fixture
+def patched_sdk(monkeypatch):
+    """Records the (prompt, options) query() was actually called with, and
+    makes generate_read's isinstance checks pass against the fakes."""
+    import claude_agent_sdk
+
+    calls = []
+
+    async def fake_query(*, prompt, options):
+        calls.append({"prompt": prompt, "options": options})
+        yield _FakeAssistantMessage(_WELL_FORMED)
+
+    monkeypatch.setattr(claude_agent_sdk, "AssistantMessage", _FakeAssistantMessage)
+    monkeypatch.setattr(claude_agent_sdk, "TextBlock", _FakeTextBlock)
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    return calls
+
+
+def test_read_does_not_follow_the_brief_generators_model(patched_sdk):
+    """Decoupled on purpose. briefing.DEFAULT_MODEL also drives the daily
+    brief, where a model change is a prompt change that has to clear the
+    scorer first — coupling meant this call could not be tuned at all."""
+    from local_fitness.agent import briefing
+
+    asyncio.run(workout_coach.generate_read(PROFILE, a_card()))
+    assert patched_sdk[0]["options"].model == workout_coach.DEFAULT_MODEL
+    assert workout_coach.DEFAULT_MODEL != briefing.DEFAULT_MODEL
+
+
+def test_read_disables_thinking_and_runs_at_low_effort(patched_sdk):
+    """Load-bearing, not polish: this model runs adaptive thinking whenever
+    `thinking` is unset, so moving the model ID forward without these would
+    have made an already-67s call slower."""
+    asyncio.run(workout_coach.generate_read(PROFILE, a_card()))
+    options = patched_sdk[0]["options"]
+    assert options.effort == "low"
+    assert options.thinking == {"type": "disabled"}
+    assert options.max_turns == 1        # single-shot; no tool loop
+
+
+def test_read_respects_an_explicit_model_override(patched_sdk):
+    asyncio.run(workout_coach.generate_read(
+        PROFILE, a_card(), model="claude-haiku-4-5"))
+    assert patched_sdk[0]["options"].model == "claude-haiku-4-5"
+
+
+# === ungraded metrics reach the prompt with their own reason ===============
+
+def _card_with_ungraded_pace():
+    card = a_card()
+    card["metrics"]["pace"] = {
+        "grade": None, "actual": 399.2, "expected": 300.0, "deviation": None,
+        "reference": "plan", "actual_display": "10:42/mi avg",
+        "note": ("interval day, no splits recorded — average pace can't be "
+                 "graded against a rep target"),
+    }
+    return card
+
+
+def test_prompt_gives_the_metrics_own_reason_not_a_generic_one():
+    """"not enough to grade" is true of a thin reference pool and wrong for an
+    interval day with no splits — and the model will invent the difference."""
+    _, user_prompt = workout_coach.build_prompt(PROFILE, _card_with_ungraded_pace())
+    assert "no splits recorded" in user_prompt
+    assert "Pace: n/a — not enough to grade" not in user_prompt
+
+
+def test_prompt_labels_a_split_derived_pace():
+    """A bare "8:03/mi" beside a rep target would read as the whole run's
+    average, which is exactly the confusion the split-grading fix removes."""
+    card = a_card()
+    card["metrics"]["pace"]["actual_display"] = "8:03/mi best mile"
+    _, user_prompt = workout_coach.build_prompt(PROFILE, card)
+    assert "actual 8:03/mi best mile" in user_prompt
+
+
+def test_fallback_read_carries_the_metrics_reason_through():
+    out = workout_coach.fallback_read(_card_with_ungraded_pace())
+    assert out["pace"].startswith("10:42/mi avg.")
+    assert "no splits recorded" in out["pace"]
