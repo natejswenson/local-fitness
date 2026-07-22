@@ -485,3 +485,39 @@ def test_load_activities_by_date_selects_the_pace_the_gate_needs(tmp_path):
     row = by_date["2026-07-21"][0]
     assert row["avg_pace_sec_per_km"] == pytest.approx(1090.5)
     assert plans._running_distance([row]) == 0.0
+
+
+def test_a_bike_ride_is_never_run_distance():
+    """Regression (shipped in 0.27.0, caught by the perf gate's review): the
+    pace gate answers run-vs-walk, not foot-vs-wheel. A 30km ride paces at
+    ~2:00/mi, so gating on pace alone counted it as 30km of RUNNING."""
+    bike = {"activity_type": "cycling", "distance_meters": 30000.0,
+            "duration_seconds": 3600, "avg_pace_sec_per_km": 120.0}
+    assert plans._ran(bike) is False
+    assert plans._running_distance([bike]) == 0.0
+    assert plans._walking_distance([bike]) == 0.0
+    assert plans._foot_distance([bike]) == 0.0
+
+
+def test_a_bike_ride_does_not_satisfy_a_long_run():
+    workout = {"type": "long", "target_distance_m": 12874.8}
+    bike = {"activity_type": "cycling", "distance_meters": 30000.0,
+            "duration_seconds": 3600, "avg_pace_sec_per_km": 120.0}
+    assert plans.classify_workout(workout, [bike]) == "missed"
+
+
+def test_workout_actuals_returns_foot_run_and_walk_in_one_pass():
+    day = [_REAL_RUN, _MISLABELLED_WALK,
+           {"activity_type": "cycling", "distance_meters": 30000.0,
+            "duration_seconds": 3600, "avg_pace_sec_per_km": 120.0}]
+    foot, run, walk, pace, types = plans._workout_actuals(day)
+    assert foot == pytest.approx(14777.60)
+    assert run == pytest.approx(9574.85)
+    assert walk == pytest.approx(5202.75)
+    assert run + walk == pytest.approx(foot)
+    assert pace is not None
+    assert types == ["other", "running"]
+
+
+def test_workout_actuals_pace_is_none_without_foot_distance():
+    assert plans._workout_actuals([])[3] is None
