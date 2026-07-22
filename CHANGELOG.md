@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-07-22
+
+### Fixed
+- **The report-card read named a letter grade, because the prompt handed it
+  every letter.** `_GRADE_TONE` forbids it outright, yet the user prompt
+  printed `Distance: D- — actual 5.95 mi vs target 5.00 mi` for each metric and
+  `Overall grade D (1.05 GPA)` above them, and `_GRADE_TONE` itself spelled out
+  `"A"`, `"B-"`, `"C+"` as examples. The read was being shown the thing it was
+  told not to say. Measured over 96 paragraphs on 3 real cards: **3 leaked
+  (3.1%)** — "an F, no rounding it up", "F-grade pace", "the C+ says so" — and a
+  leaked read **regenerated to the SAME letter**, because the retry saw the same
+  prompt.
+
+  The prompt now carries SEVERITY instead (`grade_severity`: on target →
+  slightly off → off → well off → missed badly). The severity has to be there or
+  the read drifts out of agreement with the table beside it: a +19% distance
+  overshoot is a D- only because intent scaling says an interval day is not the
+  place for extra miles, and that judgment is not recoverable from the raw
+  numbers. Re-measured on the identical protocol: **0 of 96 (0.0%)**, median
+  latency unchanged at 9.1s.
+- **A backstop for what the prompt can only ask for.** `find_grade_leak` scans
+  the parsed read and `generate_read_cached` regenerates ONCE on a hit, keeping
+  the retry only if it is actually clean. Deliberately narrow: a bare "A" is
+  almost always the article ("A blown interval session…"), and a false positive
+  would throw away a clean read and pay for another generation. The pattern is
+  specified by two lists in `tests/test_workout_coach.py` — 8 real leaks, 9
+  lookalikes — which must both be extended before it is touched. It matters
+  more than the rate suggests because reads are cached: a leak would otherwise
+  stick until the card's inputs change.
+
 ## [0.28.0] - 2026-07-22
 
 ### Fixed
