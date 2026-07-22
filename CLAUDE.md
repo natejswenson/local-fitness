@@ -220,11 +220,17 @@ today", "how's my training load", "what did I run last week"):
   than 14 days needs the complete list, so pass `full=true` to get it; the
   rollups (`adherence_pct`, `days_to_race`, `goal_gap`, `this_week`, …) are
   always whole-plan regardless of the `workouts` window.
-- **The agent owns the entire plan lifecycle — there is no UI.** When the user
-  wants to change their plan (move a long run, swap days, adjust a session),
-  edit it with `update_plan_workout(date, type/distance_mi/pace_min_per_mi/description)`
-  — it re-prescribes one day on the *active* plan (`type='rest'` clears
-  distance/pace). Structure changes (whole new plan) go through
+- **The agent owns the entire plan lifecycle — there is no UI.** To adjust a
+  session, `update_plan_workout(date, type/distance_mi/pace_min_per_mi/duration_min/description)`
+  re-prescribes ONE day on the *active* plan. `type='rest'` clears distance,
+  pace **and** duration, and overwrites `description` with `"Rest day"`.
+  **It cannot move or add a day.** `date` is the `UPDATE`'s key, not an editable
+  column (`plans._EDITABLE_WORKOUT_COLS` = `type`, `target_distance_m`,
+  `target_pace_sec_per_km`, `target_duration_sec`, `description`), and a date
+  with no existing prescription errors rather than inserting. So "move Saturday's
+  long run to Sunday" is **two calls** — rest the old day, prescribe the new one
+  — and only works if the new day already exists on the plan. Structure changes
+  (whole new plan) go through
   `propose_training_plan`/`revise_training_plan` (drafts), and the rest of the
   lifecycle — activating a draft, dropping a draft, or abandoning the active
   plan outright — is `commit_training_plan`/`discard_training_plan_draft`/

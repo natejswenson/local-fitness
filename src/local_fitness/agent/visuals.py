@@ -1,5 +1,10 @@
-"""Rendering internals shared by the `generate_brief_report` and
-`generate_chart` MCP tools (agent/tools.py, LOCAL_ONLY_TOOLS).
+"""Rendering internals shared by the `generate_brief_report`, `workout_report_card`
+and `generate_chart` MCP tools (agent/tools.py).
+
+Only the first two are `LOCAL_ONLY_TOOLS` — they hand back a filesystem path, which
+is useless to a caller on the far side of the networked `/mcp/` transport.
+`generate_chart` moved into `ALL_TOOLS` (2026-07-13) once it returned the PNG as an
+inline MCP image content block, since a client no longer needs the path.
 
 Heavy native imports (matplotlib, weasyprint) are deferred into the two
 render functions' bodies rather than this module's top level — this module

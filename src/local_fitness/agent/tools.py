@@ -340,11 +340,14 @@ _CHART_SCHEMA = {
             "enum": ["calendar", "line", "bar", "combo", "spark"],
             "description": (
                 "calendar = week-stacked emoji heat-grid (default; compact and "
-                "fully visible for any window); line = colored value-line (heat "
-                "emoji on an invisible canvas; weekly-averaged past ~5 weeks so it "
-                "fits); bar = emoji-color horizontal bars, one row per day (best ≤ "
-                "~2 weeks); combo = 2D vertical bars + trend line (mono, handles "
-                "negatives like TSB); spark = one-line sparkline."
+                "fully visible for any window); line = smooth monochrome curve "
+                "in box-drawing glyphs with a y-axis (heavily smoothed and "
+                "down-sampled to fit the width — reads as the trend, not the "
+                "daily values); bar = emoji-color horizontal bars, one row per "
+                "day, weekly-averaged past ~3 weeks (best ≤ ~2 weeks); combo = "
+                "2D vertical bars + trend line (mono, handles negatives like "
+                "TSB), weekly-averaged on the same threshold; spark = one-line "
+                "sparkline."
             ),
         },
     },
