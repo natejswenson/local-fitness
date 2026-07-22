@@ -948,21 +948,27 @@ def _overlay_pace_axis(ax, series: dict, accent: str, paper: str) -> None:
     ax2.spines["right"].set_color(accent)
 
 
+def ref_mode_is_running(card: dict) -> bool:
+    """Which locomotion pool this card was graded against, for the meta line."""
+    return (card.get("reference") or {}).get("mode_label") == "running"
+
+
 def _render_metric_table_html(card: dict) -> str:
     from . import report_card as rc
 
     rows = ""
     for key, label in rc._METRIC_LABELS:
         m = card["metrics"][key]
-        fmt = rc._FORMATTERS[key]
-        # HR is held to a band, not a point, and supplies its own display —
-        # see rc.expected_text.
+        # Both columns defer to the card's own display strings: HR is held to a
+        # band rather than a point, and quality pace is graded on the fastest
+        # split rather than the run average. See rc.expected_text / rc.actual_text.
         expected = rc.expected_text(key, m)
+        actual = rc.actual_text(key, m)
         grade = m.get("grade") or "n/a"
         rows += f"""
         <tr>
           <td class="metric-name">{html.escape(label)}</td>
-          <td>{html.escape(fmt(m.get("actual")))}</td>
+          <td>{html.escape(actual)}</td>
           <td>{html.escape(expected)}</td>
           <td>{html.escape(rc._delta_text(key, m))}</td>
           <td class="metric-grade {_grade_class(grade)}">{html.escape(grade)}</td>
@@ -1082,6 +1088,15 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
         (m.get("reference") or "").startswith("plan")
         for m in card["metrics"].values()
     ) else "60d median"
+    # The locomotion filter has to be disclosed — it is invisible in the numbers,
+    # and a reader checking against Garmin's own app would see a different
+    # median. It rides the meta line rather than the notes list because the
+    # one-page budget is load-bearing here: as a bullet, this sentence plus the
+    # split-graded-pace note pushed a 6-split card onto a second page.
+    n_excluded = (card.get("reference") or {}).get("excluded_other_mode") or 0
+    if n_excluded:
+        other = "walk" if ref_mode_is_running(card) else "run"
+        graded_by += f", {n_excluded} {other}s excluded"
     subtitle = (
         f"{rc._fmt_distance(act.get('distance_meters'))} in "
         f"{units_mod.format_duration(act.get('duration_seconds')) or '—'} · "
@@ -1093,6 +1108,8 @@ def _build_report_card_html(card: dict, split_chart: bytes | None = None) -> str
              for key, label in rc._METRIC_LABELS if card["metrics"][key].get("note")]
     if card["metrics"]["load"].get("spike"):
         notes.append("Training Load: spike — more than double your median day.")
+    if overall.get("capped_by") == "F":
+        notes.append(f"Overall: capped at {overall['grade']} — a metric graded F.")
     notes_html = (
         '<ul class="card-notes">'
         + "".join(f"<li>{html.escape(n)}</li>" for n in notes)

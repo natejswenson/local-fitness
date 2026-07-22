@@ -6,6 +6,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-07-21
+
+### Fixed
+- **The report card's reference pool was measuring runs against walks.**
+  `activity_type` is Garmin's label, not a measurement: walking-desk sessions
+  log as `treadmill_running`, and both the exact-type filter and
+  `plans._is_running` (a substring match) passed every one of them through. On
+  live data the 60-day pool held 46 activities split 16 real runs
+  (8:40–11:46/mi, HR 114–172) against 30 walking-pad sessions (14:08–84:20/mi,
+  HR 76–120), so the "median comparable activity" was a 15:50/mi walk at
+  116 bpm and 22 training load. A genuine interval session was scoring **A+ on
+  both heart rate and training load** — 40% of the composite — for clearing a
+  walking bar. Comparability is now gated on measured locomotion
+  (`RUN_PACE_CEILING_SEC_PER_MI`, a 13:00 mile) *before* the type filters, so
+  widening can't drag the walking corpus into a thin running pool. A paceless
+  row has an unknown mode and joins neither side. The card states the exclusion
+  count, since the filter is invisible in the numbers otherwise.
+- **Interval pace was a structurally guaranteed F.** A plan's quality-day pace
+  describes the *reps*, but `avg_pace_sec_per_km` averages in the warmup, the
+  recovery jogs and the cooldown — so grading one against the other returned F
+  for every correctly-executed interval session. Measured: a 6:58/mi
+  prescription averaged 10:42/mi and scored F while its 4th mile ran 9:25 at
+  164 bpm. Quality-day pace is now graded on the fastest full split — the one
+  documented exception to "no grade reads `activity_splits`" — and returns n/a
+  *with a stated reason* when there are no splits, rather than falling back to
+  the comparison it exists to avoid.
+- **A training-load spike scored A+ directly above its own spike warning.**
+  `load_deviation` was one-sided-low and uncapped, so a day at 81 load against
+  a 22 expectation printed A+ on the row above "**spike** — more than double
+  your median day", while the coaching read called it "stacking debt". Load is
+  now penalized in both directions past `LOAD_SPIKE_FACTOR`; landing at or
+  under the threshold is still a clean A.
+- **The composite outvoted the point of the workout.** `overall_grade` is now
+  intent-weighted (`INTENT_METRIC_WEIGHTS`): pace carries an easy or quality
+  day, distance carries a long run. Flat weights let HR and load (40%
+  combined) score a prescribed 10:28 easy run executed at 9:28 an overall B on
+  a card whose own read called it "a race finish". An F on any metric also caps
+  the overall at C, stated in the notes.
+- Ungraded metrics no longer print a Delta — a "224s/mi slower" beside an n/a
+  re-made the very comparison the n/a refuses.
+
+### Changed
+- **`workout_coach` no longer follows `briefing.DEFAULT_MODEL`.** That constant
+  also drives the daily brief, where a model change is a prompt change that has
+  to clear the scorer and a cross-model A/B first — so the coupling meant the
+  report card's read could not be tuned at all. It now carries its own
+  `DEFAULT_MODEL`, sized to what the call actually does: phrase four 45-word
+  paragraphs from grades `report_card.py` already computed. `effort` and
+  `thinking` are set explicitly and are load-bearing rather than polish —
+  current Sonnet runs adaptive thinking whenever `thinking` is unset, so moving
+  the model ID forward without them would have made an already-67s call slower.
+- `HR_BANDS` re-verified against the cleaned distribution and deliberately left
+  unchanged: excluding walking-pad sessions moves the `treadmill_running`
+  median from 116 to 145, which now agrees with the never-contaminated outdoor
+  median of 144.5, so the constants describe both pools.
+
 ## [0.25.0] - 2026-07-20
 
 ### Added
