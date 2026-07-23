@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-07-22
+
+### Fixed
+- **Re-generated PDFs no longer show a stale render.** `generate_brief_report`
+  and `workout_report_card` wrote a deterministic filename (`brief-<date>.pdf`,
+  `report-card-<id>.pdf`), so a re-render reused the same path — and macOS
+  `open` refocuses an already-open Preview window instead of reloading the
+  bytes. The result was a stale-looking page that made a user conclude the data
+  pipeline was serving old data (it wasn't). Both filenames are now
+  content-addressed (`…-<sha8>.pdf` via `tools._content_tag`): changed content
+  lands on a fresh filename (a new window), identical content reuses the file
+  (idempotent).
+
+### Changed
+- **`save_brief` now advertises the real Brief JSON Schema** instead of an
+  opaque `{"brief": dict}`. Derived from the pydantic `Brief` model (with
+  `$defs` hoisted to the schema root and `required` narrowed to the caller-
+  supplied `takeaways`), so a client can construct a valid brief — including the
+  tone enum and `{metric, days}` sub-object — from the tool contract alone,
+  rather than reading `schemas.py`. Filesystem-less MCP clients (Claude Desktop,
+  a phone over `/mcp/`) can now build a brief they previously could not.
+
 ## [0.28.1] - 2026-07-22
 
 ### Fixed
