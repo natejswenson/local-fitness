@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from datetime import date
 from pathlib import Path
 
 from .. import config
@@ -36,12 +37,50 @@ from .grounding import GroundingFlag
 
 _LOG = logging.getLogger(__name__)
 
-_VERDICT_PHRASE = {
-    "done": "You hit yesterday's session clean.",
-    "partial": "Yesterday came up short of the prescription.",
-    "missed": "Yesterday was a skip.",
-    "compliant": "Yesterday was a scheduled rest day.",
+# Verdict wording is date-relative: the graded day being referred to can be
+# the report's own date (an evening re-render after today's run synced and
+# graded), yesterday, or — when the data frontier lags — several days back.
+# A single hardcoded "Yesterday" mislabels the first and third cases, and the
+# fallback's whole contract is that only WORDING degrades, never facts.
+_VERDICT_PHRASE_TODAY = {
+    "done": "Today's session is already in the book.",
+    "partial": "Today's session came up short of the prescription.",
+    "missed": "Today's session is a skip so far.",
+    "compliant": "Today is a scheduled rest day.",
 }
+# ``{ref}`` is "Yesterday" or an absolute date like "Jul 8".
+_VERDICT_PHRASE_PRIOR = {
+    "done": "{ref} you hit the session clean.",
+    "partial": "{ref} came up short of the prescription.",
+    "missed": "{ref} was a skip.",
+    "compliant": "{ref} was a scheduled rest day.",
+}
+
+
+def _relative_day(prior_date: str | None, target_date: str | None) -> str:
+    """How to refer to a graded day relative to the report's date: ``"Today"``,
+    ``"Yesterday"``, or an absolute ``"Jul 8"``. Falls back to the absolute
+    date whenever the relationship can't be computed (missing/malformed date,
+    no target), so the wording is never *wrong* about which day it means — only
+    less familiar. Returns ``""`` only when there is no usable prior date at
+    all, in which case the caller omits the verdict phrase entirely."""
+    if not prior_date:
+        return ""
+    try:
+        pd = date.fromisoformat(prior_date)
+    except (ValueError, TypeError):
+        return ""
+    if target_date:
+        try:
+            delta = (date.fromisoformat(target_date) - pd).days
+        except (ValueError, TypeError):
+            delta = None
+        if delta is not None:
+            if delta <= 0:
+                return "Today"
+            if delta == 1:
+                return "Yesterday"
+    return f"{pd:%b} {pd.day}"
 
 # Mirrors system_prompt's "Translate technical metrics on first use" bullet
 # (prompts.py) — always included so the PDF coaching line honors the same
@@ -268,6 +307,7 @@ def fallback_coaching_line(
     last_7_days: list[dict],
     days_to_race: int | None,
     goal_type: str,
+    target_date: str | None = None,
 ) -> str:
     """Deterministic, template-based coaching line — used only when
     ``generate_coaching_line`` fails. Pure: identical inputs always
@@ -278,11 +318,26 @@ def fallback_coaching_line(
     including them rendered the same instruction three times over
     ("easy · 4.0 mi @ 9:39/mi" / "Easy 4mi. Keep HR under 140." / "Today: easy
     4.0 mi @ 9:39/mi. Easy 4mi. Keep HR under 140."). A coaching line's job is
-    the part the prescription does not already say."""
+    the part the prescription does not already say.
+
+    ``target_date`` (the report's own date) makes the graded-day reference
+    correct: ``last_7_days`` includes ``target_date`` itself, and a run that
+    has already synced+graded ``done`` on the report's date is the first
+    non-pending entry — so a hardcoded "Yesterday" credited today's run to
+    yesterday. When omitted, the day is named by its absolute date, which is
+    never wrong about which day it means."""
     prior = next((d for d in last_7_days if d.get("verdict") != "pending"), None)
     parts: list[str] = []
     if prior is not None:
-        phrase = _VERDICT_PHRASE.get(prior["verdict"])
+        ref = _relative_day(prior.get("date"), target_date)
+        verdict = prior["verdict"]
+        if ref == "Today":
+            phrase = _VERDICT_PHRASE_TODAY.get(verdict)
+        elif ref:
+            template = _VERDICT_PHRASE_PRIOR.get(verdict)
+            phrase = template.format(ref=ref) if template else None
+        else:
+            phrase = None  # no usable date — omit rather than assert a wrong day
         if phrase:
             parts.append(phrase)
 

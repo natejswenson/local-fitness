@@ -2649,6 +2649,7 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["last_7_days"],
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
+                target_date=target_date,
             )
         plan_section["today"]["coaching_line"] = coaching_line
 

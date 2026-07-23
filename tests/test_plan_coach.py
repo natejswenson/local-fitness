@@ -122,7 +122,9 @@ def test_build_prompt_remains_pure_and_deterministic_with_notes():
 # --- fallback_coaching_line: pure, deterministic ---------------------------
 
 def test_fallback_partial_prior_day():
-    line = plan_coach.fallback_coaching_line(_TODAY_EASY, _LAST_7_DAYS, 71, "10k")
+    # target_date is the day after the graded partial → "Yesterday".
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, _LAST_7_DAYS, 71, "10k", target_date="2026-07-09")
     assert line == (
         "Yesterday came up short of the prescription. 71 days to your 10k."
     )
@@ -132,7 +134,8 @@ def test_fallback_never_restates_the_prescription_or_description():
     """The PDF's Today callout prints the prescription and the description
     directly above this line; repeating either made the same instruction
     appear three times on one card."""
-    line = plan_coach.fallback_coaching_line(_TODAY_EASY, _LAST_7_DAYS, 71, "10k")
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, _LAST_7_DAYS, 71, "10k", target_date="2026-07-09")
     assert "4.0 mi" not in line
     assert "9:30" not in line
     assert "keep HR under 140" not in line.lower()
@@ -141,20 +144,75 @@ def test_fallback_never_restates_the_prescription_or_description():
 @pytest.mark.parametrize(
     "verdict,expected_prefix",
     [
-        ("done", "You hit yesterday's session clean."),
+        ("done", "Yesterday you hit the session clean."),
         ("missed", "Yesterday was a skip."),
         ("compliant", "Yesterday was a scheduled rest day."),
     ],
 )
 def test_fallback_verdict_phrases(verdict, expected_prefix):
     history = [{"date": "2026-07-08", "type": "x", "planned_mi": None, "actual_mi": None, "verdict": verdict}]
-    line = plan_coach.fallback_coaching_line(_TODAY_EASY, history, 71, "10k")
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, history, 71, "10k", target_date="2026-07-09")
     assert line.startswith(expected_prefix)
+
+
+def test_fallback_today_graded_run_is_not_called_yesterday():
+    """The bug: last_7_days INCLUDES target_date, so a run that has already
+    synced and graded on the report's own date is the first non-pending entry.
+    A hardcoded "Yesterday" credited today's run to yesterday; the reference
+    must resolve to today."""
+    history = [{"date": "2026-07-09", "type": "tempo", "planned_mi": 5.0,
+                "actual_mi": 5.1, "verdict": "done"}]
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, history, 71, "10k", target_date="2026-07-09")
+    assert line.startswith("Today's session is already in the book.")
+    assert "yesterday" not in line.lower()
+
+
+def test_fallback_today_rest_day_reads_as_today():
+    """A rest day grades 'compliant' unconditionally, all day — so on a rest
+    day the first non-pending entry is today, and it must not say 'Yesterday
+    was a scheduled rest day.'"""
+    history = [{"date": "2026-07-09", "type": "rest", "planned_mi": None,
+                "actual_mi": None, "verdict": "compliant"}]
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, history, 71, "10k", target_date="2026-07-09")
+    assert line.startswith("Today is a scheduled rest day.")
+
+
+def test_fallback_lagging_frontier_names_the_actual_day():
+    """When the frontier lags, the first non-pending entry can be several days
+    old — "Yesterday" would misattribute a days-old result. It must name the
+    real day instead."""
+    history = [
+        {"date": "2026-07-09", "type": "easy", "planned_mi": 4.0, "actual_mi": None, "verdict": "pending"},
+        {"date": "2026-07-08", "type": "easy", "planned_mi": 4.0, "actual_mi": None, "verdict": "pending"},
+        {"date": "2026-07-06", "type": "tempo", "planned_mi": 3.0, "actual_mi": 0.0, "verdict": "missed"},
+    ]
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, history, 71, "10k", target_date="2026-07-09")
+    assert line.startswith("Jul 6 was a skip.")
+    assert "yesterday" not in line.lower()
+
+
+def test_fallback_without_target_date_names_absolute_day():
+    """No target_date (legacy caller) → the day is named by its absolute date,
+    never a possibly-wrong relative word."""
+    line = plan_coach.fallback_coaching_line(_TODAY_EASY, _LAST_7_DAYS, 71, "10k")
+    assert line.startswith("Jul 8 came up short of the prescription.")
+
+
+def test_fallback_missing_prior_date_omits_the_verdict_phrase():
+    history = [{"type": "x", "planned_mi": None, "actual_mi": None, "verdict": "done"}]
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, history, 71, "10k", target_date="2026-07-09")
+    assert line == "71 days to your 10k."
 
 
 def test_fallback_all_pending_history_has_no_verdict_phrase():
     history = [{"date": "2026-07-09", "type": "easy", "planned_mi": 4.0, "actual_mi": None, "verdict": "pending"}]
-    line = plan_coach.fallback_coaching_line(_TODAY_EASY, history, 71, "10k")
+    line = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, history, 71, "10k", target_date="2026-07-09")
     assert line == "71 days to your 10k."
 
 
@@ -170,8 +228,10 @@ def test_fallback_no_race_date_uses_working_toward_phrasing():
 
 
 def test_fallback_is_pure():
-    a = plan_coach.fallback_coaching_line(_TODAY_EASY, _LAST_7_DAYS, 71, "10k")
-    b = plan_coach.fallback_coaching_line(_TODAY_EASY, _LAST_7_DAYS, 71, "10k")
+    a = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, _LAST_7_DAYS, 71, "10k", target_date="2026-07-09")
+    b = plan_coach.fallback_coaching_line(
+        _TODAY_EASY, _LAST_7_DAYS, 71, "10k", target_date="2026-07-09")
     assert a == b
 
 
