@@ -2778,18 +2778,23 @@ async def generate_chart(args: dict) -> dict:
     except Exception as e:
         return _err(f"chart render failed: {e}")
 
-    # {today} is computed here, not a tool argument — it exists in the
-    # filename only to distinguish chart runs across days. The idempotent-
-    # overwrite guarantee (identical metric/chart_type/days -> identical
-    # file) therefore holds only within a single calendar day.
-    today = date.today().isoformat()
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
+    # Content-address the filename with the same tag the two PDF tools use
+    # (0.28.2): macOS `open` REFOCUSES an already-open Preview window for a path
+    # it has seen rather than reloading the bytes, so a day-deterministic
+    # `chart-...-<date>.png` name showed a STALE chart when the same
+    # metric/chart_type/days re-rendered after an intra-day sync. The content
+    # tag makes changed bytes land on a NEW filename (a genuinely fresh window)
+    # while identical bytes reuse one file (idempotent — refocusing is correct
+    # when the bytes match). See _content_tag and the PDF paths above.
     try:
         final_path = _write_atomic(
-            reports_dir, f"chart-{metric}-{chart_type}-{days}d-{today}.png", png_bytes
+            reports_dir,
+            f"chart-{metric}-{chart_type}-{days}d-{_content_tag(png_bytes)}.png",
+            png_bytes,
         )
     except ValueError:
         return _err("resolved path escaped reports directory")

@@ -2091,17 +2091,41 @@ def test_generate_chart_render_failure_is_error(seeded, monkeypatch):
 
 
 def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
-    # INV-T8 + INV-9: valid PNG at the filename format metric-chart_type-Nd-date.
+    # INV-T8 + INV-9: valid PNG at the content-addressed filename format
+    # chart-metric-chart_type-Nd-<sha8>.png.
     reports_dir, _briefs_dir = reports_tmp
     payload, err = call(
         tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
     )
     assert not err
     path = Path(payload["path"])
-    today = date.today().isoformat()
-    assert path.name == f"chart-rhr-line-14d-{today}.png"
+    assert re.fullmatch(r"chart-rhr-line-14d-[0-9a-f]{8}\.png", path.name)
     assert path.parent == reports_dir
     assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_generate_chart_filename_is_content_addressed(seeded, reports_tmp):
+    # Same stale-Preview-refocus fix the PDFs got in 0.28.2: identical chart
+    # bytes reuse ONE filename (idempotent — refocus is correct), but changed
+    # bytes must land on a NEW filename so macOS `open` shows the fresh render
+    # instead of refocusing a stale window. A day-stamped name could not do
+    # this (it was constant across an intra-day re-render).
+    args = {"metric": "rhr", "days": 14, "chart_type": "line"}
+    p1, err1 = call(tools.generate_chart, args)
+    p2, err2 = call(tools.generate_chart, args)
+    assert not err1 and not err2
+    # Identical data twice -> identical content-addressed filename.
+    assert p1["path"] == p2["path"]
+
+    # Change the underlying series, re-render the SAME request: because the
+    # rendered bytes differ, the filename must change.
+    with db.connect() as conn:
+        conn.execute("UPDATE daily_metrics SET rhr = rhr + 7")
+        conn.commit()
+    p3, err3 = call(tools.generate_chart, args)
+    assert not err3
+    assert p3["path"] != p1["path"]
+    assert Path(p3["path"]).name.startswith("chart-rhr-line-14d-")
 
 
 def test_generate_chart_response_carries_inline_image_block(seeded, reports_tmp):
