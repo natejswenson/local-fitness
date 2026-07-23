@@ -2361,6 +2361,26 @@ def test_weekly_rollup_single_workout():
     assert rollup["slips"] == 0
 
 
+def test_weekly_rollup_run_walk_split_reconciles_to_foot_total():
+    # A pace-gated day: run + walking-pad session, both on foot. week_actual_mi
+    # is the FOOT total (run + walk) — the tool's headline; week_run_mi is the
+    # brief PDF strip's headline. The split must sum back to the foot total so
+    # the two sibling surfaces reconcile and can't drift into contradiction.
+    # Exact-mile meters keep the per-day-then-sum rounding clean.
+    workouts = [{
+        "date": "2026-07-10", "verdict": "done", "type": "interval",
+        "target_distance_m": 9600.0,
+        "actual_distance_m": 12874.752,      # 8.0 mi foot total (run + walk)
+        "actual_run_distance_m": 8046.72,    # 5.0 mi run
+        "actual_walk_distance_m": 4828.032,  # 3.0 mi walk
+    }]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["week_run_mi"] == 5.0
+    assert rollup["week_walk_mi"] == 3.0
+    assert rollup["week_actual_mi"] == 8.0   # foot total, NOT run-only
+    assert round(rollup["week_run_mi"] + rollup["week_walk_mi"], 1) == rollup["week_actual_mi"]
+
+
 def test_weekly_rollup_days_reverse_chronological():
     workouts = [
         {"date": "2026-07-06", "verdict": "done", "type": "easy",
@@ -2500,6 +2520,21 @@ def test_build_plan_section_active_plan_full_values(plan_seeded):
     assert by_date[(today - timedelta(days=5)).isoformat()]["verdict"] == "compliant"
     assert by_date[(today - timedelta(days=6)).isoformat()]["verdict"] == "missed"
     assert by_date[(today - timedelta(days=6)).isoformat()]["actual_mi"] == 0.0
+
+
+def test_progress_this_week_reconciles_with_brief_plan_section(plan_seeded):
+    # The two sibling mileage surfaces must agree: get_training_plan_progress's
+    # this_week.week_actual_mi is the FOOT total split by week_run_mi/week_walk_mi,
+    # and its week_run_mi is exactly what _build_plan_section (the brief PDF strip)
+    # headlines as its own week_actual_mi. Pins the semantic so the two can't
+    # silently diverge again (the pre-fix defect: same key, two different numbers).
+    today = date.today().isoformat()
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    tw = body["this_week"]
+    assert round(tw["week_run_mi"] + tw["week_walk_mi"], 1) == tw["week_actual_mi"]
+    section = tools._build_plan_section(today)
+    assert section["week_actual_mi"] == tw["week_run_mi"]
 
 
 def test_build_plan_section_no_workouts_in_window_is_none(plan_seeded):

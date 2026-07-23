@@ -589,8 +589,9 @@ def _plan_chart_weekly_rows(graded: list[dict]) -> list[dict]:
 @tool(
     "plan_chart",
     "Render a scheduled-vs-actual training-plan chart (ASCII/emoji): one bar "
-    "per day (or per week for long windows) — █ = miles run, ░ = shortfall vs "
-    "plan, verdict glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
+    "per day (or per week for long windows) — █ = on-foot miles (run + walk, "
+    "since easy days count prescribed walking), ░ = shortfall vs plan, verdict "
+    "glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
     "THE tool for 'planned vs actual' / 'am I hitting my plan' asks — don't "
     "hand-roll a chart. Reproduce the full output in a fenced code block in "
     "your reply, then add the coach read — never leave it only in the "
@@ -636,7 +637,11 @@ async def plan_chart(args: dict) -> dict:
         rows = _plan_chart_rows(graded)
         n_runs = sum(1 for r in rows if not r["rest"])
         title = f"plan vs actual · last {days}d · {n_runs} runs{adh}"
-        legend = "█ run vs ░ short of plan (mi) · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
+        # █ plots actual_distance_m, which is ON-FOOT miles (run + walk) —
+        # NOT run-only. Easy days count prescribed walking by design, so the
+        # label must say on-foot, matching the bar and the PDF strip's
+        # run/walk convention (0.27.0 label-vs-measurement class).
+        legend = "█ on-foot mi vs ░ short of plan · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
 
     return _text(charts.render_plan_vs_actual(rows, title=title, legend=legend))
 
@@ -2109,7 +2114,10 @@ _PROGRESS_SCHEMA = {
     "Day-by-day progress of the ACTIVE training plan: every prescribed "
     "workout with its graded verdict (done | partial | missed | compliant | "
     "pending), plus goal, days-to-race, adherence %, projected finish, goal "
-    "gap, and this week's planned/actual mileage. The `workouts` list is "
+    "gap, and this week's mileage. this_week.week_actual_mi is total ON-FOOT "
+    "miles (run + walk — easy days count prescribed walking by design); "
+    "week_run_mi + week_walk_mi split it, and week_run_mi matches the brief "
+    "PDF's plan-strip headline. The `workouts` list is "
     "windowed by default (14 days back from the data frontier, 7 days "
     "forward from today — today is always in-window even under a stale "
     "frontier) — pass full=true for the complete list across the whole plan "
@@ -2199,9 +2207,16 @@ async def get_training_plan_progress(args: dict) -> dict:
     target_time_seconds = detail.get("target_time_seconds")
     goal_gap = plans.goal_gap(predicted_finish_seconds, target_time_seconds)
     rollup = weekly_rollup(detail["workouts"], today)
+    # week_actual_mi is total ON-FOOT miles (run + walk) — easy/recovery days
+    # count prescribed walking by design (CLAUDE.md). The brief PDF's plan strip
+    # headlines RUN miles instead, so expose the run/walk split here (already on
+    # the rollup) so the two surfaces reconcile: week_run_mi + week_walk_mi ==
+    # week_actual_mi, and week_run_mi is the PDF strip's headline number.
     this_week = {
         "week_planned_mi": rollup["week_planned_mi"],
         "week_actual_mi": rollup["week_actual_mi"],
+        "week_run_mi": rollup["week_run_mi"],
+        "week_walk_mi": rollup["week_walk_mi"],
         "slips": rollup["slips"],
     }
 

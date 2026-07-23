@@ -6,8 +6,9 @@
 
 THE tool for "planned vs actual", "am I hitting my plan", "how's the week
 going". It reads the ACTIVE plan, grades every prescribed day against real
-activities, and draws two series in one bar — `█` for miles actually run, `░`
-padding out to the prescribed distance, so the `░` tail *is* the shortfall.
+activities, and draws two series in one bar — `█` for **on-foot** miles (run +
+walk, since easy days count prescribed walking by design), `░` padding out to
+the prescribed distance, so the `░` tail *is* the shortfall.
 Never hand-roll matplotlib or an ASCII grid for this view. Use
 [`chart`](chart.md) instead when the question is about a single metric over
 time (RHR, sleep, TSB) rather than about adherence, and
@@ -35,7 +36,7 @@ legend. Then one row per day: `MM-DD type`, verdict glyph, bar, then
 
 ```
 plan vs actual · last 10d · 10 runs · adherence 94%
-█ run vs ░ short of plan (mi) · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending
+█ on-foot mi vs ░ short of plan · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending
 07-12 easy     🟩 ████████             3.6 /  3.0
 07-13 easy     🟨 ███████░░            3.0 /  4.0
 07-14 tempo    🟩 ███████░░░░          3.0 /  5.0
@@ -78,8 +79,9 @@ plan_chart(days=10)
 
 Paste the block above into the reply, then the read: *"94% adherence and the
 only yellow in ten days is a 3-of-4 easy day. The 07-14 tempo came in 2 miles
-light, and yesterday's interval session ran 9.2 against a prescribed 5 — you're
-not under-doing this plan, you're over-cooking the quality days."*
+light, and yesterday's interval bar reads 9.2 on-foot against a prescribed 5 —
+but that's run plus walking-pad miles, so check `week_run_mi` before calling it
+over-cooked; the run itself may have been on target."*
 
 ## Gotchas
 
@@ -105,10 +107,12 @@ not under-doing this plan, you're over-cooking the quality days."*
 - **Bars are relative, not absolute.** Cell width is `max(planned, actual)
   across the window / 20`, so bar lengths are only comparable *within* one
   chart.
-- **Walking-pad sessions currently count toward prescribed running mileage.**
-  `plans._is_running` is a substring match on the Garmin label, and a
-  walking-desk session logs as `treadmill_running` — a known open issue
-  (2026-07-21 devlog), out of scope for this tool but visible in its numbers.
+- **The `█` bar is ON-FOOT miles (run + walk), not run-only.** It plots
+  `actual_distance_m`, which counts prescribed walking on easy/recovery days by
+  design (CLAUDE.md, 0.27.0) — so the legend says "on-foot mi", not "run". The
+  brief PDF's plan strip headlines run-only miles instead; when you need the
+  run/walk split, read [`get_training_plan_progress`](get_training_plan_progress.md)'s
+  `this_week.week_run_mi` / `week_walk_mi`.
 
 ## See also
 
