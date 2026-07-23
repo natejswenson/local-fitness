@@ -2934,11 +2934,21 @@ async def workout_report_card(args: dict) -> dict:
 
     try:
         async with visuals.RENDER_LOCK:
-            pdf_bytes = await asyncio.to_thread(
+            pdf_bytes, pages = await asyncio.to_thread(
                 visuals.render_report_card_pdf, card, split_chart
             )
     except Exception as e:
         return _err(f"PDF render failed: {e}")
+    if pages != 1:
+        # The card has no droppable content (unlike the brief's takeaway tail),
+        # so the density ladder is the only lever and it's exhausted. Never let
+        # a PDF spill silently (CLAUDE.md) — a warning is the honest signal that
+        # this card's splits + coach read outgrew even the densest rung.
+        LOG.warning(
+            "report card for activity %s still %d pages at the densest preset",
+            inputs["activity"]["activity_id"], pages,
+        )
+        payload["pages"] = pages
 
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)

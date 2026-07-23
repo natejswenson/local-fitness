@@ -2991,6 +2991,32 @@ def test_report_card_writes_a_pdf(rc_seeded, reports_tmp):
     assert path.read_bytes()[:5] == b"%PDF-"
 
 
+def test_report_card_surfaces_page_overflow_instead_of_spilling_silently(
+    rc_seeded, reports_tmp, monkeypatch, caplog
+):
+    """When the density ladder is exhausted (page_count > 1), the card has no
+    droppable content, so the tool must SAY so — a `pages` field on the payload
+    and a WARNING log — never emit a silent 2-page 'single-page' card. A ladder
+    that fit (pages == 1) leaves the payload clean."""
+    from local_fitness.agent import visuals
+
+    monkeypatch.setattr(
+        visuals, "render_report_card_pdf", lambda *_a, **_k: (b"%PDF-two-pages", 2))
+    with caplog.at_level(logging.WARNING):
+        payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert payload["pages"] == 2
+    assert any("still 2 pages" in r.message for r in caplog.records)
+
+
+def test_report_card_single_page_leaves_no_pages_field(rc_seeded, reports_tmp):
+    """The overflow signal is present ONLY on overflow — a normal one-page card
+    carries no `pages` key."""
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert "pages" not in payload
+
+
 def test_report_card_pdf_states_the_rolling_reference(rc_seeded, reports_tmp):
     """The 'which yardstick' requirement is asserted in the rendered page, not
     merely in the payload."""
