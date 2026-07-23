@@ -704,7 +704,7 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
 
         baseline = status_mod._baseline_row(conn, today)
         metric_rows = status_mod._metric_rows(conn, today, baseline)
-        training_load = status_mod._training_load(baseline)
+        training_load = status_mod._training_load(baseline, today)
         sig = _compute_signals(conn, today, baseline, step_goal,
                                plan_today.get("today") if plan_today else None, days_to_race)
         workouts_14d = _workouts_payload(conn, today)

@@ -252,6 +252,38 @@ def test_assemble_status_seeded_tsb_interpretation(seeded_status_db):
     assert status["training_load"]["interpretation"] == "neutral"
 
 
+def test_training_load_current_baseline_is_not_stale(seeded_status_db):
+    # The baselines row is dated today, so as_of == today and staleness is 0 —
+    # the served CTL/ATL/TSB really is current.
+    today = date.today().isoformat()
+    tl = assemble_status()["training_load"]
+    assert tl["as_of"] == today
+    assert tl["baseline_stale_days"] == 0
+
+
+def test_training_load_flags_a_frozen_data_frontier(seeded_status_db):
+    # A frozen frontier (pulls failing / laptop off) leaves the newest baselines
+    # row days behind. TSB decays daily even with no workouts, so the payload
+    # must disclose that the CTL/ATL/TSB is 4 days old rather than present it as
+    # today's freshness. The row is dated `today`; asking for the snapshot as of
+    # 4 days later exercises exactly that gap.
+    from datetime import timedelta
+
+    row_date = date.today()
+    as_of_query = (row_date + timedelta(days=4)).isoformat()
+    tl = assemble_status(today=as_of_query)["training_load"]
+    assert tl["as_of"] == row_date.isoformat()
+    assert tl["baseline_stale_days"] == 4
+    # The CTL/ATL/TSB numbers are still served (the disclosure rides alongside).
+    assert tl["tsb"] == -5.0
+
+
+def test_training_load_empty_db_carries_null_staleness(empty_db):
+    tl = assemble_status()["training_load"]
+    assert tl["as_of"] is None
+    assert tl["baseline_stale_days"] is None
+
+
 # --- 3c: sleep_seconds row value_formatted/baseline_formatted --------------
 
 @pytest.fixture
