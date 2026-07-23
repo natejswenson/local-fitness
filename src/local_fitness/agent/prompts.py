@@ -15,9 +15,12 @@ from . import coach
 #: actually resolves the name (DB > env > default) for every caller.
 DEFAULT_USER_NAME = config.DEFAULT_USER_NAME
 
-# Default coach profile (today's behavior). Import-safe: coach.load_profile
-# falls back to an in-code constant if adaptive.md is missing/malformed, so
-# building the module constants below never raises.
+# Default coach profile — follows coach.DEFAULT_PROFILE (hardass since
+# 0.31.0). Import-safe: coach.load_profile falls back to an in-code constant
+# if the profile file is missing/malformed, so building the module constants
+# below never raises. ADAPTIVE is kept as a named alias for callers/tests
+# that want that specific profile rather than "the default".
+DEFAULT = coach.load_profile(coach.DEFAULT_PROFILE)
 ADAPTIVE = coach.load_profile("adaptive")
 
 
@@ -50,15 +53,20 @@ def coach_voice_block(
             f"This sets HOW you talk to {user_name}. His saved notes REFINE it "
             f"(a note asking\nfor a softer/harder touch on a point overrides "
             f"the profile there).\n\n"
-            f"{profile.persona}\n\n{profile.dials_line}"
+            f"{profile.effective_persona}\n\n{profile.dials_line}"
         )
+    tuned = ""
+    if profile.spec is not None:
+        tuned = ("\nThis voice was tuned conversationally; the spec below is "
+                 "authoritative over\nthe shipped profile.")
     return (
         f'# Your coaching voice — the "{profile.name}" profile\n'
         f"This profile sets HOW you talk to {user_name}; follow it for every line.\n"
         f"{user_name}'s saved notes (below, if any) REFINE this voice — a note that\n"
         f"asks for a softer or harder touch on a specific point overrides the profile\n"
-        f"for that point, but the profile is the base tone otherwise.\n\n"
-        f"{profile.persona}\n\n{profile.dials_line}"
+        f"for that point, but the profile is the base tone otherwise."
+        f"{tuned}\n\n"
+        f"{profile.effective_persona}\n\n{profile.dials_line}"
     )
 
 
@@ -113,7 +121,7 @@ def coach_memory_block(
 
 def system_prompt(
     user_name: str = DEFAULT_USER_NAME,
-    profile: coach.CoachProfile = ADAPTIVE,
+    profile: coach.CoachProfile = DEFAULT,
     memory_text: str | None = None,
 ) -> str:
     # Pull any durable user preferences saved via save_user_note. These
@@ -258,7 +266,7 @@ def briefing_prompt(
     user_name: str = DEFAULT_USER_NAME,
     daily_step_goal: int = 10000,
     recent_briefs_summary: str = "",
-    profile: coach.CoachProfile = ADAPTIVE,
+    profile: coach.CoachProfile = DEFAULT,
 ) -> str:
     # Deterministic tone gating: harsh profiles (adaptive, hardass) assemble the
     # harsh-tone imperative blocks for the goal-based mandates; soft profiles
@@ -709,7 +717,7 @@ Return ONLY the JSON object. Nothing else.
 
 def brief_v2_system_prompt(
     user_name: str = DEFAULT_USER_NAME,
-    profile: coach.CoachProfile = ADAPTIVE,
+    profile: coach.CoachProfile = DEFAULT,
     memory_text: str | None = None,
 ) -> str:
     # memory_text passed in for the same import-time reason as system_prompt;
@@ -799,7 +807,7 @@ def brief_v2_user_prompt(
     user_name: str = DEFAULT_USER_NAME,
     daily_step_goal: int = 10000,
     recent_briefs_summary: str = "",
-    profile: coach.CoachProfile = ADAPTIVE,
+    profile: coach.CoachProfile = DEFAULT,
     persist_via_tool: bool = False,
 ) -> str:
     # The in-process toolless generator RETURNS the JSON (its stdout IS the brief).

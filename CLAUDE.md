@@ -304,6 +304,31 @@ These are settled — don't redesign without a reason.
   `tests/test_prompts.py` fails the build if a prompt module puts a personal
   name in a non-docstring string literal. When adding a prompt surface, add it
   to `_voice_surfaces` in that file — the gate is what keeps this true.
+- **The personality is tunable conversationally; the shipped default is the
+  hardass accountability mirror** (0.31.0). `coach.DEFAULT_PROFILE` is
+  `"hardass"` (rewritten as an original accountability-mirror persona — never
+  naming/imitating a real coach, with a "Using your memory" receipts section
+  and a never-do list that pins "red recovery day → order the rest") and
+  `config.coach_profile()`'s default literal matches — config can't import
+  coach (cycle), so `tests/test_coach.py::test_config_default_matches_coach_default`
+  pins the pair. The tuning layer: `agent/personality.py` owns a
+  `PersonalitySpec` stored as JSON in settings key `coach_personality_spec`
+  (≤8 KB, identity ≤4000 chars, ≤12 items/list, ≤16 intensity topics),
+  edited ONLY via the `get_coach_personality`/`update_coach_personality` MCP
+  tools (agent-owned writes, like plans). **Virtual seeding**: no stored spec
+  → behavior is byte-identical to the profile `.md` files; the first update
+  materializes `seed_from_profile(active)` + patch. `resolve_coach_profile`
+  parses the spec out of the `all_settings()` dict it already fetched (zero
+  added reads) and attaches it as `CoachProfile.spec`;
+  `profile.effective_persona` (spec render > file prose) is what
+  `coach_voice_block` speaks. A spec whose `base_profile` mismatches the
+  active profile is **ignored but retained** (switch back and the tuning
+  returns; the get tool reports `base_profile_mismatch`). The 5 numeric dials
+  stay in their existing settings keys — the update tool writes those keys,
+  never duplicates them into the spec. Precedence: **notes > spec > profile
+  file**. Kill switch `LOCAL_FITNESS_COACH_SPEC=0` ignores (never deletes)
+  the spec. `scripts/score_profiles.py`'s hardass markers track the persona's
+  actual signature lines — update them together.
 - **Run-vs-walk is decided by measured pace everywhere, never by
   `activity_type`** (0.27.0). Garmin's label lies — walking-desk sessions log
   as `treadmill_running` — so `plans.GradingConfig.pace_gated_locomotion` (on

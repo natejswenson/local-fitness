@@ -42,9 +42,11 @@ def test_harsh_block_gating_matches_harshness():
     assert not coach.load_profile("supportive").includes_harsh_block
 
 
-def test_unknown_profile_falls_back_to_adaptive():
-    assert coach.load_profile("nope").name == "adaptive"
-    assert coach.load_profile("").name == "adaptive"
+def test_unknown_profile_falls_back_to_the_default():
+    # DEFAULT_PROFILE is hardass since 0.31.0 — the shipped identity.
+    assert coach.DEFAULT_PROFILE == "hardass"
+    assert coach.load_profile("nope").name == "hardass"
+    assert coach.load_profile("").name == "hardass"
 
 
 def test_import_fallback_when_profile_dir_missing(monkeypatch):
@@ -60,8 +62,15 @@ def test_import_fallback_when_profile_dir_missing(monkeypatch):
 
 # --- resolve + overrides ---------------------------------------------------
 
-def test_resolve_default_is_adaptive(dbp):
-    assert coach.resolve_coach_profile().name == "adaptive"
+def test_resolve_default_is_the_hardass_identity(dbp):
+    assert coach.resolve_coach_profile().name == "hardass"
+
+
+def test_config_default_matches_coach_default(dbp):
+    # config can't import coach (cycle), so its default literal is a copy —
+    # this is the cross-check that keeps the pair from drifting.
+    from local_fitness import config as config_mod
+    assert config_mod.coach_profile() == coach.DEFAULT_PROFILE
 
 
 def test_resolve_picks_profile_from_setting(dbp):
