@@ -6,6 +6,87 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-23
+
+Fifteen fixes from a multi-agent audit across three axes — terminal UX, MCP
+tool quality, and data reliability. Every finding was independently verified
+against the code before implementation; six other claims were refuted and
+dropped.
+
+### Fixed — data correctness
+- **Tempo/interval days are graded on the full done|partial|missed ladder.**
+  The duration branch never consulted `done_fraction`, so any running ≥40% of
+  a quality day's target graded a full "done" and such days could never grade
+  "missed". The ladder now mirrors the distance grading
+  (`done_fraction`/`partial_fraction`); easy/long-day and walk-gating
+  semantics are untouched.
+- **Backfilled activities land on the right local date.** `backfill.py`
+  decoded Garmin's local-epoch `startTimeLocal` with host-TZ
+  `datetime.fromtimestamp`, applying the timezone offset twice — a 05:30
+  activity filed under the previous day. The local epoch is now decoded
+  offset-free; the genuinely-GMT `beginTimestamp` fallback keeps host-TZ
+  decoding.
+- **A day whose Garmin endpoints all fail no longer writes an all-NULL row.**
+  Previously the row masked the gap forever and the pull reported "success"
+  having saved nothing; now the day stays missing (retried by gap detection),
+  lands in `days_failed`, and the pull reports `partial`. The upsert also
+  switched to per-column `COALESCE`, so a transient endpoint failure inside
+  the freshness window can never overwrite finalized data with NULLs (this
+  incidentally stops the daily pull from clobbering backfill's
+  `training_status`).
+- **Mid-run Garmin auth expiry aborts the pull.** `_safe`'s blanket
+  `except Exception` swallowed `GarminConnectAuthenticationError`, making the
+  abort-the-rest handler dead code; the pull could run to "success" on an
+  expired token. Auth errors now propagate; other per-endpoint errors stay
+  best-effort.
+
+### Fixed — MCP accuracy & terminal UX
+- **`run_sql` discloses its 500-row cap.** Results beyond 500 rows set
+  `truncated: true` with a hint to add `LIMIT`/aggregate, and the cap is
+  stated in the tool description — previously a clipped result was
+  indistinguishable from a complete one and totals came back confidently
+  wrong.
+- **`list_observations` is bounded** (default `limit` 100, `truncated` flag),
+  mirroring `query_workouts` — the bare call was an unbounded
+  `SELECT * FROM observations`.
+- **`update_plan_workout` echoes what it wrote.** The confirmation now
+  includes the duration it just set (the graded field on quality days, per
+  its own description) and the resolved `seq` on double days.
+- **`get_metric` / `find_anomalies` payloads are readable.** Formatted
+  companions (h:mm durations, min/mi paces, sensible rounding) ride alongside
+  the raw fields, and `get_metric` skips NULL calendar-day padding, reporting
+  `days_with_data` vs the window instead.
+- **Weekly mileage means the same thing on every surface.** The brief PDF's
+  plan section now computes on-foot miles like `get_training_plan_progress`'s
+  `week_actual_mi` (walking on easy days counts by design), and `plan_chart`'s
+  legend says what the bar actually plots.
+
+### Fixed — output reliability
+- **PDF content tags now hash the render's inputs, not the PDF bytes.**
+  WeasyPrint's PDF serialization is not byte-reproducible — identical HTML
+  diverged on ~50% of paired Linux renders — so 0.28.2's bytes-based
+  `_content_tag` broke the "identical content reuses one filename" half of
+  its own contract at random (and made its CI test a coin flip). Both PDF
+  filenames now derive from the logical content (brief/card + chart bytes +
+  brand theme + app version) via `_render_tag`; `generate_chart`'s PNG keeps
+  byte-hashing since matplotlib's writer is reproducible.
+- **`generate_chart` PNGs are content-addressed** (`…-<sha8>.png`), closing
+  the same stale-Preview-refocus hole 0.28.2 fixed for PDFs — an intra-day
+  re-render after a sync landed fresh bytes on the same path.
+- **A report card that overflows one page says so.** `render_report_card_pdf`
+  now returns `(bytes, page_count)` like the brief renderer, and
+  `workout_report_card` stamps `pages` + logs a warning when the density
+  ladder is exhausted, instead of spilling silently.
+- **Training load carries its as-of date.** `assemble_status` adds `as_of` +
+  `baseline_stale_days` to `training_load`, so a stale baselines row can no
+  longer masquerade as current fitness/fatigue/freshness.
+- **The plan-coach fallback line is date-aware.** It said "Yesterday…" about
+  whatever day was the latest graded one — including today's own run. The
+  reference now resolves Today / Yesterday / the actual date.
+- **The MCP server logs its coach-persona fail-open** instead of silently
+  serving a persona-less server when the profile can't load, and the drifted
+  `LOCAL_ONLY_TOOLS` docs on the transport boundary were corrected.
+
 ## [0.28.2] - 2026-07-22
 
 ### Fixed

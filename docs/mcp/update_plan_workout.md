@@ -77,18 +77,25 @@ field names and augmented with display units.
 {
   "date": "2026-07-25",
   "type": "long",
+  "seq": 1,
   "distance_meters": 19312.128,
   "avg_pace_sec_per_km": 385.87,
+  "duration_seconds": null,
   "description": "Long run 12 mi, easy effort.",
   "distance_mi": 12.0,
   "pace_min_per_mi": "10:21"
 }
 ```
 
-- `distance_meters` / `avg_pace_sec_per_km` — the raw stored values (note the names: they follow
-  the `activities` convention, not `target_*`).
+- `distance_meters` / `avg_pace_sec_per_km` / `duration_seconds` — the raw stored values (note the
+  names: they follow the `activities` convention, not `target_*`). `duration_seconds` is `null` on a
+  distance-typed day.
+- `seq` — which intra-day session was edited (1 = AM, 2 = PM), so a double-day edit is unambiguous
+  in the reply.
 - `distance_mi` — present only when display units are miles; omitted in km mode.
 - `pace_min_per_mi` — formatted string, always present when a pace is stored.
+- `duration_formatted` — present only when a duration is stored (e.g. `"40:00"` for a tempo day),
+  so a `duration_min` edit can be confirmed straight from the tool result.
 
 Errors:
 
@@ -121,8 +128,8 @@ That is **two** calls — the tool cannot change a workout's date:
 First call returns:
 
 ```json
-{"date": "2026-07-25", "type": "rest", "distance_meters": null,
- "avg_pace_sec_per_km": null, "description": "Rest day"}
+{"date": "2026-07-25", "type": "rest", "seq": 1, "distance_meters": null,
+ "avg_pace_sec_per_km": null, "duration_seconds": null, "description": "Rest day"}
 ```
 
 Second returns the re-prescribed Sunday, as above.
@@ -137,10 +144,10 @@ Second returns the re-prescribed Sunday, as above.
   day cannot gain one while active.
 - **Imperial in, metric stored — the inverse of `propose_training_plan`.** This tool takes miles and
   min/mi; `propose`/`revise` take metres and sec/km. Mixing them up is the most common mistake here.
-- **The response does not echo duration.** Setting `duration_min` writes `target_duration_sec`
-  correctly, but the returned payload has no duration field at all — it carries only
-  `date`/`type`/`distance_meters`/`avg_pace_sec_per_km`/`description`. Read the day back via
-  `get_training_plan_progress` if you need to confirm a duration change.
+- **The response echoes the whole prescription.** Setting `duration_min` writes
+  `target_duration_sec` and the payload now carries it back as `duration_seconds` plus a formatted
+  `duration_formatted` (and `seq` for which session was edited), so a duration change confirms from
+  the tool result — no follow-up `get_training_plan_progress` needed.
 - **Duration is what grades `tempo`/`interval`; distance is what grades `easy`/`long`/`race`.**
   Setting `distance_mi` on a tempo day is display-only — adherence still measures running duration.
 - **No dry run, no undo.** The write is immediate and the previous prescription is gone.

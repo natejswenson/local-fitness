@@ -36,7 +36,20 @@ out to `sqlite3` via Bash for a DB read — that has happened once and it dumped
 ```
 
 `count` is `len(rows)` after truncation, **not** the number of rows the query
-matched. A `count` of exactly `500` means you very likely hit the cap.
+matched. When more than 500 rows matched, the result is clipped to 500 and the
+payload carries `"truncated": true` plus a `"hint"` string:
+
+```json
+{
+  "rows": ["… 500 rows …"],
+  "count": 500,
+  "truncated": true,
+  "hint": "row cap hit — showing the first 500 of a larger result; add a LIMIT or aggregate to see the rest"
+}
+```
+
+Absence of `truncated` means the result is complete (even at exactly 500 rows —
+the tool fetches 501 to tell "exactly 500 matched" from "the cap clipped more").
 
 On failure the tool returns an MCP error payload (`is_error: true`) with one of a
 small, deliberately non-leaky set of messages:
@@ -94,10 +107,12 @@ Abridged output:
   rejected with `forbidden keyword: create` even though it's a pure read.
   Likewise `replace (a, b, c)` written with a space after the function name is
   rejected; `replace(a, b, c)` is fine. Reformulate rather than fight it.
-- **500 rows, silently.** `fetchmany(500)` truncates with no flag in the payload.
-  Put your own `LIMIT`/aggregation in the query when the result set could be
-  larger — `activity_hr_samples` alone holds ~1700 rows for a single run, and
-  `body_battery_samples`/`stress_samples` are per-sample tables.
+- **500-row cap, signalled.** The result is clipped at 500 rows, but not
+  silently: `"truncated": true` and a `"hint"` land in the payload when the cap
+  is hit, so you know the set was cut. Put your own `LIMIT`/aggregation in the
+  query when the result set could be larger — `activity_hr_samples` alone holds
+  ~1700 rows for a single run, and `body_battery_samples`/`stress_samples` are
+  per-sample tables.
 - **5-second wall clock.** A SQLite progress handler checks the deadline every
   10,000 VM ops and interrupts the statement, so a recursive CTE or a cartesian
   join gets `query exceeded time budget` instead of hanging the single-threaded

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import hashlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -199,7 +200,9 @@ async def get_today_status(_args: dict) -> dict:
 
 @tool(
     "get_metric",
-    "Get raw daily values for one metric over the last N days. Returns time series sorted oldest-first.",
+    "Get raw daily values for one metric over the last N days, oldest-first. "
+    "Skips days with no reading (NULL) and reports days_with_data vs the window. "
+    "*_seconds metrics carry a value_formatted (e.g. '7h 33m') alongside the raw value.",
     {"metric": str, "days": int},
 )
 async def get_metric(args: dict) -> dict:
@@ -211,12 +214,35 @@ async def get_metric(args: dict) -> dict:
         return _err(err)
     days = args["days"]
     cutoff = (date.today() - timedelta(days=days)).isoformat()
+    # Skip NULL readings: for sparse columns (vo2_max updates only on run days)
+    # a long window is otherwise mostly {"value": null} rows — pure token cost.
+    # get_metric_trend already filters the same way; this aligns the two on what
+    # "a day with data" means. days_with_data vs days_window surfaces the gap so
+    # nothing is silently hidden.
     with db.connect() as conn:
         rows = conn.execute(
-            f"SELECT date, {metric} AS value FROM daily_metrics WHERE date >= ? ORDER BY date",
+            f"SELECT date, {metric} AS value FROM daily_metrics "
+            f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date",
             (cutoff,),
         ).fetchall()
-    return _text([dict(r) for r in rows])
+    # Formatted companion for duration-shaped metrics — the coach voice never
+    # speaks raw seconds ("25200 seconds"); attach the "7h 33m" shape at the
+    # payload boundary, same discipline get_metric_trend/compare_periods follow.
+    fmt = units.format_hm if metric.endswith("_seconds") else None
+    values = []
+    for r in rows:
+        row = dict(r)
+        if fmt is not None:
+            formatted = fmt(row["value"])
+            if formatted is not None:
+                row["value_formatted"] = formatted
+        values.append(row)
+    return _text({
+        "metric": metric,
+        "days_window": days,
+        "days_with_data": len(values),
+        "values": values,
+    })
 
 
 @tool(
@@ -564,8 +590,9 @@ def _plan_chart_weekly_rows(graded: list[dict]) -> list[dict]:
 @tool(
     "plan_chart",
     "Render a scheduled-vs-actual training-plan chart (ASCII/emoji): one bar "
-    "per day (or per week for long windows) — █ = miles run, ░ = shortfall vs "
-    "plan, verdict glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
+    "per day (or per week for long windows) — █ = on-foot miles (run + walk, "
+    "since easy days count prescribed walking), ░ = shortfall vs plan, verdict "
+    "glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
     "THE tool for 'planned vs actual' / 'am I hitting my plan' asks — don't "
     "hand-roll a chart. Reproduce the full output in a fenced code block in "
     "your reply, then add the coach read — never leave it only in the "
@@ -611,7 +638,11 @@ async def plan_chart(args: dict) -> dict:
         rows = _plan_chart_rows(graded)
         n_runs = sum(1 for r in rows if not r["rest"])
         title = f"plan vs actual · last {days}d · {n_runs} runs{adh}"
-        legend = "█ run vs ░ short of plan (mi) · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
+        # █ plots actual_distance_m, which is ON-FOOT miles (run + walk) —
+        # NOT run-only. Easy days count prescribed walking by design, so the
+        # label must say on-foot, matching the bar and the PDF strip's
+        # run/walk convention (0.27.0 label-vs-measurement class).
+        legend = "█ on-foot mi vs ░ short of plan · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
 
     return _text(charts.render_plan_vs_actual(rows, title=title, legend=legend))
 
@@ -854,6 +885,11 @@ async def find_anomalies(args: dict) -> dict:
                 ORDER BY dm.date DESC""",
             (cutoff, threshold),
         ).fetchall()
+    # sleep_seconds baselines are raw AVG()/SD floats (~10 significant digits)
+    # and the value is raw seconds — attach the "7h 33m" companion the coach
+    # voice must speak instead, and round the baseline floats at the payload
+    # boundary, the same discipline get_metric_trend/compare_periods follow.
+    fmt = units.format_hm if metric.endswith("_seconds") else None
     anomalies = []
     for r in rows:
         row = dict(r)
@@ -861,6 +897,17 @@ async def find_anomalies(args: dict) -> dict:
         if position is not None:
             row["sd_distance"] = round(position["sd_distance"], 2)
             row["direction"] = position["direction"]
+        if fmt is not None:
+            for raw_key, fmt_key in (
+                ("value", "value_formatted"),
+                ("baseline_mean", "baseline_formatted"),
+            ):
+                formatted = fmt(row.get(raw_key))
+                if formatted is not None:
+                    row[fmt_key] = formatted
+        for field in ("baseline_mean", "baseline_sd"):
+            if row.get(field) is not None:
+                row[field] = round(row[field], 2)
         anomalies.append(row)
     return _text({
         "metric": metric,
@@ -1122,6 +1169,11 @@ async def recovery_pattern(args: dict) -> dict:
 # (single-threaded) server. Granularity: how many VM ops between deadline checks.
 _RUN_SQL_TIME_BUDGET_S = 5.0
 _RUN_SQL_PROGRESS_OPS = 10_000
+# Hard row cap on a run_sql result. Bounds a "SELECT * FROM activities"-style ask
+# so an ad-hoc query can't shove the whole table into the model's context. The
+# cap is SIGNALLED, not silent: _run_sql_blocking fetches one past it so run_sql
+# can tell "exactly 500 rows matched" from "the cap clipped a larger result".
+_RUN_SQL_ROW_CAP = 500
 
 
 def _run_sql_blocking(q: str) -> list[dict]:
@@ -1132,6 +1184,9 @@ def _run_sql_blocking(q: str) -> list[dict]:
     aborts once the deadline passes, which makes SQLite raise OperationalError.
     Runs in a worker thread (via asyncio.to_thread) so even a within-budget
     heavy query never blocks the event loop.
+
+    Fetches ``_RUN_SQL_ROW_CAP + 1`` rows so the caller can detect (and flag)
+    truncation instead of silently returning a clipped set as if complete.
     """
     deadline = time.monotonic() + _RUN_SQL_TIME_BUDGET_S
 
@@ -1142,7 +1197,7 @@ def _run_sql_blocking(q: str) -> list[dict]:
     with db.connect_readonly() as conn:
         conn.set_progress_handler(_abort_if_over_budget, _RUN_SQL_PROGRESS_OPS)
         try:
-            return [dict(r) for r in conn.execute(q).fetchmany(500)]
+            return [dict(r) for r in conn.execute(q).fetchmany(_RUN_SQL_ROW_CAP + 1)]
         finally:
             conn.set_progress_handler(None, 0)
 
@@ -1151,7 +1206,9 @@ def _run_sql_blocking(q: str) -> list[dict]:
     "run_sql",
     "Execute a read-only SELECT or WITH query against the fitness DB. "
     "Tables and columns: " + _render_schema() + ". "
-    "Use this for ad-hoc analysis the other tools don't cover.",
+    "Use this for ad-hoc analysis the other tools don't cover. "
+    f"Results are capped at {_RUN_SQL_ROW_CAP} rows; when more match, the "
+    "payload carries \"truncated\": true — add a LIMIT or aggregate to see the rest.",
     {"query": str},
 )
 async def run_sql(args: dict) -> dict:
@@ -1185,6 +1242,15 @@ async def run_sql(args: dict) -> dict:
             "query failed: invalid query — check table/column names "
             "against the fitness://schema resource"
         )
+    if len(rows) > _RUN_SQL_ROW_CAP:
+        rows = rows[:_RUN_SQL_ROW_CAP]
+        return _text({
+            "rows": rows,
+            "count": len(rows),
+            "truncated": True,
+            "hint": f"row cap hit — showing the first {_RUN_SQL_ROW_CAP} "
+                    "of a larger result; add a LIMIT or aggregate to see the rest",
+        })
     return _text({"rows": rows, "count": len(rows)})
 
 
@@ -1357,11 +1423,21 @@ async def log_observation(args: dict) -> dict:
     return _text({"logged": True, "observation": dict(row)})
 
 
+# Default row cap on list_observations. Observations are the daily-logging
+# surface (weight, RPE, soreness, mood), so an unbounded SELECT * would dump a
+# year+ of rows into the reply once logging is at cadence. Mirrors
+# query_workouts' default-50 pattern; run_sql stays the full-history escape hatch.
+_LIST_OBSERVATIONS_DEFAULT_LIMIT = 100
+
 _LIST_OBSERVATIONS_SCHEMA = {
     "type": "object",
     "properties": {
         "days": {"type": "integer", "description": "Only observations from the last N days."},
         "obs_type": {"type": "string", "description": "Filter to one obs_type."},
+        "limit": {
+            "type": "integer",
+            "description": f"Max rows, most recent first (default {_LIST_OBSERVATIONS_DEFAULT_LIMIT}).",
+        },
     },
     "required": [],
 }
@@ -1370,7 +1446,9 @@ _LIST_OBSERVATIONS_SCHEMA = {
 @tool(
     "list_observations",
     "List logged observations, most recent first. Optional filters: days "
-    "lookback and obs_type.",
+    f"lookback and obs_type. Capped at {_LIST_OBSERVATIONS_DEFAULT_LIMIT} rows "
+    "by default (pass limit for more); when the cap is hit the payload carries "
+    "\"truncated\": true — narrow with days/obs_type or raise limit.",
     _LIST_OBSERVATIONS_SCHEMA,
 )
 async def list_observations(args: dict) -> dict:
@@ -1386,13 +1464,21 @@ async def list_observations(args: dict) -> dict:
         where.append("obs_type = ?")
         params.append(args["obs_type"])
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    limit = int(args.get("limit") or _LIST_OBSERVATIONS_DEFAULT_LIMIT)
     with db.connect() as conn:
+        # Fetch one past the cap so a full page is distinguishable from a
+        # clipped larger set — same truncation-signal shape as run_sql.
         rows = conn.execute(
             f"SELECT * FROM observations {where_sql} "
-            "ORDER BY observed_on DESC, observation_id DESC",
-            params,
+            "ORDER BY observed_on DESC, observation_id DESC LIMIT ?",
+            (*params, limit + 1),
         ).fetchall()
-    return _text({"observations": [dict(r) for r in rows], "count": len(rows)})
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    payload = {"observations": [dict(r) for r in rows], "count": len(rows)}
+    if truncated:
+        payload["truncated"] = True
+    return _text(payload)
 
 
 @tool(
@@ -1782,10 +1868,18 @@ async def update_plan_workout(args: dict) -> dict:
     except ValueError as e:
         return _err(str(e))
 
+    # Echo the whole prescription that was written, so the model can confirm
+    # the change from the tool result without a follow-up read. duration_min is
+    # the graded field for tempo/interval days (per this tool's own
+    # description), so target_duration_sec MUST be in the echo — via the
+    # duration_seconds key _augment_workout formats into duration_formatted,
+    # mirroring the distance_meters/avg_pace_sec_per_km remaps beside it. seq
+    # tells the user which session of a double day was edited.
     return _text(_augment_workout({
-        "date": row["date"], "type": row["type"],
+        "date": row["date"], "type": row["type"], "seq": row["seq"],
         "distance_meters": row["target_distance_m"],
         "avg_pace_sec_per_km": row["target_pace_sec_per_km"],
+        "duration_seconds": row["target_duration_sec"],
         "description": row["description"],
     }))
 
@@ -2021,7 +2115,10 @@ _PROGRESS_SCHEMA = {
     "Day-by-day progress of the ACTIVE training plan: every prescribed "
     "workout with its graded verdict (done | partial | missed | compliant | "
     "pending), plus goal, days-to-race, adherence %, projected finish, goal "
-    "gap, and this week's planned/actual mileage. The `workouts` list is "
+    "gap, and this week's mileage. this_week.week_actual_mi is total ON-FOOT "
+    "miles (run + walk — easy days count prescribed walking by design); "
+    "week_run_mi + week_walk_mi split it, and week_run_mi matches the brief "
+    "PDF's plan-strip headline. The `workouts` list is "
     "windowed by default (14 days back from the data frontier, 7 days "
     "forward from today — today is always in-window even under a stale "
     "frontier) — pass full=true for the complete list across the whole plan "
@@ -2111,9 +2208,16 @@ async def get_training_plan_progress(args: dict) -> dict:
     target_time_seconds = detail.get("target_time_seconds")
     goal_gap = plans.goal_gap(predicted_finish_seconds, target_time_seconds)
     rollup = weekly_rollup(detail["workouts"], today)
+    # week_actual_mi is total ON-FOOT miles (run + walk) — easy/recovery days
+    # count prescribed walking by design (CLAUDE.md). The brief PDF's plan strip
+    # headlines RUN miles instead, so expose the run/walk split here (already on
+    # the rollup) so the two surfaces reconcile: week_run_mi + week_walk_mi ==
+    # week_actual_mi, and week_run_mi is the PDF strip's headline number.
     this_week = {
         "week_planned_mi": rollup["week_planned_mi"],
         "week_actual_mi": rollup["week_actual_mi"],
+        "week_run_mi": rollup["week_run_mi"],
+        "week_walk_mi": rollup["week_walk_mi"],
         "slips": rollup["slips"],
     }
 
@@ -2342,16 +2446,58 @@ async def _auto_open(path: Path) -> None:
 def _content_tag(data: bytes) -> str:
     """A short content hash for a rendered artifact's filename.
 
-    Content-addressing the PDF filename fixes a real trust bug: PDFs are written
-    to a per-process tmp dir and auto-opened with macOS `open`, but `open`
-    RE-FOCUSES an already-open Preview window for a path it has seen rather than
-    reloading the bytes. A deterministic `brief-<date>.pdf` name therefore showed
-    a stale render on every re-generate — a user read yesterday's-looking page
-    and concluded the data pipeline was stale (observed 2026-07-22). Suffixing
-    the name with the content hash means changed content always lands on a NEW
-    filename (a genuinely fresh window), while identical content reuses the same
-    file (idempotent — refocusing is correct when the bytes match)."""
+    Content-addressing the filename fixes a real trust bug: artifacts are
+    written to a per-process tmp dir and auto-opened with macOS `open`, but
+    `open` RE-FOCUSES an already-open Preview window for a path it has seen
+    rather than reloading the bytes. A deterministic `brief-<date>.pdf` name
+    therefore showed a stale render on every re-generate — a user read
+    yesterday's-looking page and concluded the data pipeline was stale
+    (observed 2026-07-22). Suffixing the name with the content hash means
+    changed content always lands on a NEW filename (a genuinely fresh window),
+    while identical content reuses the same file (idempotent — refocusing is
+    correct when the bytes match).
+
+    Use this on artifact bytes ONLY when the renderer is byte-reproducible
+    (matplotlib's PNG writer is). PDFs must go through `_render_tag` instead:
+    WeasyPrint's byte stream is NOT reproducible — see that docstring."""
     return hashlib.sha256(data).hexdigest()[:8]
+
+
+def _render_tag(*parts: object) -> str:
+    """`_content_tag` for PDFs: hash the render's logical INPUTS, not its bytes.
+
+    WeasyPrint's PDF serialization is not byte-reproducible — the same HTML
+    string rendered twice in one process can produce different bytes depending
+    on interpreter allocation state (measured 2026-07-23: ~50% of paired
+    renders diverged on Linux CI/Docker; macOS's allocator usually masks it,
+    which is why 0.28.2's bytes-hash looked stable locally). Hashing the PDF
+    bytes therefore broke the "identical content reuses one filename" half of
+    the contract at random. Hashing what we ASKED the renderer to draw keeps
+    both halves deterministic on every platform.
+
+    Each part is either raw bytes (chart PNGs — themselves content) or a
+    JSON-serializable structure, canonicalized with sort_keys. The app version
+    and resolved brand theme are always mixed in, so a release that changes
+    layout or a brand-file change still lands on a fresh filename rather than
+    refocusing a stale-looking window."""
+    from local_fitness.agent import branding
+
+    h = hashlib.sha256()
+    h.update(_APP_VERSION.encode())
+    h.update(json.dumps(branding.load_theme(), sort_keys=True, default=str).encode())
+    for p in parts:
+        if isinstance(p, (bytes, bytearray)):
+            h.update(bytes(p))
+        else:
+            h.update(json.dumps(p, sort_keys=True, default=str).encode())
+        h.update(b"\x1f")
+    return h.hexdigest()[:8]
+
+
+try:
+    _APP_VERSION = importlib.metadata.version("local-fitness")
+except importlib.metadata.PackageNotFoundError:  # uninstalled source tree
+    _APP_VERSION = "0"
 
 
 def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
@@ -2546,6 +2692,7 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["last_7_days"],
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
+                target_date=target_date,
             )
         plan_section["today"]["coaching_line"] = coaching_line
 
@@ -2606,8 +2753,12 @@ async def generate_brief_report(args: dict) -> dict:
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
     try:
+        tag = _render_tag(
+            trial.model_dump(mode="json"), plan_section, omitted,
+            *(trial_charts[k] for k in sorted(trial_charts)),
+        )
         final_path = _write_atomic(
-            reports_dir, f"brief-{target_date}-{_content_tag(pdf_bytes)}.pdf", pdf_bytes)
+            reports_dir, f"brief-{target_date}-{tag}.pdf", pdf_bytes)
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
@@ -2675,18 +2826,23 @@ async def generate_chart(args: dict) -> dict:
     except Exception as e:
         return _err(f"chart render failed: {e}")
 
-    # {today} is computed here, not a tool argument — it exists in the
-    # filename only to distinguish chart runs across days. The idempotent-
-    # overwrite guarantee (identical metric/chart_type/days -> identical
-    # file) therefore holds only within a single calendar day.
-    today = date.today().isoformat()
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
+    # Content-address the filename with the same tag the two PDF tools use
+    # (0.28.2): macOS `open` REFOCUSES an already-open Preview window for a path
+    # it has seen rather than reloading the bytes, so a day-deterministic
+    # `chart-...-<date>.png` name showed a STALE chart when the same
+    # metric/chart_type/days re-rendered after an intra-day sync. The content
+    # tag makes changed bytes land on a NEW filename (a genuinely fresh window)
+    # while identical bytes reuse one file (idempotent — refocusing is correct
+    # when the bytes match). See _content_tag and the PDF paths above.
     try:
         final_path = _write_atomic(
-            reports_dir, f"chart-{metric}-{chart_type}-{days}d-{today}.png", png_bytes
+            reports_dir,
+            f"chart-{metric}-{chart_type}-{days}d-{_content_tag(png_bytes)}.png",
+            png_bytes,
         )
     except ValueError:
         return _err("resolved path escaped reports directory")
@@ -2826,20 +2982,31 @@ async def workout_report_card(args: dict) -> dict:
 
     try:
         async with visuals.RENDER_LOCK:
-            pdf_bytes = await asyncio.to_thread(
+            pdf_bytes, pages = await asyncio.to_thread(
                 visuals.render_report_card_pdf, card, split_chart
             )
     except Exception as e:
         return _err(f"PDF render failed: {e}")
+    if pages != 1:
+        # The card has no droppable content (unlike the brief's takeaway tail),
+        # so the density ladder is the only lever and it's exhausted. Never let
+        # a PDF spill silently (CLAUDE.md) — a warning is the honest signal that
+        # this card's splits + coach read outgrew even the densest rung.
+        LOG.warning(
+            "report card for activity %s still %d pages at the densest preset",
+            inputs["activity"]["activity_id"], pages,
+        )
+        payload["pages"] = pages
 
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
     try:
+        tag = _render_tag(card, split_chart or b"")
         final_path = _write_atomic(
             reports_dir,
-            f"report-card-{inputs['activity']['activity_id']}-{_content_tag(pdf_bytes)}.pdf",
+            f"report-card-{inputs['activity']['activity_id']}-{tag}.pdf",
             pdf_bytes,
         )
     except ValueError:

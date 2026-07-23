@@ -422,8 +422,16 @@ These are settled — don't redesign without a reason.
   claims it; this is an accepted residual risk for a personal, single-user
   tool, not something hardened further. **Both PDF filenames are
   content-addressed** (0.28.2): `brief-<date>-<sha8>.pdf` and
-  `report-card-<id>-<sha8>.pdf`, where `sha8` is `_content_tag()` (first 8 hex
-  of the sha256 of the PDF bytes). This is not cosmetic — macOS `open`
+  `report-card-<id>-<sha8>.pdf`, where `sha8` is `_render_tag()` — a sha256
+  over the render's logical INPUTS (brief/card content + chart PNG bytes +
+  brand theme + app version), NOT over the PDF bytes. Bytes-hashing was
+  0.28.2's original design and it was wrong: WeasyPrint's PDF serialization
+  is not byte-reproducible (the same HTML rendered twice in one process
+  diverged on ~50% of paired Linux renders, measured 2026-07-23; macOS's
+  allocator usually masks it), so the "identical content reuses one filename"
+  half of the contract failed at random and its CI test was a coin flip.
+  `generate_chart`'s PNG still uses `_content_tag()` (bytes) — matplotlib's
+  PNG writer IS reproducible. This is not cosmetic — macOS `open`
   RE-FOCUSES an already-open Preview window for a path it has seen rather than
   reloading the bytes, so the old deterministic `brief-<date>.pdf` showed a
   STALE render on every re-generate. A user read yesterday's-looking page and

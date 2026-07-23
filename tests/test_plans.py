@@ -153,13 +153,34 @@ def test_multiple_runs_summed():
 def test_interval_graded_on_duration():
     w = {"type": "interval", "target_duration_sec": 3600}
     assert plans.classify_workout(w, [_run(4000, duration=3600)]) == "done"
-    assert plans.classify_workout(w, [_run(2000, duration=600)]) == "partial"
+    # 600/3600 = 0.167 is below partial_fraction (0.40) → missed, not partial:
+    # quality days now grade against the full done|partial|missed ladder.
+    assert plans.classify_workout(w, [_run(2000, duration=600)]) == "missed"
     assert plans.classify_workout(w, []) == "missed"
 
 
 def test_tempo_graded_on_duration():
     w = {"type": "tempo", "target_duration_sec": 2400}
     assert plans.classify_workout(w, [_run(5000, duration=2400)]) == "done"
+    assert plans.classify_workout(w, []) == "missed"
+
+
+def test_duration_ladder_bands():
+    # A quality day must consult done_fraction (0.80), not grade "done" at 40%.
+    # Boundaries pinned at 0.39/0.40/0.79/0.80/0.81 of a 3600s target.
+    w = {"type": "interval", "target_duration_sec": 3600}
+    assert plans.classify_workout(w, [_run(4000, duration=1403)]) == "missed"   # 0.390
+    assert plans.classify_workout(w, [_run(4000, duration=1440)]) == "partial"  # 0.400 boundary
+    assert plans.classify_workout(w, [_run(4000, duration=1476)]) == "partial"  # 0.410
+    assert plans.classify_workout(w, [_run(4000, duration=2844)]) == "partial"  # 0.790
+    assert plans.classify_workout(w, [_run(4000, duration=2880)]) == "done"     # 0.800 boundary
+    assert plans.classify_workout(w, [_run(4000, duration=2916)]) == "done"     # 0.810
+
+
+def test_duration_no_target_is_by_feel():
+    # No prescribed duration → any running effort still grades done (by feel).
+    w = {"type": "tempo", "target_duration_sec": None}
+    assert plans.classify_workout(w, [_run(3000, duration=300)]) == "done"
     assert plans.classify_workout(w, []) == "missed"
 
 
@@ -274,12 +295,14 @@ def test_custom_fractions_shift_distance_bands():
     assert plans.classify_workout(w, [_run(1000)], cfg) == "missed"   # 0.10 < 0.2
 
 
-def test_partial_fraction_threads_into_duration_band():
+def test_custom_fractions_shift_duration_bands():
+    # Both cfg fractions thread into the duration ladder, same as distance.
     w = {"type": "interval", "target_duration_sec": 3600}
-    run = [_run(4000, duration=1500)]  # 1500/3600 = 0.4167
-    assert plans.classify_workout(w, run) == "done"  # default 0.40: 0.417 ≥ 0.40
-    cfg = plans.GradingConfig(partial_fraction=0.5)
-    assert plans.classify_workout(w, run, cfg) == "partial"  # 0.417 < 0.5
+    assert plans.classify_workout(w, [_run(4000, duration=1500)]) == "partial"  # 0.417 ∈ [0.40,0.80)
+    cfg = plans.GradingConfig(done_fraction=0.5, partial_fraction=0.2)
+    assert plans.classify_workout(w, [_run(4000, duration=2160)], cfg) == "done"     # 0.60 ≥ 0.5
+    assert plans.classify_workout(w, [_run(4000, duration=1080)], cfg) == "partial"  # 0.30 ∈ [0.2,0.5)
+    assert plans.classify_workout(w, [_run(4000, duration=360)], cfg) == "missed"    # 0.10 < 0.2
 
 
 def test_count_walks_mileage_toggle():
