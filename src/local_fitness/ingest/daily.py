@@ -86,6 +86,14 @@ class DayIngestFailure(Exception):
 def _safe(call: Callable, *args, **kwargs) -> Any:
     try:
         return call(*args, **kwargs)
+    except GarminConnectAuthenticationError:
+        # Auth expiry mid-run invalidates every remaining call — never swallow
+        # it to None. Re-raise so pull()'s per-day `raise` and outer handler
+        # classify the run as auth_failure/mfa_required, the one state whose
+        # remedy (re-seed with an interactive pull) the user must be told about.
+        # Without this the blanket `except Exception` below ate it, the loop kept
+        # going writing empty days, and the run could still end 'success'.
+        raise
     except Exception as e:
         LOG.warning("API call %s failed: %s", getattr(call, "__name__", call), e)
         return None

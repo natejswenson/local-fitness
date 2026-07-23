@@ -153,6 +153,7 @@ class FakeGarmin:
         hr_zones=HR_ZONES,
         splits=SPLITS,
         poison_bb_dates=None,
+        auth_fail_sleep_dates=None,
     ):
         self._summary = summary
         self._sleep = sleep
@@ -163,13 +164,20 @@ class FakeGarmin:
         self._hr_zones = hr_zones
         self._splits = splits
         self._poison = set(poison_bb_dates or ())
+        # Dates on which get_sleep_data raises an auth error mid-run (token
+        # expiry), letting us prove the run aborts instead of swallowing it.
+        self._auth_fail_sleep = set(auth_fail_sleep_dates or ())
+        self.summary_calls: list[str] = []
         self.activity_range_calls: list[tuple[str, str]] = []
 
     # wellness ---------------------------------------------------------------
     def get_user_summary(self, cdate):
+        self.summary_calls.append(cdate)
         return self._summary
 
     def get_sleep_data(self, cdate):
+        if cdate in self._auth_fail_sleep:
+            raise GarminConnectAuthenticationError("token expired mid-run")
         return self._sleep
 
     def get_body_battery(self, start, end):
@@ -517,6 +525,31 @@ def test_pull_all_endpoints_fail_never_reports_success(seeded_db, monkeypatch):
     with db.connect(seeded_db) as conn:
         n = conn.execute("SELECT COUNT(*) AS n FROM daily_metrics").fetchone()["n"]
     assert n == 0
+
+
+def test_pull_mid_run_auth_expiry_aborts_and_flags_auth_failure(seeded_db, monkeypatch):
+    """An endpoint auth error mid-loop aborts the run instead of being swallowed.
+
+    _safe used to catch GarminConnectAuthenticationError under its blanket
+    `except Exception`, so the per-day `raise` handler was unreachable for
+    endpoint calls: the loop kept going, wrote empty days, and could still end
+    'success'. Now the auth error propagates, the run is flagged auth_failure,
+    and no further day is attempted.
+    """
+    today = date(2026, 6, 25)
+    monkeypatch.setattr(daily, "EARLIEST_BACKFILL_DATE", today - timedelta(days=2))
+    # Dates run most-recent-first: today, -1, -2. Fail on day 2 (-1).
+    fail_day = (today - timedelta(days=1)).isoformat()
+    oldest_day = (today - timedelta(days=2)).isoformat()
+    fake = FakeGarmin(activities=[], auth_fail_sleep_dates={fail_day})
+    monkeypatch.setattr(daily, "_client", lambda *a, **k: fake)
+
+    res = daily.pull(through=today)
+
+    assert res["status"] == "auth_failure"
+    # Day 3 (the oldest) was never attempted — the run aborted on day 2.
+    assert oldest_day not in fake.summary_calls
+    assert today.isoformat() in fake.summary_calls  # day 1 did run
 
 
 def test_pull_force_from_targets_full_range(seeded_db, monkeypatch):
