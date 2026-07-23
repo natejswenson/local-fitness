@@ -555,6 +555,20 @@ def test_update_plan_workout_duration_min_sets_graded_field(seeded):
     assert row["target_duration_sec"] == 1800
 
 
+def test_update_plan_workout_echoes_duration_and_seq_it_wrote(seeded):
+    # The confirmation payload must carry the duration just written (the graded
+    # field for tempo/interval) so the model can confirm the edit from the tool
+    # result — not re-query or confirm blind. Pre-fix the echo dropped both
+    # target_duration_sec and seq.
+    d = _active_double_day(seeded)
+    body, err = call(tools.update_plan_workout,
+                     {"date": d, "seq": 2, "duration_min": 40})
+    assert not err
+    assert body["seq"] == 2                       # which session of the double day
+    assert body["duration_seconds"] == 2400       # the value actually written
+    assert body["duration_formatted"] == "40:00"  # formatted for the reply
+
+
 def test_update_plan_workout_rest_defaults_description(seeded):
     # MED-2: a rest-flip without a new description must not leave the old
     # hard-run prose on the rest day.

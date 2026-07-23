@@ -1821,10 +1821,18 @@ async def update_plan_workout(args: dict) -> dict:
     except ValueError as e:
         return _err(str(e))
 
+    # Echo the whole prescription that was written, so the model can confirm
+    # the change from the tool result without a follow-up read. duration_min is
+    # the graded field for tempo/interval days (per this tool's own
+    # description), so target_duration_sec MUST be in the echo — via the
+    # duration_seconds key _augment_workout formats into duration_formatted,
+    # mirroring the distance_meters/avg_pace_sec_per_km remaps beside it. seq
+    # tells the user which session of a double day was edited.
     return _text(_augment_workout({
-        "date": row["date"], "type": row["type"],
+        "date": row["date"], "type": row["type"], "seq": row["seq"],
         "distance_meters": row["target_distance_m"],
         "avg_pace_sec_per_km": row["target_pace_sec_per_km"],
+        "duration_seconds": row["target_duration_sec"],
         "description": row["description"],
     }))
 
