@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -2132,14 +2133,47 @@ async def get_training_plan_progress(args: dict) -> dict:
     })
 
 
+def _save_brief_input_schema() -> dict:
+    """Advertise the real Brief JSON Schema as the tool's input contract, not an
+    opaque ``{"brief": dict}``.
+
+    Derived from the pydantic ``Brief`` model so it can never drift from what the
+    server validates. Two adjustments make the advertised contract match what a
+    caller must actually supply:
+
+    * ``$defs`` are hoisted to the top level so the nested ``$ref``s (Takeaway,
+      TakeawayMetric, and the tone/metric enums) resolve — a client reading the
+      schema sees the exact takeaway shape and enum values instead of grepping
+      ``schemas.py`` for them (which the agent had to do on 2026-07-22).
+    * ``brief.required`` is narrowed to ``["takeaways"]`` because
+      ``briefs.save_brief`` stamps ``date``/``user_name``/``generated_at``
+      server-side before validation — advertising them as required would force
+      the caller to invent values the server discards.
+    """
+    brief_schema = Brief.model_json_schema()
+    defs = brief_schema.pop("$defs", {})
+    brief_schema["required"] = ["takeaways"]
+    return {
+        "type": "object",
+        "properties": {"brief": brief_schema},
+        "required": ["brief"],
+        "$defs": defs,
+    }
+
+
+_SAVE_BRIEF_INPUT_SCHEMA = _save_brief_input_schema()
+
+
 @tool(
     "save_brief",
-    "Persist a composed daily brief. Pass the brief as JSON matching the Brief "
-    "schema (a `takeaways` list; date/user_name/generated_at are stamped "
-    "server-side). The server validates against the schema and atomically "
-    "writes briefings/<today>.json — invalid briefs are rejected. Use this "
-    "after composing the brief via the `brief` prompt.",
-    {"brief": dict},
+    "Persist a composed daily brief. Pass `brief` as a JSON object matching the "
+    "Brief schema in this tool's inputSchema — a `takeaways` list (1-5 items), "
+    "each with headline, summary, tone (positive/caution/critical/neutral), an "
+    "optional metric ({metric, days}), and optional markdown `details`. "
+    "date/user_name/generated_at are stamped server-side — omit them. The server "
+    "validates and atomically writes briefings/<today>.json; invalid briefs are "
+    "rejected. Use after composing the brief via the `brief` prompt.",
+    _SAVE_BRIEF_INPUT_SCHEMA,
 )
 async def save_brief(args: dict) -> dict:
     # Thin wrapper over briefs.save_brief (the single integrity gate). DROP the
@@ -2303,6 +2337,21 @@ async def _auto_open(path: Path) -> None:
         await asyncio.sleep(1.5)
     except Exception:
         LOG.warning("auto-open failed for %s", path, exc_info=True)
+
+
+def _content_tag(data: bytes) -> str:
+    """A short content hash for a rendered artifact's filename.
+
+    Content-addressing the PDF filename fixes a real trust bug: PDFs are written
+    to a per-process tmp dir and auto-opened with macOS `open`, but `open`
+    RE-FOCUSES an already-open Preview window for a path it has seen rather than
+    reloading the bytes. A deterministic `brief-<date>.pdf` name therefore showed
+    a stale render on every re-generate — a user read yesterday's-looking page
+    and concluded the data pipeline was stale (observed 2026-07-22). Suffixing
+    the name with the content hash means changed content always lands on a NEW
+    filename (a genuinely fresh window), while identical content reuses the same
+    file (idempotent — refocusing is correct when the bytes match)."""
+    return hashlib.sha256(data).hexdigest()[:8]
 
 
 def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
@@ -2557,7 +2606,8 @@ async def generate_brief_report(args: dict) -> dict:
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
     try:
-        final_path = _write_atomic(reports_dir, f"brief-{target_date}.pdf", pdf_bytes)
+        final_path = _write_atomic(
+            reports_dir, f"brief-{target_date}-{_content_tag(pdf_bytes)}.pdf", pdf_bytes)
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
@@ -2789,7 +2839,7 @@ async def workout_report_card(args: dict) -> dict:
     try:
         final_path = _write_atomic(
             reports_dir,
-            f"report-card-{inputs['activity']['activity_id']}.pdf",
+            f"report-card-{inputs['activity']['activity_id']}-{_content_tag(pdf_bytes)}.pdf",
             pdf_bytes,
         )
     except ValueError:
