@@ -384,3 +384,33 @@ def test_is_public_path_deny_by_default():
     assert srv._is_public_path("/foo") is False
     assert srv._is_public_path("/") is False
     assert srv._is_public_path("/assets/index.js") is False
+
+
+# --- coach-journal tools store hostile text inertly (0.30.0) -----------------
+# The journal's `text` reaches (a) an INSERT and (b) every future prompt.
+# (a) must be parameterized-only; this pins that a classic injection string is
+# stored verbatim (data, not SQL) and mutates nothing else.
+
+
+def test_coach_journal_injection_strings_are_stored_inertly(tmp_path, monkeypatch):
+    import asyncio
+    import json
+
+    from local_fitness import db
+    from local_fitness.agent import tools as agent_tools
+
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+
+    hostile = "'); DROP TABLE coach_journal; --"
+    result = asyncio.run(agent_tools.save_coach_memory.handler({"text": hostile}))
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["saved"] is True
+
+    with db.connect(p) as conn:
+        # Table survived, and the hostile string is plain data.
+        rows = conn.execute("SELECT text FROM coach_journal").fetchall()
+        assert [r["text"] for r in rows] == [hostile]
+        # settings untouched (no side-channel write).
+        assert conn.execute("SELECT COUNT(*) c FROM settings").fetchone()["c"] == 0

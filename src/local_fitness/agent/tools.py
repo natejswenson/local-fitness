@@ -33,7 +33,8 @@ from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
 from . import (
-    briefs, charts, coach, interpret, plan_coach, report_card, units, workout_coach,
+    briefs, charts, coach, interpret, journal, memory, plan_coach, reflect,
+    report_card, units, workout_coach,
 )
 from .schemas import Brief
 
@@ -41,6 +42,11 @@ LOG = logging.getLogger(__name__)
 
 
 SERVER_NAME = "fitness"
+
+# Strong references to in-flight auto-reflect tasks (workout_report_card's
+# fire-and-forget hook). asyncio holds tasks weakly; without this set a
+# scheduled reflection could be garbage-collected mid-flight.
+_REFLECT_TASKS: set[asyncio.Task] = set()
 
 BASELINE_METRICS = {"rhr", "sleep_seconds"}
 
@@ -1335,6 +1341,92 @@ async def delete_user_note(args: dict) -> dict:
     if not ok:
         return _err(f"no note at line {line}")
     return _text({"deleted": True, "line": line})
+
+
+@tool(
+    "save_coach_memory",
+    "Write ONE line into your coach's journal — YOUR record of the "
+    "relationship, distinct from user-preference notes. Use it when "
+    "something in the conversation is worth remembering across sessions: "
+    "an excuse for a skipped session, a promise ('back on it Monday'), an "
+    "injury flag, a breakthrough. One dated line in your own coach voice, "
+    "under 240 chars. Skip routine Q&A. The journal is capped at 60 "
+    "entries (oldest pruned) and feeds every future brief and report card.",
+    {
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "The memory line, <=240 chars, coach voice.",
+            },
+            "date": {
+                "type": "string",
+                "description": "ISO date the memory is about; defaults to today.",
+            },
+        },
+        "required": ["text"],
+    },
+)
+async def save_coach_memory(args: dict) -> dict:
+    text = (args.get("text") or "").strip()
+    entry_date = args.get("date")
+    if entry_date is not None and not _DATE_RE.match(str(entry_date)):
+        return _err(f"malformed date '{entry_date}', expected YYYY-MM-DD")
+    try:
+        entry = journal.save_entry(text, source="chat", entry_date=entry_date)
+    except ValueError as e:
+        return _err(str(e))
+    return _text({"saved": True, **entry})
+
+
+@tool(
+    "list_coach_memories",
+    "Read your coach's journal (newest first) — what you've written down "
+    "about the relationship. Use when the user asks 'what do you remember', "
+    "before saving a new memory (avoid duplicates — escalate instead), or "
+    "to ground a callback. Returns entry_ids for delete_coach_memory.",
+    {
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "integer",
+                "description": "Only entries about the trailing N days.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max entries returned (default 50).",
+            },
+        },
+        "required": [],
+    },
+)
+async def list_coach_memories(args: dict) -> dict:
+    days = args.get("days")
+    limit = args.get("limit")
+    if limit is None:
+        limit = 50
+    if days is not None and (not isinstance(days, int) or days <= 0):
+        return _err("days must be a positive integer")
+    if not isinstance(limit, int) or limit <= 0:
+        return _err("limit must be a positive integer")
+    entries = journal.list_entries(days=days, limit=min(limit, journal.JOURNAL_CAP))
+    return _text({"memories": entries, "count": len(entries)})
+
+
+@tool(
+    "delete_coach_memory",
+    "Remove one journal entry by entry_id (from list_coach_memories). Use "
+    "when the user tells you to forget something, or when an entry turned "
+    "out to be wrong. Confirm with the user first if the target is ambiguous.",
+    {"entry_id": int},
+)
+async def delete_coach_memory(args: dict) -> dict:
+    entry_id = args.get("entry_id")
+    if entry_id is None or not isinstance(entry_id, int):
+        return _err("entry_id is required")
+    if not journal.delete_entry(entry_id):
+        return _err(f"no journal entry with entry_id {entry_id}")
+    return _text({"deleted": True, "entry_id": entry_id})
 
 
 @tool(
@@ -2681,6 +2773,14 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["goal_type"],
                 notes_text=notes.render_for_prompt(),
                 user_name=config.user_name(),
+                # Keyed to the brief's own date (like the whole section), with
+                # that brief's own reflection excluded so reflect can't bust
+                # this cache (see memory.render_memory_for_prompt).
+                memory_text=memory.render_memory_for_prompt(
+                    today=target_date,
+                    exclude_source_key=("brief", target_date),
+                    user_name=config.user_name(),
+                ),
             )
         except Exception:
             LOG.warning(
@@ -2931,15 +3031,34 @@ async def workout_report_card(args: dict) -> dict:
     # fallback — a missing credential or a dead stream costs the phrasing, never
     # the card, since every grade in it was already computed in Python.
     profile = coach.resolve_coach_profile()
+    _activity_key = str(inputs["activity"]["activity_id"])
     try:
         card["coach_read"] = await workout_coach.generate_read_cached(
             profile, card, notes_text=notes.render_for_prompt(),
-            user_name=config.user_name())
+            user_name=config.user_name(),
+            # THIS card's own journal entries are excluded: without that,
+            # reflecting on the card would change its next prompt, bust the
+            # read cache, and regenerate on every render forever.
+            memory_text=memory.render_memory_for_prompt(
+                exclude_source_key=("report_card", _activity_key),
+                user_name=config.user_name(),
+            ))
     except Exception:
         LOG.warning(
             "workout read generation failed for activity %s, using fallback",
             inputs["activity"]["activity_id"], exc_info=True)
         card["coach_read"] = workout_coach.fallback_read(card)
+
+    # Auto-reflect (fire-and-forget): the coach may write this session into
+    # its journal. has_event makes the common case — re-rendering a card —
+    # skip even task creation, so a re-render never pays an SDK call and can
+    # never double-write (the DB unique index backstops the race regardless).
+    # The task reference is held module-side; asyncio only weakly references
+    # scheduled tasks and an unreferenced one can be GC'd mid-flight.
+    if memory.memory_enabled() and not journal.has_event("report_card", _activity_key):
+        _task = asyncio.create_task(reflect.reflect_after_report_card(card))
+        _REFLECT_TASKS.add(_task)
+        _task.add_done_callback(_REFLECT_TASKS.discard)
     payload = {
         "markdown": report_card.render_markdown(card),
         "activity_id": inputs["activity"]["activity_id"],
@@ -3036,6 +3155,9 @@ ALL_TOOLS = [
     list_user_notes,
     update_user_note,
     delete_user_note,
+    save_coach_memory,
+    list_coach_memories,
+    delete_coach_memory,
     daily_snapshot,
     log_observation,
     list_observations,
