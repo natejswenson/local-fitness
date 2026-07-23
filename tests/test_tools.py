@@ -1598,7 +1598,10 @@ def test_sync_garmin_data_is_in_full_tool_set():
     assert f"mcp__{tools.SERVER_NAME}__sync_garmin_data" in tools.allowed_tool_names()
 
 
-# --- LOCAL_ONLY_TOOLS: generate_brief_report / generate_chart --------------
+# --- PDF/chart tools: generate_brief_report / generate_chart ---------------
+# NB: LOCAL_ONLY_TOOLS is generate_brief_report + workout_report_card; since
+# Fix A (2026-07-13) generate_chart lives in ALL_TOOLS (it returns an inline
+# image block, so a remote caller no longer needs the local file path).
 
 
 def test_fetch_metric_series_matches_chart_tool_output(seeded):

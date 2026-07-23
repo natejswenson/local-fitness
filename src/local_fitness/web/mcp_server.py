@@ -430,8 +430,12 @@ def build_server(extra_tools: list | None = None) -> Server:
     ``extra_tools`` is forwarded to ``agent_tools.make_server()`` — ONLY
     ``run_stdio()`` passes ``LOCAL_ONLY_TOOLS`` here. ``build_session_manager()``
     below calls this argument-free, which is the load-bearing line that keeps
-    the local-only tools (generate_brief_report, generate_chart) off the
-    streamable-HTTP /mcp/ transport. If a future edit ever passes
+    ``agent_tools.LOCAL_ONLY_TOOLS`` (see its definition for the current
+    membership and the rule that decides it: a tool handing back a filesystem
+    path a remote caller can't retrieve is local-only) off the streamable-HTTP
+    /mcp/ transport. Today that set is generate_brief_report + workout_report_card
+    (both write PDFs); generate_chart is NOT in it — it moved into ALL_TOOLS
+    once it returned an inline image block. If a future edit ever passes
     ``LOCAL_ONLY_TOOLS`` there too "for consistency", the HTTP transport
     silently regains tools this whole boundary exists to keep off it."""
     instance = agent_tools.make_server(extra_tools=extra_tools)["instance"]
@@ -469,12 +473,12 @@ def build_session_manager(
 
 
 async def run_stdio() -> None:
-    """Serve the same tools over stdio (local, auth-free), PLUS the
-    local-only PDF/chart tools (generate_brief_report, generate_chart) —
-    reachable here and ONLY here, never over the streamable-HTTP /mcp/
-    transport (see build_server's extra_tools note and the design doc).
-    No HTTP, so the Host/Origin and trailing-slash gotchas of the HTTP path
-    do not apply."""
+    """Serve the same tools over stdio (local, auth-free), PLUS
+    ``agent_tools.LOCAL_ONLY_TOOLS`` — the PDF-writing tools
+    (generate_brief_report + workout_report_card) — reachable here and ONLY
+    here, never over the streamable-HTTP /mcp/ transport (see build_server's
+    extra_tools note and the design doc). No HTTP, so the Host/Origin and
+    trailing-slash gotchas of the HTTP path do not apply."""
     from mcp.server.stdio import stdio_server
 
     server = build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
