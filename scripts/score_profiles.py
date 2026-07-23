@@ -66,7 +66,9 @@ def build_checks() -> list[tuple[str, bool]]:
     sp_hardass = prompts.system_prompt("TestRunner", coach.load_profile("hardass")).lower()
     checks.append((
         "[hardass] persona carries accountability language",
-        any(m in sp_hardass for m in ("no excuse", "this is on you", "stop coasting", "do better")),
+        any(m in sp_hardass for m in ("that's on you", "the log doesn't lie",
+                                      "excuses don't log miles",
+                                      "accountability mirror")),
     ))
 
     sp_supportive = prompts.system_prompt("TestRunner", coach.load_profile("supportive")).lower()

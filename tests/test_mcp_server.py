@@ -485,7 +485,8 @@ def test_instructions_reflect_live_profile():
     instr = server.create_initialization_options().instructions
     assert instr and "mcp__fitness__" in instr
     assert all(j in instr for j in ("CTL", "ATL", "TSB"))  # jargon translation retained
-    assert any(m in instr.lower() for m in ("no excuse", "this is on you", "relentless"))
+    assert any(m in instr.lower() for m in
+               ("that's on you", "the log doesn't lie", "accountability mirror"))
 
 
 def test_instructions_change_between_calls():
@@ -498,7 +499,7 @@ def test_instructions_change_between_calls():
     db.set_setting("coach_profile", "supportive", db_path=p)
     supp = server.create_initialization_options().instructions
     assert hard != supp
-    assert "no excuse" not in supp.lower()
+    assert "the log doesn't lie" not in supp.lower()
 
 
 def test_instructions_fail_open_on_resolve_error(monkeypatch, caplog):

@@ -46,7 +46,8 @@ def test_tool_schemas_well_formed():
     # sidestepping the no-file-retrieval problem that made it local-only)
     # +plan_chart (round-2 facet review: two-series scheduled-vs-actual)
     # +save/list/delete_coach_memory (0.30.0 coach-memory journal tools)
-    assert len(agent_tools.ALL_TOOLS) == 38
+    # +get/update_coach_personality (0.31.0 tunable personality spec)
+    assert len(agent_tools.ALL_TOOLS) == 40
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

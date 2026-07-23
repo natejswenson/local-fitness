@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import replace as replace_dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,8 +34,8 @@ from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
 from . import (
-    briefs, charts, coach, interpret, journal, memory, plan_coach, reflect,
-    report_card, units, workout_coach,
+    briefs, charts, coach, interpret, journal, memory, personality, plan_coach,
+    reflect, report_card, units, workout_coach,
 )
 from .schemas import Brief
 
@@ -1427,6 +1428,170 @@ async def delete_coach_memory(args: dict) -> dict:
     if not journal.delete_entry(entry_id):
         return _err(f"no journal entry with entry_id {entry_id}")
     return _text({"deleted": True, "entry_id": entry_id})
+
+
+def _spec_payload(spec: personality.PersonalitySpec) -> dict:
+    return {
+        "base_profile": spec.base_profile,
+        "identity": spec.identity,
+        "catchphrases": list(spec.catchphrases),
+        "principles": list(spec.principles),
+        "never_do": list(spec.never_do),
+        "intensity": dict(spec.intensity),
+        "updated_at": spec.updated_at,
+    }
+
+
+@tool(
+    "get_coach_personality",
+    "The live coach personality: active profile, the tuned spec (or the "
+    "profile-file seed if never tuned), the five numeric dials, and journal "
+    "size. Call before update_coach_personality so an edit patches what is "
+    "actually there. `customized` says whether a tuned spec is in force; "
+    "`base_profile_mismatch` means a spec exists but was tuned for a "
+    "DIFFERENT profile (ignored until you switch back or reset).",
+    {},
+)
+async def get_coach_personality(_args: dict) -> dict:
+    profile = coach.resolve_coach_profile()
+    stored = personality.parse_spec(db.get_setting(personality.SPEC_KEY))
+    effective = profile.spec or personality.seed_from_profile(profile)
+    with db.connect() as conn:
+        journal_count = conn.execute(
+            "SELECT COUNT(*) FROM coach_journal").fetchone()[0]
+    return _text({
+        "profile": profile.name,
+        "customized": profile.spec is not None,
+        "base_profile_mismatch": (
+            stored is not None and stored.base_profile != profile.name),
+        "spec": _spec_payload(effective),
+        "dials": {
+            "harshness": profile.harshness,
+            "warmth": profile.warmth,
+            "push": profile.push,
+            "roast_threshold": profile.roast_threshold,
+            "praise_threshold": profile.praise_threshold,
+        },
+        "intensity_levels": list(personality.INTENSITY_LEVELS),
+        "known_topics": sorted(personality.TOPIC_WHITELIST),
+        "journal_entries": journal_count,
+        "memory_enabled": memory.memory_enabled(),
+    })
+
+
+_DIAL_FIELDS = {"harshness": (0, 10), "warmth": (0, 10), "push": (0, 10)}
+_THRESH_FIELDS = {"roast_threshold": (0.0, 1.20), "praise_threshold": (0.0, 1.20)}
+
+
+@tool(
+    "update_coach_personality",
+    "Tune the coach's personality conversationally — the agent-owned write "
+    "path (there is no UI). All fields optional: `identity` replaces the "
+    "persona prose; add/remove_catchphrase, add/remove_principle, "
+    "add/remove_never_do edit the lists; `set_intensity` maps topic slugs "
+    "(e.g. step_goal_nagging, quality_day_misses — 'medium' clears an "
+    "override) to off|low|medium|high|brutal; harshness/warmth/push (0-10) "
+    "and roast/praise_threshold (0-1.20) write the numeric dials; "
+    "`reset: true` discards the tuned spec (with no other fields = back to "
+    "the shipped profile). The first tuning call seeds the spec from the "
+    "active profile. Takes effect on the next prompt render — no restart.",
+    {
+        "type": "object",
+        "properties": {
+            "identity": {"type": "string", "description": "Replacement persona prose (<=4000 chars)."},
+            "add_catchphrase": {"type": "string"},
+            "remove_catchphrase": {"type": "string"},
+            "add_principle": {"type": "string"},
+            "remove_principle": {"type": "string"},
+            "add_never_do": {"type": "string"},
+            "remove_never_do": {"type": "string"},
+            "set_intensity": {
+                "type": "object",
+                "description": "topic slug -> off|low|medium|high|brutal",
+            },
+            "harshness": {"type": "integer"},
+            "warmth": {"type": "integer"},
+            "push": {"type": "integer"},
+            "roast_threshold": {"type": "number"},
+            "praise_threshold": {"type": "number"},
+            "reset": {"type": "boolean"},
+        },
+        "required": [],
+    },
+)
+async def update_coach_personality(args: dict) -> dict:
+    reset = bool(args.get("reset"))
+    dial_args = {}
+    errors: list[str] = []
+    for key, (lo, hi) in _DIAL_FIELDS.items():
+        if key in args:
+            v = args[key]
+            if not isinstance(v, int) or not (lo <= v <= hi):
+                errors.append(f"{key} must be an integer {lo}-{hi}")
+            else:
+                dial_args[f"coach_{key}"] = str(v)
+    for key, (lo, hi) in _THRESH_FIELDS.items():
+        if key in args:
+            v = args[key]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not (lo <= v <= hi):
+                errors.append(f"{key} must be a number {lo}-{hi}")
+            else:
+                dial_args[f"coach_{key}"] = str(float(v))
+
+    spec_patch = {k: v for k, v in args.items()
+                  if k in personality.PATCH_FIELDS}
+    clean_patch, patch_errors = personality.validate_patch(spec_patch)
+    errors.extend(patch_errors)
+    unknown = set(args) - personality.PATCH_FIELDS - set(_DIAL_FIELDS) \
+        - set(_THRESH_FIELDS) - {"reset"}
+    for key in sorted(unknown):
+        errors.append(f"unknown field '{key}'")
+    if errors:
+        return _err(
+            "; ".join(errors),
+            editable_fields=sorted(
+                personality.PATCH_FIELDS | set(_DIAL_FIELDS)
+                | set(_THRESH_FIELDS) | {"reset"}),
+            intensity_levels=list(personality.INTENSITY_LEVELS),
+        )
+    if not reset and not clean_patch and not dial_args:
+        return _err("nothing to update — pass at least one editable field")
+
+    for key, value in dial_args.items():
+        db.set_setting(key, value)
+
+    profile = coach.resolve_coach_profile()
+    if reset and not clean_patch:
+        # Back to stock: drop the stored spec outright.
+        with db.connect() as conn:
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (personality.SPEC_KEY,))
+        return _text({"updated": True, "reset": True,
+                      "profile": profile.name, "customized": False,
+                      "dials_changed": sorted(dial_args)})
+
+    if clean_patch:
+        base = (personality.seed_from_profile(profile) if reset
+                else (profile.spec or personality.seed_from_profile(profile)))
+        new_spec = personality.apply_patch(base, clean_patch)
+        new_spec = replace_dataclass(
+            new_spec,
+            base_profile=profile.name,
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        raw = personality.spec_to_json(new_spec)
+        if len(raw.encode("utf-8")) > personality.SPEC_MAX_BYTES:
+            return _err(
+                f"personality spec would exceed {personality.SPEC_MAX_BYTES} "
+                "bytes — trim the identity or the lists first")
+        db.set_setting(personality.SPEC_KEY, raw)
+        return _text({"updated": True, "profile": profile.name,
+                      "customized": True, "spec": _spec_payload(new_spec),
+                      "dials_changed": sorted(dial_args)})
+
+    return _text({"updated": True, "profile": profile.name,
+                  "customized": profile.spec is not None,
+                  "dials_changed": sorted(dial_args)})
 
 
 @tool(
@@ -3158,6 +3323,8 @@ ALL_TOOLS = [
     save_coach_memory,
     list_coach_memories,
     delete_coach_memory,
+    get_coach_personality,
+    update_coach_personality,
     daily_snapshot,
     log_observation,
     list_observations,

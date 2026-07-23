@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-07-23
+
+Second half of the memory-based-personality build: the coach's personality
+is now conversationally tunable, and the shipped default is a rewritten
+hard-ass — an original "accountability mirror" persona built to spend the
+memory 0.30.0 gave it.
+
+### Added
+- **Tunable personality spec** (`agent/personality.py`): a bounded,
+  DB-stored spec (settings key `coach_personality_spec` — ≤8 KB, identity
+  ≤4000 chars, ≤12 items per list, ≤16 intensity topics) carrying identity
+  prose, catchphrases, principles, never-do rules, and per-topic intensity
+  (`off|low|medium|high|brutal`). The profile `.md` files become first-run
+  seeds; once tuned, the spec is what every voice surface speaks
+  (`CoachProfile.effective_persona`). Virtual seeding: an untuned clone is
+  byte-identical to before.
+- **Two tuning tools** — `get_coach_personality` /
+  `update_coach_personality` — the agent-owned write path (there is no UI):
+  "ease up about the step goal" becomes `set_intensity:
+  {step_goal_nagging: low}`, live on the next render, no restart. Dial
+  fields write the existing `coach_*` settings keys; `reset: true` returns
+  to stock. A spec tuned for a different profile is ignored but retained
+  (reported as `base_profile_mismatch`).
+- **Kill switch**: `LOCAL_FITNESS_COACH_SPEC=0` ignores a stored spec
+  without deleting it.
+
+### Changed
+- **`hardass` is the shipped default profile** (`coach.DEFAULT_PROFILE`,
+  `config.coach_profile()`), and `hardass.md` is rewritten from 5 bullets
+  into a full personality: the accountability mirror — identity, philosophy
+  ("motivation is weather, discipline is climate"), signature lines with a
+  one-per-brief cadence rule, a "Using your memory" section that spends the
+  0.30.0 ledger/journal as receipts ("Third skipped quality day this month.
+  Jul 12, Jul 19, today."), and a hard never-do list (never invent a
+  number, never mock injury — on a red recovery day the hard call IS the
+  rest, never cite a real coach or athlete). Dials/thresholds unchanged
+  (9/1/10 · 1.00/1.05), so the V1/V2 harsh-block gates work untouched.
+  Opt-out: `fitness config set coach_profile adaptive` (or supportive /
+  neutral).
+
 ## [0.30.0] - 2026-07-23
 
 The coach remembers. First half of the memory-based-personality build

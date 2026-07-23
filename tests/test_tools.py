@@ -3451,3 +3451,81 @@ def test_report_card_reflection_respects_the_kill_switch(rc_seeded, monkeypatch)
     _payload, err = call(tools.workout_report_card, {"format": "table"})
     assert not err
     assert scheduled == []
+
+
+# --- personality tuning tools (0.31.0) ---------------------------------------
+
+
+def test_get_coach_personality_untuned_serves_the_seed(seeded):
+    payload, err = call(tools.get_coach_personality, {})
+    assert not err
+    assert payload["profile"] == "hardass"  # the shipped default
+    assert payload["customized"] is False
+    assert payload["base_profile_mismatch"] is False
+    from local_fitness.agent import coach as coach_mod
+    assert payload["spec"]["identity"] == coach_mod.load_profile("hardass").persona
+    assert payload["dials"]["harshness"] == 9
+    assert "step_goal_nagging" in payload["known_topics"]
+
+
+def test_update_coach_personality_materializes_and_applies(seeded):
+    payload, err = call(tools.update_coach_personality, {
+        "add_never_do": "Never lecture about sleep.",
+        "set_intensity": {"step_goal_nagging": "low"},
+    })
+    assert not err
+    assert payload["customized"] is True
+    assert payload["spec"]["never_do"] == ["Never lecture about sleep."]
+    assert payload["spec"]["intensity"] == {"step_goal_nagging": "low"}
+    assert payload["spec"]["updated_at"]
+
+    # The tuned voice is live on the next resolve — no restart.
+    from local_fitness.agent import coach as coach_mod
+    profile = coach_mod.resolve_coach_profile()
+    assert profile.spec is not None
+    assert "Never lecture about sleep." in profile.effective_persona
+    assert "step_goal_nagging: low" in profile.effective_persona
+
+
+def test_update_coach_personality_dials_write_the_existing_settings_keys(seeded):
+    payload, err = call(tools.update_coach_personality,
+                        {"harshness": 10, "roast_threshold": 1.1})
+    assert not err
+    assert payload["dials_changed"] == ["coach_harshness", "coach_roast_threshold"]
+    assert db.get_setting("coach_harshness") == "10"
+    assert db.get_setting("coach_roast_threshold") == "1.1"
+    from local_fitness.agent import coach as coach_mod
+    assert coach_mod.resolve_coach_profile().harshness == 10
+
+
+def test_update_coach_personality_rejects_bad_input_with_the_whitelist(seeded):
+    payload, err = call(tools.update_coach_personality,
+                        {"harshness": 99, "sock_color": "red",
+                         "set_intensity": {"sleep": "loud"}})
+    assert err
+    msg = payload.get("error", "") if isinstance(payload, dict) else str(payload)
+    assert "harshness must be an integer 0-10" in msg
+    assert "unknown field 'sock_color'" in msg
+    assert "bad intensity level 'loud'" in msg
+    assert "editable_fields" in payload
+    _payload, err = call(tools.update_coach_personality, {})
+    assert err  # nothing to update
+
+
+def test_update_coach_personality_reset_returns_to_stock(seeded):
+    call(tools.update_coach_personality, {"identity": "Custom voice."})
+    from local_fitness.agent import personality as personality_mod
+    assert db.get_setting(personality_mod.SPEC_KEY) is not None
+    payload, err = call(tools.update_coach_personality, {"reset": True})
+    assert not err
+    assert payload["reset"] is True and payload["customized"] is False
+    assert db.get_setting(personality_mod.SPEC_KEY) is None
+    from local_fitness.agent import coach as coach_mod
+    profile = coach_mod.resolve_coach_profile()
+    assert profile.effective_persona == profile.persona
+
+
+def test_update_coach_personality_spec_size_cap(seeded):
+    _payload, err = call(tools.update_coach_personality,
+                         {"identity": "x" * 4001})
+    assert err  # identity over its own cap is rejected before storage
