@@ -420,7 +420,18 @@ These are settled — don't redesign without a reason.
   (PID dead + >24h old) on each process's first call — `atexit` doesn't fire
   on `SIGKILL`/`SIGTERM`, so an abrupt kill can still leak until the sweep
   claims it; this is an accepted residual risk for a personal, single-user
-  tool, not something hardened further. After a successful write, the file
+  tool, not something hardened further. **Both PDF filenames are
+  content-addressed** (0.28.2): `brief-<date>-<sha8>.pdf` and
+  `report-card-<id>-<sha8>.pdf`, where `sha8` is `_content_tag()` (first 8 hex
+  of the sha256 of the PDF bytes). This is not cosmetic — macOS `open`
+  RE-FOCUSES an already-open Preview window for a path it has seen rather than
+  reloading the bytes, so the old deterministic `brief-<date>.pdf` showed a
+  STALE render on every re-generate. A user read yesterday's-looking page and
+  concluded the whole data pipeline was stale (observed 2026-07-22, a real
+  trust hit). The content tag means changed content always lands on a NEW
+  filename (a genuinely fresh window) while identical content reuses the same
+  file (idempotent — refocusing is correct when the bytes match). Don't revert
+  to a static name. After a successful write, the file
   is auto-opened via macOS `open` (best-effort, never fails the tool call;
   logs a warning and no-ops on other platforms). Set
   `LOCAL_FITNESS_REPORTS_DIR` to opt back into a persistent directory (still
@@ -434,6 +445,20 @@ These are settled — don't redesign without a reason.
   Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS Homebrew's
   install isn't on the default dylib search path and needs
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
+- **`save_brief` advertises the real Brief JSON Schema** (0.28.2), not an opaque
+  `{"brief": dict}`. `tools._save_brief_input_schema()` derives it from
+  `schemas.Brief.model_json_schema()` (so it can't drift from what the server
+  validates), hoists the pydantic `$defs` to the schema root so the nested
+  `$ref`s resolve, and narrows `brief.required` to `["takeaways"]` because
+  `briefs.save_brief` stamps `date`/`user_name`/`generated_at` server-side. The
+  Agent SDK forwards a dict schema verbatim ONLY when it has a top-level string
+  `type` + `properties` (else it treats the dict as a `{name: python-type}`
+  shorthand and silently drops the rest) — the constant satisfies that, guarded
+  by `test_save_brief_schema_meets_the_sdk_passthrough_condition`. Motivation: a
+  live agent had to grep + Read `schemas.py` to learn the Takeaway/tone/metric
+  shapes before it could save (2026-07-22); a filesystem-less MCP client
+  (Claude Desktop, a phone over `/mcp/`) couldn't construct a valid brief at
+  all. Now the contract carries the enum values and sub-object shapes.
 - **Workout grading is deterministic Python, not model judgment** (0.25.0).
   `agent/report_card.py` backs the `workout_report_card` tool and follows the
   `interpret.py` rule: the LLM phrases a judgment, it never derives one code

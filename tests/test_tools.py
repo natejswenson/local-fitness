@@ -1354,6 +1354,38 @@ def test_save_brief_tool_invalid_is_error(briefs_tmp):
     assert list(briefs_tmp.glob("*.json")) == []
 
 
+def test_save_brief_advertises_the_full_takeaway_schema():
+    """The tool's inputSchema must expose the real Brief/Takeaway shape — the
+    tone enum and the {metric, days} sub-object — so a client (Claude Desktop, a
+    phone with no filesystem) can build a valid brief from the contract alone,
+    instead of grepping schemas.py the way the agent had to on 2026-07-22."""
+    s = tools._SAVE_BRIEF_INPUT_SCHEMA
+    # A full JSON Schema, not the opaque {"brief": dict} shorthand.
+    assert s["type"] == "object"
+    assert set(s["properties"]) == {"brief"}
+    brief = s["properties"]["brief"]
+    # Only takeaways is required of the CALLER — date/user_name/generated_at are
+    # stamped server-side by briefs.save_brief and must not be demanded here.
+    assert brief["required"] == ["takeaways"]
+    # The nested takeaway shape is reachable via hoisted $defs (so its $ref
+    # resolves at the schema root).
+    props = s["$defs"]["Takeaway"]["properties"]
+    assert {"headline", "summary", "tone"} <= set(props)
+    assert set(props["tone"]["enum"]) == {"positive", "caution", "critical", "neutral"}
+    assert "TakeawayMetric" in s["$defs"]
+
+
+def test_save_brief_schema_meets_the_sdk_passthrough_condition():
+    """The Agent SDK forwards a dict schema verbatim ONLY when it has a
+    top-level string `type` plus `properties`; otherwise it reinterprets the
+    dict as a {name: python-type} shorthand and would silently discard our
+    Brief schema. Guard the pass-through condition, and that the registered
+    tool actually carries this exact schema object."""
+    s = tools._SAVE_BRIEF_INPUT_SCHEMA
+    assert isinstance(s.get("type"), str) and "properties" in s
+    assert tools.save_brief.input_schema is s
+
+
 def test_brief_loop_excludes_write_tools():
     """Contract invariant: the brief loop's allow-list (read_only_tool_names)
     is a strict subset of all tools and never includes a write or the
@@ -1506,6 +1538,48 @@ def test_write_atomic_writes_final_bytes_and_no_tmp_left_behind(tmp_path):
     assert path == reports_dir / "out.png"
     assert path.read_bytes() == b"hello"
     assert list(reports_dir.glob("*.tmp")) == []
+
+
+def test_content_tag_is_deterministic_and_content_sensitive():
+    # Same bytes -> same 8-hex tag (idempotent re-render reuses one filename);
+    # different bytes -> different tag (a changed render lands on a fresh name,
+    # which is what makes macOS `open` show a new window instead of refocusing
+    # the stale one). Both facts are load-bearing for the stale-PDF fix.
+    tag = tools._content_tag(b"the pdf bytes")
+    assert re.fullmatch(r"[0-9a-f]{8}", tag)
+    assert tools._content_tag(b"the pdf bytes") == tag
+    assert tools._content_tag(b"the pdf bytes!") != tag
+    # It is exactly the sha256 prefix, not some other hash.
+    import hashlib
+    assert tag == hashlib.sha256(b"the pdf bytes").hexdigest()[:8]
+
+
+def test_brief_pdf_filename_is_content_addressed(seeded, reports_tmp, monkeypatch):
+    # Regenerating the SAME brief content reuses one filename (idempotent), but
+    # a content change moves to a NEW filename so the viewer opens fresh bytes
+    # rather than refocusing a stale Preview window (the 2026-07-22 "you used
+    # old data" bug). We drive the content change through the rendered PDF.
+    _reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "First", "summary": "s", "tone": "neutral", "details": "one"},
+    ])
+    p1, err1 = call(tools.generate_brief_report, {"date": d})
+    p2, err2 = call(tools.generate_brief_report, {"date": d})
+    assert not err1 and not err2
+    # Identical input twice -> identical content-addressed filename.
+    assert p1["path"] == p2["path"]
+
+    # Change the brief, re-render: the filename must change (different bytes).
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "Totally different headline now", "summary": "s2",
+         "tone": "critical", "details": "two two two"},
+    ])
+    p3, err3 = call(tools.generate_brief_report, {"date": d})
+    assert not err3
+    assert p3["path"] != p1["path"]
+    # Both still carry today's date and land in the reports dir.
+    assert Path(p3["path"]).name.startswith(f"brief-{d}-")
 
 
 @pytest.fixture(autouse=True)
@@ -1787,7 +1861,10 @@ def test_generate_brief_report_happy_path_embeds_chart(seeded, reports_tmp):
     payload, err = call(tools.generate_brief_report, {"date": d})
     assert not err
     path = Path(payload["path"])
-    assert path.name == f"brief-{d}.pdf"
+    # The filename carries an 8-hex content tag between the date and .pdf so a
+    # re-render with changed content lands on a fresh Preview window (see
+    # tools._content_tag / test_brief_pdf_filename_is_content_addressed).
+    assert re.fullmatch(rf"brief-{re.escape(d)}-[0-9a-f]{{8}}\.pdf", path.name)
     assert path.parent == reports_dir
     pdf_bytes = path.read_bytes()
     assert pdf_bytes[:5] == b"%PDF-"
@@ -2742,7 +2819,7 @@ def test_report_card_writes_a_pdf(rc_seeded, reports_tmp):
     payload, err = call(tools.workout_report_card, {})
     assert not err
     path = Path(payload["path"])
-    assert path.name == "report-card-1.pdf"
+    assert re.fullmatch(r"report-card-1-[0-9a-f]{8}\.pdf", path.name)
     assert path.parent == reports_dir
     assert path.read_bytes()[:5] == b"%PDF-"
 
