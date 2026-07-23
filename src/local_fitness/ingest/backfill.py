@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import db
@@ -312,10 +312,25 @@ def _ingest_activities(raw: bytes) -> int:
             if not activity_id:
                 continue
 
-            # Times: beginTimestamp is GMT epoch ms; startTimeLocal is local epoch ms (float)
-            local_ms = act.get("startTimeLocal") or act.get("beginTimestamp")
+            # Times: beginTimestamp is GMT epoch ms; startTimeLocal is a LOCAL
+            # epoch ms — pre-shifted so that reading it AS UTC yields the local
+            # wall-clock time. datetime.fromtimestamp() would apply the host tz
+            # offset a SECOND time, so on a UTC-N host every start_time comes out
+            # N hours early and any pre-dawn activity rolls to the previous date
+            # (the live pull slices the ISO string and never had this bug). Decode
+            # the local epoch as UTC and drop the tzinfo to recover wall-clock;
+            # only the genuinely-GMT beginTimestamp fallback goes through
+            # fromtimestamp (host-local), which is what it means.
+            local_ms = act.get("startTimeLocal")
+            gmt_ms = act.get("beginTimestamp")
             if isinstance(local_ms, (int, float)) and local_ms > 1e11:
-                start_dt = datetime.fromtimestamp(local_ms / 1000)
+                start_dt = datetime.fromtimestamp(
+                    local_ms / 1000, tz=timezone.utc
+                ).replace(tzinfo=None)
+                start_iso = start_dt.isoformat()
+                cdate = start_dt.date().isoformat()
+            elif isinstance(gmt_ms, (int, float)) and gmt_ms > 1e11:
+                start_dt = datetime.fromtimestamp(gmt_ms / 1000)
                 start_iso = start_dt.isoformat()
                 cdate = start_dt.date().isoformat()
             else:

@@ -68,7 +68,7 @@ window ending today, unrelated to the 14/7 one.
   "predicted_finish_seconds": 6612.4,
   "predicted_finish_formatted": "1:50:12",
   "goal_gap": {"gap_seconds": 312.4, "gap_pct": 4.96, "on_pace": false},
-  "this_week": {"week_planned_mi": 28.5, "week_actual_mi": 24.1, "slips": 1},
+  "this_week": {"week_planned_mi": 28.5, "week_actual_mi": 24.1, "week_run_mi": 21.8, "week_walk_mi": 2.3, "slips": 1},
   "workouts": [
     {
       "date": "2026-07-19", "seq": 1, "week_index": 1, "type": "long",
@@ -93,7 +93,7 @@ window ending today, unrelated to the 14/7 one.
 | `adherence_pct` | Whole plan, graded (non-`pending`) workouts only. `done`/`compliant` = 1.0, `partial` = 0.5, `missed` = 0. `null` when nothing has graded. |
 | `predicted_finish_seconds` / `_formatted` | Riegel projection (`t2 = t1 · (d2/d1)^1.06`) from the fastest qualifying run in the last `riegel_lookback_days` (default 120, ≥2 km, running only) onto `goal_distance_m`. `null` if either is missing. |
 | `goal_gap` | `{gap_seconds, gap_pct, on_pace}` — projected minus goal, so **positive means slower than goal**. `null` when `target_time_seconds` is missing or `<= 0`, or when there is no projection. |
-| `this_week` | Trailing 7 days ending **today**: `week_planned_mi`, `week_actual_mi`, `slips` (count of `partial` + `missed`). `actual_mi` is suppressed on `pending` and `compliant` days, so an ungraded run does not inflate the actual. |
+| `this_week` | Trailing 7 days ending **today**: `week_planned_mi`, `week_actual_mi`, `week_run_mi`, `week_walk_mi`, `slips` (count of `partial` + `missed`). `week_actual_mi` is total **on-foot** miles (run + walk — easy days count prescribed walking by design); `week_run_mi + week_walk_mi` split it, so the tool and the brief PDF reconcile. **`week_run_mi` is the number the brief PDF's plan strip headlines** (it shows run miles, not foot miles). `actual_mi` is suppressed on `pending` and `compliant` days, so an ungraded run does not inflate the actual. |
 | `workouts` | Windowed unless `full: true`. See below. |
 
 Each `workouts` entry: `date`, `seq`, `week_index`, `type`, `target_distance_m`,
@@ -122,7 +122,7 @@ Abridged:
   "adherence_pct": 83,
   "predicted_finish_formatted": "1:50:12",
   "goal_gap": {"gap_seconds": 312.4, "gap_pct": 4.96, "on_pace": false},
-  "this_week": {"week_planned_mi": 28.5, "week_actual_mi": 24.1, "slips": 1},
+  "this_week": {"week_planned_mi": 28.5, "week_actual_mi": 24.1, "week_run_mi": 21.8, "week_walk_mi": 2.3, "slips": 1},
   "workouts": [
     {"date": "2026-06-29", "type": "easy", "target_distance_mi": 5.0,
      "actual_distance_mi": 5.1, "verdict": "done"},

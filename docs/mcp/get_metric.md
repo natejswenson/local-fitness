@@ -6,8 +6,9 @@
 
 The rawest read in the surface: one column out of `daily_metrics` over a window,
 with no interpretation attached. Reach for it when you need the actual series —
-to eyeball specific days, count missing readings, or feed the numbers into your
-own arithmetic.
+to eyeball specific days or feed the numbers into your own arithmetic. Days
+with no reading are dropped and reported as a `days_with_data` vs `days_window`
+count, so a sparse metric doesn't pad the payload with null rows.
 
 When *not* to use it: if the question is "is this going up or down / is today
 normal", call [`get_metric_trend`](get_metric_trend.md) instead — it returns the
@@ -32,17 +33,40 @@ Allowed `metric` values (`tools.DAILY_NUMERIC_METRICS`):
 
 ## Returns
 
-A JSON array of `{date, value}` objects, sorted oldest-first. Nothing else — no
-mean, no baseline, no interpretation.
+An object: the metric, the requested window, a `days_with_data` count, and a
+`values` array of `{date, value}` objects sorted oldest-first. Days with no
+reading (NULL) are dropped, so `days_with_data` vs `days_window` tells you how
+much of the window actually had data. No mean, baseline, or interpretation.
 
 ```json
-[
-  {"date": "2026-07-15", "value": 52},
-  {"date": "2026-07-16", "value": null},
-  {"date": "2026-07-17", "value": 55},
-  "…",
-  {"date": "2026-07-21", "value": 54}
-]
+{
+  "metric": "rhr",
+  "days_window": 7,
+  "days_with_data": 6,
+  "values": [
+    {"date": "2026-07-15", "value": 52},
+    {"date": "2026-07-17", "value": 55},
+    "…",
+    {"date": "2026-07-21", "value": 54}
+  ]
+}
+```
+
+For `*_seconds` metrics each row also carries a `value_formatted` companion (the
+hours-and-minutes shape the coach voice speaks), so you never hand-convert raw
+seconds:
+
+```json
+{
+  "metric": "sleep_seconds",
+  "days_window": 3,
+  "days_with_data": 3,
+  "values": [
+    {"date": "2026-07-19", "value": 27180, "value_formatted": "7h 33m"},
+    {"date": "2026-07-20", "value": 25200, "value_formatted": "7h 00m"},
+    {"date": "2026-07-21", "value": 21600, "value_formatted": "6h 00m"}
+  ]
+}
 ```
 
 On a bad metric name the tool returns an error payload listing the whole
@@ -61,33 +85,40 @@ get_metric(metric="rhr", days=7)
 ```
 
 ```json
-[
-  {"date": "2026-07-14", "value": 51},
-  {"date": "2026-07-15", "value": 52},
-  {"date": "2026-07-16", "value": null},
-  {"date": "2026-07-17", "value": 55},
-  {"date": "2026-07-18", "value": 54},
-  {"date": "2026-07-19", "value": 59},
-  {"date": "2026-07-20", "value": 54},
-  {"date": "2026-07-21", "value": 54}
-]
+{
+  "metric": "rhr",
+  "days_window": 7,
+  "days_with_data": 7,
+  "values": [
+    {"date": "2026-07-14", "value": 51},
+    {"date": "2026-07-15", "value": 52},
+    {"date": "2026-07-17", "value": 55},
+    {"date": "2026-07-18", "value": 54},
+    {"date": "2026-07-19", "value": 59},
+    {"date": "2026-07-20", "value": 54},
+    {"date": "2026-07-21", "value": 54}
+  ]
+}
 ```
 
 ## Gotchas
 
-- **Nulls are returned, not filtered.** A day with a row but no reading comes
-  back as `"value": null`. (This differs from
-  [`get_metric_trend`](get_metric_trend.md), which drops nulls before computing.)
-  Days with no `daily_metrics` row at all are simply absent — don't assume the
-  array length equals `days`.
+- **Nulls are dropped, not returned.** A day with a row but no reading is
+  omitted from `values` (matching [`get_metric_trend`](get_metric_trend.md),
+  which also drops nulls). `days_with_data` counts the rows you got back; compare
+  it against `days_window` to see how sparse the metric was over the window
+  (`vo2_max`, for instance, only updates on run days). Don't assume
+  `len(values)` equals `days`.
 - **The window is `date >= today - days`, inclusive on both ends**, so a 7-day
-  ask can return 8 dated rows (the cutoff day through today), as above.
+  ask can span the cutoff day through today.
 - **CTL / ATL / TSB are not available here.** They live in the `baselines` table,
   not `daily_metrics`. Use [`training_load_status`](training_load_status.md) for
   the current values plus 30-day history, or [`chart`](chart.md) /
   [`generate_chart`](generate_chart.md), whose whitelists do include them.
-- **Values are raw SI-ish DB units.** `sleep_seconds` is seconds, not `"7h 33m"`.
-  Convert before speaking them — the coach voice never says "25200 seconds".
+- **Values are raw SI-ish DB units, but `*_seconds` metrics carry a formatted
+  companion.** `sleep_seconds` rows include `value_formatted` (`"7h 33m"`) —
+  speak that, never the raw `25200`. Non-duration metrics have no
+  `value_formatted`; their raw value is already speakable.
 - **No baseline context.** "54" means nothing without the 60-day mean; pair this
   with [`daily_snapshot`](daily_snapshot.md) or use `get_metric_trend`, which
   attaches the baseline for `rhr` and `sleep_seconds`.

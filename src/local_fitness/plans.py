@@ -345,9 +345,18 @@ def classify_workout(
         if actual <= 0:
             return "missed"
         target = workout.get("target_duration_sec")
-        if target and actual < cfg.partial_fraction * target:
+        if not target:  # null/0 target → "by feel": any running duration counts
+            return "done"
+        # Mirror the distance ladder: quality days grade done|partial|missed
+        # against the same cfg fractions. Before this the branch never consulted
+        # cfg.done_fraction — any running ≥ 40% of target graded a full "done",
+        # so a 25-min effort against a 60-min tempo scored 1.0 adherence.
+        frac = actual / target
+        if frac >= cfg.done_fraction:
+            return "done"
+        if frac >= cfg.partial_fraction:
             return "partial"
-        return "done"
+        return "missed"
 
     if wtype == "cross":
         has_cross = any(

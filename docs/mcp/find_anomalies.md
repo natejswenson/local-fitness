@@ -31,9 +31,11 @@ Each anomaly row:
 | Field | Meaning |
 |---|---|
 | `date` | ISO date. |
-| `value` | The raw metric value that day (seconds for `sleep_seconds` — translate before showing it). |
-| `baseline_mean` | That day's 60-day rolling mean from `baselines`. |
-| `baseline_sd` | That day's 60-day rolling SD. |
+| `value` | The raw metric value that day (seconds for `sleep_seconds`). |
+| `value_formatted` | **`sleep_seconds` only** — the `"7h 33m"` shape to speak instead of raw seconds. Absent for `rhr` (its raw value is already speakable). |
+| `baseline_mean` | That day's 60-day rolling mean from `baselines`, rounded to 2 dp. |
+| `baseline_formatted` | **`sleep_seconds` only** — the baseline mean as `"7h 26m"`. |
+| `baseline_sd` | That day's 60-day rolling SD, rounded to 2 dp. |
 | `sd_distance` | **interpret.py** — signed distance in SDs: `(value - mean) / sd`, 2 dp. |
 | `direction` | **interpret.py** — `"above"` or `"below"` the baseline. |
 
@@ -62,6 +64,22 @@ because every row it returns is by definition already outside the normal band.
      "baseline_sd": 2.6, "sd_distance": 3.31, "direction": "above"},
     {"date": "2026-06-02", "value": 43, "baseline_mean": 49.9,
      "baseline_sd": 2.7, "sd_distance": -2.56, "direction": "below"},
+    …
+  ]
+}
+```
+
+For `sleep_seconds`, each row also carries the formatted companions:
+
+```json
+{
+  "metric": "sleep_seconds",
+  "lookback_days": 90,
+  "sd_threshold": 2.0,
+  "anomalies": [
+    {"date": "2026-07-04", "value": 18000, "value_formatted": "5h 00m",
+     "baseline_mean": 26784.33, "baseline_formatted": "7h 26m",
+     "baseline_sd": 3600.67, "sd_distance": -2.44, "direction": "below"},
     …
   ]
 }

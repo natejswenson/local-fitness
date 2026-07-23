@@ -26,7 +26,7 @@ import pdfplumber
 import pytest
 
 from local_fitness import db, plans
-from local_fitness.agent import branding, interpret, report_card, tools, visuals
+from local_fitness.agent import branding, interpret, report_card, tools, units, visuals
 
 
 def test_text_emits_compact_json():
@@ -126,7 +126,39 @@ def test_get_today_status_description_mirrors_daily_snapshot():
 def test_get_metric_valid(seeded):
     payload, err = call(tools.get_metric, {"metric": "rhr", "days": 14})
     assert not err
-    assert all("value" in row for row in payload)
+    assert payload["metric"] == "rhr"
+    assert payload["days_window"] == 14
+    assert payload["days_with_data"] == len(payload["values"])
+    assert all("value" in row and row["value"] is not None for row in payload["values"])
+
+
+def test_get_metric_skips_null_rows(seeded):
+    # The fixture inserts rhr/sleep_seconds but never vo2_max, so every
+    # daily_metrics row has a NULL vo2_max. Pre-fix, get_metric returned a
+    # row-per-day of {"value": null}; now those days are dropped and
+    # days_with_data reports the gap instead of hiding it.
+    payload, err = call(tools.get_metric, {"metric": "vo2_max", "days": 30})
+    assert not err
+    assert payload["values"] == []
+    assert payload["days_with_data"] == 0
+    assert payload["days_window"] == 30
+
+
+def test_get_metric_formats_seconds_metrics(seeded):
+    # sleep_seconds must carry the "7h 33m" companion the coach voice speaks —
+    # the model is explicitly forbidden from showing raw seconds.
+    payload, err = call(tools.get_metric, {"metric": "sleep_seconds", "days": 5})
+    assert not err
+    assert payload["values"]
+    for row in payload["values"]:
+        assert row["value_formatted"] == units.format_hm(row["value"])
+        assert row["value_formatted"].endswith("m")
+
+
+def test_get_metric_non_seconds_metric_has_no_formatted_field(seeded):
+    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 5})
+    assert not err
+    assert all("value_formatted" not in row for row in payload["values"])
 
 
 def test_get_metric_unknown(seeded):
@@ -576,6 +608,32 @@ def test_find_anomalies_sd_distance_and_direction(seeded):
         assert row["direction"] in ("above", "below")
 
 
+def test_find_anomalies_sleep_formats_and_rounds(seeded):
+    # sleep_seconds anomalies must carry the "7h 33m" companions the coach
+    # voice speaks, and the raw AVG()/SD baseline floats must be rounded at the
+    # payload boundary (pre-fix they passed through as ~10-digit floats and the
+    # value stayed raw seconds).
+    today = date.today()
+    with db.connect(seeded) as conn:
+        # A clear low-sleep anomaly against a fabricated non-round baseline.
+        conn.execute("UPDATE daily_metrics SET sleep_seconds=? WHERE date=?",
+                     (18000, today.isoformat()))
+        conn.execute(
+            "UPDATE baselines SET sleep_seconds_60day_mean=?, sleep_seconds_60day_sd=? "
+            "WHERE date=?",
+            (26784.333333333, 3600.6666666, today.isoformat()),
+        )
+    payload, err = call(tools.find_anomalies, {"metric": "sleep_seconds", "sd_threshold": 1.0})
+    assert not err
+    assert payload["anomalies"]
+    row = next(r for r in payload["anomalies"] if r["date"] == today.isoformat())
+    assert row["value_formatted"] == units.format_hm(18000)      # "5h 00m"
+    assert row["baseline_formatted"] == units.format_hm(26784.333333333)
+    assert row["baseline_mean"] == 26784.33                       # rounded 2dp
+    assert row["baseline_sd"] == 3600.67
+    assert row["direction"] == "below"
+
+
 def test_training_load_status_tsb_zone_matches_interpret(seeded):
     payload, err = call(tools.training_load_status, {})
     assert not err
@@ -845,6 +903,31 @@ def test_run_sql_bad_table_points_at_schema_resource(seeded):
     assert "operational error" not in payload["error"]
 
 
+def test_run_sql_truncates_and_flags_at_row_cap(seeded):
+    # A cross join yields far more than the 500-row cap. The result must be
+    # clipped to exactly 500 AND carry truncated + a hint, so the model never
+    # reads a clipped set as complete (the pre-fix bug: silent fetchmany(500)).
+    payload, err = call(tools.run_sql, {
+        "query": "SELECT a.date FROM daily_metrics a, daily_metrics b LIMIT 501"
+    })
+    assert not err
+    assert payload["count"] == 500
+    assert len(payload["rows"]) == 500
+    assert payload["truncated"] is True
+    assert "LIMIT" in payload["hint"]
+
+
+def test_run_sql_exactly_at_cap_is_not_flagged_truncated(seeded):
+    # Exactly 500 matched rows is a COMPLETE result — fetching 501 lets the tool
+    # tell that from a clipped larger set, so no truncated flag fires at the edge.
+    payload, err = call(tools.run_sql, {
+        "query": "SELECT a.date FROM daily_metrics a, daily_metrics b LIMIT 500"
+    })
+    assert not err
+    assert payload["count"] == 500
+    assert "truncated" not in payload
+
+
 # --- day-window robustness: over-large N must be a clean _err, not OverflowError ---
 
 _BIG = 10**9  # timedelta(days=N) raises OverflowError around here
@@ -1009,6 +1092,31 @@ def test_list_observations_rejects_huge_days(seeded):
     payload, err = call(tools.list_observations, {"days": _BIG})
     assert err
     assert "days must be between" in payload["error"]
+
+
+def test_list_observations_caps_at_limit_and_flags_truncated(seeded):
+    # The daily-logging surface is unbounded without a cap: log 3, ask for 2,
+    # and the newest 2 come back flagged truncated (pre-fix: SELECT * dumped all
+    # 3 with no LIMIT and no signal).
+    for w in (160, 161, 162):
+        call(tools.log_observation, {"obs_type": "weight", "value": w})
+    listed, err = call(tools.list_observations, {"limit": 2})
+    assert not err
+    assert listed["count"] == 2
+    assert listed["truncated"] is True
+    # ORDER BY observation_id DESC — the newest two, not an arbitrary two.
+    assert [o["value_num"] for o in listed["observations"]] == [162, 161]
+
+
+def test_list_observations_under_cap_is_not_flagged(seeded):
+    # A result that fits the cap is complete — no truncated flag, even at the
+    # exact edge (fetch limit+1 distinguishes a full page from a clipped one).
+    for w in (160, 161):
+        call(tools.log_observation, {"obs_type": "weight", "value": w})
+    listed, err = call(tools.list_observations, {"limit": 2})
+    assert not err
+    assert listed["count"] == 2
+    assert "truncated" not in listed
 
 
 def test_log_observation_invalid_obs_type(seeded):
@@ -1490,7 +1598,10 @@ def test_sync_garmin_data_is_in_full_tool_set():
     assert f"mcp__{tools.SERVER_NAME}__sync_garmin_data" in tools.allowed_tool_names()
 
 
-# --- LOCAL_ONLY_TOOLS: generate_brief_report / generate_chart --------------
+# --- PDF/chart tools: generate_brief_report / generate_chart ---------------
+# NB: LOCAL_ONLY_TOOLS is generate_brief_report + workout_report_card; since
+# Fix A (2026-07-13) generate_chart lives in ALL_TOOLS (it returns an inline
+# image block, so a remote caller no longer needs the local file path).
 
 
 def test_fetch_metric_series_matches_chart_tool_output(seeded):
@@ -1552,6 +1663,27 @@ def test_content_tag_is_deterministic_and_content_sensitive():
     # It is exactly the sha256 prefix, not some other hash.
     import hashlib
     assert tag == hashlib.sha256(b"the pdf bytes").hexdigest()[:8]
+
+
+def test_render_tag_hashes_inputs_not_renderer_output(monkeypatch):
+    # PDFs tag on the render's logical INPUTS because WeasyPrint's byte
+    # stream is not reproducible (2026-07-23: identical HTML diverged on
+    # ~50% of paired Linux renders). The tag must be: stable across calls,
+    # order-canonical for dicts, sensitive to every input part, and
+    # sensitive to the brand theme and app version (a layout change must
+    # not refocus a stale-looking window).
+    tag = tools._render_tag({"a": 1, "b": 2}, None, 0, b"png")
+    assert re.fullmatch(r"[0-9a-f]{8}", tag)
+    assert tools._render_tag({"b": 2, "a": 1}, None, 0, b"png") == tag
+    assert tools._render_tag({"a": 1, "b": 3}, None, 0, b"png") != tag
+    assert tools._render_tag({"a": 1, "b": 2}, {"x": 1}, 0, b"png") != tag
+    assert tools._render_tag({"a": 1, "b": 2}, None, 1, b"png") != tag
+    assert tools._render_tag({"a": 1, "b": 2}, None, 0, b"png2") != tag
+    # Part boundaries matter: shifting bytes between adjacent parts changes
+    # the tag (no concatenation ambiguity).
+    assert tools._render_tag(b"ab", b"c") != tools._render_tag(b"a", b"bc")
+    monkeypatch.setattr(tools, "_APP_VERSION", "999.0.0")
+    assert tools._render_tag({"a": 1, "b": 2}, None, 0, b"png") != tag
 
 
 def test_brief_pdf_filename_is_content_addressed(seeded, reports_tmp, monkeypatch):
@@ -1983,17 +2115,41 @@ def test_generate_chart_render_failure_is_error(seeded, monkeypatch):
 
 
 def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
-    # INV-T8 + INV-9: valid PNG at the filename format metric-chart_type-Nd-date.
+    # INV-T8 + INV-9: valid PNG at the content-addressed filename format
+    # chart-metric-chart_type-Nd-<sha8>.png.
     reports_dir, _briefs_dir = reports_tmp
     payload, err = call(
         tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
     )
     assert not err
     path = Path(payload["path"])
-    today = date.today().isoformat()
-    assert path.name == f"chart-rhr-line-14d-{today}.png"
+    assert re.fullmatch(r"chart-rhr-line-14d-[0-9a-f]{8}\.png", path.name)
     assert path.parent == reports_dir
     assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_generate_chart_filename_is_content_addressed(seeded, reports_tmp):
+    # Same stale-Preview-refocus fix the PDFs got in 0.28.2: identical chart
+    # bytes reuse ONE filename (idempotent — refocus is correct), but changed
+    # bytes must land on a NEW filename so macOS `open` shows the fresh render
+    # instead of refocusing a stale window. A day-stamped name could not do
+    # this (it was constant across an intra-day re-render).
+    args = {"metric": "rhr", "days": 14, "chart_type": "line"}
+    p1, err1 = call(tools.generate_chart, args)
+    p2, err2 = call(tools.generate_chart, args)
+    assert not err1 and not err2
+    # Identical data twice -> identical content-addressed filename.
+    assert p1["path"] == p2["path"]
+
+    # Change the underlying series, re-render the SAME request: because the
+    # rendered bytes differ, the filename must change.
+    with db.connect() as conn:
+        conn.execute("UPDATE daily_metrics SET rhr = rhr + 7")
+        conn.commit()
+    p3, err3 = call(tools.generate_chart, args)
+    assert not err3
+    assert p3["path"] != p1["path"]
+    assert Path(p3["path"]).name.startswith("chart-rhr-line-14d-")
 
 
 def test_generate_chart_response_carries_inline_image_block(seeded, reports_tmp):
@@ -2253,6 +2409,26 @@ def test_weekly_rollup_single_workout():
     assert rollup["slips"] == 0
 
 
+def test_weekly_rollup_run_walk_split_reconciles_to_foot_total():
+    # A pace-gated day: run + walking-pad session, both on foot. week_actual_mi
+    # is the FOOT total (run + walk) — the tool's headline; week_run_mi is the
+    # brief PDF strip's headline. The split must sum back to the foot total so
+    # the two sibling surfaces reconcile and can't drift into contradiction.
+    # Exact-mile meters keep the per-day-then-sum rounding clean.
+    workouts = [{
+        "date": "2026-07-10", "verdict": "done", "type": "interval",
+        "target_distance_m": 9600.0,
+        "actual_distance_m": 12874.752,      # 8.0 mi foot total (run + walk)
+        "actual_run_distance_m": 8046.72,    # 5.0 mi run
+        "actual_walk_distance_m": 4828.032,  # 3.0 mi walk
+    }]
+    rollup = tools.weekly_rollup(workouts, "2026-07-12")
+    assert rollup["week_run_mi"] == 5.0
+    assert rollup["week_walk_mi"] == 3.0
+    assert rollup["week_actual_mi"] == 8.0   # foot total, NOT run-only
+    assert round(rollup["week_run_mi"] + rollup["week_walk_mi"], 1) == rollup["week_actual_mi"]
+
+
 def test_weekly_rollup_days_reverse_chronological():
     workouts = [
         {"date": "2026-07-06", "verdict": "done", "type": "easy",
@@ -2392,6 +2568,21 @@ def test_build_plan_section_active_plan_full_values(plan_seeded):
     assert by_date[(today - timedelta(days=5)).isoformat()]["verdict"] == "compliant"
     assert by_date[(today - timedelta(days=6)).isoformat()]["verdict"] == "missed"
     assert by_date[(today - timedelta(days=6)).isoformat()]["actual_mi"] == 0.0
+
+
+def test_progress_this_week_reconciles_with_brief_plan_section(plan_seeded):
+    # The two sibling mileage surfaces must agree: get_training_plan_progress's
+    # this_week.week_actual_mi is the FOOT total split by week_run_mi/week_walk_mi,
+    # and its week_run_mi is exactly what _build_plan_section (the brief PDF strip)
+    # headlines as its own week_actual_mi. Pins the semantic so the two can't
+    # silently diverge again (the pre-fix defect: same key, two different numbers).
+    today = date.today().isoformat()
+    body, err = call(tools.get_training_plan_progress, {})
+    assert not err
+    tw = body["this_week"]
+    assert round(tw["week_run_mi"] + tw["week_walk_mi"], 1) == tw["week_actual_mi"]
+    section = tools._build_plan_section(today)
+    assert section["week_actual_mi"] == tw["week_run_mi"]
 
 
 def test_build_plan_section_no_workouts_in_window_is_none(plan_seeded):
@@ -2822,6 +3013,32 @@ def test_report_card_writes_a_pdf(rc_seeded, reports_tmp):
     assert re.fullmatch(r"report-card-1-[0-9a-f]{8}\.pdf", path.name)
     assert path.parent == reports_dir
     assert path.read_bytes()[:5] == b"%PDF-"
+
+
+def test_report_card_surfaces_page_overflow_instead_of_spilling_silently(
+    rc_seeded, reports_tmp, monkeypatch, caplog
+):
+    """When the density ladder is exhausted (page_count > 1), the card has no
+    droppable content, so the tool must SAY so — a `pages` field on the payload
+    and a WARNING log — never emit a silent 2-page 'single-page' card. A ladder
+    that fit (pages == 1) leaves the payload clean."""
+    from local_fitness.agent import visuals
+
+    monkeypatch.setattr(
+        visuals, "render_report_card_pdf", lambda *_a, **_k: (b"%PDF-two-pages", 2))
+    with caplog.at_level(logging.WARNING):
+        payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert payload["pages"] == 2
+    assert any("still 2 pages" in r.message for r in caplog.records)
+
+
+def test_report_card_single_page_leaves_no_pages_field(rc_seeded, reports_tmp):
+    """The overflow signal is present ONLY on overflow — a normal one-page card
+    carries no `pages` key."""
+    payload, err = call(tools.workout_report_card, {})
+    assert not err
+    assert "pages" not in payload
 
 
 def test_report_card_pdf_states_the_rolling_reference(rc_seeded, reports_tmp):
