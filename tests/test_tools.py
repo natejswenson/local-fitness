@@ -845,6 +845,31 @@ def test_run_sql_bad_table_points_at_schema_resource(seeded):
     assert "operational error" not in payload["error"]
 
 
+def test_run_sql_truncates_and_flags_at_row_cap(seeded):
+    # A cross join yields far more than the 500-row cap. The result must be
+    # clipped to exactly 500 AND carry truncated + a hint, so the model never
+    # reads a clipped set as complete (the pre-fix bug: silent fetchmany(500)).
+    payload, err = call(tools.run_sql, {
+        "query": "SELECT a.date FROM daily_metrics a, daily_metrics b LIMIT 501"
+    })
+    assert not err
+    assert payload["count"] == 500
+    assert len(payload["rows"]) == 500
+    assert payload["truncated"] is True
+    assert "LIMIT" in payload["hint"]
+
+
+def test_run_sql_exactly_at_cap_is_not_flagged_truncated(seeded):
+    # Exactly 500 matched rows is a COMPLETE result — fetching 501 lets the tool
+    # tell that from a clipped larger set, so no truncated flag fires at the edge.
+    payload, err = call(tools.run_sql, {
+        "query": "SELECT a.date FROM daily_metrics a, daily_metrics b LIMIT 500"
+    })
+    assert not err
+    assert payload["count"] == 500
+    assert "truncated" not in payload
+
+
 # --- day-window robustness: over-large N must be a clean _err, not OverflowError ---
 
 _BIG = 10**9  # timedelta(days=N) raises OverflowError around here

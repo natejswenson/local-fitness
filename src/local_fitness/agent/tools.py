@@ -1122,6 +1122,11 @@ async def recovery_pattern(args: dict) -> dict:
 # (single-threaded) server. Granularity: how many VM ops between deadline checks.
 _RUN_SQL_TIME_BUDGET_S = 5.0
 _RUN_SQL_PROGRESS_OPS = 10_000
+# Hard row cap on a run_sql result. Bounds a "SELECT * FROM activities"-style ask
+# so an ad-hoc query can't shove the whole table into the model's context. The
+# cap is SIGNALLED, not silent: _run_sql_blocking fetches one past it so run_sql
+# can tell "exactly 500 rows matched" from "the cap clipped a larger result".
+_RUN_SQL_ROW_CAP = 500
 
 
 def _run_sql_blocking(q: str) -> list[dict]:
@@ -1132,6 +1137,9 @@ def _run_sql_blocking(q: str) -> list[dict]:
     aborts once the deadline passes, which makes SQLite raise OperationalError.
     Runs in a worker thread (via asyncio.to_thread) so even a within-budget
     heavy query never blocks the event loop.
+
+    Fetches ``_RUN_SQL_ROW_CAP + 1`` rows so the caller can detect (and flag)
+    truncation instead of silently returning a clipped set as if complete.
     """
     deadline = time.monotonic() + _RUN_SQL_TIME_BUDGET_S
 
@@ -1142,7 +1150,7 @@ def _run_sql_blocking(q: str) -> list[dict]:
     with db.connect_readonly() as conn:
         conn.set_progress_handler(_abort_if_over_budget, _RUN_SQL_PROGRESS_OPS)
         try:
-            return [dict(r) for r in conn.execute(q).fetchmany(500)]
+            return [dict(r) for r in conn.execute(q).fetchmany(_RUN_SQL_ROW_CAP + 1)]
         finally:
             conn.set_progress_handler(None, 0)
 
@@ -1151,7 +1159,9 @@ def _run_sql_blocking(q: str) -> list[dict]:
     "run_sql",
     "Execute a read-only SELECT or WITH query against the fitness DB. "
     "Tables and columns: " + _render_schema() + ". "
-    "Use this for ad-hoc analysis the other tools don't cover.",
+    "Use this for ad-hoc analysis the other tools don't cover. "
+    f"Results are capped at {_RUN_SQL_ROW_CAP} rows; when more match, the "
+    "payload carries \"truncated\": true — add a LIMIT or aggregate to see the rest.",
     {"query": str},
 )
 async def run_sql(args: dict) -> dict:
@@ -1185,6 +1195,15 @@ async def run_sql(args: dict) -> dict:
             "query failed: invalid query — check table/column names "
             "against the fitness://schema resource"
         )
+    if len(rows) > _RUN_SQL_ROW_CAP:
+        rows = rows[:_RUN_SQL_ROW_CAP]
+        return _text({
+            "rows": rows,
+            "count": len(rows),
+            "truncated": True,
+            "hint": f"row cap hit — showing the first {_RUN_SQL_ROW_CAP} "
+                    "of a larger result; add a LIMIT or aggregate to see the rest",
+        })
     return _text({"rows": rows, "count": len(rows)})
 
 
