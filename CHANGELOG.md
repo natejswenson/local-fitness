@@ -62,6 +62,14 @@ dropped.
   legend says what the bar actually plots.
 
 ### Fixed — output reliability
+- **PDF content tags now hash the render's inputs, not the PDF bytes.**
+  WeasyPrint's PDF serialization is not byte-reproducible — identical HTML
+  diverged on ~50% of paired Linux renders — so 0.28.2's bytes-based
+  `_content_tag` broke the "identical content reuses one filename" half of
+  its own contract at random (and made its CI test a coin flip). Both PDF
+  filenames now derive from the logical content (brief/card + chart bytes +
+  brand theme + app version) via `_render_tag`; `generate_chart`'s PNG keeps
+  byte-hashing since matplotlib's writer is reproducible.
 - **`generate_chart` PNGs are content-addressed** (`…-<sha8>.png`), closing
   the same stale-Preview-refocus hole 0.28.2 fixed for PDFs — an intra-day
   re-render after a sync landed fresh bytes on the same path.

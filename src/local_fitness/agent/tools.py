@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import hashlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -2445,16 +2446,58 @@ async def _auto_open(path: Path) -> None:
 def _content_tag(data: bytes) -> str:
     """A short content hash for a rendered artifact's filename.
 
-    Content-addressing the PDF filename fixes a real trust bug: PDFs are written
-    to a per-process tmp dir and auto-opened with macOS `open`, but `open`
-    RE-FOCUSES an already-open Preview window for a path it has seen rather than
-    reloading the bytes. A deterministic `brief-<date>.pdf` name therefore showed
-    a stale render on every re-generate — a user read yesterday's-looking page
-    and concluded the data pipeline was stale (observed 2026-07-22). Suffixing
-    the name with the content hash means changed content always lands on a NEW
-    filename (a genuinely fresh window), while identical content reuses the same
-    file (idempotent — refocusing is correct when the bytes match)."""
+    Content-addressing the filename fixes a real trust bug: artifacts are
+    written to a per-process tmp dir and auto-opened with macOS `open`, but
+    `open` RE-FOCUSES an already-open Preview window for a path it has seen
+    rather than reloading the bytes. A deterministic `brief-<date>.pdf` name
+    therefore showed a stale render on every re-generate — a user read
+    yesterday's-looking page and concluded the data pipeline was stale
+    (observed 2026-07-22). Suffixing the name with the content hash means
+    changed content always lands on a NEW filename (a genuinely fresh window),
+    while identical content reuses the same file (idempotent — refocusing is
+    correct when the bytes match).
+
+    Use this on artifact bytes ONLY when the renderer is byte-reproducible
+    (matplotlib's PNG writer is). PDFs must go through `_render_tag` instead:
+    WeasyPrint's byte stream is NOT reproducible — see that docstring."""
     return hashlib.sha256(data).hexdigest()[:8]
+
+
+def _render_tag(*parts: object) -> str:
+    """`_content_tag` for PDFs: hash the render's logical INPUTS, not its bytes.
+
+    WeasyPrint's PDF serialization is not byte-reproducible — the same HTML
+    string rendered twice in one process can produce different bytes depending
+    on interpreter allocation state (measured 2026-07-23: ~50% of paired
+    renders diverged on Linux CI/Docker; macOS's allocator usually masks it,
+    which is why 0.28.2's bytes-hash looked stable locally). Hashing the PDF
+    bytes therefore broke the "identical content reuses one filename" half of
+    the contract at random. Hashing what we ASKED the renderer to draw keeps
+    both halves deterministic on every platform.
+
+    Each part is either raw bytes (chart PNGs — themselves content) or a
+    JSON-serializable structure, canonicalized with sort_keys. The app version
+    and resolved brand theme are always mixed in, so a release that changes
+    layout or a brand-file change still lands on a fresh filename rather than
+    refocusing a stale-looking window."""
+    from local_fitness.agent import branding
+
+    h = hashlib.sha256()
+    h.update(_APP_VERSION.encode())
+    h.update(json.dumps(branding.load_theme(), sort_keys=True, default=str).encode())
+    for p in parts:
+        if isinstance(p, (bytes, bytearray)):
+            h.update(bytes(p))
+        else:
+            h.update(json.dumps(p, sort_keys=True, default=str).encode())
+        h.update(b"\x1f")
+    return h.hexdigest()[:8]
+
+
+try:
+    _APP_VERSION = importlib.metadata.version("local-fitness")
+except importlib.metadata.PackageNotFoundError:  # uninstalled source tree
+    _APP_VERSION = "0"
 
 
 def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
@@ -2710,8 +2753,12 @@ async def generate_brief_report(args: dict) -> dict:
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
     try:
+        tag = _render_tag(
+            trial.model_dump(mode="json"), plan_section, omitted,
+            *(trial_charts[k] for k in sorted(trial_charts)),
+        )
         final_path = _write_atomic(
-            reports_dir, f"brief-{target_date}-{_content_tag(pdf_bytes)}.pdf", pdf_bytes)
+            reports_dir, f"brief-{target_date}-{tag}.pdf", pdf_bytes)
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
@@ -2956,9 +3003,10 @@ async def workout_report_card(args: dict) -> dict:
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
     try:
+        tag = _render_tag(card, split_chart or b"")
         final_path = _write_atomic(
             reports_dir,
-            f"report-card-{inputs['activity']['activity_id']}-{_content_tag(pdf_bytes)}.pdf",
+            f"report-card-{inputs['activity']['activity_id']}-{tag}.pdf",
             pdf_bytes,
         )
     except ValueError:

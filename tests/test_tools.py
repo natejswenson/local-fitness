@@ -1665,6 +1665,27 @@ def test_content_tag_is_deterministic_and_content_sensitive():
     assert tag == hashlib.sha256(b"the pdf bytes").hexdigest()[:8]
 
 
+def test_render_tag_hashes_inputs_not_renderer_output(monkeypatch):
+    # PDFs tag on the render's logical INPUTS because WeasyPrint's byte
+    # stream is not reproducible (2026-07-23: identical HTML diverged on
+    # ~50% of paired Linux renders). The tag must be: stable across calls,
+    # order-canonical for dicts, sensitive to every input part, and
+    # sensitive to the brand theme and app version (a layout change must
+    # not refocus a stale-looking window).
+    tag = tools._render_tag({"a": 1, "b": 2}, None, 0, b"png")
+    assert re.fullmatch(r"[0-9a-f]{8}", tag)
+    assert tools._render_tag({"b": 2, "a": 1}, None, 0, b"png") == tag
+    assert tools._render_tag({"a": 1, "b": 3}, None, 0, b"png") != tag
+    assert tools._render_tag({"a": 1, "b": 2}, {"x": 1}, 0, b"png") != tag
+    assert tools._render_tag({"a": 1, "b": 2}, None, 1, b"png") != tag
+    assert tools._render_tag({"a": 1, "b": 2}, None, 0, b"png2") != tag
+    # Part boundaries matter: shifting bytes between adjacent parts changes
+    # the tag (no concatenation ambiguity).
+    assert tools._render_tag(b"ab", b"c") != tools._render_tag(b"a", b"bc")
+    monkeypatch.setattr(tools, "_APP_VERSION", "999.0.0")
+    assert tools._render_tag({"a": 1, "b": 2}, None, 0, b"png") != tag
+
+
 def test_brief_pdf_filename_is_content_addressed(seeded, reports_tmp, monkeypatch):
     # Regenerating the SAME brief content reuses one filename (idempotent), but
     # a content change moves to a NEW filename so the viewer opens fresh bytes
