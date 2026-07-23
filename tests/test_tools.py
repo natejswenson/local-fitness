@@ -1036,6 +1036,31 @@ def test_list_observations_rejects_huge_days(seeded):
     assert "days must be between" in payload["error"]
 
 
+def test_list_observations_caps_at_limit_and_flags_truncated(seeded):
+    # The daily-logging surface is unbounded without a cap: log 3, ask for 2,
+    # and the newest 2 come back flagged truncated (pre-fix: SELECT * dumped all
+    # 3 with no LIMIT and no signal).
+    for w in (160, 161, 162):
+        call(tools.log_observation, {"obs_type": "weight", "value": w})
+    listed, err = call(tools.list_observations, {"limit": 2})
+    assert not err
+    assert listed["count"] == 2
+    assert listed["truncated"] is True
+    # ORDER BY observation_id DESC — the newest two, not an arbitrary two.
+    assert [o["value_num"] for o in listed["observations"]] == [162, 161]
+
+
+def test_list_observations_under_cap_is_not_flagged(seeded):
+    # A result that fits the cap is complete — no truncated flag, even at the
+    # exact edge (fetch limit+1 distinguishes a full page from a clipped one).
+    for w in (160, 161):
+        call(tools.log_observation, {"obs_type": "weight", "value": w})
+    listed, err = call(tools.list_observations, {"limit": 2})
+    assert not err
+    assert listed["count"] == 2
+    assert "truncated" not in listed
+
+
 def test_log_observation_invalid_obs_type(seeded):
     _payload, err = call(tools.log_observation, {"obs_type": "bogus", "value": 1})
     assert err

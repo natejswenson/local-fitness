@@ -23,6 +23,7 @@ follows, these are readings it interprets.
 |---|---|---|---|---|
 | `days` | integer | no | no limit | Only observations with `observed_on` in the last N days. Bounds-checked to `[1, 3650]`; non-int (including `bool`) or out-of-range errors. `0` is falsy and silently means "no filter". |
 | `obs_type` | string | no | all types | Filter to one of `energy`, `feeling`, `injury`, `mood`, `note`, `rpe`, `soreness`, `weight`. **Not validated** — an unknown value returns zero rows rather than an error. |
+| `limit` | integer | no | `100` | Max rows returned, most recent first. When more rows match, the result is clipped and the payload carries `"truncated": true`. Raise it (or narrow with `days`/`obs_type`) to see more; [`run_sql`](run_sql.md) is the unbounded escape hatch. |
 
 ## Returns
 
@@ -44,7 +45,9 @@ Whole rows, ordered `observed_on DESC, observation_id DESC`:
 ```
 
 Numeric types populate `value_num` with `value_text` null; free-text types the
-reverse. No rows matched returns `{"observations": [], "count": 0}`.
+reverse. No rows matched returns `{"observations": [], "count": 0}`. When more
+than `limit` rows match, the newest `limit` are returned and the payload adds
+`"truncated": true`.
 
 ## Example
 
@@ -64,9 +67,10 @@ reverse. No rows matched returns `{"observations": [], "count": 0}`.
 
 ## Gotchas
 
-- **No limit and no pagination.** Called with no arguments it returns every
-  observation ever logged. Pass `days` unless you genuinely want the full
-  history.
+- **Defaults to the newest 100.** Called with no arguments it returns at most
+  `limit` (default 100) rows and flags `"truncated": true` when it clipped a
+  larger set — it no longer dumps the entire table. Pass `days`/`obs_type` to
+  narrow, raise `limit`, or use [`run_sql`](run_sql.md) for the full history.
 - **`obs_type` is unvalidated.** A typo (`"RPE"`, `"soreness_level"`) returns an
   empty list that looks exactly like "nothing logged". The comparison is a plain
   SQL `=`, so it is case-sensitive.

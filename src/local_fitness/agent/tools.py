@@ -1376,11 +1376,21 @@ async def log_observation(args: dict) -> dict:
     return _text({"logged": True, "observation": dict(row)})
 
 
+# Default row cap on list_observations. Observations are the daily-logging
+# surface (weight, RPE, soreness, mood), so an unbounded SELECT * would dump a
+# year+ of rows into the reply once logging is at cadence. Mirrors
+# query_workouts' default-50 pattern; run_sql stays the full-history escape hatch.
+_LIST_OBSERVATIONS_DEFAULT_LIMIT = 100
+
 _LIST_OBSERVATIONS_SCHEMA = {
     "type": "object",
     "properties": {
         "days": {"type": "integer", "description": "Only observations from the last N days."},
         "obs_type": {"type": "string", "description": "Filter to one obs_type."},
+        "limit": {
+            "type": "integer",
+            "description": f"Max rows, most recent first (default {_LIST_OBSERVATIONS_DEFAULT_LIMIT}).",
+        },
     },
     "required": [],
 }
@@ -1389,7 +1399,9 @@ _LIST_OBSERVATIONS_SCHEMA = {
 @tool(
     "list_observations",
     "List logged observations, most recent first. Optional filters: days "
-    "lookback and obs_type.",
+    f"lookback and obs_type. Capped at {_LIST_OBSERVATIONS_DEFAULT_LIMIT} rows "
+    "by default (pass limit for more); when the cap is hit the payload carries "
+    "\"truncated\": true — narrow with days/obs_type or raise limit.",
     _LIST_OBSERVATIONS_SCHEMA,
 )
 async def list_observations(args: dict) -> dict:
@@ -1405,13 +1417,21 @@ async def list_observations(args: dict) -> dict:
         where.append("obs_type = ?")
         params.append(args["obs_type"])
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    limit = int(args.get("limit") or _LIST_OBSERVATIONS_DEFAULT_LIMIT)
     with db.connect() as conn:
+        # Fetch one past the cap so a full page is distinguishable from a
+        # clipped larger set — same truncation-signal shape as run_sql.
         rows = conn.execute(
             f"SELECT * FROM observations {where_sql} "
-            "ORDER BY observed_on DESC, observation_id DESC",
-            params,
+            "ORDER BY observed_on DESC, observation_id DESC LIMIT ?",
+            (*params, limit + 1),
         ).fetchall()
-    return _text({"observations": [dict(r) for r in rows], "count": len(rows)})
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    payload = {"observations": [dict(r) for r in rows], "count": len(rows)}
+    if truncated:
+        payload["truncated"] = True
+    return _text(payload)
 
 
 @tool(
