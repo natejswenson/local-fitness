@@ -26,7 +26,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .. import config, db
-from ..agent import brief_planner, briefs, coach, prompts
+from ..agent import brief_planner, briefs, coach, memory, prompts
 from ..agent import tools as agent_tools
 from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
@@ -218,8 +218,12 @@ def _latest_brief_markdown() -> str:
 def _coach_prompt(arguments: dict[str, str] | None) -> types.GetPromptResult:
     """The running-coach persona pre-filled with today's snapshot."""
     # The persona ALREADY embeds the user's saved notes via
-    # render_for_prompt(); do NOT append them again here.
-    persona = prompts.system_prompt(_user_name(), coach.resolve_coach_profile())
+    # render_for_prompt(); do NOT append them again here. Memory is resolved
+    # here (fail-silent, "" when disabled/empty) because the prompt builders
+    # are pure — see prompts.system_prompt's memory_text note.
+    persona = prompts.system_prompt(
+        _user_name(), coach.resolve_coach_profile(),
+        memory.render_memory_for_prompt(user_name=_user_name()))
     snapshot = _render_status(assemble_status())
     text = (
         f"{persona}\n\n"
@@ -272,7 +276,9 @@ def _brief_prompt() -> types.GetPromptResult:
     profile = coach.resolve_coach_profile()
     recent_briefs_summary = briefs._recent_briefs_summary()
     context = brief_planner.assemble_brief_context()
-    system = prompts.brief_v2_system_prompt(user_name, profile)
+    system = prompts.brief_v2_system_prompt(
+        user_name, profile,
+        memory.render_memory_for_prompt(compact=True, user_name=user_name))
     user = prompts.brief_v2_user_prompt(
         context, user_name, _daily_step_goal(), recent_briefs_summary, profile,
         persist_via_tool=True,
@@ -399,7 +405,8 @@ def _install_coach_persona(instance: Server) -> None:
     def _with_coach_persona(*args, **kwargs):
         try:
             instance.instructions = prompts.system_prompt(
-                _user_name(), coach.resolve_coach_profile()
+                _user_name(), coach.resolve_coach_profile(),
+                memory.render_memory_for_prompt(user_name=_user_name()),
             )
         except Exception:
             # Fail-open: never break the handshake. But a persistent failure

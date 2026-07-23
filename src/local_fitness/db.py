@@ -179,6 +179,23 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_obs_date ON observations(observed_on);
 CREATE INDEX IF NOT EXISTS idx_obs_type ON observations(obs_type);
 
+CREATE TABLE IF NOT EXISTS coach_journal (
+    entry_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL,           -- ISO timestamp of the write
+    entry_date  TEXT NOT NULL,           -- ISO date the memory is about
+    source      TEXT NOT NULL,           -- 'brief' | 'report_card' | 'chat'
+    source_key  TEXT,                    -- brief date / activity_id; NULL for chat
+    seq         INTEGER NOT NULL DEFAULT 1,
+    text        TEXT NOT NULL            -- one line, <=240 chars
+);
+CREATE INDEX IF NOT EXISTS idx_journal_date ON coach_journal(entry_date);
+-- One memory-set per reflected event, enforced structurally: a reflect race
+-- (two renders of the same card racing the has_event pre-check) fails loudly
+-- on the second insert instead of silently double-writing — the same
+-- philosophy as idx_one_active_plan.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_event
+    ON coach_journal(source, source_key, seq) WHERE source_key IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS training_plans (
     plan_id              INTEGER PRIMARY KEY AUTOINCREMENT,
     status               TEXT NOT NULL,          -- 'draft' | 'active' | 'archived'

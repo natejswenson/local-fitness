@@ -3348,3 +3348,106 @@ def test_fetch_metric_series_defaults_to_today_for_live_callers(seeded):
     dated = tools._fetch_metric_series("rhr", 3650, end=date.today().isoformat())
     default = tools._fetch_metric_series("rhr", 3650)
     assert dated == default
+
+
+# --- coach-memory journal tools (0.30.0) -------------------------------------
+
+
+def test_save_coach_memory_round_trip(seeded):
+    saved, err = call(tools.save_coach_memory,
+                      {"text": "Blamed the heat again — second time this month."})
+    assert not err
+    assert saved["saved"] is True
+    assert saved["source"] == "chat"
+    listed, err = call(tools.list_coach_memories, {})
+    assert not err
+    assert listed["count"] == 1
+    assert listed["memories"][0]["text"] == (
+        "Blamed the heat again — second time this month.")
+
+
+def test_save_coach_memory_validation(seeded):
+    _p, err = call(tools.save_coach_memory, {"text": "   "})
+    assert err
+    _p, err = call(tools.save_coach_memory, {"text": "x" * 241})
+    assert err
+    _p, err = call(tools.save_coach_memory,
+                   {"text": "fine", "date": "not-a-date"})
+    assert err
+    payload, err = call(tools.save_coach_memory,
+                        {"text": "dated", "date": "2026-07-20"})
+    assert not err
+    assert payload["entry_date"] == "2026-07-20"
+
+
+def test_list_coach_memories_args_validated(seeded):
+    _p, err = call(tools.list_coach_memories, {"days": -1})
+    assert err
+    _p, err = call(tools.list_coach_memories, {"limit": 0})
+    assert err
+    payload, err = call(tools.list_coach_memories, {"days": 30, "limit": 5})
+    assert not err
+    assert payload["memories"] == []
+
+
+def test_delete_coach_memory(seeded):
+    saved, _ = call(tools.save_coach_memory, {"text": "forget me"})
+    deleted, err = call(tools.delete_coach_memory,
+                        {"entry_id": saved["entry_id"]})
+    assert not err and deleted["deleted"] is True
+    _p, err = call(tools.delete_coach_memory, {"entry_id": saved["entry_id"]})
+    assert err
+    _p, err = call(tools.delete_coach_memory, {})
+    assert err
+
+
+def test_report_card_schedules_reflection_exactly_once(rc_seeded, monkeypatch):
+    """First render schedules the fire-and-forget reflection; a re-render (the
+    common case) must skip even task creation via the has_event pre-check."""
+    from local_fitness.agent import journal as journal_mod
+    from local_fitness.agent import reflect as reflect_mod
+
+    scheduled = []
+
+    def recording_reflect(card):
+        scheduled.append(card["activity"]["activity_id"])
+
+        async def _noop():
+            return None
+
+        return _noop()
+
+    monkeypatch.setattr(reflect_mod, "reflect_after_report_card",
+                        recording_reflect)
+    _payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert scheduled == [1]
+
+    # The reflection itself would have written the event row; simulate that,
+    # then re-render: no second scheduling.
+    journal_mod.save_entry("tempo collapsed late", source="report_card",
+                           source_key="1")
+    _payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert scheduled == [1]
+
+
+def test_report_card_reflection_respects_the_kill_switch(rc_seeded, monkeypatch):
+    from local_fitness.agent import reflect as reflect_mod
+
+    scheduled = []
+
+    def recording_reflect(card):
+        scheduled.append(True)
+
+        async def _noop():
+            return None
+
+        return _noop()
+
+    monkeypatch.setattr(reflect_mod, "reflect_after_report_card",
+                        recording_reflect)
+    monkeypatch.setenv("LOCAL_FITNESS_COACH_MEMORY", "0")
+    _payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert scheduled == []

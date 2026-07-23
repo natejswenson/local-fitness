@@ -36,6 +36,7 @@ from . import briefs
 from . import coach
 from . import grounding
 from . import local_model
+from . import memory
 from . import opencode_model
 from . import prompts
 from . import tools as agent_tools
@@ -620,6 +621,17 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         daily_step_goal = 10000
     coach_profile = coach.resolve_coach_profile()
     recent_briefs = _recent_briefs_summary()
+    # The coach's memory (ledger + journal), resolved ONCE per generation and
+    # passed into the pure prompt builders. Today's own brief entries are
+    # excluded so a same-day regenerate can't see the reflection of the brief
+    # it is replacing. Never raises — "" on any failure or when disabled.
+    _today_iso = date.today().isoformat()
+    memory_compact = memory.render_memory_for_prompt(
+        compact=True, today=_today_iso,
+        exclude_source_key=("brief", _today_iso), user_name=user_name)
+    memory_full = memory.render_memory_for_prompt(
+        today=_today_iso, exclude_source_key=("brief", _today_iso),
+        user_name=user_name)
     # The BriefContext, kept for the post-stream advisory grounding check.
     # Stays None unless a branch below assembles one — V2 always does (it's
     # also the toolless generation input); V1 does too since 4b, but SOLELY
@@ -650,7 +662,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
                 f"'opencode:<provider>/<model>' (e.g. 'opencode:ollama/gemma4')")
         profile = _MODEL_PROFILES.get(alt_model_name, _DEFAULT_PROFILE)
 
-        alt_system_prompt = prompts.brief_v2_system_prompt(user_name, coach_profile)
+        alt_system_prompt = prompts.brief_v2_system_prompt(
+            user_name, coach_profile, memory_compact)
         alt_prompt_text = prompts.brief_v2_user_prompt(
             brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
         if profile.plan_prompt_facts and brief_context.plan_today is not None:
@@ -697,7 +710,8 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         # obtain a number outside the context it was handed.
         brief_context = brief_planner.assemble_brief_context(today=date.today().isoformat())
         options = ClaudeAgentOptions(
-            system_prompt=prompts.brief_v2_system_prompt(user_name, coach_profile),
+            system_prompt=prompts.brief_v2_system_prompt(
+                user_name, coach_profile, memory_compact),
             model=model,
             permission_mode="bypassPermissions",
             max_turns=1,
@@ -716,7 +730,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             # — and therefore its behavior — unchanged. Chat + the web agent keep
             # the full set via allowed_tool_names().
             allowed_tools=agent_tools.read_only_tool_names(),
-            system_prompt=prompts.system_prompt(user_name, coach_profile),
+            system_prompt=prompts.system_prompt(user_name, coach_profile, memory_full),
             model=model,
             permission_mode="bypassPermissions",
             max_turns=20,
@@ -977,6 +991,16 @@ def generate_and_save(model: str = DEFAULT_MODEL) -> Path:
             time.sleep(_brief_retry_delay_s())
             continue
         break
+    # Auto-reflect: the coach writes today's journal memory (0-2 lines) now
+    # that the brief is safely saved. Deliberately AFTER persistence and
+    # fail-silent, so a reflect problem — or its ~10s latency — can never cost
+    # the brief. Only this production entry reflects; generate_streaming's
+    # eval/scoring callers never do.
+    try:
+        from . import reflect
+        reflect.reflect_after_brief_sync(last_brief)
+    except Exception:
+        LOG.warning("coach reflect after brief failed (ignored)", exc_info=True)
     # The save path wrote briefings/<date>.json; reconstruct the same path the
     # gate produced (date is server-stamped to today inside save_brief).
     return Path(DEFAULT_BRIEFINGS_DIR / f"{last_brief['date']}.json")

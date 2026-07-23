@@ -77,15 +77,58 @@ def user_notes_block(user_name: str, notes_text: str | None) -> str:
     )
 
 
+def coach_memory_block(
+    user_name: str, memory_text: str | None, *, compact: bool = False
+) -> str:
+    """The coach's-memory section, or "" when there is none.
+
+    PURE like the other two blocks — ``memory_text`` is the caller's
+    already-rendered ``memory.render_memory_for_prompt()`` output, never read
+    here (required for the prompt-hash caches; see the module comment above).
+
+    The header carries the grounding contract for callbacks: the ledger lines
+    are computed facts and the journal lines are the coach's own prior notes —
+    both quotable as receipts — and nothing outside the section may be
+    "remembered". An empty section therefore means no callbacks, which is the
+    safe degradation when memory is disabled or the DB is fresh.
+    """
+    if not memory_text:
+        return ""
+    if compact:
+        return (
+            f"# What you remember about {user_name}\n"
+            f"Use as receipts/callbacks (counts + dates). NEVER cite a memory "
+            f"or count\nnot listed here.\n{memory_text}"
+        )
+    return (
+        f"# What you remember about {user_name}\n"
+        f"Computed from his data plus your own journal. Use these as receipts "
+        f"and\ncallbacks — name the count, name the date ('third missed "
+        f"quality day this\nmonth'). A repeated behavior gets named as a "
+        f"pattern. NEVER invent a memory,\na count, or a quote that is not "
+        f"listed here; if this section is empty, make\nno callbacks.\n"
+        f"{memory_text}"
+    )
+
+
 def system_prompt(
     user_name: str = DEFAULT_USER_NAME,
     profile: coach.CoachProfile = ADAPTIVE,
+    memory_text: str | None = None,
 ) -> str:
     # Pull any durable user preferences saved via save_user_note. These
     # shape every brief and chat and are the agent's primary lever for
     # learning how the user wants to be coached.
+    #
+    # memory_text is PASSED IN (callers resolve memory.render_memory_for_prompt)
+    # rather than resolved here like notes are: this module builds SYSTEM_PROMPT
+    # at import time, and a DB read at import would open/create the DB as a
+    # side effect of `import prompts` — notes' file read degrades to "" on a
+    # fresh clone, a DB connect does not.
     notes = user_notes_block(user_name, user_notes_mod.render_for_prompt())
     notes_section = f"\n\n{notes}\n" if notes else ""
+    mem = coach_memory_block(user_name, memory_text)
+    memory_section = f"\n{mem}\n" if mem else ""
 
     return f"""You are {user_name}'s personal running coach.
 
@@ -122,7 +165,7 @@ cold; he doesn't.
   (not seconds). Plain comparisons, not standard deviations.
 
 {coach_voice_block(user_name, profile)}
-
+{memory_section}
 # Grounding rules
 1. Every claim cites a specific number + time window.
 2. If the data is sparse or noisy, say so plainly.
@@ -197,6 +240,17 @@ If the target is ambiguous, ask which note number first.
 
 At most one save_user_note / update_user_note / delete_user_note call
 per chat turn unless {user_name} explicitly asks for several.
+
+# Writing your journal
+You keep a coach's journal (the memory section above shows recent entries).
+When something in THIS conversation is worth remembering across sessions —
+an excuse for a skipped session, an injury flag, a promise ("back on it
+Monday"), a breakthrough — save it with ``save_coach_memory``: one line,
+dated, in your own coach voice ("Blamed the heat again — second time this
+month."). Notes are {user_name}'s preferences; the journal is YOUR record
+of the relationship — don't mix them up. Skip routine Q&A; at most one
+save per turn. ``list_coach_memories`` / ``delete_coach_memory`` manage it
+when {user_name} asks what you remember or tells you to forget something.
 """
 
 
@@ -656,9 +710,16 @@ Return ONLY the JSON object. Nothing else.
 def brief_v2_system_prompt(
     user_name: str = DEFAULT_USER_NAME,
     profile: coach.CoachProfile = ADAPTIVE,
+    memory_text: str | None = None,
 ) -> str:
+    # memory_text passed in for the same import-time reason as system_prompt;
+    # callers use memory.render_memory_for_prompt(compact=True) — the compact
+    # variant is hard-capped (memory.COMPACT_MAX_CHARS) because V2 is
+    # deliberately the shrunk prompt and must not silently grow.
     notes = user_notes_block(user_name, user_notes_mod.render_for_prompt())
     notes_section = f"\n{notes}\n" if notes else ""
+    mem = coach_memory_block(user_name, memory_text, compact=True)
+    memory_section = f"\n{mem}\n" if mem else ""
     return f"""You are {user_name}'s personal running coach.
 
 {user_name} runs a Garmin Instinct Solar (no overnight HRV — Body Battery +
@@ -679,7 +740,7 @@ he doesn't.
   comparisons, not standard deviations.
 
 {coach_voice_block(user_name, profile, compact=True)}
-
+{memory_section}
 # Grounding rules
 1. Every claim cites a specific number from the provided data + its window.
 2. If the data is sparse, say so plainly — don't pad.

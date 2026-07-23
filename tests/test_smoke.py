@@ -45,7 +45,8 @@ def test_tool_schemas_well_formed():
     # LOCAL_ONLY_TOOLS once it returns an inline image content block,
     # sidestepping the no-file-retrieval problem that made it local-only)
     # +plan_chart (round-2 facet review: two-series scheduled-vs-actual)
-    assert len(agent_tools.ALL_TOOLS) == 35
+    # +save/list/delete_coach_memory (0.30.0 coach-memory journal tools)
+    assert len(agent_tools.ALL_TOOLS) == 38
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

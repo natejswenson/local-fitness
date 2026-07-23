@@ -6,6 +6,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-23
+
+The coach remembers. First half of the memory-based-personality build
+(tunable personality spec + the new hard-ass default land separately):
+every voice surface now carries a two-layer memory, so briefs, report
+cards, and chat can make receipts-backed callbacks ("third missed quality
+day this month — Jul 12, Jul 19, today") instead of judging each day in
+isolation.
+
+### Added
+- **Deterministic relationship ledger** (`agent/ledger.py`): plan-adherence
+  miss/done streaks and windows (reusing `plans.build_plan_detail`'s
+  verdicts — never re-grading), step-goal streaks computed as-of-yesterday
+  (today's partial count can't flip the block intra-day), repeat patterns
+  in logged observations (mood/energy/soreness thresholds, injury from the
+  first log), and notable recent results. Pure stdlib functions over plain
+  dicts, per the `interpret.py` rule: Python derives every count the coach
+  may quote; the LLM only phrases.
+- **Coach journal** (`agent/journal.py`, `coach_journal` table): short
+  dated memory lines the coach writes itself. 60-entry cap pruned on every
+  write, 240-char lines, and a partial unique index on
+  `(source, source_key, seq)` so one reflected event can never double-write.
+- **Auto-reflect** (`agent/reflect.py`): after each saved daily brief and
+  each first-render report card, a toolless Sonnet-low single-shot call
+  (same measured config as `workout_coach`, ~10s) writes 0–2 journal lines
+  — or `NONE`, since most days aren't worth remembering. Fail-silent and
+  post-persistence: a reflect problem can never cost the brief or the card.
+  `journal.has_event` + `exclude_source_key` filtering make it idempotent
+  and cache-cascade-proof.
+- **Memory on every voice surface**: `prompts.coach_memory_block` (pure,
+  carries the never-invent grounding contract) composed by `system_prompt`,
+  `brief_v2_system_prompt` (compact variant, hard-capped at 600 chars so V2
+  stays the shrunk prompt), `plan_coach.build_prompt`, and
+  `workout_coach.build_prompt` — all as passed-in text, preserving the
+  prompt-hash disk caches.
+- **Three chat tools** — `save_coach_memory` / `list_coach_memories` /
+  `delete_coach_memory` — so the live agent can journal mid-conversation
+  (an excuse, a promise, an injury flag) and manage memories when asked
+  "what do you remember?".
+- **Kill switch**: `LOCAL_FITNESS_COACH_MEMORY=0` disables both the
+  injection and the reflect writes; journal data is untouched.
+
 ## [0.29.0] - 2026-07-23
 
 Fifteen fixes from a multi-agent audit across three axes — terminal UX, MCP

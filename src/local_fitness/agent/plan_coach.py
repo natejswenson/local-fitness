@@ -113,6 +113,7 @@ def build_prompt(
     goal_type: str,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
 ) -> tuple[str, str]:
     """Assemble the ``(system_prompt, user_prompt)`` pair for the coaching
     line. Pure string assembly — no I/O, no randomness, fully unit-testable.
@@ -125,6 +126,11 @@ def build_prompt(
     coaching line exactly as it already is in chat/brief. The
     metric-translation block is appended unconditionally, independent of
     ``notes_text``.
+
+    ``memory_text`` follows the identical convention for the coach's memory
+    (``memory.render_memory_for_prompt()`` output) — passed in, not resolved,
+    because this prompt's hash is ``generate_coaching_line_cached``'s cache
+    key and a builder that did I/O would break caching.
     """
     system_prompt = (
         f"You are {user_name}'s running coach, writing ONE short paragraph (2-4 "
@@ -134,6 +140,9 @@ def build_prompt(
         "Output ONLY the coaching paragraph itself — no headline, no "
         'markdown, no quotation marks, no preamble like "Here\'s your line".'
     )
+    memory_section = prompts.coach_memory_block(user_name, memory_text)
+    if memory_section:
+        system_prompt += f"\n\n{memory_section}"
     notes_section = prompts.user_notes_block(user_name, notes_text)
     if notes_section:
         system_prompt += f"\n\n{notes_section}"
@@ -173,6 +182,7 @@ async def generate_coaching_line(
     timeout: float = 30.0,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
 ) -> str:
     """Claude-generated coaching line prepping the athlete for today's run.
 
@@ -197,7 +207,7 @@ async def generate_coaching_line(
 
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        notes_text=notes_text, user_name=user_name,
+        notes_text=notes_text, user_name=user_name, memory_text=memory_text,
     )
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -268,6 +278,7 @@ async def generate_coaching_line_cached(
     timeout: float = 30.0,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
     cache_path: Path | None = None,
 ) -> str:
     """``generate_coaching_line`` behind a single-entry disk cache.
@@ -284,6 +295,7 @@ async def generate_coaching_line_cached(
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, notes_text=notes_text, user_name=user_name,
+        memory_text=memory_text,
     )
     key = hashlib.sha256(
         "\x00".join([system_prompt, user_prompt, model or "default"]).encode("utf-8")
@@ -296,7 +308,7 @@ async def generate_coaching_line_cached(
     line = await generate_coaching_line(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, model=model, timeout=timeout, notes_text=notes_text,
-        user_name=user_name,
+        user_name=user_name, memory_text=memory_text,
     )
     _write_cached_line(path, key, line)
     return line
