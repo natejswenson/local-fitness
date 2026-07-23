@@ -199,7 +199,9 @@ async def get_today_status(_args: dict) -> dict:
 
 @tool(
     "get_metric",
-    "Get raw daily values for one metric over the last N days. Returns time series sorted oldest-first.",
+    "Get raw daily values for one metric over the last N days, oldest-first. "
+    "Skips days with no reading (NULL) and reports days_with_data vs the window. "
+    "*_seconds metrics carry a value_formatted (e.g. '7h 33m') alongside the raw value.",
     {"metric": str, "days": int},
 )
 async def get_metric(args: dict) -> dict:
@@ -211,12 +213,35 @@ async def get_metric(args: dict) -> dict:
         return _err(err)
     days = args["days"]
     cutoff = (date.today() - timedelta(days=days)).isoformat()
+    # Skip NULL readings: for sparse columns (vo2_max updates only on run days)
+    # a long window is otherwise mostly {"value": null} rows — pure token cost.
+    # get_metric_trend already filters the same way; this aligns the two on what
+    # "a day with data" means. days_with_data vs days_window surfaces the gap so
+    # nothing is silently hidden.
     with db.connect() as conn:
         rows = conn.execute(
-            f"SELECT date, {metric} AS value FROM daily_metrics WHERE date >= ? ORDER BY date",
+            f"SELECT date, {metric} AS value FROM daily_metrics "
+            f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date",
             (cutoff,),
         ).fetchall()
-    return _text([dict(r) for r in rows])
+    # Formatted companion for duration-shaped metrics — the coach voice never
+    # speaks raw seconds ("25200 seconds"); attach the "7h 33m" shape at the
+    # payload boundary, same discipline get_metric_trend/compare_periods follow.
+    fmt = units.format_hm if metric.endswith("_seconds") else None
+    values = []
+    for r in rows:
+        row = dict(r)
+        if fmt is not None:
+            formatted = fmt(row["value"])
+            if formatted is not None:
+                row["value_formatted"] = formatted
+        values.append(row)
+    return _text({
+        "metric": metric,
+        "days_window": days,
+        "days_with_data": len(values),
+        "values": values,
+    })
 
 
 @tool(
@@ -854,6 +879,11 @@ async def find_anomalies(args: dict) -> dict:
                 ORDER BY dm.date DESC""",
             (cutoff, threshold),
         ).fetchall()
+    # sleep_seconds baselines are raw AVG()/SD floats (~10 significant digits)
+    # and the value is raw seconds — attach the "7h 33m" companion the coach
+    # voice must speak instead, and round the baseline floats at the payload
+    # boundary, the same discipline get_metric_trend/compare_periods follow.
+    fmt = units.format_hm if metric.endswith("_seconds") else None
     anomalies = []
     for r in rows:
         row = dict(r)
@@ -861,6 +891,17 @@ async def find_anomalies(args: dict) -> dict:
         if position is not None:
             row["sd_distance"] = round(position["sd_distance"], 2)
             row["direction"] = position["direction"]
+        if fmt is not None:
+            for raw_key, fmt_key in (
+                ("value", "value_formatted"),
+                ("baseline_mean", "baseline_formatted"),
+            ):
+                formatted = fmt(row.get(raw_key))
+                if formatted is not None:
+                    row[fmt_key] = formatted
+        for field in ("baseline_mean", "baseline_sd"):
+            if row.get(field) is not None:
+                row[field] = round(row[field], 2)
         anomalies.append(row)
     return _text({
         "metric": metric,

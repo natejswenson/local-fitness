@@ -26,7 +26,7 @@ import pdfplumber
 import pytest
 
 from local_fitness import db, plans
-from local_fitness.agent import branding, interpret, report_card, tools, visuals
+from local_fitness.agent import branding, interpret, report_card, tools, units, visuals
 
 
 def test_text_emits_compact_json():
@@ -126,7 +126,39 @@ def test_get_today_status_description_mirrors_daily_snapshot():
 def test_get_metric_valid(seeded):
     payload, err = call(tools.get_metric, {"metric": "rhr", "days": 14})
     assert not err
-    assert all("value" in row for row in payload)
+    assert payload["metric"] == "rhr"
+    assert payload["days_window"] == 14
+    assert payload["days_with_data"] == len(payload["values"])
+    assert all("value" in row and row["value"] is not None for row in payload["values"])
+
+
+def test_get_metric_skips_null_rows(seeded):
+    # The fixture inserts rhr/sleep_seconds but never vo2_max, so every
+    # daily_metrics row has a NULL vo2_max. Pre-fix, get_metric returned a
+    # row-per-day of {"value": null}; now those days are dropped and
+    # days_with_data reports the gap instead of hiding it.
+    payload, err = call(tools.get_metric, {"metric": "vo2_max", "days": 30})
+    assert not err
+    assert payload["values"] == []
+    assert payload["days_with_data"] == 0
+    assert payload["days_window"] == 30
+
+
+def test_get_metric_formats_seconds_metrics(seeded):
+    # sleep_seconds must carry the "7h 33m" companion the coach voice speaks —
+    # the model is explicitly forbidden from showing raw seconds.
+    payload, err = call(tools.get_metric, {"metric": "sleep_seconds", "days": 5})
+    assert not err
+    assert payload["values"]
+    for row in payload["values"]:
+        assert row["value_formatted"] == units.format_hm(row["value"])
+        assert row["value_formatted"].endswith("m")
+
+
+def test_get_metric_non_seconds_metric_has_no_formatted_field(seeded):
+    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 5})
+    assert not err
+    assert all("value_formatted" not in row for row in payload["values"])
 
 
 def test_get_metric_unknown(seeded):
@@ -574,6 +606,32 @@ def test_find_anomalies_sd_distance_and_direction(seeded):
         expected = round((row["value"] - row["baseline_mean"]) / row["baseline_sd"], 2)
         assert row["sd_distance"] == expected
         assert row["direction"] in ("above", "below")
+
+
+def test_find_anomalies_sleep_formats_and_rounds(seeded):
+    # sleep_seconds anomalies must carry the "7h 33m" companions the coach
+    # voice speaks, and the raw AVG()/SD baseline floats must be rounded at the
+    # payload boundary (pre-fix they passed through as ~10-digit floats and the
+    # value stayed raw seconds).
+    today = date.today()
+    with db.connect(seeded) as conn:
+        # A clear low-sleep anomaly against a fabricated non-round baseline.
+        conn.execute("UPDATE daily_metrics SET sleep_seconds=? WHERE date=?",
+                     (18000, today.isoformat()))
+        conn.execute(
+            "UPDATE baselines SET sleep_seconds_60day_mean=?, sleep_seconds_60day_sd=? "
+            "WHERE date=?",
+            (26784.333333333, 3600.6666666, today.isoformat()),
+        )
+    payload, err = call(tools.find_anomalies, {"metric": "sleep_seconds", "sd_threshold": 1.0})
+    assert not err
+    assert payload["anomalies"]
+    row = next(r for r in payload["anomalies"] if r["date"] == today.isoformat())
+    assert row["value_formatted"] == units.format_hm(18000)      # "5h 00m"
+    assert row["baseline_formatted"] == units.format_hm(26784.333333333)
+    assert row["baseline_mean"] == 26784.33                       # rounded 2dp
+    assert row["baseline_sd"] == 3600.67
+    assert row["direction"] == "below"
 
 
 def test_training_load_status_tsb_zone_matches_interpret(seeded):
