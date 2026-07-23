@@ -246,17 +246,20 @@ def no_saved_notes(monkeypatch):
     monkeypatch.setattr(notes_mod, "render_for_prompt", lambda *a, **k: "")
 
 
-def _voice_surfaces(name: str, notes: str | None = None):
+def _voice_surfaces(name: str, notes: str | None = None,
+                    memory: str | None = None):
     """(profile, [(label, system_prompt_text)]) for every voice-bearing surface."""
     p = coach.load_profile(name)
     return p, [
-        ("system_prompt", prompts.system_prompt("Alex", p)),
-        ("brief_v2_system_prompt", prompts.brief_v2_system_prompt("Alex", p)),
+        ("system_prompt", prompts.system_prompt("Alex", p, memory)),
+        ("brief_v2_system_prompt",
+         prompts.brief_v2_system_prompt("Alex", p, memory)),
         ("plan_coach", plan_coach.build_prompt(
             p, _TODAY, _WEEK, 75, 71, "10k",
-            notes_text=notes, user_name="Alex")[0]),
+            notes_text=notes, user_name="Alex", memory_text=memory)[0]),
         ("workout_coach", workout_coach.build_prompt(
-            p, _CARD, notes_text=notes, user_name="Alex")[0]),
+            p, _CARD, notes_text=notes, user_name="Alex",
+            memory_text=memory)[0]),
     ]
 
 
@@ -350,11 +353,50 @@ def test_user_notes_block_is_empty_without_notes():
     assert prompts.user_notes_block("Alex", "") == ""
 
 
+# --- coach memory on the voice surfaces (0.30.0) ----------------------------
+
+_MEMORY = "- Plan: 3 missed sessions in the last 14 days (last: Jul 19 interval)."
+
+
+def test_every_voice_surface_carries_supplied_memory(no_saved_notes):
+    """All four surfaces must inject the memory block when memory text is
+    supplied — a surface that drops it silently loses every callback."""
+    _p, surfaces = _voice_surfaces("hardass", memory=_MEMORY)
+    for label, text in surfaces:
+        assert _MEMORY in text, f"{label} dropped the supplied memory"
+        assert "What you remember about Alex" in text, (
+            f"{label} mislabels the memory section")
+
+
+def test_no_memory_means_no_memory_section(no_saved_notes):
+    """Empty memory (disabled, fresh DB) must remove the SECTION, not render
+    an empty header — an empty 'what you remember' invites invention."""
+    _p, surfaces = _voice_surfaces("hardass", memory=None)
+    for label, text in surfaces:
+        assert "What you remember" not in text, (
+            f"{label} renders a memory header with no memory")
+
+
+def test_memory_block_carries_the_grounding_contract():
+    """The header must forbid invented callbacks — that sentence is the whole
+    safety story for handing the model a 'memory'."""
+    full = prompts.coach_memory_block("Alex", _MEMORY)
+    compact = prompts.coach_memory_block("Alex", _MEMORY, compact=True)
+    for block in (full, compact):
+        assert _MEMORY in block
+        assert "NEVER" in block
+    assert len(compact) < len(full)
+    assert prompts.coach_memory_block("Alex", None) == ""
+    assert prompts.coach_memory_block("Alex", "") == ""
+
+
 # --- source guard: no personal name in executable prompt text ---------------
 
 _PROMPT_MODULES = (
     "agent/prompts.py", "agent/plan_coach.py", "agent/workout_coach.py",
     "agent/brief_planner.py", "agent/briefing.py",
+    "agent/ledger.py", "agent/journal.py", "agent/memory.py",
+    "agent/reflect.py",
 )
 _SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "local_fitness"
 

@@ -330,6 +330,34 @@ These are settled — don't redesign without a reason.
   `slope_direction`, etc.) to their payloads instead of leaving the model to
   apply a static legend string by hand. The rule holds project-wide: the LLM
   phrases a judgment, it never derives one that tested Python can compute.
+- **The coach has a two-layer memory on every voice surface** (0.30.0). Layer 1
+  is the deterministic relationship ledger (`agent/ledger.py`, pure +
+  persistence divider like `plans.py`): adherence miss/done streaks (reusing
+  `plans.build_plan_detail`'s verdicts — never re-grading), step-goal streaks
+  computed **as-of-yesterday** (today's partial count must never flip the block
+  intra-day — that stability is what keeps the prompt-hash caches valid),
+  observation repeat-patterns, and notable results. Layer 2 is the coach's own
+  journal (`agent/journal.py`, `coach_journal` table — 60-entry cap pruned on
+  write, 240-char lines, partial unique index on `(source, source_key, seq)`).
+  `agent/memory.py` is the ONE resolver; `prompts.coach_memory_block` is the
+  pure injection block whose header carries the grounding contract (callbacks
+  may cite only listed facts; empty section → no callbacks). **Memory is
+  passed INTO the four voice surfaces as `memory_text`, never resolved inside
+  the builders** — the PDF coaches key disk caches on the prompt hash, and
+  `prompts.py` builds `SYSTEM_PROMPT` at import (an internal DB read would
+  open the DB on `import prompts`). The compact V2 variant is hard-capped at
+  `memory.COMPACT_MAX_CHARS` (600) so V2 stays the shrunk prompt. Writes:
+  `agent/reflect.py` auto-reflects after each **saved** brief
+  (`generate_and_save` tail — post-persistence, fail-silent, +~10s on the
+  launchd job) and each **first-render** report card (fire-and-forget task;
+  `journal.has_event` pre-check + the unique index + `exclude_source_key`
+  filtering make it idempotent and cache-cascade-proof: a card's own journal
+  entries are excluded from that card's prompt, or reflecting would bust its
+  cache forever). Chat writes via `save_coach_memory`/`list_coach_memories`/
+  `delete_coach_memory` (in `ALL_TOOLS`). `LOCAL_FITNESS_COACH_MEMORY=0` is
+  the kill switch for injection AND reflect; journal data survives it. Memory
+  resolution never runs inside a perf-benchmarked hot path — SDK-call sites
+  only.
 - **Daily brief job needs a Claude credential in `.env`.** The launchd job
   (`com.localfitness.brief` → `fitness brief --if-missing`) couples pull →
   recompute-baselines → generate → save atomically, firing at **06:30 with

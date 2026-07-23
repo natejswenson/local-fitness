@@ -1402,7 +1402,9 @@ async def save_coach_memory(args: dict) -> dict:
 )
 async def list_coach_memories(args: dict) -> dict:
     days = args.get("days")
-    limit = args.get("limit") or 50
+    limit = args.get("limit")
+    if limit is None:
+        limit = 50
     if days is not None and (not isinstance(days, int) or days <= 0):
         return _err("days must be a positive integer")
     if not isinstance(limit, int) or limit <= 0:
