@@ -14,6 +14,7 @@ Design: ``docs/plans/2026-06-16-fitness-mcp-server-design.md``.
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date
 from typing import Any
@@ -31,6 +32,8 @@ from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
 from ..agent.schemas import Brief
 from ..agent.status import assemble_status
+
+_LOG = logging.getLogger(__name__)
 
 # MCP resource URIs. The schema doc and the latest brief are the two read-only
 # resources advertised to clients; the coach prompt is the one slash-command.
@@ -399,7 +402,18 @@ def _install_coach_persona(instance: Server) -> None:
                 _user_name(), coach.resolve_coach_profile()
             )
         except Exception:
-            instance.instructions = None  # fail-open: never break the handshake
+            # Fail-open: never break the handshake. But a persistent failure
+            # (corrupt user_notes, a settings-table problem) silently strips
+            # the ENTIRE rendering contract — lead-with-answer, table shape,
+            # miles, the coach voice — from every future session, and without a
+            # log there's no signal pointing at why. Sibling fail-open paths
+            # (notes.py, branding.py) all log; this one didn't. Synchronous log
+            # only — the RACE-FREE note above forbids an await here.
+            _LOG.warning(
+                "coach persona resolution failed; serving no MCP instructions",
+                exc_info=True,
+            )
+            instance.instructions = None
         return _orig(*args, **kwargs)
 
     instance.create_initialization_options = _with_coach_persona
