@@ -91,15 +91,17 @@ def _as_profile_name(s) -> str:
 
 
 def coach_profile(db_path=None, conn: sqlite3.Connection | None = None) -> str:
-    """Selected coach tone profile name (DB > env > default 'adaptive'). The
-    returned name is whitelisted downstream by coach.load_profile.
+    """Selected coach tone profile name (DB > env > default 'hardass'). The
+    returned name is whitelisted downstream by coach.load_profile. The default
+    literal must equal coach.DEFAULT_PROFILE — config can't import coach
+    (cycle), so tests/test_config.py pins the pair together.
 
     Accepts an already-open ``conn`` (threaded through to ``_resolve``, the
     function that actually reads the DB) to let hot-path callers share one
     connection instead of opening a fresh one per lookup; behavior is
     unchanged when omitted."""
     return _resolve("coach_profile", "LOCAL_FITNESS_COACH_PROFILE",
-                    "adaptive", _as_profile_name, db_path, conn=conn)
+                    "hardass", _as_profile_name, db_path, conn=conn)
 
 
 def _as_user_name(s) -> str:

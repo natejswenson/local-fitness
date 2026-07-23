@@ -23,12 +23,18 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .. import config, db
+from . import personality
 
 _PROFILE_DIR = Path(__file__).resolve().parent / "coach_profiles"
 
-#: valid profile names (also the shipped files). Unknown → adaptive.
+#: valid profile names (also the shipped files). Unknown → the default.
 PROFILE_NAMES = frozenset({"adaptive", "supportive", "neutral", "hardass"})
-DEFAULT_PROFILE = "adaptive"
+#: hardass since 0.31.0 — the accountability-mirror coach IS the product's
+#: identity; a fresh clone gets it out of the box. The other profiles stay one
+#: `fitness config set coach_profile <name>` away. config.coach_profile()'s
+#: default literal must match (config can't import coach — cycle — so
+#: tests/test_config.py cross-checks the two).
+DEFAULT_PROFILE = "hardass"
 
 # Dial bounds (clamp on resolve; out-of-range → the profile's own value).
 _DIAL_MIN, _DIAL_MAX = 0, 10
@@ -51,6 +57,19 @@ class CoachProfile:
     roast_threshold: float
     praise_threshold: float
     persona: str  # the .md body — the tone/voice bullets
+    #: The conversationally-tuned personality spec, when one is stored for
+    #: this profile (resolve_coach_profile attaches it; load_profile leaves it
+    #: None). A frozen-dataclass default, so every existing constructor call
+    #: and test is untouched.
+    spec: personality.PersonalitySpec | None = None
+
+    @property
+    def effective_persona(self) -> str:
+        """What the voice surfaces actually speak with: the tuned spec when
+        present, else the profile file's prose."""
+        if self.spec is not None:
+            return personality.render_spec_persona(self.spec)
+        return self.persona
 
     @property
     def includes_harsh_block(self) -> bool:
@@ -169,6 +188,14 @@ def resolve_coach_profile(
     base = load_profile(name)
     settings = db.all_settings(db_path=db_path, conn=conn)
 
+    # The tuned personality spec rides the settings dict already fetched —
+    # zero added reads. A spec seeded from a DIFFERENT profile is ignored but
+    # retained (switch back and the tuning returns); get_coach_personality
+    # surfaces the mismatch so the agent can offer a reset.
+    spec = personality.parse_spec(settings.get(personality.SPEC_KEY))
+    if spec is not None and spec.base_profile != base.name:
+        spec = None
+
     def _dial(key, default):
         v = config._resolve_from(settings, f"coach_{key}", f"LOCAL_FITNESS_COACH_{key.upper()}", default, int)
         return v if _DIAL_MIN <= v <= _DIAL_MAX else default
@@ -185,4 +212,5 @@ def resolve_coach_profile(
         roast_threshold=_thresh("roast_threshold", base.roast_threshold),
         praise_threshold=_thresh("praise_threshold", base.praise_threshold),
         persona=base.persona,
+        spec=spec,
     )
