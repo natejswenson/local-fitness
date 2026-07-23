@@ -71,6 +71,18 @@ def _client(mfa_callback: Callable[[], str] | None = None) -> Garmin:
     return client
 
 
+class DayIngestFailure(Exception):
+    """Every core endpoint failed for a day, so no row was written.
+
+    Raised by ``_ingest_day`` when both ``get_user_summary`` and
+    ``get_sleep_data`` return None. Writing an all-NULL row would mark the gap
+    permanently filled (``missing_daily_dates`` checks row existence only) and
+    let ``pull()`` report ``success`` on a day it saved nothing. Raising instead
+    routes the day into ``days_failed`` and leaves the date missing so a later
+    pull retries it.
+    """
+
+
 def _safe(call: Callable, *args, **kwargs) -> Any:
     try:
         return call(*args, **kwargs)
@@ -100,8 +112,15 @@ def _to_real(v: Any) -> float | None:
 def _ingest_day(client: Garmin, conn, cdate: date) -> None:
     cdate_str = cdate.isoformat()
 
-    summary = _safe(client.get_user_summary, cdate_str) or {}
-    sleep = _safe(client.get_sleep_data, cdate_str) or {}
+    summary_raw = _safe(client.get_user_summary, cdate_str)
+    sleep_raw = _safe(client.get_sleep_data, cdate_str)
+    if summary_raw is None and sleep_raw is None:
+        # Both core endpoints failed (outage / transient 5xx / a swallowed
+        # non-auth error). Don't write an all-NULL row — raise so the day lands
+        # in days_failed and stays missing for a later retry.
+        raise DayIngestFailure(f"all core endpoints failed for {cdate_str}")
+    summary = summary_raw or {}
+    sleep = sleep_raw or {}
     sleep_dto = sleep.get("dailySleepDTO", {}) if isinstance(sleep, dict) else {}
     sleep_scores = sleep_dto.get("sleepScores") if isinstance(sleep_dto, dict) else {}
     overall = (sleep_scores or {}).get("overall") if isinstance(sleep_scores, dict) else {}
@@ -146,8 +165,19 @@ def _ingest_day(client: Garmin, conn, cdate: date) -> None:
 
     cols = ", ".join(daily.keys())
     placeholders = ", ".join(f":{k}" for k in daily.keys())
+    # Preserve existing non-NULL values instead of a blind INSERT OR REPLACE: the
+    # freshness window re-pulls the last few days even when a row exists, so a
+    # transient outage that returned NULL for one endpoint would otherwise wipe a
+    # finalized column (sleep/steps/RHR) and silently thin the 60-day baselines
+    # (AVG skips NULLs). COALESCE(new, old) keeps the freshest non-NULL value;
+    # day-end finalized totals are non-NULL, so the freshness re-fetch still wins.
+    update_cols = [k for k in daily.keys() if k != "date"]
+    set_clause = ", ".join(
+        f"{k} = COALESCE(excluded.{k}, daily_metrics.{k})" for k in update_cols
+    )
     conn.execute(
-        f"INSERT OR REPLACE INTO daily_metrics ({cols}) VALUES ({placeholders})",
+        f"INSERT INTO daily_metrics ({cols}) VALUES ({placeholders}) "
+        f"ON CONFLICT(date) DO UPDATE SET {set_clause}",
         daily,
     )
 

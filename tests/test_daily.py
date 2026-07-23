@@ -256,11 +256,40 @@ def test_ingest_day_full_transform(seeded_db):
     assert stress_n == 2
 
 
-def test_ingest_day_missing_endpoints_no_crash(seeded_db):
-    """Every get_* returns None → row still written, all-NULL, no exception."""
+def test_ingest_day_all_core_endpoints_fail_raises_and_writes_no_row(seeded_db):
+    """Both core endpoints None → raise DayIngestFailure, write NO row.
+
+    An all-NULL row would mark the gap permanently filled and let pull() report
+    success on a day it saved nothing.
+    """
     d = date(2026, 6, 21)
     fake = FakeGarmin(
         summary=None,
+        sleep=None,
+        body_battery=None,
+        max_metrics=None,
+        stress=None,
+    )
+    with db.connect(seeded_db) as conn:
+        with pytest.raises(daily.DayIngestFailure):
+            daily._ingest_day(fake, conn, d)
+
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT * FROM daily_metrics WHERE date = ?", (d.isoformat(),)
+        ).fetchone()
+    assert row is None  # the date is left missing so a later pull retries it
+
+
+def test_ingest_day_partial_endpoints_still_write(seeded_db):
+    """Summary succeeds but the rest fail → row IS written with what arrived.
+
+    Only when EVERY core endpoint fails do we skip the write; a single working
+    endpoint keeps the day best-effort.
+    """
+    d = date(2026, 6, 21)
+    fake = FakeGarmin(
+        summary={"restingHeartRate": 48, "totalSteps": 5000},
         sleep=None,
         body_battery=None,
         max_metrics=None,
@@ -274,10 +303,32 @@ def test_ingest_day_missing_endpoints_no_crash(seeded_db):
             "SELECT * FROM daily_metrics WHERE date = ?", (d.isoformat(),)
         ).fetchone()
     assert row is not None
-    assert row["rhr"] is None
-    assert row["sleep_seconds"] is None
-    assert row["body_battery_min"] is None
-    assert row["vo2_max"] is None
+    assert row["rhr"] == 48
+    assert row["steps"] == 5000
+    assert row["sleep_seconds"] is None  # sleep endpoint failed
+
+
+def test_ingest_day_coalesce_never_clobbers_finalized_values(seeded_db):
+    """A freshness re-pull with a failed endpoint must not wipe a good column.
+
+    Seed a full row, then re-ingest the same date with sleep fetch failing
+    (summary still works). The finalized sleep values must survive.
+    """
+    d = date(2026, 6, 22)
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(FakeGarmin(), conn, d)  # full row, sleep_seconds=27000
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(
+            FakeGarmin(summary={"restingHeartRate": 55}, sleep=None), conn, d
+        )
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT rhr, sleep_seconds, sleep_score FROM daily_metrics WHERE date = ?",
+            (d.isoformat(),),
+        ).fetchone()
+    assert row["rhr"] == 55  # fresh non-NULL value wins
+    assert row["sleep_seconds"] == 27000  # NOT clobbered to NULL by the failed fetch
+    assert row["sleep_score"] == 82
 
 
 def test_ingest_day_insert_or_replace_overwrites(seeded_db):
@@ -437,6 +488,35 @@ def test_pull_partial_when_a_day_fails(seeded_db, monkeypatch):
     assert "failed" in res["error"]
     run = _latest_run(seeded_db)
     assert run["status"] == "partial"
+
+
+def test_pull_all_endpoints_fail_never_reports_success(seeded_db, monkeypatch):
+    """A run where every day's core endpoints fail must not report success.
+
+    Before the fix, each day wrote an all-NULL row, missing_daily_dates saw the
+    rows → gap_after=0, days_failed stayed empty → status='success' on a pull
+    that saved nothing. Now the days land in days_failed, no rows are written,
+    and the dates stay missing.
+    """
+    today = date(2026, 6, 25)
+    monkeypatch.setattr(daily, "EARLIEST_BACKFILL_DATE", today - timedelta(days=2))
+    fake = FakeGarmin(
+        summary=None, sleep=None, body_battery=None, max_metrics=None,
+        stress=None, activities=[],
+    )
+    monkeypatch.setattr(daily, "_client", lambda *a, **k: fake)
+
+    res = daily.pull(through=today)
+
+    assert res["status"] != "success"
+    assert res["status"] == "partial"
+    assert res["days_pulled"] == 0  # nothing saved
+    assert res["gap_days_remaining"] == 3  # all three dates still missing
+    assert "failed" in res["error"]
+    # No rows written for any of the failed dates.
+    with db.connect(seeded_db) as conn:
+        n = conn.execute("SELECT COUNT(*) AS n FROM daily_metrics").fetchone()["n"]
+    assert n == 0
 
 
 def test_pull_force_from_targets_full_range(seeded_db, monkeypatch):
