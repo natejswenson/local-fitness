@@ -47,7 +47,9 @@ def test_tool_schemas_well_formed():
     # +plan_chart (round-2 facet review: two-series scheduled-vs-actual)
     # +save/list/delete_coach_memory (0.30.0 coach-memory journal tools)
     # +get/update_coach_personality (0.31.0 tunable personality spec)
-    assert len(agent_tools.ALL_TOOLS) == 40
+    # +list_report_cards/get_report_card (0.32.0 persisted card snapshots —
+    # shared surface: pure JSON, no filesystem path)
+    assert len(agent_tools.ALL_TOOLS) == 42
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

@@ -3529,3 +3529,208 @@ def test_update_coach_personality_spec_size_cap(seeded):
     _payload, err = call(tools.update_coach_personality,
                          {"identity": "x" * 4001})
     assert err  # identity over its own cap is rejected before storage
+
+
+# --- report-card persistence: fast path + query tools ------------------------
+
+_RC_READ_TEXT = (
+    "DISTANCE: covered the ground today.\n"
+    "PACE: quick stuff throughout.\n"
+    "HEART RATE: low and easy the whole way.\n"
+    "TRAINING LOAD: banked plenty for the week."
+)
+
+
+@pytest.fixture
+def rc_cards(rc_seeded, tmp_path, monkeypatch):
+    """rc_seeded plus tmp user-notes, so notes edits in tests never touch the
+    repo's real data/user_notes.md."""
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    return rc_seeded
+
+
+def _patch_generate(monkeypatch, text=_RC_READ_TEXT):
+    calls = {"n": 0}
+
+    async def _gen(profile, card, **kwargs):
+        calls["n"] += 1
+        return text
+
+    monkeypatch.setattr(tools.workout_coach, "generate_read", _gen)
+    return calls
+
+
+def _patch_generate_raises(monkeypatch, message="stream died"):
+    async def _gen(profile, card, **kwargs):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(tools.workout_coach, "generate_read", _gen)
+
+
+def _rc_raw_row(activity_id=1):
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM report_cards WHERE activity_id = ?",
+            (activity_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def test_report_card_render_persists_a_real_read_snapshot(
+        rc_cards, reports_tmp, monkeypatch):
+    _patch_generate(monkeypatch)
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    row = _rc_raw_row(1)
+    assert row is not None
+    assert row["read_cache_key"] is not None
+    assert row["overall_grade"] == payload["overall"]["grade"]
+    assert row["distance_grade"] == payload["grades"]["distance"]
+    stored = json.loads(row["card_json"])
+    assert stored["coach_read"]["distance"] == "covered the ground today."
+
+
+def test_report_card_fast_path_skips_generation_and_keeps_the_row(
+        rc_cards, reports_tmp, monkeypatch):
+    """Second render: the stored card serves the read (no SDK call even with
+    the single-entry file cache gone) and the row stays byte-identical —
+    the keyed no-op end to end."""
+    calls = _patch_generate(monkeypatch)
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err and calls["n"] == 1
+    before = _rc_raw_row(1)
+    # Remove the single-entry file cache so ONLY the store can avoid a call.
+    (db.DEFAULT_DB_PATH.parent / "workout_coach_cache.json").unlink()
+
+    async def _must_not_generate(profile, card, **kwargs):
+        raise AssertionError("fast path should have reused the stored read")
+
+    monkeypatch.setattr(tools.workout_coach, "generate_read", _must_not_generate)
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    # The stored read, not the fallback template, made it onto the card.
+    assert "covered the ground today." in payload["markdown"]
+    assert _rc_raw_row(1) == before
+
+
+def test_report_card_first_fallback_persists_with_a_null_key(
+        rc_cards, reports_tmp, monkeypatch):
+    _patch_generate_raises(monkeypatch)
+    payload, err = call(tools.workout_report_card, {
+        "activity_id": 105, "format": "table"})
+    assert not err
+    row = _rc_raw_row(105)
+    assert row is not None
+    assert row["read_cache_key"] is None
+
+
+def test_report_card_fallback_render_never_clobbers_the_stored_real_read(
+        rc_cards, reports_tmp, monkeypatch, tmp_path):
+    _patch_generate(monkeypatch)
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    before = _rc_raw_row(1)
+    assert before["read_cache_key"] is not None
+    # A notes edit changes the prompt key, so the fast path misses; the
+    # generation then fails — the documented transient stream death.
+    (tmp_path / "user_notes.md").write_text("- go easier on me\n")
+    (db.DEFAULT_DB_PATH.parent / "workout_coach_cache.json").unlink()
+    _patch_generate_raises(monkeypatch)
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    # This render showed the template, but the stored snapshot kept the
+    # coach's real words AND that render's grades — whole-row no-op.
+    assert "covered the ground today." not in payload["markdown"]
+    assert _rc_raw_row(1) == before
+
+
+def test_report_card_new_real_read_overwrites_the_whole_row(
+        rc_cards, reports_tmp, monkeypatch, tmp_path):
+    _patch_generate(monkeypatch)
+    call(tools.workout_report_card, {"format": "table"})
+    before = _rc_raw_row(1)
+    (tmp_path / "user_notes.md").write_text("- new coaching note\n")
+    (db.DEFAULT_DB_PATH.parent / "workout_coach_cache.json").unlink()
+    _patch_generate(monkeypatch, text=_RC_READ_TEXT.replace(
+        "covered the ground today.", "a whole new verdict."))
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    after = _rc_raw_row(1)
+    assert after["read_cache_key"] != before["read_cache_key"]
+    assert "a whole new verdict." in json.dumps(after["card_json"])
+
+
+def test_report_card_save_failure_never_fails_the_render(
+        rc_cards, reports_tmp, monkeypatch):
+    """save_card's never-raises contract, exercised through the call site:
+    a broken write drops the row, never the card."""
+    _patch_generate(monkeypatch)
+    monkeypatch.setattr(
+        tools.card_store, "_UPSERT_SQL", "INSERT INTO no_such_table VALUES (1)")
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert payload["markdown"].startswith("# Report Card")
+    assert _rc_raw_row(1) is None
+
+
+def test_list_report_cards_empty_and_bad_args(seeded):
+    payload, err = call(tools.list_report_cards, {})
+    assert not err
+    assert payload == {"cards": [], "count": 0}
+    payload, err = call(tools.list_report_cards, {"start_date": "07-01-2026"})
+    assert err and "malformed start_date" in payload["error"]
+    payload, err = call(tools.list_report_cards, {"intent_class": "tempo"})
+    assert err
+    assert payload["allowed"] == ["easy", "long", "quality", "steady"]
+    payload, err = call(tools.list_report_cards, {"limit": 0})
+    assert err and "limit" in payload["error"]
+
+
+def test_list_report_cards_payload_filters_and_order(rc_cards, reports_tmp, monkeypatch):
+    _patch_generate(monkeypatch)
+    for activity_id in (103, 105):
+        payload, err = call(tools.workout_report_card, {
+            "activity_id": activity_id, "format": "table"})
+        assert not err
+        (db.DEFAULT_DB_PATH.parent / "workout_coach_cache.json").unlink()
+    payload, err = call(tools.list_report_cards, {})
+    assert not err
+    assert payload["count"] == 2
+    # activity 103 is 3 days ago, 105 is 5 days ago — newest run first.
+    assert [c["activity_id"] for c in payload["cards"]] == [103, 105]
+    top = payload["cards"][0]
+    assert set(top["grades"]) == {"distance", "pace", "hr", "load"}
+    assert top["overall"] is not None and top["graded_at"]
+    # The date filter pins actual rows, not just a count.
+    cutoff = (date.today() - timedelta(days=4)).isoformat()
+    payload, err = call(tools.list_report_cards, {"start_date": cutoff})
+    assert [c["activity_id"] for c in payload["cards"]] == [103]
+
+
+def test_get_report_card_missing_row_points_at_a_local_session(seeded):
+    payload, err = call(tools.get_report_card, {"activity_id": 42})
+    assert err
+    assert "local session" in payload["error"]
+    payload, err = call(tools.get_report_card, {})
+    assert err and "activity_id is required" in payload["error"]
+
+
+def test_get_report_card_returns_the_stored_snapshot_verbatim(
+        rc_cards, reports_tmp, monkeypatch):
+    _patch_generate(monkeypatch)
+    rendered, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    payload, err = call(tools.get_report_card, {"activity_id": 1})
+    assert not err
+    assert payload["activity_id"] == 1
+    assert payload["date"] == date.today().isoformat()
+    assert payload["graded_at"]
+    assert payload["markdown"].startswith("# Report Card")
+    assert payload["coach_read"]["distance"] == "covered the ground today."
+    assert payload["card"]["overall"]["grade"] == rendered["overall"]["grade"]
+
+
+def test_card_query_tools_are_shared_not_local_only():
+    all_names = {t.name for t in tools.ALL_TOOLS}
+    local_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
+    assert {"list_report_cards", "get_report_card"} <= all_names
+    assert not {"list_report_cards", "get_report_card"} & local_names
