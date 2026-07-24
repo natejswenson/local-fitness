@@ -34,8 +34,8 @@ from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
 from . import (
-    briefs, charts, coach, interpret, journal, memory, personality, plan_coach,
-    reflect, report_card, units, workout_coach,
+    briefs, card_store, charts, coach, interpret, journal, memory, personality,
+    plan_coach, reflect, report_card, units, workout_coach,
 )
 from .schemas import Brief
 
@@ -3197,22 +3197,45 @@ async def workout_report_card(args: dict) -> dict:
     # the card, since every grade in it was already computed in Python.
     profile = coach.resolve_coach_profile()
     _activity_key = str(inputs["activity"]["activity_id"])
-    try:
-        card["coach_read"] = await workout_coach.generate_read_cached(
-            profile, card, notes_text=notes.render_for_prompt(),
-            user_name=config.user_name(),
-            # THIS card's own journal entries are excluded: without that,
-            # reflecting on the card would change its next prompt, bust the
-            # read cache, and regenerate on every render forever.
-            memory_text=memory.render_memory_for_prompt(
-                exclude_source_key=("report_card", _activity_key),
-                user_name=config.user_name(),
-            ))
-    except Exception:
-        LOG.warning(
-            "workout read generation failed for activity %s, using fallback",
-            inputs["activity"]["activity_id"], exc_info=True)
-        card["coach_read"] = workout_coach.fallback_read(card)
+    _user_name = config.user_name()
+    # Resolved ONCE into locals and threaded byte-identically into both the
+    # key and the generator — any drift and the fast-path key never matches.
+    _notes_text = notes.render_for_prompt()
+    # THIS card's own journal entries are excluded: without that, reflecting
+    # on the card would change its next prompt, bust the read cache, and
+    # regenerate on every render forever.
+    _memory_text = memory.render_memory_for_prompt(
+        exclude_source_key=("report_card", _activity_key),
+        user_name=_user_name,
+    )
+    # Fast path: the stored card doubles as a per-activity read cache. On a
+    # key match the stored parsed read is reused as-is — no SDK call — and
+    # read_key stays non-NULL so save_card's guarded UPSERT sees an equal key
+    # and no-ops (the row stays byte-identical; this render's recomputed
+    # grades never land under the stored render's words).
+    read_key: str | None = workout_coach.read_cache_key(
+        profile, card, notes_text=_notes_text, user_name=_user_name,
+        memory_text=_memory_text)
+    _stored = card_store.load_read(inputs["activity"]["activity_id"])
+    if (_stored and _stored[0] == read_key
+            and card_store.read_is_complete(_stored[1])):
+        card["coach_read"] = _stored[1]
+        LOG.info("workout read reused from the stored card (key match)")
+    else:
+        try:
+            card["coach_read"] = await workout_coach.generate_read_cached(
+                profile, card, notes_text=_notes_text, user_name=_user_name,
+                memory_text=_memory_text)
+        except Exception:
+            LOG.warning(
+                "workout read generation failed for activity %s, using fallback",
+                inputs["activity"]["activity_id"], exc_info=True)
+            card["coach_read"] = workout_coach.fallback_read(card)
+            # Fallback-ness is known ONLY from this except branch — the
+            # template and a real read are structurally identical dicts. A
+            # NULL key means "not the coach's voice": never reused by the
+            # fast path, never allowed to overwrite a real-read row.
+            read_key = None
 
     # Auto-reflect (fire-and-forget): the coach may write this session into
     # its journal. has_event makes the common case — re-rendering a card —
@@ -3224,6 +3247,13 @@ async def workout_report_card(args: dict) -> dict:
         _task = asyncio.create_task(reflect.reflect_after_report_card(card))
         _REFLECT_TASKS.add(_task)
         _task.add_done_callback(_REFLECT_TASKS.discard)
+
+    # Persist the card as a dated snapshot (both formats). save_card never
+    # raises, and key identity decides the write: an equal-key render is a
+    # byte-identical no-op, a fallback never overwrites a real-read row.
+    # to_thread keeps its busy_timeout wait off the event loop, mirroring the
+    # PDF renders below.
+    await asyncio.to_thread(card_store.save_card, card, read_cache_key=read_key)
     payload = {
         "markdown": report_card.render_markdown(card),
         "activity_id": inputs["activity"]["activity_id"],
@@ -3300,6 +3330,131 @@ async def workout_report_card(args: dict) -> dict:
     return _text(payload)
 
 
+# Shared text both card-query tool descriptions carry: the stored card is a
+# dated snapshot, and the honest labeling of what graded_at does (and does
+# not) promise is the load-bearing part — see the 2026-07-23 design doc.
+_CARD_SNAPSHOT_NOTE = (
+    "This is the stored snapshot as graded on graded_at — the most recent "
+    "render whose read differed (a distinct prompt-key render), so graded_at "
+    "can lag more recent renders whose inputs hashed identically. Grades "
+    "reflect the plan active at that render, not a retroactive regrade, and "
+    "a fresh live render may show a slightly different grade."
+)
+
+
+@tool(
+    "list_report_cards",
+    "Past workout report cards (stored snapshots), newest run first. One call "
+    "answers 'how have my quality days trended' — each row carries the "
+    "overall grade, GPA and the four metric grades without re-grading "
+    "anything. Filter by date range and/or intent_class "
+    "(easy|long|quality|steady). Use get_report_card for one card's full "
+    "detail and the coach's read. History accumulates as cards are rendered "
+    "(no backfill), so older activities may have no row. "
+    + _CARD_SNAPSHOT_NOTE,
+    {
+        "type": "object",
+        "properties": {
+            "start_date": {
+                "type": "string",
+                "description": "Earliest workout date, YYYY-MM-DD inclusive.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Latest workout date, YYYY-MM-DD inclusive.",
+            },
+            "intent_class": {
+                "type": "string",
+                "enum": ["easy", "long", "quality", "steady"],
+                "description": "Only cards of this workout class.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max cards returned (default 20).",
+            },
+        },
+        "required": [],
+    },
+)
+async def list_report_cards(args: dict) -> dict:
+    for field in ("start_date", "end_date"):
+        value = args.get(field)
+        if value is not None and not _DATE_RE.match(str(value)):
+            return _err(f"malformed {field} '{value}', expected YYYY-MM-DD")
+    intent_class = args.get("intent_class")
+    if intent_class is not None and intent_class not in card_store.INTENT_CLASSES:
+        return _err(
+            f"unknown intent_class '{intent_class}'",
+            allowed=list(card_store.INTENT_CLASSES))
+    limit = args.get("limit")
+    if limit is None:
+        limit = 20
+    if not isinstance(limit, int) or limit <= 0:
+        return _err("limit must be a positive integer")
+    rows = card_store.list_cards(
+        start_date=args.get("start_date"), end_date=args.get("end_date"),
+        intent_class=intent_class, limit=limit)
+    cards = [
+        {
+            "activity_id": r["activity_id"],
+            "date": r["activity_date"],
+            "graded_at": r["graded_at"],
+            "intent": r["intent"],
+            "intent_class": r["intent_class"],
+            "overall": r["overall_grade"],
+            "gpa": r["gpa"],
+            "capped_by": r["capped_by"],
+            "grades": {
+                "distance": r["distance_grade"],
+                "pace": r["pace_grade"],
+                "hr": r["hr_grade"],
+                "load": r["load_grade"],
+            },
+        }
+        for r in rows
+    ]
+    return _text({"cards": cards, "count": len(cards)})
+
+
+@tool(
+    "get_report_card",
+    "One stored workout report card by activity_id: the full graded snapshot, "
+    "the coach's verbal read from that render, and a preformatted `markdown` "
+    "card (render it to the user VERBATIM — it is already formatted). "
+    + _CARD_SNAPSHOT_NOTE + " Use list_report_cards to find activity_ids.",
+    {"activity_id": int},
+)
+async def get_report_card(args: dict) -> dict:
+    activity_id = args.get("activity_id")
+    if activity_id is None or not isinstance(activity_id, int):
+        return _err("activity_id is required")
+    loaded = card_store.load_card(activity_id)
+    if loaded is None:
+        return _err(
+            f"no stored report card for activity {activity_id} yet — a card "
+            "is stored whenever it is rendered from a local session "
+            "(workout_report_card is stdio-only and cannot be called over "
+            "the network)",
+            activity_id=activity_id)
+    try:
+        markdown = report_card.render_markdown(loaded["card"])
+    except Exception:
+        # A stored snapshot that predates a renderer change must still be
+        # retrievable — the structured card is the data, markdown is sugar.
+        LOG.warning(
+            "stored card for activity %s failed to render markdown",
+            activity_id, exc_info=True)
+        markdown = None
+    return _text({
+        "activity_id": loaded["activity_id"],
+        "date": loaded["activity_date"],
+        "graded_at": loaded["graded_at"],
+        "card": loaded["card"],
+        "markdown": markdown,
+        "coach_read": loaded["card"].get("coach_read"),
+    })
+
+
 ALL_TOOLS = [
     get_today_status,
     get_brief_context,
@@ -3341,6 +3496,8 @@ ALL_TOOLS = [
     get_training_plan_progress,
     save_brief,
     generate_chart,
+    list_report_cards,
+    get_report_card,
 ]
 
 # Registered ONLY here, never merged into ALL_TOOLS — wired into run_stdio()

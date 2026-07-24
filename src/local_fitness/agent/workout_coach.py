@@ -507,6 +507,43 @@ def _write_cache(path: Path, key: str, text: str) -> None:
         _LOG.warning("workout_coach cache write failed (ignored)", exc_info=True)
 
 
+def read_cache_key(
+    profile: CoachProfile,
+    card: dict,
+    *,
+    model: str | None = None,
+    notes_text: str | None = None,
+    user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
+) -> str:
+    """The read's cache key — the ONE key definition, shared by
+    ``generate_read_cached``'s file cache and ``card_store``'s persisted rows.
+
+    Pure: ``build_prompt`` is pure, so the key is a function of the card,
+    voice, notes and memory alone. The byte layout is load-bearing —
+    ``sha256("\\x00".join([system_prompt, user_prompt, model or "default",
+    str(activity_id)]))``, with the literal ``"default"`` (NOT
+    ``DEFAULT_MODEL``) when ``model`` is None — because a stored row's key
+    must hash identically to the file cache's or the fast path silently
+    never fires.
+
+    activity_id is part of the key even though it is deliberately absent from
+    the prompt (a bare row id is noise to the model). Without it, two
+    sessions on the same day with the same name and the same grades — a
+    double day, which the tool already handles via other_activities_on_date —
+    hash identically, and the second card silently serves the first's read.
+    """
+    system_prompt, user_prompt = build_prompt(
+        profile, card, notes_text=notes_text, user_name=user_name,
+        memory_text=memory_text)
+    return hashlib.sha256(
+        "\x00".join([
+            system_prompt, user_prompt, model or "default",
+            str((card.get("activity") or {}).get("activity_id", "")),
+        ]).encode("utf-8")
+    ).hexdigest()
+
+
 async def generate_read_cached(
     profile: CoachProfile,
     card: dict,
@@ -532,20 +569,9 @@ async def generate_read_cached(
     activities re-generates each time, which is the accepted cost of not
     building a cache manager for a personal tool.
     """
-    system_prompt, user_prompt = build_prompt(
-        profile, card, notes_text=notes_text, user_name=user_name,
-        memory_text=memory_text)
-    # activity_id is part of the key even though it is deliberately absent from
-    # the prompt (a bare row id is noise to the model). Without it, two
-    # sessions on the same day with the same name and the same grades — a
-    # double day, which the tool already handles via other_activities_on_date —
-    # hash identically, and the second card silently serves the first's read.
-    key = hashlib.sha256(
-        "\x00".join([
-            system_prompt, user_prompt, model or "default",
-            str((card.get("activity") or {}).get("activity_id", "")),
-        ]).encode("utf-8")
-    ).hexdigest()
+    key = read_cache_key(
+        profile, card, model=model, notes_text=notes_text,
+        user_name=user_name, memory_text=memory_text)
     path = cache_path or _cache_path()
     cached = _read_cache(path, key)
     if cached is not None:
@@ -637,6 +663,6 @@ def fallback_read(card: dict) -> dict[str, str]:
 
 __all__ = [
     "build_prompt", "generate_read", "generate_read_cached", "fallback_read",
-    "parse_read", "reference_summary", "READ_SECTIONS",
+    "parse_read", "read_cache_key", "reference_summary", "READ_SECTIONS",
     "DEFAULT_MODEL", "DEFAULT_EFFORT", "DEFAULT_TIMEOUT_S",
 ]

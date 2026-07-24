@@ -234,6 +234,25 @@ CREATE INDEX IF NOT EXISTS idx_plan_workouts_date ON plan_workouts(date);
 -- two rows.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_workouts_day
     ON plan_workouts(plan_id, date, seq);
+
+CREATE TABLE IF NOT EXISTS report_cards (
+    activity_id     INTEGER PRIMARY KEY,   -- one row = latest stored card per activity
+    activity_date   TEXT NOT NULL,         -- ISO date of the workout
+    graded_at       TEXT NOT NULL,         -- ISO timestamp of the stored render
+    intent          TEXT,
+    intent_class    TEXT,                  -- easy | long | quality | steady
+    intent_source   TEXT,                  -- 'plan' | 'inferred'
+    overall_grade   TEXT,
+    gpa             REAL,
+    capped_by       TEXT,
+    distance_grade  TEXT,
+    pace_grade      TEXT,
+    hr_grade        TEXT,
+    load_grade      TEXT,
+    read_cache_key  TEXT,                  -- prompt key of the stored read; NULL = template fallback
+    card_json       TEXT NOT NULL          -- full card snapshot incl. coach_read
+);
+CREATE INDEX IF NOT EXISTS idx_report_cards_date ON report_cards(activity_date);
 """
 
 

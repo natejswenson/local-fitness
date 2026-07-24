@@ -686,6 +686,33 @@ These are settled — don't redesign without a reason.
     a prescribed 10:28 easy run executed at 9:28 scored a B-, letting the card
     print an overall A for a run its own read called "you never ran easy at
     all". The card must never contradict its own coaching line.
+- **Report cards persist as dated snapshots — the coach's durable card
+  memory** (0.32.0). Every `workout_report_card` render saves the full card
+  (grades + the coach's read) to the `report_cards` table via
+  `agent/card_store.py` (journal-style pure/persistence split). The stored
+  row is **the card as actually shown, graded against the plan active at
+  that render** — grades drift with the active plan, so this is a historical
+  record, never a live view, and there is **no backfill** (history
+  accumulates as cards render). The save is fail-silent through **one atomic
+  guarded UPSERT keyed on the read's prompt key** (`busy_timeout=5000`,
+  awaited via `asyncio.to_thread`): an **equal-key render is a byte-identical
+  no-op** — so `graded_at` dates the most recent *distinct-key* render, and
+  the letter a query tool shows can lag a fresh live render by within-bucket
+  grade drift (labeled, not silent) — and a template-fallback render never
+  overwrites a real-read row (a stored card's words and grades always come
+  from ONE render; no splicing path exists). The stored read doubles as a
+  **per-activity read cache**: `workout_coach.read_cache_key` is the single
+  key definition, and a re-render whose prompt key matches the stored row
+  reuses the read with no SDK call. Query surface: `list_report_cards` +
+  `get_report_card` in `ALL_TOOLS` (pure JSON → reachable over stdio AND
+  `/mcp/`; `workout_report_card` itself stays stdio-only). Two load-bearing
+  assumptions: **no delete/prune path exists** (`load_read` reads outside
+  the UPSERT's guard — a pruning tool would open a corrupting window; don't
+  add one without revisiting the fast path), and **stored cards are never
+  injected into `render_memory_for_prompt`** (would bust the prompt-hash
+  caches and re-open the self-render cascade `exclude_source_key` guards
+  against — a v2 injection needs a parallel exclusion first). Design:
+  `docs/plans/2026-07-23-report-card-persistence-design.md`.
 - **Per-sample HR traces are fetched on demand, never backfilled**
   (`ingest/details.py`, 0.25.0). `get_activity_details` returns ~1700 samples
   per run; pulling that for all 747 activities is both a backfill nobody asked

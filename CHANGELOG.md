@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-07-23
+
+Report cards become part of the coach's durable memory: every rendered card
+persists as a dated snapshot, queryable from every surface — including the
+phone, which could never render a card at all.
+
+### Added
+- **`report_cards` store** (`agent/card_store.py` + new table): each render
+  of `workout_report_card` persists the full card (grades, intent, GPA, the
+  coach's verbal read) as a **dated snapshot** — the card as actually shown,
+  graded against the plan active at that render. No backfill: history
+  accumulates as cards are rendered. Write is fail-silent via ONE atomic
+  guarded UPSERT keyed on the read's prompt key (`busy_timeout=5000`,
+  awaited off the event loop): an equal-key render is a byte-identical
+  no-op, and a template-fallback render never overwrites a real-read row —
+  a stored card's words and grades always come from the same render.
+- **Two shared query tools** — `list_report_cards` (date/intent-class
+  filters, newest run first — "how have my quality days trended" in one
+  call) and `get_report_card` (the stored card, coach read, and verbatim
+  markdown). Both in `ALL_TOOLS`: pure JSON, so they reach stdio AND the
+  networked `/mcp/` transport.
+- **Per-activity read reuse**: the stored card doubles as a persistent read
+  cache. `workout_coach.read_cache_key` (the factored single key
+  definition) lets a re-render of ANY previously rendered card reuse its
+  stored read on an exact prompt-key match — alternating between two old
+  cards no longer costs ~10s of SDK call each.
+
 ## [0.31.0] - 2026-07-23
 
 Second half of the memory-based-personality build: the coach's personality

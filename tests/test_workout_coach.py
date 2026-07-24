@@ -649,3 +649,48 @@ def test_the_clean_retry_is_what_gets_cached(monkeypatch, tmp_path):
         PROFILE, a_card(), cache_path=cache))
     assert calls["n"] == 0, "second render should hit the cache"
     assert again["pace"] == "2:27 slower than the ask"
+
+
+# --- read_cache_key: the ONE key definition ---------------------------------
+
+def test_read_cache_key_matches_the_file_cache_key(tmp_path, monkeypatch):
+    """The factored helper and generate_read_cached must hash identically —
+    the card_store fast path compares its stored key against the helper's, so
+    any byte drift silently disables read reuse forever."""
+    async def _gen(profile, card, **k):
+        return FOUR_SECTIONS
+
+    monkeypatch.setattr(workout_coach, "generate_read", _gen)
+    cache = tmp_path / "cache.json"
+    card = a_card()
+    asyncio.run(workout_coach.generate_read_cached(
+        PROFILE, card, cache_path=cache))
+    entry = json.loads(cache.read_text())
+    assert entry["key"] == workout_coach.read_cache_key(PROFILE, card)
+
+
+def test_read_cache_key_model_none_is_the_literal_default():
+    """model=None hashes the literal "default", NOT DEFAULT_MODEL — the byte
+    layout generate_read_cached has always used."""
+    card = a_card()
+    assert (workout_coach.read_cache_key(PROFILE, card)
+            == workout_coach.read_cache_key(PROFILE, card, model="default"))
+    assert (workout_coach.read_cache_key(PROFILE, card)
+            != workout_coach.read_cache_key(
+                PROFILE, card, model=workout_coach.DEFAULT_MODEL))
+
+
+def test_read_cache_key_separates_same_day_twin_activities():
+    """Two sessions with identical prompts but different activity_ids must not
+    share a key — the double-day guard."""
+    assert (workout_coach.read_cache_key(PROFILE, a_card())
+            != workout_coach.read_cache_key(
+                PROFILE, a_card({"activity_id": 2})))
+
+
+def test_read_cache_key_changes_with_notes_and_memory():
+    base = workout_coach.read_cache_key(PROFILE, a_card())
+    assert base != workout_coach.read_cache_key(
+        PROFILE, a_card(), notes_text="- be nicer about hills")
+    assert base != workout_coach.read_cache_key(
+        PROFILE, a_card(), memory_text="- missed Tuesday")
