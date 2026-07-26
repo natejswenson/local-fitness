@@ -34,7 +34,7 @@ handler passes none of them.)
 
 ## Returns
 
-A `model_dump()` of `schemas.BriefContext`. Eleven top-level keys:
+A `model_dump()` of `schemas.BriefContext`. Fifteen top-level keys:
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -46,10 +46,29 @@ A `model_dump()` of `schemas.BriefContext`. Eleven top-level keys:
 | `trends` | list[GroundedValue] | The `rhr` / `sleep_score` / `steps` / `body_battery_max` entries from `snapshot`, re-emitted. |
 | `workouts_14d` | list[dict] | The actual activities of the last 14 days, newest first. |
 | `anomalies` | list[dict] | RHR readings in the last 14 days more than 2 SD above the 60-day mean. |
-| `continuity` | list[str] | Last-7 brief lead headlines. Always `[]` from this tool — see Gotchas. |
+| `continuity` | list[str] | Last-7 brief lead headlines, newest first. |
 | `plan_today` | dict \| null | Active-plan status rollup, or `null` when no plan is active. |
 | `step_goal` | int | The `daily_step_goal` setting; `10000` when unset or unparseable. |
 | `days_to_race` | int \| null | Days from `date` to the active plan's race date. `null` with no active plan. |
+| `data_frontier` | str \| null | Newest date with any `daily_metrics` row — how current the data actually is. |
+| `baseline_stale_days` | int \| null | Days from the baselines row backing `training_load` to `date`. |
+| `brief_stale_days` | int \| null | Days from the newest saved brief to `date`. |
+| `tsb_zone` | str \| null | `interpret.tsb_zone(tsb)` — `very fatigued` / `fatigued` / `neutral` / `fresh`. |
+
+### Freshness
+
+The three staleness fields exist to make the *orphaned sync* visible: the pull
+advances the data frontier but brief generation fails, or the pull itself
+stalls and the baselines row freezes. TSB decays daily even with zero
+workouts, so a stale baselines row served as current reports the wrong
+freshness — `baseline_stale_days` is what tells you the CTL/ATL/TSB numbers
+describe a day that has already passed. Any of them may be `null` (no data,
+no briefs); `null` means "unknown", not "fresh".
+
+`tsb_zone` is the deterministic read of `training_load`'s `tsb`, single-sourced
+from `interpret.tsb_zone` so this tool, `training_load_status` and the brief
+can't disagree about what "fatigued" means. It is `null` — not the string
+`"no training-load data yet"` — when there is no TSB.
 
 ### GroundedValue
 
@@ -187,10 +206,14 @@ carries the deterministic interpretation from `interpret.sd_position` —
     "…"
   ],
   "anomalies": [],
-  "continuity": [],
+  "continuity": ["Easy 5 on tap — RHR is back at baseline", "…"],
   "plan_today": {"active": true, "…": "…"},
   "step_goal": 10000,
-  "days_to_race": 75
+  "days_to_race": 75,
+  "data_frontier": "2026-07-21",
+  "baseline_stale_days": 0,
+  "brief_stale_days": 1,
+  "tsb_zone": "neutral"
 }
 ```
 
@@ -229,10 +252,12 @@ prescribed easy 5 is the ceiling, not the floor. Answer from `display` strings �
 
 ## Gotchas
 
-- **`continuity` is always `[]` from this tool.** The handler calls
-  `assemble_brief_context()` with no `recent_briefs`, so the last-7 headline list
-  is never populated over MCP. Only the in-process brief composer passes it. If
-  you need continuity, read the saved briefs.
+- **`continuity` is the LEAD headline of each recent brief, not all of them.**
+  The handler now passes `briefs.load_recent_briefs()` in (it used to pass
+  nothing, so `continuity` was permanently `[]` over MCP), but
+  `_continuity` keeps only the first takeaway of each of the last seven saved
+  briefs, newest first. It is `[]` when no briefs are on disk. For the full
+  text of a past brief, read `briefings/<date>.json`.
 - **No `user_notes`.** `BriefContext` has no notes field at all. Use
   [`daily_snapshot`](daily_snapshot.md) or `list_user_notes` for the coaching
   preferences.
@@ -252,6 +277,14 @@ prescribed easy 5 is the ceiling, not the floor. Answer from `display` strings �
   run predates that window, `days_since_last_run` reads `null` (which
   `long_run_absence` treats as "fires") and `recent_te` is short — an accepted
   tradeoff for a bounded scan.
+- **"Run" means measured pace, not `activity_type`.** Garmin files walking-desk
+  sessions as `treadmill_running`, so `days_since_last_run`, `runs_14d`,
+  `runs_prior_14d` and `recent_te` gate on `interpret.is_running_effort` (a
+  13:00 mile ceiling) and fall back to the label only for a row with no pace.
+  A labelled run at walking pace is excluded; a bike ride is excluded whatever
+  its pace, because the on-foot label is checked first. These counts will
+  therefore be LOWER than a naive `activity_type` query over the same window —
+  that is the fix, not a discrepancy.
 - **`plan_today` is graded against the real data frontier**, not against `date` —
   `build_plan_status` has no "as of" perspective. `days_to_race` and which
   workout is "today" are the only date-relative parts.

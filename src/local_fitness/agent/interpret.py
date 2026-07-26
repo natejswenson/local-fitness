@@ -58,6 +58,19 @@ COHENS_D_LARGE = 0.8
 # derivation).
 TREND_FLAT_SD_MULTIPLIER = 0.5
 
+# --- riegel_confidence -------------------------------------------------------
+# How far a Riegel projection reaches beyond the effort it was measured from,
+# as goal distance / effort distance. Upper-bound **inclusive** (unlike
+# baseline_position's strict bands): a 5k measured onto a 10k is exactly 2.0
+# and is squarely "medium", not a boundary case to argue about.
+#
+# The numbers are the exponent's own honesty range, not taste: t2 = t1 *
+# (d2/d1)^1.06 was fitted on race results at adjacent distances, so a 1.5x
+# reach (5k -> 10k-ish) is what it was built for, while a 10x reach (2 km ->
+# half marathon) is asserting a race result from a warmup.
+RIEGEL_HIGH_RATIO = 1.5
+RIEGEL_MEDIUM_RATIO = 3.0
+
 
 def tsb_zone(tsb: float | None) -> str:
     """Plain-English read of training stress balance.
@@ -212,6 +225,28 @@ def effect_size(
                 magnitude = "negligible"
 
     return {"delta_pct": delta_pct, "cohens_d": cohens_d, "magnitude": magnitude}
+
+
+def riegel_confidence(extrapolation_ratio: float | None) -> str:
+    """How much to trust a Riegel projection, from how far it reaches.
+
+    ``extrapolation_ratio`` is goal distance / measured-effort distance.
+    Bands are upper-bound **inclusive**: ``<= 1.5`` high, ``<= 3.0`` medium,
+    above that low. See ``RIEGEL_HIGH_RATIO`` for why those numbers.
+
+    ``None`` or a non-positive ratio -> ``"no data"``: a zero/negative reach
+    is degenerate, not confident. Unreachable from ``plans.build_plan_detail``
+    (which computes the field only once ``riegel_predict`` has returned a
+    number, which requires both distances truthy) — defined and pinned anyway,
+    per this module's never-raise-on-degenerate-input contract.
+    """
+    if extrapolation_ratio is None or extrapolation_ratio <= 0:
+        return "no data"
+    if extrapolation_ratio <= RIEGEL_HIGH_RATIO:
+        return "high"
+    if extrapolation_ratio <= RIEGEL_MEDIUM_RATIO:
+        return "medium"
+    return "low"
 
 
 def sd_position(value: float | None, mean: float | None, sd: float | None) -> dict | None:

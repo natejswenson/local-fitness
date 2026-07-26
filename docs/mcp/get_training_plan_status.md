@@ -46,6 +46,8 @@ When a plan is active:
   "target_time_formatted": "1:45:00",
   "days_to_race": 75,
   "adherence_pct": 83,
+  "sessions_adherence_pct": 71,
+  "rest_days_counted": 9,
   "today": {
     "type": "tempo",
     "target_distance_m": null,
@@ -57,6 +59,8 @@ When a plan is active:
     "target_duration_formatted": "40:00"
   },
   "last_graded": {
+    "date": "2026-07-20",
+    "seq": 1,
     "type": "long",
     "target_distance_m": 19312.1,
     "target_pace_sec_per_km": 385.9,
@@ -76,10 +80,12 @@ When a plan is active:
 | `target_time_formatted` | `target_time_seconds` rendered `H:MM:SS`; `null` when the goal time is. |
 | `days_to_race` | `race_date − date.today()`. Negative once the race is past. `null` if either date fails to parse. |
 | `adherence_pct` | Whole-plan, over graded (non-`pending`) workouts only. `done`/`compliant` = 1.0, `partial` = 0.5, `missed` = 0. `null` when nothing has graded yet. |
+| `sessions_adherence_pct` | The same calculation with **rest days dropped from both the numerator and the denominator** — adherence over prescribed sessions only. `null` when the graded window holds no non-rest workout. |
+| `rest_days_counted` | How many graded rest days sit inside `adherence_pct`. The size of the gap between the two percentages. |
 | `today` | The workout prescribed for `date.today()`, or `null` if the plan has no row for today. |
 | `last_graded` | The most recent workout by date whose verdict is not `pending` — i.e. the last day that actually counted. `null` early in a plan. |
 
-Both workout objects are the same slim shape: `type`, `target_distance_m`,
+Both workout objects are the same slim shape: `date`, `seq`, `type`, `target_distance_m`,
 `target_pace_sec_per_km`, `target_duration_sec`, `description`, `verdict`, plus display fields
 (`target_distance_mi` in miles mode only, `target_pace_min_per_mi`, `target_duration_formatted`)
 when the underlying value exists. There are no `actual_*` fields on this path — use
@@ -125,6 +131,14 @@ Answer with the prescription and one line of coach read — don't narrate the lo
   date (the plan hasn't started, has ended, or a gap day was never given a row).
 - **`adherence_pct` is whole-plan, not recent.** A strong last two weeks barely moves it on a
   16-week plan. For a recent read, use `get_training_plan_progress`'s `this_week` or `plan_chart`.
+- **`adherence_pct` counts rest days as fully complied, and they sit in the denominator too**, so a
+  plan with two or three rest days a week floors the number well above what was actually trained: a
+  week of 3 rests and 4 skipped runs scores 43%. Quote `sessions_adherence_pct` alongside it (or
+  instead of it) whenever the question is "am I doing the work" — `rest_days_counted` says how much
+  of the gap the rest days account for. `adherence_pct` keeps its original meaning unchanged; it is
+  what the brief PDF and every stored comparison already speak.
+- **`last_graded` carries its own `date` and `seq`.** Use them — a verdict with no date is a
+  "missed" that could be yesterday or three weeks ago, and the two are coached very differently.
 - **No `predicted_finish` / `goal_gap` / `this_week` here** — those live only on
   `get_training_plan_progress`.
 - **Drafts are invisible.** `{"active": false}` while a draft is sitting unopened is expected.

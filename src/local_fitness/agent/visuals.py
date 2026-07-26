@@ -627,6 +627,17 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
     walk_mi = plan_section.get("week_walk_mi") or 0
     walk_suffix = f" · +{walk_mi:.1f} walked" if walk_mi else ""
 
+    # Rest-day-free adherence rides the tiny dim LABEL, never the numeral —
+    # the same move as walk_suffix above, for the same reason: the 1.25em/900
+    # .value slot in a ~third-rail tile is exactly where a compound value
+    # collided with its neighbour once already. A label this long wraps to a
+    # second line inside its own tile (there is a space to break at), costing
+    # height the density ladder absorbs rather than width that would spill.
+    # `is not None`, not truthy: 0% of sessions is the number that most needs
+    # printing next to a flattering total.
+    sessions_pct = plan_section.get("sessions_adherence_pct")
+    adherence_suffix = f" · {sessions_pct}% sessions" if sessions_pct is not None else ""
+
     # 3-up + 1 wide, not 2x2: the three short values fit a third of the rail
     # each, while "This Week" is a compound value that overflowed its half-rail
     # tile and collided with the tile beside it (see the stat-strip CSS note).
@@ -635,7 +646,7 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
       <tr>
         <td class="stat-tile">
           <div class="value">{plan_section["adherence_pct"]}%</div>
-          <div class="label">Adherence</div>
+          <div class="label">Adherence{adherence_suffix}</div>
         </td>
         <td class="stat-tile">
           <div class="value">{tile2_value}</div>

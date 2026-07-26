@@ -114,6 +114,7 @@ def build_prompt(
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,
+    sessions_adherence_pct: int | None = None,
 ) -> tuple[str, str]:
     """Assemble the ``(system_prompt, user_prompt)`` pair for the coaching
     line. Pure string assembly — no I/O, no randomness, fully unit-testable.
@@ -131,6 +132,13 @@ def build_prompt(
     (``memory.render_memory_for_prompt()`` output) — passed in, not resolved,
     because this prompt's hash is ``generate_coaching_line_cached``'s cache
     key and a builder that did I/O would break caching.
+
+    ``sessions_adherence_pct`` (``plans._sessions_adherence_pct``) is appended
+    to the adherence line when supplied, so the coach reads the number that
+    excludes rest days alongside the one that counts them — a plan with three
+    rest days a week can show 80%+ overall while half the running went
+    undone. Optional and ``None`` by default: omitting it reproduces the
+    previous prompt byte for byte, so an un-wired caller keeps its cache.
     """
     system_prompt = (
         f"You are {user_name}'s running coach, writing ONE short paragraph (2-4 "
@@ -151,7 +159,12 @@ def build_prompt(
     if today_workout.get("description"):
         lines.append(f"Prescription notes: {today_workout['description']}")
 
-    lines.append(f"Plan adherence over the last graded stretch: {adherence_pct}%.")
+    adherence_line = f"Plan adherence over the last graded stretch: {adherence_pct}%."
+    if sessions_adherence_pct is not None:
+        adherence_line += (
+            f" Excluding rest days, {sessions_adherence_pct}% of prescribed sessions."
+        )
+    lines.append(adherence_line)
     if days_to_race is not None:
         lines.append(f"{days_to_race} days to the {goal_type}.")
     else:
@@ -183,6 +196,7 @@ async def generate_coaching_line(
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,
+    sessions_adherence_pct: int | None = None,
 ) -> str:
     """Claude-generated coaching line prepping the athlete for today's run.
 
@@ -208,6 +222,7 @@ async def generate_coaching_line(
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
         notes_text=notes_text, user_name=user_name, memory_text=memory_text,
+        sessions_adherence_pct=sessions_adherence_pct,
     )
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -279,6 +294,7 @@ async def generate_coaching_line_cached(
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,
+    sessions_adherence_pct: int | None = None,
     cache_path: Path | None = None,
 ) -> str:
     """``generate_coaching_line`` behind a single-entry disk cache.
@@ -295,7 +311,7 @@ async def generate_coaching_line_cached(
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, notes_text=notes_text, user_name=user_name,
-        memory_text=memory_text,
+        memory_text=memory_text, sessions_adherence_pct=sessions_adherence_pct,
     )
     key = hashlib.sha256(
         "\x00".join([system_prompt, user_prompt, model or "default"]).encode("utf-8")
@@ -309,6 +325,7 @@ async def generate_coaching_line_cached(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, model=model, timeout=timeout, notes_text=notes_text,
         user_name=user_name, memory_text=memory_text,
+        sessions_adherence_pct=sessions_adherence_pct,
     )
     _write_cached_line(path, key, line)
     return line
@@ -376,6 +393,13 @@ def _plan_section_pool(plan_section: dict) -> list[tuple[float, str]]:
     adherence_pct = plan_section.get("adherence_pct")
     if adherence_pct is not None:
         pool.append((abs(float(adherence_pct)), "adherence_pct"))
+
+    # Cited only when the caller wired it (build_prompt appends it to the
+    # adherence line under the same condition) — a number the line can't have
+    # seen must not become a licence to invent one.
+    sessions_adherence_pct = plan_section.get("sessions_adherence_pct")
+    if sessions_adherence_pct is not None:
+        pool.append((abs(float(sessions_adherence_pct)), "sessions_adherence_pct"))
 
     days_to_race = plan_section.get("days_to_race")
     if days_to_race is not None:

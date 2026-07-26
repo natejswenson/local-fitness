@@ -924,28 +924,87 @@ async def find_anomalies(args: dict) -> dict:
     })
 
 
+# The pull statuses that mean nothing landed and the caller has to act.
+# `partial` is deliberately NOT here: daily.pull reports it whenever any gap
+# remains anywhere back to EARLIEST_BACKFILL_DATE, so a DB with one missing
+# historical day is partial on every sync forever — flagging that as an error
+# told the user their fresh sync had failed.
+_SYNC_FAILURE_STATUSES = frozenset({
+    "auth_failure", "not_configured", "failure", "interrupted",
+})
+
+
+def _sync_state(result: dict, *, recomputed: bool) -> str:
+    """One-line plain-English read of a pull that isn't an outright failure.
+
+    House rule (see interpret.py): tested Python derives the judgment, the
+    model only phrases it around this string. Deterministic in the pull dict.
+    """
+    status = result.get("status") or "unknown"
+    days = int(result.get("days_pulled") or 0)
+    activities = int(result.get("activities_loaded") or 0)
+    last_date = result.get("last_date")
+
+    if days or activities:
+        counted = []
+        if days:
+            counted.append(f"{days} day(s)")
+        if activities:
+            counted.append(f"{activities} activity row(s)")
+        head = "synced " + ", ".join(counted)
+        if last_date:
+            head += f" through {last_date}"
+    elif status == "skipped":
+        head = "already up to date"
+    else:
+        head = "no new data landed"
+
+    caveats = [
+        f"{count} day(s) {label}"
+        for count, label in (
+            (int(result.get("deferred_count") or 0), "deferred"),
+            (int(result.get("days_failed") or 0), "failed"),
+            (int(result.get("gap_days_remaining") or 0), "still missing"),
+        )
+        if count
+    ]
+    tail = "baselines recomputed" if recomputed else "baselines unchanged"
+    segments = [f"{status} — {head}"] + ([", ".join(caveats)] if caveats else []) + [tail]
+    return "; ".join(segments)
+
+
 @tool(
     "sync_garmin_data",
     "Pull the latest data from Garmin Connect into the database (gap-aware: "
     "fills missing days, always refreshes the last few days so day-end totals "
-    "overwrite partial values) and recompute baselines/training-load if new "
-    "data landed. Every other tool only reads what's already in the DB — call "
-    "this first when the user asks to sync/refresh/pull/update their data, or "
-    "when today's data looks stale or missing.",
+    "overwrite partial values) and recompute baselines/training-load whenever "
+    "any new day or activity landed. Every other tool only reads what's "
+    "already in the DB — call this first when the user asks to "
+    "sync/refresh/pull/update their data, or when today's data looks stale or "
+    "missing. Read the returned `sync_state` line: status 'partial' is normal "
+    "when older history is still incomplete and does NOT mean this sync "
+    "failed.",
     {},
 )
 async def sync_garmin_data(_args: dict) -> dict:
     result = await asyncio.to_thread(daily_ingest.pull, max_days=SYNC_MAX_DAYS)
-    if result.get("status") == "success" and result.get("days_pulled", 0) > 0:
+    status = result.get("status")
+    # Recompute on any landed data, not just a clean `success`: activities can
+    # arrive without a new wellness day, and gating on `success` meant a DB
+    # with an old gap never refreshed CTL/ATL/TSB again — downstream tools
+    # served stale training load while reporting current data.
+    recomputed = bool(result.get("days_pulled") or result.get("activities_loaded"))
+    if recomputed:
         await asyncio.to_thread(baselines_mod.recompute, lookback_days=90)
-    if result.get("error"):
+    if status in _SYNC_FAILURE_STATUSES:
         return _err(
-            result["error"],
-            status=result.get("status"),
+            result.get("error") or f"Garmin sync failed ({status})",
+            status=status,
             days_pulled=result.get("days_pulled", 0),
+            days_failed=result.get("days_failed", 0),
             last_date=result.get("last_date"),
         )
-    return _text(result)
+    return _text({**result, "sync_state": _sync_state(result, recomputed=recomputed)})
 
 
 @tool(
@@ -2402,9 +2461,11 @@ async def get_training_plan_status(_args: dict) -> dict:
         cfg = plans.resolve_grading_config(conn=conn)
     status = plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
 
-    # 2d: pure formatting of data already in hand — plans.py gains no units
-    # import (consistent with the existing invariant); no goal_gap/this_week/
-    # predicted_finish_formatted here, this tool has no Riegel projection.
+    # 2d: pure formatting of data already in hand. (plans.py does import
+    # agent.units since 0.35.0 — a pure stdlib leaf, no cycle — so display
+    # formatting there is fine too; projection_basis is the precedent.) No
+    # goal_gap/this_week/predicted_finish_formatted here, this tool has no
+    # Riegel projection.
     status["target_time_formatted"] = units.format_duration(status.get("target_time_seconds"))
     for key in ("today", "last_graded"):
         w = status.get(key)
@@ -2465,7 +2526,12 @@ async def get_training_plan_progress(args: dict) -> dict:
         activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
         cutoff = (date.today() - timedelta(
             days=config.riegel_lookback_days(conn=conn))).isoformat()
-        best_effort = plans.best_recent_effort(cutoff, conn=conn)
+        # The goal distance is a PREFERENCE for the basis, not a filter: it
+        # asks for an effort at least a quarter of race distance so the
+        # projection isn't a 10x reach, and falls back to any qualifying run
+        # when nothing that long exists (see best_recent_effort).
+        best_effort = plans.best_recent_effort(
+            cutoff, conn=conn, goal_distance_m=active.get("goal_distance_m"))
         cfg = plans.resolve_grading_config(conn=conn)
     detail = plans.build_plan_detail(active, frontier, activities_by_date, best_effort, cfg)
 
@@ -2551,8 +2617,16 @@ async def get_training_plan_progress(args: dict) -> dict:
         "target_time_formatted": units.format_duration(target_time_seconds),
         "days_to_race": days_to_race,
         "adherence_pct": detail.get("adherence_pct"),
+        "sessions_adherence_pct": detail.get("sessions_adherence_pct"),
+        "rest_days_counted": detail.get("rest_days_counted"),
         "predicted_finish_seconds": predicted_finish_seconds,
         "predicted_finish_formatted": units.format_duration(predicted_finish_seconds),
+        # Spread, not two .get()s: build_plan_detail OMITS both keys when there
+        # is no basis (never None-values them), and that absence has to survive
+        # this projection — a `"projection_basis": null` beside a real
+        # predicted time reads as a measurement with the receipt lost.
+        **{k: detail[k] for k in ("projection_basis", "projection_confidence")
+           if k in detail},
         "goal_gap": goal_gap,
         "this_week": this_week,
         "workouts": workouts,
@@ -2629,7 +2703,12 @@ async def get_brief_context(_args: dict) -> dict:
     # Lazy import: brief_planner -> status -> tools would cycle at import time.
     from . import brief_planner
 
-    return _text(brief_planner.assemble_brief_context().model_dump())
+    # recent_briefs must be passed IN — assemble_brief_context never reads the
+    # briefings dir itself, so omitting it (as this handler used to) left
+    # `continuity` permanently empty over MCP while the in-process composer
+    # got the real headlines.
+    return _text(brief_planner.assemble_brief_context(
+        recent_briefs=briefs.load_recent_briefs()).model_dump())
 
 
 # --- generate_brief_report: PDF report rendering ---------------------------
@@ -2913,6 +2992,12 @@ def _build_plan_section(target_date: str) -> dict | None:
 
     return {
         "adherence_pct": adherence_pct,
+        # The rest-day-free companion to adherence_pct, plus how many rest days
+        # separate them. Stays None (not 0-defaulted like adherence_pct above)
+        # when the window holds no prescribed session: 0% would assert that
+        # nothing got done, when the truth is that nothing was asked for.
+        "sessions_adherence_pct": detail.get("sessions_adherence_pct"),
+        "rest_days_counted": detail.get("rest_days_counted"),
         "goal_type": detail.get("goal_type") or "goal",
         "days_to_race": days_to_race,
         "week_planned_mi": week_planned_mi,
@@ -3001,6 +3086,10 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["adherence_pct"],
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
+                # .get, not []: an older payload shape (a cached section, a
+                # caller predating this field) must not KeyError. None keeps
+                # the prompt — and so the disk cache key — exactly as it was.
+                sessions_adherence_pct=plan_section.get("sessions_adherence_pct"),
                 notes_text=notes.render_for_prompt(),
                 user_name=config.user_name(),
                 # Keyed to the brief's own date (like the whole section), with

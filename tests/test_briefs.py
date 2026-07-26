@@ -268,6 +268,68 @@ def test_recent_briefs_summary_skips_unparseable_and_emptyish(briefs_dir):
     assert summary.count("- [") == 1
 
 
+# --- load_recent_briefs ----------------------------------------------------
+# The typed counterpart to _recent_briefs_summary. V2's planner takes brief
+# dicts (it derives its own continuity headlines), and get_brief_context has to
+# hand them in — assemble_brief_context never reads the briefings dir itself.
+
+def test_load_recent_briefs_returns_payloads_newest_first(briefs_dir):
+    anchor = date(2026, 6, 16)
+    d1 = (anchor - timedelta(days=1)).isoformat()
+    d3 = (anchor - timedelta(days=3)).isoformat()
+    _write_raw_brief(briefs_dir, d1, "Yesterday: easy 5k")
+    _write_raw_brief(briefs_dir, d3, "Three days ago: rest")
+
+    out = briefs.load_recent_briefs(today=anchor)
+    assert [b["takeaways"][0]["headline"] for b in out] == [
+        "Yesterday: easy 5k", "Three days ago: rest"]
+
+
+def test_load_recent_briefs_excludes_today_and_honors_the_window(briefs_dir):
+    anchor = date(2026, 6, 16)
+    _write_raw_brief(briefs_dir, anchor.isoformat(), "Today, already written")
+    _write_raw_brief(briefs_dir, (anchor - timedelta(days=1)).isoformat(), "In window")
+    _write_raw_brief(briefs_dir, (anchor - timedelta(days=8)).isoformat(), "Too old")
+
+    out = briefs.load_recent_briefs(today=anchor)
+    assert [b["takeaways"][0]["headline"] for b in out] == ["In window"]
+
+    # The window is a parameter, not a constant, and 8 days back reaches it.
+    wide = briefs.load_recent_briefs(today=anchor, days=8)
+    assert [b["takeaways"][0]["headline"] for b in wide] == ["In window", "Too old"]
+
+
+def test_load_recent_briefs_skips_corrupt_and_non_object_files(briefs_dir):
+    anchor = date(2026, 6, 16)
+    _write_raw_json(briefs_dir, (anchor - timedelta(days=1)).isoformat(), "{ not valid json")
+    _write_raw_json(briefs_dir, (anchor - timedelta(days=2)).isoformat(), '["a list"]')
+    _write_raw_brief(briefs_dir, (anchor - timedelta(days=3)).isoformat(), "Survivor")
+
+    out = briefs.load_recent_briefs(today=anchor)
+    assert len(out) == 1
+    assert out[0]["takeaways"][0]["headline"] == "Survivor"
+
+
+def test_load_recent_briefs_empty_without_a_briefings_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", tmp_path / "never-created")
+    assert briefs.load_recent_briefs(today=date(2026, 6, 16)) == []
+
+
+def test_recent_briefs_summary_and_load_recent_briefs_walk_the_same_files(briefs_dir):
+    """Both continuity surfaces share `_iter_recent_briefs`, so they can never
+    disagree about which briefs count as recent."""
+    anchor = date(2026, 6, 16)
+    for offset in (1, 4, 7):
+        _write_raw_brief(briefs_dir, (anchor - timedelta(days=offset)).isoformat(),
+                         f"Headline {offset}")
+    summary = briefs._recent_briefs_summary(today=anchor)
+    loaded = briefs.load_recent_briefs(today=anchor)
+    assert [b["takeaways"][0]["headline"] for b in loaded] == [
+        "Headline 1", "Headline 4", "Headline 7"]
+    for headline in ("Headline 1", "Headline 4", "Headline 7"):
+        assert headline in summary
+
+
 # --- _default_briefings_dir env override -----------------------------------
 
 def test_default_briefings_dir_honors_env_override(monkeypatch, tmp_path):

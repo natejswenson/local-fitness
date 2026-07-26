@@ -33,7 +33,7 @@ import re
 from pathlib import Path
 
 from .. import config
-from . import prompts
+from . import prompts, units
 from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
@@ -269,11 +269,30 @@ def _describe_activity(row: dict) -> str:
 
 
 def _describe_prescription(w: dict) -> str:
+    """One upcoming plan day, for the "setting up for" block.
+
+    These rows come from ``plans.get_active_plan()``, so they carry the stored
+    columns (``target_distance_m`` / ``target_pace_sec_per_km`` /
+    ``target_duration_sec``), not the mile-and-min/mi display fields. Reading
+    only the display keys meant every number silently dropped out and the model
+    was handed a bare date and workout type. The display keys are still read
+    first, since a caller may pass an already-converted row.
+    """
     parts = [f"{w.get('date')}: {w.get('type') or 'workout'}"]
-    if w.get("distance_mi") is not None:
-        parts.append(f"{w['distance_mi']} mi")
-    if w.get("pace_min_per_mi"):
-        parts.append(f"@ {w['pace_min_per_mi']}/mi")
+    miles = w.get("distance_mi")
+    if miles is None:
+        miles = units.to_miles(w.get("target_distance_m"))
+    if miles is not None:
+        parts.append(f"{miles} mi")
+    pace = w.get("pace_min_per_mi") or units.format_pace_min_per_mi(
+        w.get("target_pace_sec_per_km"))
+    if pace:
+        parts.append(f"@ {pace}/mi")
+    duration_sec = w.get("target_duration_sec")
+    if duration_sec:
+        # Minutes, not H:MM:SS — a prescription is written as "45 min", and the
+        # duration-formatted form reads like a finishing time.
+        parts.append(f"{round(duration_sec / 60)} min")
     if w.get("description"):
         parts.append(str(w["description"]))
     return " · ".join(parts)

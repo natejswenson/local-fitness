@@ -16,7 +16,7 @@ from datetime import date as _date
 from pathlib import Path
 
 from . import config, db
-from .agent import interpret
+from .agent import interpret, units
 
 # --- constants -------------------------------------------------------------
 
@@ -405,6 +405,75 @@ def riegel_predict(
     if not best_distance_m or not best_time_s or not target_distance_m:
         return None
     return best_time_s * (target_distance_m / best_distance_m) ** RIEGEL_EXP
+
+
+def select_best_effort(rows: list[dict]) -> dict | None:
+    """Fastest RUNNING effort among candidate rows — the Riegel basis.
+
+    The pure half of ``best_recent_effort`` (which supplies the rows): takes
+    plain dicts carrying ``activity_type``/``distance_meters``/
+    ``duration_seconds``/``date``/``avg_pace_sec_per_km``, returns the winner
+    in the same shape plus the ``date`` and pace that justify it, or ``None``.
+
+    Two gates, in this order:
+
+    * **On foot by label.** The label is unreliable about run-vs-walk but
+      perfectly reliable about foot-vs-wheel (see ``_ran``), and a bike ride's
+      ~2:00/mi "pace" would win every pace comparison outright.
+    * **Running by measured pace, with no label fallback.** This is the
+      deliberate difference from ``_ran``, where a paceless row falls back to
+      the label rather than vanishing from mileage. Here a paceless row is
+      EXCLUDED: dropping one costs nothing (the next-best effort takes over),
+      while admitting one wrong row re-prices the entire race projection —
+      a walking-pad session files as ``treadmill_running`` and would win on
+      pace against nothing at all.
+    """
+    best = None
+    best_pace = None
+    for r in rows:
+        if not _is_on_foot(r.get("activity_type")):
+            continue
+        pace = r.get("avg_pace_sec_per_km")
+        if interpret.is_running_effort(pace) is not True:
+            continue
+        if best_pace is None or pace < best_pace:
+            best = {
+                "distance_m": r.get("distance_meters"),
+                "time_s": r.get("duration_seconds"),
+                "date": r.get("date"),
+                "avg_pace_sec_per_km": pace,
+            }
+            best_pace = pace
+    return best
+
+
+def projection_basis(
+    best_effort: dict | None, goal_distance_m: float | None
+) -> dict | None:
+    """The effort a Riegel projection was computed FROM, in display units.
+
+    ``None`` unless both the effort's distance and the goal distance are
+    usable — the same precondition ``riegel_predict`` applies, so a caller
+    that has a projection always has a basis and vice versa.
+
+    ``extrapolation_ratio`` (goal / effort, 1 decimal) is the number that
+    decides whether the projection means anything: without it a 2 km treadmill
+    effort and a 20 km long run produce half-marathon predictions that look
+    equally authoritative on the page. Feed it to
+    ``interpret.riegel_confidence``.
+    """
+    if not best_effort:
+        return None
+    distance_m = best_effort.get("distance_m")
+    if not distance_m or not goal_distance_m:
+        return None
+    return {
+        "distance_mi": units.to_miles(distance_m),
+        "pace_min_per_mi": units.format_pace_min_per_mi(
+            best_effort.get("avg_pace_sec_per_km")),
+        "date": best_effort.get("date"),
+        "extrapolation_ratio": round(goal_distance_m / distance_m, 1),
+    }
 
 
 def goal_gap(
@@ -842,37 +911,56 @@ def best_recent_effort(
     db_path: Path | None = None,
     min_distance_m: float = 2000.0,
     conn: sqlite3.Connection | None = None,
+    goal_distance_m: float | None = None,
 ) -> dict | None:
-    """Fastest recent running effort since `cutoff` as {distance_m, time_s} for Riegel.
+    """Fastest recent running effort since `cutoff` — the Riegel basis.
+
+    Returns ``{distance_m, time_s, date, avg_pace_sec_per_km}`` (the date and
+    pace so the projection can name and rate its own yardstick) or ``None``.
+    Selection itself is pure — see ``select_best_effort`` for the two gates and
+    why a paceless row is dropped rather than label-matched.
+
+    ``goal_distance_m`` PREFERS a distance floor of a quarter of the goal.
+    Riegel is an *extrapolation*: at the bare 2 km floor a half marathon is a
+    10x reach and a marathon a 21x one, which is a race prediction asserted
+    from a warmup. A quarter of the goal caps the reach at 4x.
+
+    The preference is a soft one — when nothing clears the raised floor the
+    search falls back to the flat ``min_distance_m``. Someone whose longest
+    recent run is 3 km still gets a projection, because
+    ``build_plan_detail``'s ``extrapolation_ratio`` and ``low`` confidence
+    already LABEL a weak basis, and a labelled weak projection beats a blank
+    where the number should be. Omitting ``goal_distance_m`` (the default, and
+    the only option on a ``custom`` plan) skips the raised floor entirely.
 
     Accepts an already-open ``conn`` to let hot-path callers share one
     connection instead of opening a fresh one per lookup; behavior is
     unchanged when omitted."""
+    # date and avg_pace_sec_per_km are both load-bearing, not incidental: the
+    # pace decides run-vs-walk (the label lies — see select_best_effort) and
+    # the date is what lets the projection state which run it came from.
+    sql = (
+        "SELECT date, activity_type, distance_meters, duration_seconds, "
+        "avg_pace_sec_per_km "
+        "FROM activities WHERE date >= ? AND distance_meters >= ? "
+        "AND avg_pace_sec_per_km IS NOT NULL"
+    )
     if conn is not None:
-        rows = conn.execute(
-            "SELECT activity_type, distance_meters, duration_seconds, avg_pace_sec_per_km "
-            "FROM activities WHERE date >= ? AND distance_meters >= ? "
-            "AND avg_pace_sec_per_km IS NOT NULL",
-            (cutoff, min_distance_m),
-        ).fetchall()
+        raw = conn.execute(sql, (cutoff, min_distance_m)).fetchall()
     else:
         with db.connect(db_path) as c:
-            rows = c.execute(
-                "SELECT activity_type, distance_meters, duration_seconds, avg_pace_sec_per_km "
-                "FROM activities WHERE date >= ? AND distance_meters >= ? "
-                "AND avg_pace_sec_per_km IS NOT NULL",
-                (cutoff, min_distance_m),
-            ).fetchall()
-    best = None
-    best_pace = None
-    for r in rows:
-        if not _is_running(r["activity_type"]):
-            continue
-        pace = r["avg_pace_sec_per_km"]
-        if best_pace is None or pace < best_pace:
-            best = {"distance_m": r["distance_meters"], "time_s": r["duration_seconds"]}
-            best_pace = pace
-    return best
+            raw = c.execute(sql, (cutoff, min_distance_m)).fetchall()
+    rows = [dict(r) for r in raw]
+
+    # One query at the flat floor, then narrow in Python — a second round trip
+    # for the fallback would cost a DB open on a path the perf gate counts.
+    preferred_floor = max(min_distance_m, goal_distance_m / 4) if goal_distance_m else min_distance_m
+    if preferred_floor > min_distance_m:
+        best = select_best_effort(
+            [r for r in rows if (r.get("distance_meters") or 0.0) >= preferred_floor])
+        if best is not None:
+            return best
+    return select_best_effort(rows)
 
 
 def get_draft_plan(db_path: Path | None = None) -> dict | None:
@@ -881,14 +969,47 @@ def get_draft_plan(db_path: Path | None = None) -> dict | None:
 
 # --- assembly for the tab + brief -----------------------------------------
 
+#: adherence credit per verdict. A rest day is "compliant" — full credit for
+#: doing nothing, which is correct for the day and misleading in aggregate;
+#: see ``_sessions_adherence_pct``.
+_ADHERENCE_CREDIT = {"done": 1.0, "compliant": 1.0, "partial": 0.5, "missed": 0.0}
+
+
 def _adherence_pct(graded_workouts: list[dict]) -> int | None:
     """Percent adherence over graded (non-pending) workouts. partial = half."""
     graded = [w for w in graded_workouts if w["verdict"] != "pending"]
     if not graded:
         return None
-    credit = {"done": 1.0, "compliant": 1.0, "partial": 0.5, "missed": 0.0}
-    score = sum(credit.get(w["verdict"], 0.0) for w in graded)
+    score = sum(_ADHERENCE_CREDIT.get(w["verdict"], 0.0) for w in graded)
     return round(100 * score / len(graded))
+
+
+def _sessions_adherence_pct(graded_workouts: list[dict]) -> int | None:
+    """``_adherence_pct`` over prescribed SESSIONS only — rest days dropped
+    from the numerator AND the denominator.
+
+    Rest days are free credit sitting in the denominator, so a plan with a lot
+    of them floors the headline number well above what was actually trained: a
+    week of 3 rests and 4 skipped runs scores 43% overall while 0% of the
+    running happened. This is the companion number, not a replacement —
+    ``adherence_pct`` keeps its exact historical meaning, since it is what the
+    PDF, the brief and every stored comparison already speak.
+
+    ``None`` when the graded window holds no non-rest workout at all (a taper
+    week, a fresh plan) — the same "nothing to average" contract as
+    ``_adherence_pct``.
+    """
+    return _adherence_pct([w for w in graded_workouts if w.get("type") != "rest"])
+
+
+def _rest_days_counted(graded_workouts: list[dict]) -> int:
+    """How many graded rest days are inflating ``adherence_pct`` — the size of
+    the gap between it and ``sessions_adherence_pct``, so a reader can size the
+    effect instead of inferring it from the two percentages."""
+    return sum(
+        1 for w in graded_workouts
+        if w.get("type") == "rest" and w["verdict"] != "pending"
+    )
 
 
 def _workout_actuals(
@@ -959,13 +1080,24 @@ def build_plan_detail(
             best_effort.get("distance_m"), best_effort.get("time_s"),
             plan.get("goal_distance_m"),
         )
-    return {
+    detail = {
         **{k: v for k, v in plan.items() if k != "workouts"},
         "workouts": graded,
         "weekly_mileage": weekly_mileage(plan["workouts"], activities_by_date, cfg),
         "predicted_finish_seconds": predicted,
         "adherence_pct": _adherence_pct(graded),
+        "sessions_adherence_pct": _sessions_adherence_pct(graded),
+        "rest_days_counted": _rest_days_counted(graded),
     }
+    # A projection with no stated basis reads as a measurement. Both fields are
+    # OMITTED rather than None-valued when there's nothing to cite, so a
+    # consumer can't render "basis: none" beside a real predicted time.
+    basis = projection_basis(best_effort, plan.get("goal_distance_m"))
+    if basis is not None:
+        detail["projection_basis"] = basis
+        detail["projection_confidence"] = interpret.riegel_confidence(
+            basis["extrapolation_ratio"])
+    return detail
 
 
 def _slim_workout(workout: dict | None) -> dict | None:
@@ -974,6 +1106,11 @@ def _slim_workout(workout: dict | None) -> dict | None:
         return None
     desc = (workout.get("description") or "")[:120]
     return {
+        # WHICH day this is. `last_graded` without a date is a verdict floating
+        # free of time — a "missed" that could be yesterday or three weeks ago,
+        # which the coach then has to guess at (and guessed wrong).
+        "date": workout.get("date"),
+        "seq": workout.get("seq"),
         "type": workout.get("type"),
         "target_distance_m": workout.get("target_distance_m"),
         "target_pace_sec_per_km": workout.get("target_pace_sec_per_km"),
@@ -1015,6 +1152,8 @@ def build_plan_status(
         "target_time_seconds": plan.get("target_time_seconds"),
         "days_to_race": days_to_race,
         "adherence_pct": _adherence_pct(graded),
+        "sessions_adherence_pct": _sessions_adherence_pct(graded),
+        "rest_days_counted": _rest_days_counted(graded),
         "today": _slim_workout(today_w),
         "last_graded": _slim_workout(last_graded),
     }

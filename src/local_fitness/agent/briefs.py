@@ -268,17 +268,22 @@ def _extract_json(text: str) -> dict:
 RECENT_BRIEFS_LOOKBACK_DAYS = 7
 
 
-def _recent_briefs_summary(today: date | None = None, days: int = RECENT_BRIEFS_LOOKBACK_DAYS) -> str:
-    """Return a compact rendering of the last ``days`` saved briefs (excluding today).
+def _iter_recent_briefs(
+    today: date | None = None, days: int = RECENT_BRIEFS_LOOKBACK_DAYS
+) -> list[tuple[date, dict]]:
+    """``(date, payload)`` for each saved brief in the ``days`` days BEFORE
+    ``today``, newest first. Skips today, missing days, and files that don't
+    read or parse.
 
-    Used to give the briefing agent continuity across days — so today's brief
-    can reference what it told {user_name} yesterday/last week and call out
-    follow-through (or the lack of it). Returns "" when there's no history.
+    The single file walk behind both continuity surfaces — ``_recent_briefs_
+    summary`` (the V1 prose block) and ``load_recent_briefs`` (the V2 planner's
+    typed dicts) — so the two can't disagree about which briefs count as
+    recent. Returns ``[]`` on a fresh clone with no briefings dir.
     """
     today = today or date.today()
     if not DEFAULT_BRIEFINGS_DIR.exists():
-        return ""
-    lines: list[str] = []
+        return []
+    out: list[tuple[date, dict]] = []
     for offset in range(1, days + 1):
         d = today - timedelta(days=offset)
         path = DEFAULT_BRIEFINGS_DIR / f"{d.isoformat()}.json"
@@ -288,6 +293,35 @@ def _recent_briefs_summary(today: date | None = None, days: int = RECENT_BRIEFS_
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        if isinstance(data, dict):
+            out.append((d, data))
+    return out
+
+
+def load_recent_briefs(
+    today: date | None = None, days: int = RECENT_BRIEFS_LOOKBACK_DAYS
+) -> list[dict]:
+    """The last ``days`` saved brief payloads, newest first (today excluded).
+
+    The typed counterpart to ``_recent_briefs_summary``: V2's planner takes
+    ``recent_briefs`` as dicts and derives its own continuity headlines, so it
+    needs the payloads rather than the rendered prose. Exists because
+    ``assemble_brief_context`` never reads briefs itself — every caller that
+    wants continuity has to hand it in, and the MCP ``get_brief_context``
+    handler previously didn't, which is why its ``continuity`` was always [].
+    """
+    return [payload for _d, payload in _iter_recent_briefs(today, days)]
+
+
+def _recent_briefs_summary(today: date | None = None, days: int = RECENT_BRIEFS_LOOKBACK_DAYS) -> str:
+    """Return a compact rendering of the last ``days`` saved briefs (excluding today).
+
+    Used to give the briefing agent continuity across days — so today's brief
+    can reference what it told {user_name} yesterday/last week and call out
+    follow-through (or the lack of it). Returns "" when there's no history.
+    """
+    lines: list[str] = []
+    for d, data in _iter_recent_briefs(today, days):
         takeaways = data.get("takeaways") or []
         if not takeaways:
             continue
