@@ -362,8 +362,19 @@ These are settled — don't redesign without a reason.
   computed **as-of-yesterday** (today's partial count must never flip the block
   intra-day — that stability is what keeps the prompt-hash caches valid),
   observation repeat-patterns, and notable results. Layer 2 is the coach's own
-  journal (`agent/journal.py`, `coach_journal` table — 60-entry cap pruned on
-  write, 240-char lines, partial unique index on `(source, source_key, seq)`).
+  journal (`agent/journal.py`, `coach_journal` table — 60-entry HOT cap
+  **archived on write, never deleted** since 0.33.0, 240-char lines, partial
+  unique index on `(source, source_key, seq)`). The archive is searchable:
+  `journal.search_entries` runs BM25 over a `coach_journal_fts` FTS5
+  external-content index (sync triggers; query tokens quoted as phrases so
+  MATCH syntax is inert; LIKE fallback when the SQLite build lacks FTS5),
+  exposed as the `recall_coach_memories` tool in `ALL_TOOLS`. **The FTS DDL
+  lives in `db.FTS_SCHEMA`, never in `SCHEMA`** — `executescript` aborts
+  whole-script on error, so FTS5-in-SCHEMA would brick every table on an
+  FTS5-less build; it self-heals on count mismatch against the `_docsize`
+  shadow table (COUNT(*) on an external-content vtable reads through to the
+  content table and always "matches"). Only `delete_coach_memory` removes
+  entries for real; there is no prune path.
   `agent/memory.py` is the ONE resolver; `prompts.coach_memory_block` is the
   pure injection block whose header carries the grounding contract (callbacks
   may cite only listed facts; empty section → no callbacks). **Memory is
@@ -379,8 +390,14 @@ These are settled — don't redesign without a reason.
   filtering make it idempotent and cache-cascade-proof: a card's own journal
   entries are excluded from that card's prompt, or reflecting would bust its
   cache forever). Chat writes via `save_coach_memory`/`list_coach_memories`/
-  `delete_coach_memory` (in `ALL_TOOLS`). `LOCAL_FITNESS_COACH_MEMORY=0` is
-  the kill switch for injection AND reflect; journal data survives it. Memory
+  `delete_coach_memory` (in `ALL_TOOLS`), and since 0.33.0 the system prompt
+  carries explicit capture directives (save durable facts when shared; a 1-2
+  line session note after substantive conversations) plus a retrieval
+  contract (search `recall_coach_memories` before claiming not to remember;
+  never cite a memory the search didn't return — gated by
+  `tests/test_prompts.py`). `LOCAL_FITNESS_COACH_MEMORY=0` is
+  the kill switch for injection AND reflect; journal data survives it and
+  recall still works (the switch never touches journal data). Memory
   resolution never runs inside a perf-benchmarked hot path — SDK-call sites
   only.
 - **Daily brief job needs a Claude credential in `.env`.** The launchd job

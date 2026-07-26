@@ -98,6 +98,19 @@ def test_journal_entry_counts_full_vs_compact(mdb):
     assert sum(1 for line in compact.splitlines() if "memory " in line) == memory.COMPACT_ENTRIES
 
 
+def test_archived_entries_never_reach_injection(mdb):
+    # 61 writes: the oldest archives. Injection (and thus the prompt-hash
+    # caches keyed on it) must only ever see the hot set.
+    journal.save_entry("the one that gets archived", source="chat",
+                       entry_date="2026-01-01")
+    for i in range(journal.JOURNAL_CAP):
+        journal.save_entry(f"hot memory {i}", source="chat",
+                           entry_date="2026-07-01")
+    text = memory.render_memory_for_prompt(user_name="Alex")
+    assert "the one that gets archived" not in text
+    assert "hot memory" in text
+
+
 def test_resolver_never_raises(mdb, monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("db exploded")

@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-07-25
+
+The coach stops forgetting: the journal archives instead of deleting, and a
+new recall tool searches everything it has ever written down.
+
+### Added
+- **Journal archive** — the 60-entry cap now flips an `archived` flag instead
+  of DELETEing. The hot injected set (and every prompt-hash cache keyed on
+  it) is unchanged; the journal itself never forgets. Only user-requested
+  `delete_coach_memory` removes entries for real.
+- **`recall_coach_memories` tool** — keyword search over the WHOLE journal
+  (hot + archived) via a new FTS5 external-content index
+  (`coach_journal_fts` + sync triggers, porter stemming, BM25 best-first).
+  User query tokens are quoted as phrases so MATCH syntax is inert; a LIKE
+  fallback keeps recall working on SQLite builds without FTS5 (`search`
+  field in the response says which mode answered). Pure JSON — reachable
+  over stdio AND the networked `/mcp/` transport. The FTS DDL lives in its
+  own `FTS_SCHEMA` script (never in `SCHEMA`) so an FTS5-less build still
+  boots; the index self-heals on count mismatch against the `_docsize`
+  shadow table.
+- **Capture directives** in the coach's standing instructions (the MCP
+  instructions payload): save durable facts when shared (injury, schedule
+  constraint, goal change, preference), write a 1-2 line session note after
+  substantive conversations, and search recall BEFORE claiming not to
+  remember — never citing a memory the search didn't return.
+
+### Changed
+- `list_coach_memories` gains `include_archived` for browsing past the hot
+  60; `get_coach_personality` reports `journal_entries` (hot, as always)
+  plus a new `journal_archived` count.
+- `LOCAL_FITNESS_COACH_MEMORY=0` still governs injection and auto-reflect
+  only — recall reads journal data directly, which survives the kill switch
+  (the documented contract: the switch never touches journal data).
+
 ## [0.32.0] - 2026-07-23
 
 Report cards become part of the coach's durable memory: every rendered card

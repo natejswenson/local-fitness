@@ -8,8 +8,11 @@ card (``reflect.py``, ``source`` = ``'brief'``/``'report_card'``) and the chat
 tools (``source`` = ``'chat'``).
 
 Contracts that keep it safe to inject into every prompt:
-  * Hard cap ``JOURNAL_CAP`` entries — every write prunes the oldest beyond it,
-    so the block's token cost is bounded forever.
+  * Hard cap ``JOURNAL_CAP`` *hot* entries — every write archives the oldest
+    beyond the cap (``archived = 1``, never DELETE), so the prompt block's
+    token cost stays bounded forever while the journal itself never forgets.
+    ``search_entries`` (FTS5 BM25, LIKE fallback) reaches the whole journal,
+    archive included; only ``delete_entry`` (user-requested forgets) removes.
   * ``ENTRY_MAX_CHARS`` per line — a memory is a line, not an essay.
   * One memory-set per reflected event: ``idx_journal_event`` (db.py) makes a
     duplicate ``(source, source_key, seq)`` insert an IntegrityError, and
@@ -39,7 +42,7 @@ def save_entry(
     entry_date: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
-    """Validate + insert one entry, then prune past ``JOURNAL_CAP``.
+    """Validate + insert one entry, then archive past ``JOURNAL_CAP``.
 
     Raises ``ValueError`` on empty/over-long text or an unknown source, and
     ``sqlite3.IntegrityError`` on a duplicate ``(source, source_key, seq)`` —
@@ -65,7 +68,7 @@ def save_entry(
             (created_at, entry_date, source, source_key, seq, text),
         )
         entry_id = cur.lastrowid
-        prune(conn)
+        archive_overflow(conn)
     return {
         "entry_id": entry_id,
         "created_at": created_at,
@@ -98,14 +101,24 @@ def list_entries(
     limit: int = 50,
     db_path: Path | None = None,
     conn: sqlite3.Connection | None = None,
+    *,
+    include_archived: bool = False,
 ) -> list[dict]:
-    """Newest-first entries, optionally restricted to the trailing ``days``."""
+    """Newest-first entries, optionally restricted to the trailing ``days``.
+
+    Default is the hot (unarchived) set — what injection and reflect see;
+    ``include_archived=True`` opens the whole journal for browsing."""
     sql = ("SELECT entry_id, created_at, entry_date, source, source_key, seq, "
-           "text FROM coach_journal")
+           "text, archived FROM coach_journal")
+    conditions: list[str] = []
     params: list = []
+    if not include_archived:
+        conditions.append("archived = 0")
     if days is not None:
-        sql += " WHERE entry_date >= date('now', ?)"
+        conditions.append("entry_date >= date('now', ?)")
         params.append(f"-{int(days)} days")
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY entry_date DESC, entry_id DESC LIMIT ?"
     params.append(int(limit))
 
@@ -125,15 +138,98 @@ def delete_entry(entry_id: int, db_path: Path | None = None) -> bool:
         return cur.rowcount > 0
 
 
-def prune(conn: sqlite3.Connection, cap: int = JOURNAL_CAP) -> int:
-    """Delete everything but the ``cap`` newest entries. Returns rows removed."""
+def archive_overflow(conn: sqlite3.Connection, cap: int = JOURNAL_CAP) -> int:
+    """Archive everything but the ``cap`` newest hot entries. Returns rows
+    flipped. An UPDATE of the flag only — the FTS index (which triggers on
+    ``UPDATE OF text``) never churns, and nothing is ever deleted here."""
     cur = conn.execute(
-        "DELETE FROM coach_journal WHERE entry_id NOT IN ("
-        "SELECT entry_id FROM coach_journal "
+        "UPDATE coach_journal SET archived = 1 "
+        "WHERE archived = 0 AND entry_id NOT IN ("
+        "SELECT entry_id FROM coach_journal WHERE archived = 0 "
         "ORDER BY entry_date DESC, entry_id DESC LIMIT ?)",
         (int(cap),),
     )
     return cur.rowcount
+
+
+# --- search ------------------------------------------------------------------
+
+
+def _fts_query(raw: str) -> str:
+    """Sanitize a user query into FTS5 MATCH syntax: every whitespace token
+    becomes a quoted phrase (implicit AND), so MATCH operators (``NEAR(``,
+    ``col:``, ``*``, stray quotes) are inert data, never syntax.
+
+    Raises ``ValueError`` when nothing searchable survives."""
+    tokens = [t for t in (raw or "").split() if any(c.isalnum() for c in t)]
+    if not tokens:
+        raise ValueError("query has no searchable words")
+    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+
+def _fts_available(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'coach_journal_fts'").fetchone()
+    return row is not None
+
+
+_SEARCH_COLS = ("j.entry_id, j.created_at, j.entry_date, j.source, "
+                "j.source_key, j.seq, j.text, j.archived")
+
+
+def _search_like(
+    conn: sqlite3.Connection, raw: str, limit: int
+) -> list[dict]:
+    """Substring fallback for FTS5-less builds: AND-joined LIKE per token,
+    newest-first (no relevance ranking available)."""
+    tokens = [t for t in (raw or "").split() if any(c.isalnum() for c in t)]
+    if not tokens:
+        raise ValueError("query has no searchable words")
+    conds, params = [], []
+    for t in tokens:
+        escaped = t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds.append(r"j.text LIKE '%' || ? || '%' ESCAPE '\'")
+        params.append(escaped)
+    params.append(int(limit))
+    rows = conn.execute(
+        f"SELECT {_SEARCH_COLS} FROM coach_journal j "
+        f"WHERE {' AND '.join(conds)} "
+        "ORDER BY j.entry_date DESC, j.entry_id DESC LIMIT ?",
+        params,
+    )
+    return [dict(r) for r in rows]
+
+
+def search_entries(
+    query: str,
+    *,
+    limit: int = 8,
+    db_path: Path | None = None,
+) -> tuple[list[dict], str]:
+    """Keyword search over the WHOLE journal — hot and archived alike.
+
+    Returns ``(matches, mode)`` where mode is ``"fts"`` (BM25 best-first) or
+    ``"like"`` (substring, newest-first — used when the SQLite build lacks
+    FTS5, or as a belt-and-suspenders catch if MATCH still errors).
+    Raises ``ValueError`` only on an unsearchable (empty/punctuation) query.
+    """
+    match = _fts_query(query)  # validates even when we fall back to LIKE
+    with db.connect(db_path) as conn:
+        if _fts_available(conn):
+            try:
+                rows = conn.execute(
+                    f"SELECT {_SEARCH_COLS} FROM coach_journal_fts "
+                    "JOIN coach_journal j "
+                    "ON j.entry_id = coach_journal_fts.rowid "
+                    "WHERE coach_journal_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?",
+                    (match, int(limit)),
+                )
+                return [dict(r) for r in rows], "fts"
+            except sqlite3.OperationalError:
+                pass
+        return _search_like(conn, query, int(limit)), "like"
 
 
 # --- rendering (pure) -------------------------------------------------------
