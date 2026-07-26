@@ -269,3 +269,131 @@ def test_compute_relationship_ledger_from_a_seeded_db(tmp_path, monkeypatch):
     assert led["patterns"][0]["pattern"] == "injury_logged"
     assert led["plan"] == ledger.plan_adherence_facts([], led["as_of"])
     assert "goal hit 4 days running" in ledger.render_ledger_block(led, "Alex")
+
+
+# --- report_card_facts -------------------------------------------------------
+
+
+def _card(day: str, gpa: float | None, grade: str | None) -> dict:
+    return {"activity_date": day, "gpa": gpa, "overall_grade": grade}
+
+
+def test_card_facts_empty_is_zeroed():
+    facts = ledger.report_card_facts([], TODAY)
+    assert facts == {
+        "count": 0, "mean_gpa": None, "grade_counts": {},
+        "trend": "no data", "window_days": ledger._CARD_WINDOW_DAYS,
+    }
+    led = ledger.compute_ledger(
+        ledger.plan_adherence_facts([], TODAY),
+        ledger.step_streak_facts([], 10000, TODAY),
+        [], [], TODAY, card_facts=facts)
+    assert "Report cards" not in ledger.render_ledger_block(led, "Alex")
+
+
+def test_card_facts_excludes_today_and_future():
+    cards = [
+        _card(TODAY, 4.0, "A"),                                    # today: out
+        _card("2026-07-24", 4.0, "A"),                              # tomorrow: out
+        _card("2026-07-22", 3.0, "B"),                              # yesterday: in
+        _card("2026-07-21", 2.0, "C"),                              # 2 days back: in
+    ]
+    facts = ledger.report_card_facts(cards, TODAY)
+    assert facts["count"] == 2
+    assert facts["mean_gpa"] == 2.5
+
+
+def test_card_facts_window_edge_day21_in_day22_out():
+    t = date.fromisoformat(TODAY)
+    edge_in = (t - timedelta(days=ledger._CARD_WINDOW_DAYS)).isoformat()
+    edge_out = (t - timedelta(days=ledger._CARD_WINDOW_DAYS + 1)).isoformat()
+    facts = ledger.report_card_facts(
+        [_card(edge_in, 3.0, "B"), _card(edge_out, 4.0, "A")], TODAY)
+    assert facts["count"] == 1
+    assert facts["mean_gpa"] == 3.0
+
+
+def test_card_facts_mean_gpa_and_base_letter_counts():
+    cards = [
+        _card("2026-07-22", 3.3, "B+"),
+        _card("2026-07-21", 2.7, "B-"),
+        _card("2026-07-20", None, "C"),   # no gpa: skipped entirely
+        _card("2026-07-19", 1.0, None),   # no grade: skipped entirely
+        _card("2026-07-18", 4.0, "A"),
+    ]
+    facts = ledger.report_card_facts(cards, TODAY)
+    assert facts["count"] == 3
+    assert facts["mean_gpa"] == round((3.3 + 2.7 + 4.0) / 3, 2)
+    assert facts["grade_counts"] == {"B": 2, "A": 1}
+
+
+def test_card_facts_trend_halves_and_min_count():
+    # Recent half (days 1-10 back) averages well above earlier (11-21 back).
+    recent = [_card(f"2026-07-{22 - i:02d}", 3.8, "A") for i in range(3)]
+    earlier = [_card(f"2026-07-{10 - i:02d}", 2.0, "C") for i in range(3)]
+    facts = ledger.report_card_facts(recent + earlier, TODAY)
+    assert facts["trend"] == "rising"
+
+    flat = ([_card("2026-07-22", 3.0, "B")] * 2
+            + [_card("2026-07-10", 3.0, "B")] * 2)
+    assert ledger.report_card_facts(flat, TODAY)["trend"] == "flat"
+
+    # Only 1 card in the earlier half: under-populated, no trend claimed.
+    under = [_card("2026-07-22", 3.0, "B"), _card("2026-07-21", 3.5, "B"),
+              _card("2026-07-10", 2.0, "C")]
+    assert ledger.report_card_facts(under, TODAY)["trend"] == "no data"
+
+
+def test_render_ledger_pins_the_card_line():
+    facts = {"count": 5, "mean_gpa": 3.12,
+              "grade_counts": {"A": 2, "B": 2, "F": 1},
+              "trend": "rising", "window_days": 21}
+    led = {"as_of": TODAY, "plan": {}, "steps": {}, "patterns": [],
+           "notables": [], "cards": facts}
+    block = ledger.render_ledger_block(led, "Alex")
+    assert ("- Report cards: 5 workouts graded in the last 3 weeks "
+            "(through yesterday) — avg GPA 3.12 (A:2 B:2 F:1); grades "
+            "rising.") in block
+
+    # Below the render floor: no line at all.
+    one = {"count": 1, "mean_gpa": 4.0, "grade_counts": {"A": 1},
+           "trend": "no data", "window_days": 21}
+    led_one = {"as_of": TODAY, "plan": {}, "steps": {}, "patterns": [],
+               "notables": [], "cards": one}
+    assert "Report cards" not in ledger.render_ledger_block(led_one, "Alex")
+
+
+def test_compute_relationship_ledger_reads_report_cards_table(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today()
+
+    def _insert(conn, back, gpa, grade):
+        d = (today - timedelta(days=back)).isoformat()
+        conn.execute(
+            "INSERT INTO report_cards (activity_id, activity_date, graded_at, "
+            "overall_grade, gpa, card_json) VALUES (?, ?, ?, ?, ?, '{}')",
+            (1000 + back, d, "2026-07-01T00:00:00", grade, gpa),
+        )
+
+    with db.connect(p) as conn:
+        _insert(conn, 0, 4.0, "A")   # today: must be excluded
+        _insert(conn, 1, 3.0, "B")
+        _insert(conn, 2, 3.5, "A")
+        _insert(conn, 3, 2.0, "C")
+
+    led = ledger.compute_relationship_ledger(db_path=p)
+    assert led["cards"]["count"] == 3
+    assert "Report cards: 3 workouts graded" in ledger.render_ledger_block(led, "Alex")
+
+
+def test_ledger_survives_missing_report_cards_table(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    with db.connect(p) as conn:
+        conn.execute("DROP TABLE report_cards")
+    led = ledger.compute_relationship_ledger(db_path=p)
+    assert led["cards"]["count"] == 0
+    assert led["cards"]["trend"] == "no data"

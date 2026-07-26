@@ -26,7 +26,8 @@ import pdfplumber
 import pytest
 
 from local_fitness import db, plans
-from local_fitness.agent import branding, interpret, report_card, tools, units, visuals
+from local_fitness.agent import (
+    branding, interpret, journal, report_card, tools, units, visuals)
 
 
 def test_text_emits_compact_json():
@@ -3399,6 +3400,66 @@ def test_delete_coach_memory(seeded):
     assert err
     _p, err = call(tools.delete_coach_memory, {})
     assert err
+
+
+def test_recall_finds_archived_memory(seeded):
+    call(tools.save_coach_memory,
+         {"text": "left achilles flared on the hill repeats",
+          "date": "2026-01-05"})
+    for i in range(journal.JOURNAL_CAP):
+        call(tools.save_coach_memory,
+             {"text": f"filler {i}", "date": "2026-07-01"})
+    payload, err = call(tools.recall_coach_memories, {"query": "achilles"})
+    assert not err
+    assert payload["search"] == "fts"
+    assert payload["count"] == 1
+    match = payload["matches"][0]
+    assert match["text"] == "left achilles flared on the hill repeats"
+    assert match["archived"] is True
+
+
+def test_recall_validates_input(seeded):
+    call(tools.save_coach_memory, {"text": "one memory"})
+    _p, err = call(tools.recall_coach_memories, {})
+    assert err
+    _p, err = call(tools.recall_coach_memories, {"query": "   "})
+    assert err
+    _p, err = call(tools.recall_coach_memories, {"query": "x" * 201})
+    assert err
+    _p, err = call(tools.recall_coach_memories, {"query": "ok", "limit": 0})
+    assert err
+    _p, err = call(tools.recall_coach_memories, {"query": "ok", "limit": "ten"})
+    assert err
+    _p, err = call(tools.recall_coach_memories, {"query": "()"})
+    assert err  # nothing searchable after sanitization
+    payload, err = call(tools.recall_coach_memories,
+                        {"query": "memory", "limit": 999})
+    assert not err
+    assert payload["count"] <= 25
+
+
+def test_list_coach_memories_include_archived(seeded):
+    for i in range(journal.JOURNAL_CAP + 1):
+        call(tools.save_coach_memory,
+             {"text": f"memory {i}", "date": "2026-07-01"})
+    hot, err = call(tools.list_coach_memories, {"limit": 200})
+    assert not err
+    assert hot["count"] == journal.JOURNAL_CAP  # clamp + archived excluded
+    everything, err = call(tools.list_coach_memories,
+                           {"limit": 200, "include_archived": True})
+    assert not err
+    assert everything["count"] == journal.JOURNAL_CAP + 1
+    assert sum(1 for m in everything["memories"] if m["archived"]) == 1
+
+
+def test_get_coach_personality_counts_active_and_archived(seeded):
+    for i in range(journal.JOURNAL_CAP + 1):
+        call(tools.save_coach_memory,
+             {"text": f"memory {i}", "date": "2026-07-01"})
+    payload, err = call(tools.get_coach_personality, {})
+    assert not err
+    assert payload["journal_entries"] == journal.JOURNAL_CAP
+    assert payload["journal_archived"] == 1
 
 
 def test_report_card_schedules_reflection_exactly_once(rc_seeded, monkeypatch):

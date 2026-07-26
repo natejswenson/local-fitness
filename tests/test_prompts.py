@@ -390,6 +390,33 @@ def test_memory_block_carries_the_grounding_contract():
     assert prompts.coach_memory_block("Alex", "") == ""
 
 
+def test_system_prompt_carries_capture_and_recall_instructions(no_saved_notes):
+    """The MCP instructions payload must keep both halves of conversation
+    memory: the capture directive (save durable facts + session notes) and
+    the retrieval directive (search before claiming not to remember) —
+    either one silently dropping breaks 'the coach remembers'."""
+    text = prompts.system_prompt("Alex", coach.resolve_coach_profile())
+    assert "save_coach_memory" in text
+    assert "recall_coach_memories" in text
+    assert "session note" in text
+    normalized = " ".join(text.split())
+    assert "Never say you don't remember without searching" in normalized
+    # Retrieval stays grounded, like the injected block's contract.
+    assert "never cite a memory the search didn't return" in normalized
+
+
+def test_system_prompt_carries_report_card_directives(no_saved_notes):
+    """The coach must reach for list_report_cards/get_report_card on grade
+    or trend questions rather than guessing from prose memory — and never
+    state a grade/GPA that didn't come from a tool call or the memory
+    section's computed summary line."""
+    text = prompts.system_prompt("Alex", coach.resolve_coach_profile())
+    normalized = " ".join(text.split())
+    assert "list_report_cards" in text
+    assert "get_report_card" in text
+    assert "NEVER state a letter grade or GPA that did not come from" in normalized
+
+
 # --- source guard: no personal name in executable prompt text ---------------
 
 _PROMPT_MODULES = (

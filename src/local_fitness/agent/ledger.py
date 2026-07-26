@@ -17,13 +17,19 @@ than re-grading — one grader, one truth.
 Step streaks are deliberately computed **as of yesterday**: today's step count
 is partial all day, and a block that flipped intra-day would bust the
 prompt-hash caches (``plan_coach``/``workout_coach``) on every render instead
-of once per day.
+of once per day. The trailing-3-week report-card aggregate (0.34.0,
+``report_card_facts``) follows the identical rule for the identical reason:
+it is computed ONLY over cards with ``activity_date`` strictly before today,
+so grading today's workout can never change today's ``memory_text`` — the
+render that saves the card must never invalidate its own cache key.
 """
 from __future__ import annotations
 
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
+
+from . import interpret
 
 #: Plan workout types that count as quality sessions for miss-tracking.
 QUALITY_TYPES = frozenset({"tempo", "interval", "race"})
@@ -50,6 +56,14 @@ _QUALITY_WINDOW_DAYS = 28
 _NOTABLE_WINDOW_DAYS = 14
 _STEP_WINDOW_DAYS = 60
 _STREAK_ENDED_MIN = 3
+
+#: "Past 3 weeks" of report cards, as-of-yesterday (see module docstring).
+_CARD_WINDOW_DAYS = 21
+#: Trend split: days 1-10 back (recent) vs 11-21 back (earlier).
+_CARD_RECENT_HALF_DAYS = 10
+#: Render floor — one graded workout isn't a trend worth a receipt line.
+_CARD_MIN_COUNT = 2
+_CARD_TREND_MIN_PER_HALF = 2
 
 
 def _iso(d: date) -> str:
@@ -269,15 +283,73 @@ def notable_results(graded_workouts: list[dict], today: str) -> list[dict]:
     return sorted(out, key=lambda r: r["date"], reverse=True)
 
 
+def report_card_facts(cards: list[dict], today: str) -> dict:
+    """Trailing-3-week report-card aggregate, as of YESTERDAY.
+
+    Only rows with ``activity_date`` strictly before ``today`` count — the
+    same discipline as ``step_streak_facts`` (see module docstring): a card
+    saved for TODAY's workout must never change today's ``memory_text``,
+    since that render's own cache key depends on it. Enforced here
+    independently of any SQL filter the caller applied, since this function
+    is exercised directly on fabricated rows in tests.
+
+    ``cards`` rows carry ``activity_date``/``gpa``/``overall_grade`` (the
+    ``report_cards`` row shape). A row with no ``gpa`` or no
+    ``overall_grade`` graded nothing usable and is skipped entirely — it
+    never counts, never enters the mean.
+    """
+    t = _parse(today)
+    in_window = []
+    for row in cards:
+        d = _parse(row.get("activity_date") or "")
+        if d is None or t is None:
+            continue
+        age = (t - d).days
+        if not (1 <= age <= _CARD_WINDOW_DAYS):
+            continue
+        if row.get("gpa") is None or not row.get("overall_grade"):
+            continue
+        in_window.append({**row, "_age": age})
+
+    count = len(in_window)
+    if count == 0:
+        return {
+            "count": 0, "mean_gpa": None, "grade_counts": {},
+            "trend": "no data", "window_days": _CARD_WINDOW_DAYS,
+        }
+
+    mean_gpa = round(sum(r["gpa"] for r in in_window) / count, 2)
+
+    grade_counts: dict[str, int] = {}
+    for r in in_window:
+        letter = r["overall_grade"][0]
+        if letter in "ABCDF":
+            grade_counts[letter] = grade_counts.get(letter, 0) + 1
+
+    recent = [r["gpa"] for r in in_window if r["_age"] <= _CARD_RECENT_HALF_DAYS]
+    earlier = [r["gpa"] for r in in_window if r["_age"] > _CARD_RECENT_HALF_DAYS]
+    if len(recent) >= _CARD_TREND_MIN_PER_HALF and len(earlier) >= _CARD_TREND_MIN_PER_HALF:
+        trend = interpret.delta_direction(
+            interpret.pct_change(sum(recent) / len(recent), sum(earlier) / len(earlier)))
+    else:
+        trend = "no data"
+
+    return {
+        "count": count, "mean_gpa": mean_gpa, "grade_counts": grade_counts,
+        "trend": trend, "window_days": _CARD_WINDOW_DAYS,
+    }
+
+
 def compute_ledger(plan_facts: dict | None, step_facts: dict | None,
                    obs_patterns: list[dict], notables: list[dict],
-                   today: str) -> dict:
+                   today: str, *, card_facts: dict | None = None) -> dict:
     return {
         "as_of": today,
         "plan": plan_facts,
         "steps": step_facts,
         "patterns": obs_patterns,
         "notables": notables,
+        "cards": card_facts,
     }
 
 
@@ -325,6 +397,18 @@ def render_ledger_block(ledger: dict, user_name: str) -> str:
         best = steps.get("best_streak_60d", 0)
         if best > steps["current_hit_streak"]:
             line += f"; best in 60 days is {best}"
+        lines.append(line + ".")
+
+    cards = ledger.get("cards") or {}
+    if cards.get("count", 0) >= _CARD_MIN_COUNT and cards.get("mean_gpa") is not None:
+        counts = cards.get("grade_counts") or {}
+        dist = " ".join(f"{g}:{counts[g]}" for g in "ABCDF" if counts.get(g))
+        line = (f"Report cards: {cards['count']} workouts graded in the last "
+                f"3 weeks (through yesterday) — avg GPA {cards['mean_gpa']:.2f}")
+        if dist:
+            line += f" ({dist})"
+        if cards.get("trend") in ("rising", "falling"):
+            line += f"; grades {cards['trend']}"
         lines.append(line + ".")
 
     _PATTERN_PHRASES = {
@@ -399,10 +483,27 @@ def load_ledger_inputs(conn: sqlite3.Connection, today: str,
             (window_start, today),
         )
     ]
+    card_window_start = _iso(t - timedelta(days=_CARD_WINDOW_DAYS))
+    try:
+        card_rows = [
+            {"activity_date": r[0], "gpa": r[1], "overall_grade": r[2]}
+            for r in conn.execute(
+                "SELECT activity_date, gpa, overall_grade FROM report_cards "
+                "WHERE activity_date >= ? AND activity_date < ? "
+                "ORDER BY activity_date",
+                (card_window_start, today),
+            )
+        ]
+    except sqlite3.OperationalError:
+        # Pre-0.32.0 DB with no report_cards table: costs this one line,
+        # never the whole memory block (memory.py fails the whole render to
+        # "" on any exception, which is a much bigger loss).
+        card_rows = []
     return {
         "graded_workouts": graded,
         "daily_steps": steps_rows,
         "observations": obs_rows,
+        "report_cards": card_rows,
         "step_goal": step_goal,
     }
 
@@ -427,7 +528,9 @@ def compute_relationship_ledger(
             inputs["daily_steps"], inputs["step_goal"], today)
         patterns = observation_patterns(inputs["observations"], today)
         notables = notable_results(inputs["graded_workouts"], today)
-        return compute_ledger(plan_facts, step_facts, patterns, notables, today)
+        card_facts = report_card_facts(inputs["report_cards"], today)
+        return compute_ledger(plan_facts, step_facts, patterns, notables,
+                              today, card_facts=card_facts)
 
     if conn is not None:
         return _run(conn)
