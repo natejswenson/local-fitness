@@ -939,17 +939,25 @@ def best_recent_effort(
     # date and avg_pace_sec_per_km are both load-bearing, not incidental: the
     # pace decides run-vs-walk (the label lies — see select_best_effort) and
     # the date is what lets the projection state which run it came from.
+    #
+    # The pace bound is a pure PRE-narrowing of what select_best_effort's
+    # gates exclude anyway (pace > ceiling → not a running effort; pace <= 0 /
+    # NULL → unknown mode, excluded) — derived from the same interpret
+    # constants so the two can't drift. It exists so a mostly-walking history
+    # doesn't get fetched and dict-converted just to be dropped in Python
+    # (this path sits under the get_training_plan_progress perf benchmark).
+    ceiling_sec_per_km = interpret.RUN_PACE_CEILING_SEC_PER_MI / interpret._KM_PER_MILE
     sql = (
         "SELECT date, activity_type, distance_meters, duration_seconds, "
         "avg_pace_sec_per_km "
         "FROM activities WHERE date >= ? AND distance_meters >= ? "
-        "AND avg_pace_sec_per_km IS NOT NULL"
+        "AND avg_pace_sec_per_km > 0 AND avg_pace_sec_per_km <= ?"
     )
     if conn is not None:
-        raw = conn.execute(sql, (cutoff, min_distance_m)).fetchall()
+        raw = conn.execute(sql, (cutoff, min_distance_m, ceiling_sec_per_km)).fetchall()
     else:
         with db.connect(db_path) as c:
-            raw = c.execute(sql, (cutoff, min_distance_m)).fetchall()
+            raw = c.execute(sql, (cutoff, min_distance_m, ceiling_sec_per_km)).fetchall()
     rows = [dict(r) for r in raw]
 
     # One query at the flat floor, then narrow in Python — a second round trip
