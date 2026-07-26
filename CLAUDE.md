@@ -304,6 +304,31 @@ These are settled — don't redesign without a reason.
   `tests/test_prompts.py` fails the build if a prompt module puts a personal
   name in a non-docstring string literal. When adding a prompt surface, add it
   to `_voice_surfaces` in that file — the gate is what keeps this true.
+- **The personality is tunable conversationally; the shipped default is the
+  hardass accountability mirror** (0.31.0). `coach.DEFAULT_PROFILE` is
+  `"hardass"` (rewritten as an original accountability-mirror persona — never
+  naming/imitating a real coach, with a "Using your memory" receipts section
+  and a never-do list that pins "red recovery day → order the rest") and
+  `config.coach_profile()`'s default literal matches — config can't import
+  coach (cycle), so `tests/test_coach.py::test_config_default_matches_coach_default`
+  pins the pair. The tuning layer: `agent/personality.py` owns a
+  `PersonalitySpec` stored as JSON in settings key `coach_personality_spec`
+  (≤8 KB, identity ≤4000 chars, ≤12 items/list, ≤16 intensity topics),
+  edited ONLY via the `get_coach_personality`/`update_coach_personality` MCP
+  tools (agent-owned writes, like plans). **Virtual seeding**: no stored spec
+  → behavior is byte-identical to the profile `.md` files; the first update
+  materializes `seed_from_profile(active)` + patch. `resolve_coach_profile`
+  parses the spec out of the `all_settings()` dict it already fetched (zero
+  added reads) and attaches it as `CoachProfile.spec`;
+  `profile.effective_persona` (spec render > file prose) is what
+  `coach_voice_block` speaks. A spec whose `base_profile` mismatches the
+  active profile is **ignored but retained** (switch back and the tuning
+  returns; the get tool reports `base_profile_mismatch`). The 5 numeric dials
+  stay in their existing settings keys — the update tool writes those keys,
+  never duplicates them into the spec. Precedence: **notes > spec > profile
+  file**. Kill switch `LOCAL_FITNESS_COACH_SPEC=0` ignores (never deletes)
+  the spec. `scripts/score_profiles.py`'s hardass markers track the persona's
+  actual signature lines — update them together.
 - **Run-vs-walk is decided by measured pace everywhere, never by
   `activity_type`** (0.27.0). Garmin's label lies — walking-desk sessions log
   as `treadmill_running` — so `plans.GradingConfig.pace_gated_locomotion` (on
@@ -330,6 +355,34 @@ These are settled — don't redesign without a reason.
   `slope_direction`, etc.) to their payloads instead of leaving the model to
   apply a static legend string by hand. The rule holds project-wide: the LLM
   phrases a judgment, it never derives one that tested Python can compute.
+- **The coach has a two-layer memory on every voice surface** (0.30.0). Layer 1
+  is the deterministic relationship ledger (`agent/ledger.py`, pure +
+  persistence divider like `plans.py`): adherence miss/done streaks (reusing
+  `plans.build_plan_detail`'s verdicts — never re-grading), step-goal streaks
+  computed **as-of-yesterday** (today's partial count must never flip the block
+  intra-day — that stability is what keeps the prompt-hash caches valid),
+  observation repeat-patterns, and notable results. Layer 2 is the coach's own
+  journal (`agent/journal.py`, `coach_journal` table — 60-entry cap pruned on
+  write, 240-char lines, partial unique index on `(source, source_key, seq)`).
+  `agent/memory.py` is the ONE resolver; `prompts.coach_memory_block` is the
+  pure injection block whose header carries the grounding contract (callbacks
+  may cite only listed facts; empty section → no callbacks). **Memory is
+  passed INTO the four voice surfaces as `memory_text`, never resolved inside
+  the builders** — the PDF coaches key disk caches on the prompt hash, and
+  `prompts.py` builds `SYSTEM_PROMPT` at import (an internal DB read would
+  open the DB on `import prompts`). The compact V2 variant is hard-capped at
+  `memory.COMPACT_MAX_CHARS` (600) so V2 stays the shrunk prompt. Writes:
+  `agent/reflect.py` auto-reflects after each **saved** brief
+  (`generate_and_save` tail — post-persistence, fail-silent, +~10s on the
+  launchd job) and each **first-render** report card (fire-and-forget task;
+  `journal.has_event` pre-check + the unique index + `exclude_source_key`
+  filtering make it idempotent and cache-cascade-proof: a card's own journal
+  entries are excluded from that card's prompt, or reflecting would bust its
+  cache forever). Chat writes via `save_coach_memory`/`list_coach_memories`/
+  `delete_coach_memory` (in `ALL_TOOLS`). `LOCAL_FITNESS_COACH_MEMORY=0` is
+  the kill switch for injection AND reflect; journal data survives it. Memory
+  resolution never runs inside a perf-benchmarked hot path — SDK-call sites
+  only.
 - **Daily brief job needs a Claude credential in `.env`.** The launchd job
   (`com.localfitness.brief` → `fitness brief --if-missing`) couples pull →
   recompute-baselines → generate → save atomically, firing at **06:30 with
@@ -420,7 +473,26 @@ These are settled — don't redesign without a reason.
   (PID dead + >24h old) on each process's first call — `atexit` doesn't fire
   on `SIGKILL`/`SIGTERM`, so an abrupt kill can still leak until the sweep
   claims it; this is an accepted residual risk for a personal, single-user
-  tool, not something hardened further. After a successful write, the file
+  tool, not something hardened further. **Both PDF filenames are
+  content-addressed** (0.28.2): `brief-<date>-<sha8>.pdf` and
+  `report-card-<id>-<sha8>.pdf`, where `sha8` is `_render_tag()` — a sha256
+  over the render's logical INPUTS (brief/card content + chart PNG bytes +
+  brand theme + app version), NOT over the PDF bytes. Bytes-hashing was
+  0.28.2's original design and it was wrong: WeasyPrint's PDF serialization
+  is not byte-reproducible (the same HTML rendered twice in one process
+  diverged on ~50% of paired Linux renders, measured 2026-07-23; macOS's
+  allocator usually masks it), so the "identical content reuses one filename"
+  half of the contract failed at random and its CI test was a coin flip.
+  `generate_chart`'s PNG still uses `_content_tag()` (bytes) — matplotlib's
+  PNG writer IS reproducible. This is not cosmetic — macOS `open`
+  RE-FOCUSES an already-open Preview window for a path it has seen rather than
+  reloading the bytes, so the old deterministic `brief-<date>.pdf` showed a
+  STALE render on every re-generate. A user read yesterday's-looking page and
+  concluded the whole data pipeline was stale (observed 2026-07-22, a real
+  trust hit). The content tag means changed content always lands on a NEW
+  filename (a genuinely fresh window) while identical content reuses the same
+  file (idempotent — refocusing is correct when the bytes match). Don't revert
+  to a static name. After a successful write, the file
   is auto-opened via macOS `open` (best-effort, never fails the tool call;
   logs a warning and no-ops on other platforms). Set
   `LOCAL_FITNESS_REPORTS_DIR` to opt back into a persistent directory (still
@@ -434,6 +506,20 @@ These are settled — don't redesign without a reason.
   Pango/HarfBuzz libs — `apt-get` on Linux/CI, but on macOS Homebrew's
   install isn't on the default dylib search path and needs
   `DYLD_LIBRARY_PATH=$(brew --prefix)/lib` (see `.env.example`).
+- **`save_brief` advertises the real Brief JSON Schema** (0.28.2), not an opaque
+  `{"brief": dict}`. `tools._save_brief_input_schema()` derives it from
+  `schemas.Brief.model_json_schema()` (so it can't drift from what the server
+  validates), hoists the pydantic `$defs` to the schema root so the nested
+  `$ref`s resolve, and narrows `brief.required` to `["takeaways"]` because
+  `briefs.save_brief` stamps `date`/`user_name`/`generated_at` server-side. The
+  Agent SDK forwards a dict schema verbatim ONLY when it has a top-level string
+  `type` + `properties` (else it treats the dict as a `{name: python-type}`
+  shorthand and silently drops the rest) — the constant satisfies that, guarded
+  by `test_save_brief_schema_meets_the_sdk_passthrough_condition`. Motivation: a
+  live agent had to grep + Read `schemas.py` to learn the Takeaway/tone/metric
+  shapes before it could save (2026-07-22); a filesystem-less MCP client
+  (Claude Desktop, a phone over `/mcp/`) couldn't construct a valid brief at
+  all. Now the contract carries the enum values and sub-object shapes.
 - **Workout grading is deterministic Python, not model judgment** (0.25.0).
   `agent/report_card.py` backs the `workout_report_card` tool and follows the
   `interpret.py` rule: the LLM phrases a judgment, it never derives one code
@@ -600,6 +686,33 @@ These are settled — don't redesign without a reason.
     a prescribed 10:28 easy run executed at 9:28 scored a B-, letting the card
     print an overall A for a run its own read called "you never ran easy at
     all". The card must never contradict its own coaching line.
+- **Report cards persist as dated snapshots — the coach's durable card
+  memory** (0.32.0). Every `workout_report_card` render saves the full card
+  (grades + the coach's read) to the `report_cards` table via
+  `agent/card_store.py` (journal-style pure/persistence split). The stored
+  row is **the card as actually shown, graded against the plan active at
+  that render** — grades drift with the active plan, so this is a historical
+  record, never a live view, and there is **no backfill** (history
+  accumulates as cards render). The save is fail-silent through **one atomic
+  guarded UPSERT keyed on the read's prompt key** (`busy_timeout=5000`,
+  awaited via `asyncio.to_thread`): an **equal-key render is a byte-identical
+  no-op** — so `graded_at` dates the most recent *distinct-key* render, and
+  the letter a query tool shows can lag a fresh live render by within-bucket
+  grade drift (labeled, not silent) — and a template-fallback render never
+  overwrites a real-read row (a stored card's words and grades always come
+  from ONE render; no splicing path exists). The stored read doubles as a
+  **per-activity read cache**: `workout_coach.read_cache_key` is the single
+  key definition, and a re-render whose prompt key matches the stored row
+  reuses the read with no SDK call. Query surface: `list_report_cards` +
+  `get_report_card` in `ALL_TOOLS` (pure JSON → reachable over stdio AND
+  `/mcp/`; `workout_report_card` itself stays stdio-only). Two load-bearing
+  assumptions: **no delete/prune path exists** (`load_read` reads outside
+  the UPSERT's guard — a pruning tool would open a corrupting window; don't
+  add one without revisiting the fast path), and **stored cards are never
+  injected into `render_memory_for_prompt`** (would bust the prompt-hash
+  caches and re-open the self-render cascade `exclude_source_key` guards
+  against — a v2 injection needs a parallel exclusion first). Design:
+  `docs/plans/2026-07-23-report-card-persistence-design.md`.
 - **Per-sample HR traces are fetched on demand, never backfilled**
   (`ingest/details.py`, 0.25.0). `get_activity_details` returns ~1700 samples
   per run; pulling that for all 747 activities is both a backfill nobody asked

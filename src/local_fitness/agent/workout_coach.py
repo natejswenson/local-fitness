@@ -143,6 +143,7 @@ def build_prompt(
     card: dict,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
 ) -> tuple[str, str]:
     """Assemble the ``(system_prompt, user_prompt)`` pair for the verbal read.
 
@@ -152,7 +153,10 @@ def build_prompt(
     ``notes_text`` is the caller's already-rendered ``notes.render_for_prompt()``
     output (the ``prompts.system_prompt`` / ``plan_coach.build_prompt``
     convention — this function does no I/O of its own), so a saved preference
-    is honored here exactly as it is in chat and the brief.
+    is honored here exactly as it is in chat and the brief. ``memory_text``
+    follows the same passed-in convention for the coach's memory; the caller
+    (``tools.workout_report_card``) resolves it with this card's own journal
+    entries excluded, so reflecting on a card never changes that card's prompt.
     """
     system_prompt = (
         f"You are {user_name}'s running coach, writing the opening read on a "
@@ -164,6 +168,9 @@ def build_prompt(
         "face.\n\n"
         f"{_FORMAT_RULES}"
     )
+    memory_section = prompts.coach_memory_block(user_name, memory_text)
+    if memory_section:
+        system_prompt += f"\n\n{memory_section}"
     notes_section = prompts.user_notes_block(user_name, notes_text)
     if notes_section:
         system_prompt += f"\n\n{notes_section}"
@@ -423,6 +430,7 @@ async def generate_read(
     timeout: float = DEFAULT_TIMEOUT_S,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
 ) -> str:
     """Claude-generated opening read for the report card.
 
@@ -437,7 +445,8 @@ async def generate_read(
         model = DEFAULT_MODEL
 
     system_prompt, user_prompt = build_prompt(
-        profile, card, notes_text=notes_text, user_name=user_name)
+        profile, card, notes_text=notes_text, user_name=user_name,
+        memory_text=memory_text)
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
@@ -498,6 +507,43 @@ def _write_cache(path: Path, key: str, text: str) -> None:
         _LOG.warning("workout_coach cache write failed (ignored)", exc_info=True)
 
 
+def read_cache_key(
+    profile: CoachProfile,
+    card: dict,
+    *,
+    model: str | None = None,
+    notes_text: str | None = None,
+    user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
+) -> str:
+    """The read's cache key — the ONE key definition, shared by
+    ``generate_read_cached``'s file cache and ``card_store``'s persisted rows.
+
+    Pure: ``build_prompt`` is pure, so the key is a function of the card,
+    voice, notes and memory alone. The byte layout is load-bearing —
+    ``sha256("\\x00".join([system_prompt, user_prompt, model or "default",
+    str(activity_id)]))``, with the literal ``"default"`` (NOT
+    ``DEFAULT_MODEL``) when ``model`` is None — because a stored row's key
+    must hash identically to the file cache's or the fast path silently
+    never fires.
+
+    activity_id is part of the key even though it is deliberately absent from
+    the prompt (a bare row id is noise to the model). Without it, two
+    sessions on the same day with the same name and the same grades — a
+    double day, which the tool already handles via other_activities_on_date —
+    hash identically, and the second card silently serves the first's read.
+    """
+    system_prompt, user_prompt = build_prompt(
+        profile, card, notes_text=notes_text, user_name=user_name,
+        memory_text=memory_text)
+    return hashlib.sha256(
+        "\x00".join([
+            system_prompt, user_prompt, model or "default",
+            str((card.get("activity") or {}).get("activity_id", "")),
+        ]).encode("utf-8")
+    ).hexdigest()
+
+
 async def generate_read_cached(
     profile: CoachProfile,
     card: dict,
@@ -506,6 +552,7 @@ async def generate_read_cached(
     timeout: float = DEFAULT_TIMEOUT_S,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
     cache_path: Path | None = None,
 ) -> dict[str, str]:
     """``generate_read`` behind a single-entry disk cache, parsed into sections.
@@ -522,19 +569,9 @@ async def generate_read_cached(
     activities re-generates each time, which is the accepted cost of not
     building a cache manager for a personal tool.
     """
-    system_prompt, user_prompt = build_prompt(
-        profile, card, notes_text=notes_text, user_name=user_name)
-    # activity_id is part of the key even though it is deliberately absent from
-    # the prompt (a bare row id is noise to the model). Without it, two
-    # sessions on the same day with the same name and the same grades — a
-    # double day, which the tool already handles via other_activities_on_date —
-    # hash identically, and the second card silently serves the first's read.
-    key = hashlib.sha256(
-        "\x00".join([
-            system_prompt, user_prompt, model or "default",
-            str((card.get("activity") or {}).get("activity_id", "")),
-        ]).encode("utf-8")
-    ).hexdigest()
+    key = read_cache_key(
+        profile, card, model=model, notes_text=notes_text,
+        user_name=user_name, memory_text=memory_text)
     path = cache_path or _cache_path()
     cached = _read_cache(path, key)
     if cached is not None:
@@ -548,7 +585,7 @@ async def generate_read_cached(
             _LOG.info("workout_coach cached read no longer parses — regenerating")
     text = await generate_read(
         profile, card, model=model, timeout=timeout, notes_text=notes_text,
-        user_name=user_name)
+        user_name=user_name, memory_text=memory_text)
     # Parse BEFORE caching: an unparseable generation must not be stored, or
     # every later render pays to rediscover that it is unusable.
     sections = parse_read(text)
@@ -572,7 +609,8 @@ async def generate_read_cached(
         try:
             retry_text = await generate_read(
                 profile, card, model=model, timeout=timeout,
-                notes_text=notes_text, user_name=user_name)
+                notes_text=notes_text, user_name=user_name,
+                memory_text=memory_text)
             retry_sections = parse_read(retry_text)
         except Exception:
             # A failed retry must never cost the card the read it already has.
@@ -625,6 +663,6 @@ def fallback_read(card: dict) -> dict[str, str]:
 
 __all__ = [
     "build_prompt", "generate_read", "generate_read_cached", "fallback_read",
-    "parse_read", "reference_summary", "READ_SECTIONS",
+    "parse_read", "read_cache_key", "reference_summary", "READ_SECTIONS",
     "DEFAULT_MODEL", "DEFAULT_EFFORT", "DEFAULT_TIMEOUT_S",
 ]

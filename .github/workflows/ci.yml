@@ -66,7 +66,7 @@ jobs:
       # baseline.yml run — see that workflow's bootstrapping note.
       - name: Upload this run's benchmark save
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-benchmark-run-${{ github.run_id }}
           path: .benchmarks/
@@ -91,7 +91,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build image (no push)
         uses: docker/build-push-action@v7

@@ -6,6 +6,218 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-07-23
+
+Report cards become part of the coach's durable memory: every rendered card
+persists as a dated snapshot, queryable from every surface — including the
+phone, which could never render a card at all.
+
+### Added
+- **`report_cards` store** (`agent/card_store.py` + new table): each render
+  of `workout_report_card` persists the full card (grades, intent, GPA, the
+  coach's verbal read) as a **dated snapshot** — the card as actually shown,
+  graded against the plan active at that render. No backfill: history
+  accumulates as cards are rendered. Write is fail-silent via ONE atomic
+  guarded UPSERT keyed on the read's prompt key (`busy_timeout=5000`,
+  awaited off the event loop): an equal-key render is a byte-identical
+  no-op, and a template-fallback render never overwrites a real-read row —
+  a stored card's words and grades always come from the same render.
+- **Two shared query tools** — `list_report_cards` (date/intent-class
+  filters, newest run first — "how have my quality days trended" in one
+  call) and `get_report_card` (the stored card, coach read, and verbatim
+  markdown). Both in `ALL_TOOLS`: pure JSON, so they reach stdio AND the
+  networked `/mcp/` transport.
+- **Per-activity read reuse**: the stored card doubles as a persistent read
+  cache. `workout_coach.read_cache_key` (the factored single key
+  definition) lets a re-render of ANY previously rendered card reuse its
+  stored read on an exact prompt-key match — alternating between two old
+  cards no longer costs ~10s of SDK call each.
+
+## [0.31.0] - 2026-07-23
+
+Second half of the memory-based-personality build: the coach's personality
+is now conversationally tunable, and the shipped default is a rewritten
+hard-ass — an original "accountability mirror" persona built to spend the
+memory 0.30.0 gave it.
+
+### Added
+- **Tunable personality spec** (`agent/personality.py`): a bounded,
+  DB-stored spec (settings key `coach_personality_spec` — ≤8 KB, identity
+  ≤4000 chars, ≤12 items per list, ≤16 intensity topics) carrying identity
+  prose, catchphrases, principles, never-do rules, and per-topic intensity
+  (`off|low|medium|high|brutal`). The profile `.md` files become first-run
+  seeds; once tuned, the spec is what every voice surface speaks
+  (`CoachProfile.effective_persona`). Virtual seeding: an untuned clone is
+  byte-identical to before.
+- **Two tuning tools** — `get_coach_personality` /
+  `update_coach_personality` — the agent-owned write path (there is no UI):
+  "ease up about the step goal" becomes `set_intensity:
+  {step_goal_nagging: low}`, live on the next render, no restart. Dial
+  fields write the existing `coach_*` settings keys; `reset: true` returns
+  to stock. A spec tuned for a different profile is ignored but retained
+  (reported as `base_profile_mismatch`).
+- **Kill switch**: `LOCAL_FITNESS_COACH_SPEC=0` ignores a stored spec
+  without deleting it.
+
+### Changed
+- **`hardass` is the shipped default profile** (`coach.DEFAULT_PROFILE`,
+  `config.coach_profile()`), and `hardass.md` is rewritten from 5 bullets
+  into a full personality: the accountability mirror — identity, philosophy
+  ("motivation is weather, discipline is climate"), signature lines with a
+  one-per-brief cadence rule, a "Using your memory" section that spends the
+  0.30.0 ledger/journal as receipts ("Third skipped quality day this month.
+  Jul 12, Jul 19, today."), and a hard never-do list (never invent a
+  number, never mock injury — on a red recovery day the hard call IS the
+  rest, never cite a real coach or athlete). Dials/thresholds unchanged
+  (9/1/10 · 1.00/1.05), so the V1/V2 harsh-block gates work untouched.
+  Opt-out: `fitness config set coach_profile adaptive` (or supportive /
+  neutral).
+
+## [0.30.0] - 2026-07-23
+
+The coach remembers. First half of the memory-based-personality build
+(tunable personality spec + the new hard-ass default land separately):
+every voice surface now carries a two-layer memory, so briefs, report
+cards, and chat can make receipts-backed callbacks ("third missed quality
+day this month — Jul 12, Jul 19, today") instead of judging each day in
+isolation.
+
+### Added
+- **Deterministic relationship ledger** (`agent/ledger.py`): plan-adherence
+  miss/done streaks and windows (reusing `plans.build_plan_detail`'s
+  verdicts — never re-grading), step-goal streaks computed as-of-yesterday
+  (today's partial count can't flip the block intra-day), repeat patterns
+  in logged observations (mood/energy/soreness thresholds, injury from the
+  first log), and notable recent results. Pure stdlib functions over plain
+  dicts, per the `interpret.py` rule: Python derives every count the coach
+  may quote; the LLM only phrases.
+- **Coach journal** (`agent/journal.py`, `coach_journal` table): short
+  dated memory lines the coach writes itself. 60-entry cap pruned on every
+  write, 240-char lines, and a partial unique index on
+  `(source, source_key, seq)` so one reflected event can never double-write.
+- **Auto-reflect** (`agent/reflect.py`): after each saved daily brief and
+  each first-render report card, a toolless Sonnet-low single-shot call
+  (same measured config as `workout_coach`, ~10s) writes 0–2 journal lines
+  — or `NONE`, since most days aren't worth remembering. Fail-silent and
+  post-persistence: a reflect problem can never cost the brief or the card.
+  `journal.has_event` + `exclude_source_key` filtering make it idempotent
+  and cache-cascade-proof.
+- **Memory on every voice surface**: `prompts.coach_memory_block` (pure,
+  carries the never-invent grounding contract) composed by `system_prompt`,
+  `brief_v2_system_prompt` (compact variant, hard-capped at 600 chars so V2
+  stays the shrunk prompt), `plan_coach.build_prompt`, and
+  `workout_coach.build_prompt` — all as passed-in text, preserving the
+  prompt-hash disk caches.
+- **Three chat tools** — `save_coach_memory` / `list_coach_memories` /
+  `delete_coach_memory` — so the live agent can journal mid-conversation
+  (an excuse, a promise, an injury flag) and manage memories when asked
+  "what do you remember?".
+- **Kill switch**: `LOCAL_FITNESS_COACH_MEMORY=0` disables both the
+  injection and the reflect writes; journal data is untouched.
+
+## [0.29.0] - 2026-07-23
+
+Fifteen fixes from a multi-agent audit across three axes — terminal UX, MCP
+tool quality, and data reliability. Every finding was independently verified
+against the code before implementation; six other claims were refuted and
+dropped.
+
+### Fixed — data correctness
+- **Tempo/interval days are graded on the full done|partial|missed ladder.**
+  The duration branch never consulted `done_fraction`, so any running ≥40% of
+  a quality day's target graded a full "done" and such days could never grade
+  "missed". The ladder now mirrors the distance grading
+  (`done_fraction`/`partial_fraction`); easy/long-day and walk-gating
+  semantics are untouched.
+- **Backfilled activities land on the right local date.** `backfill.py`
+  decoded Garmin's local-epoch `startTimeLocal` with host-TZ
+  `datetime.fromtimestamp`, applying the timezone offset twice — a 05:30
+  activity filed under the previous day. The local epoch is now decoded
+  offset-free; the genuinely-GMT `beginTimestamp` fallback keeps host-TZ
+  decoding.
+- **A day whose Garmin endpoints all fail no longer writes an all-NULL row.**
+  Previously the row masked the gap forever and the pull reported "success"
+  having saved nothing; now the day stays missing (retried by gap detection),
+  lands in `days_failed`, and the pull reports `partial`. The upsert also
+  switched to per-column `COALESCE`, so a transient endpoint failure inside
+  the freshness window can never overwrite finalized data with NULLs (this
+  incidentally stops the daily pull from clobbering backfill's
+  `training_status`).
+- **Mid-run Garmin auth expiry aborts the pull.** `_safe`'s blanket
+  `except Exception` swallowed `GarminConnectAuthenticationError`, making the
+  abort-the-rest handler dead code; the pull could run to "success" on an
+  expired token. Auth errors now propagate; other per-endpoint errors stay
+  best-effort.
+
+### Fixed — MCP accuracy & terminal UX
+- **`run_sql` discloses its 500-row cap.** Results beyond 500 rows set
+  `truncated: true` with a hint to add `LIMIT`/aggregate, and the cap is
+  stated in the tool description — previously a clipped result was
+  indistinguishable from a complete one and totals came back confidently
+  wrong.
+- **`list_observations` is bounded** (default `limit` 100, `truncated` flag),
+  mirroring `query_workouts` — the bare call was an unbounded
+  `SELECT * FROM observations`.
+- **`update_plan_workout` echoes what it wrote.** The confirmation now
+  includes the duration it just set (the graded field on quality days, per
+  its own description) and the resolved `seq` on double days.
+- **`get_metric` / `find_anomalies` payloads are readable.** Formatted
+  companions (h:mm durations, min/mi paces, sensible rounding) ride alongside
+  the raw fields, and `get_metric` skips NULL calendar-day padding, reporting
+  `days_with_data` vs the window instead.
+- **Weekly mileage means the same thing on every surface.** The brief PDF's
+  plan section now computes on-foot miles like `get_training_plan_progress`'s
+  `week_actual_mi` (walking on easy days counts by design), and `plan_chart`'s
+  legend says what the bar actually plots.
+
+### Fixed — output reliability
+- **PDF content tags now hash the render's inputs, not the PDF bytes.**
+  WeasyPrint's PDF serialization is not byte-reproducible — identical HTML
+  diverged on ~50% of paired Linux renders — so 0.28.2's bytes-based
+  `_content_tag` broke the "identical content reuses one filename" half of
+  its own contract at random (and made its CI test a coin flip). Both PDF
+  filenames now derive from the logical content (brief/card + chart bytes +
+  brand theme + app version) via `_render_tag`; `generate_chart`'s PNG keeps
+  byte-hashing since matplotlib's writer is reproducible.
+- **`generate_chart` PNGs are content-addressed** (`…-<sha8>.png`), closing
+  the same stale-Preview-refocus hole 0.28.2 fixed for PDFs — an intra-day
+  re-render after a sync landed fresh bytes on the same path.
+- **A report card that overflows one page says so.** `render_report_card_pdf`
+  now returns `(bytes, page_count)` like the brief renderer, and
+  `workout_report_card` stamps `pages` + logs a warning when the density
+  ladder is exhausted, instead of spilling silently.
+- **Training load carries its as-of date.** `assemble_status` adds `as_of` +
+  `baseline_stale_days` to `training_load`, so a stale baselines row can no
+  longer masquerade as current fitness/fatigue/freshness.
+- **The plan-coach fallback line is date-aware.** It said "Yesterday…" about
+  whatever day was the latest graded one — including today's own run. The
+  reference now resolves Today / Yesterday / the actual date.
+- **The MCP server logs its coach-persona fail-open** instead of silently
+  serving a persona-less server when the profile can't load, and the drifted
+  `LOCAL_ONLY_TOOLS` docs on the transport boundary were corrected.
+
+## [0.28.2] - 2026-07-22
+
+### Fixed
+- **Re-generated PDFs no longer show a stale render.** `generate_brief_report`
+  and `workout_report_card` wrote a deterministic filename (`brief-<date>.pdf`,
+  `report-card-<id>.pdf`), so a re-render reused the same path — and macOS
+  `open` refocuses an already-open Preview window instead of reloading the
+  bytes. The result was a stale-looking page that made a user conclude the data
+  pipeline was serving old data (it wasn't). Both filenames are now
+  content-addressed (`…-<sha8>.pdf` via `tools._content_tag`): changed content
+  lands on a fresh filename (a new window), identical content reuses the file
+  (idempotent).
+
+### Changed
+- **`save_brief` now advertises the real Brief JSON Schema** instead of an
+  opaque `{"brief": dict}`. Derived from the pydantic `Brief` model (with
+  `$defs` hoisted to the schema root and `required` narrowed to the caller-
+  supplied `takeaways`), so a client can construct a valid brief — including the
+  tone enum and `{metric, days}` sub-object — from the tool contract alone,
+  rather than reading `schemas.py`. Filesystem-less MCP clients (Claude Desktop,
+  a phone over `/mcp/`) can now build a brief they previously could not.
+
 ## [0.28.1] - 2026-07-22
 
 ### Fixed

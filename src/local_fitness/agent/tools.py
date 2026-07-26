@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -19,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import replace as replace_dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,7 +34,8 @@ from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from ..ingest import daily as daily_ingest
 from . import (
-    briefs, charts, coach, interpret, plan_coach, report_card, units, workout_coach,
+    briefs, card_store, charts, coach, interpret, journal, memory, personality,
+    plan_coach, reflect, report_card, units, workout_coach,
 )
 from .schemas import Brief
 
@@ -39,6 +43,11 @@ LOG = logging.getLogger(__name__)
 
 
 SERVER_NAME = "fitness"
+
+# Strong references to in-flight auto-reflect tasks (workout_report_card's
+# fire-and-forget hook). asyncio holds tasks weakly; without this set a
+# scheduled reflection could be garbage-collected mid-flight.
+_REFLECT_TASKS: set[asyncio.Task] = set()
 
 BASELINE_METRICS = {"rhr", "sleep_seconds"}
 
@@ -198,7 +207,9 @@ async def get_today_status(_args: dict) -> dict:
 
 @tool(
     "get_metric",
-    "Get raw daily values for one metric over the last N days. Returns time series sorted oldest-first.",
+    "Get raw daily values for one metric over the last N days, oldest-first. "
+    "Skips days with no reading (NULL) and reports days_with_data vs the window. "
+    "*_seconds metrics carry a value_formatted (e.g. '7h 33m') alongside the raw value.",
     {"metric": str, "days": int},
 )
 async def get_metric(args: dict) -> dict:
@@ -210,12 +221,35 @@ async def get_metric(args: dict) -> dict:
         return _err(err)
     days = args["days"]
     cutoff = (date.today() - timedelta(days=days)).isoformat()
+    # Skip NULL readings: for sparse columns (vo2_max updates only on run days)
+    # a long window is otherwise mostly {"value": null} rows — pure token cost.
+    # get_metric_trend already filters the same way; this aligns the two on what
+    # "a day with data" means. days_with_data vs days_window surfaces the gap so
+    # nothing is silently hidden.
     with db.connect() as conn:
         rows = conn.execute(
-            f"SELECT date, {metric} AS value FROM daily_metrics WHERE date >= ? ORDER BY date",
+            f"SELECT date, {metric} AS value FROM daily_metrics "
+            f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date",
             (cutoff,),
         ).fetchall()
-    return _text([dict(r) for r in rows])
+    # Formatted companion for duration-shaped metrics — the coach voice never
+    # speaks raw seconds ("25200 seconds"); attach the "7h 33m" shape at the
+    # payload boundary, same discipline get_metric_trend/compare_periods follow.
+    fmt = units.format_hm if metric.endswith("_seconds") else None
+    values = []
+    for r in rows:
+        row = dict(r)
+        if fmt is not None:
+            formatted = fmt(row["value"])
+            if formatted is not None:
+                row["value_formatted"] = formatted
+        values.append(row)
+    return _text({
+        "metric": metric,
+        "days_window": days,
+        "days_with_data": len(values),
+        "values": values,
+    })
 
 
 @tool(
@@ -563,8 +597,9 @@ def _plan_chart_weekly_rows(graded: list[dict]) -> list[dict]:
 @tool(
     "plan_chart",
     "Render a scheduled-vs-actual training-plan chart (ASCII/emoji): one bar "
-    "per day (or per week for long windows) — █ = miles run, ░ = shortfall vs "
-    "plan, verdict glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
+    "per day (or per week for long windows) — █ = on-foot miles (run + walk, "
+    "since easy days count prescribed walking), ░ = shortfall vs plan, verdict "
+    "glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
     "THE tool for 'planned vs actual' / 'am I hitting my plan' asks — don't "
     "hand-roll a chart. Reproduce the full output in a fenced code block in "
     "your reply, then add the coach read — never leave it only in the "
@@ -610,7 +645,11 @@ async def plan_chart(args: dict) -> dict:
         rows = _plan_chart_rows(graded)
         n_runs = sum(1 for r in rows if not r["rest"])
         title = f"plan vs actual · last {days}d · {n_runs} runs{adh}"
-        legend = "█ run vs ░ short of plan (mi) · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
+        # █ plots actual_distance_m, which is ON-FOOT miles (run + walk) —
+        # NOT run-only. Easy days count prescribed walking by design, so the
+        # label must say on-foot, matching the bar and the PDF strip's
+        # run/walk convention (0.27.0 label-vs-measurement class).
+        legend = "█ on-foot mi vs ░ short of plan · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
 
     return _text(charts.render_plan_vs_actual(rows, title=title, legend=legend))
 
@@ -853,6 +892,11 @@ async def find_anomalies(args: dict) -> dict:
                 ORDER BY dm.date DESC""",
             (cutoff, threshold),
         ).fetchall()
+    # sleep_seconds baselines are raw AVG()/SD floats (~10 significant digits)
+    # and the value is raw seconds — attach the "7h 33m" companion the coach
+    # voice must speak instead, and round the baseline floats at the payload
+    # boundary, the same discipline get_metric_trend/compare_periods follow.
+    fmt = units.format_hm if metric.endswith("_seconds") else None
     anomalies = []
     for r in rows:
         row = dict(r)
@@ -860,6 +904,17 @@ async def find_anomalies(args: dict) -> dict:
         if position is not None:
             row["sd_distance"] = round(position["sd_distance"], 2)
             row["direction"] = position["direction"]
+        if fmt is not None:
+            for raw_key, fmt_key in (
+                ("value", "value_formatted"),
+                ("baseline_mean", "baseline_formatted"),
+            ):
+                formatted = fmt(row.get(raw_key))
+                if formatted is not None:
+                    row[fmt_key] = formatted
+        for field in ("baseline_mean", "baseline_sd"):
+            if row.get(field) is not None:
+                row[field] = round(row[field], 2)
         anomalies.append(row)
     return _text({
         "metric": metric,
@@ -1121,6 +1176,11 @@ async def recovery_pattern(args: dict) -> dict:
 # (single-threaded) server. Granularity: how many VM ops between deadline checks.
 _RUN_SQL_TIME_BUDGET_S = 5.0
 _RUN_SQL_PROGRESS_OPS = 10_000
+# Hard row cap on a run_sql result. Bounds a "SELECT * FROM activities"-style ask
+# so an ad-hoc query can't shove the whole table into the model's context. The
+# cap is SIGNALLED, not silent: _run_sql_blocking fetches one past it so run_sql
+# can tell "exactly 500 rows matched" from "the cap clipped a larger result".
+_RUN_SQL_ROW_CAP = 500
 
 
 def _run_sql_blocking(q: str) -> list[dict]:
@@ -1131,6 +1191,9 @@ def _run_sql_blocking(q: str) -> list[dict]:
     aborts once the deadline passes, which makes SQLite raise OperationalError.
     Runs in a worker thread (via asyncio.to_thread) so even a within-budget
     heavy query never blocks the event loop.
+
+    Fetches ``_RUN_SQL_ROW_CAP + 1`` rows so the caller can detect (and flag)
+    truncation instead of silently returning a clipped set as if complete.
     """
     deadline = time.monotonic() + _RUN_SQL_TIME_BUDGET_S
 
@@ -1141,7 +1204,7 @@ def _run_sql_blocking(q: str) -> list[dict]:
     with db.connect_readonly() as conn:
         conn.set_progress_handler(_abort_if_over_budget, _RUN_SQL_PROGRESS_OPS)
         try:
-            return [dict(r) for r in conn.execute(q).fetchmany(500)]
+            return [dict(r) for r in conn.execute(q).fetchmany(_RUN_SQL_ROW_CAP + 1)]
         finally:
             conn.set_progress_handler(None, 0)
 
@@ -1150,7 +1213,9 @@ def _run_sql_blocking(q: str) -> list[dict]:
     "run_sql",
     "Execute a read-only SELECT or WITH query against the fitness DB. "
     "Tables and columns: " + _render_schema() + ". "
-    "Use this for ad-hoc analysis the other tools don't cover.",
+    "Use this for ad-hoc analysis the other tools don't cover. "
+    f"Results are capped at {_RUN_SQL_ROW_CAP} rows; when more match, the "
+    "payload carries \"truncated\": true — add a LIMIT or aggregate to see the rest.",
     {"query": str},
 )
 async def run_sql(args: dict) -> dict:
@@ -1184,6 +1249,15 @@ async def run_sql(args: dict) -> dict:
             "query failed: invalid query — check table/column names "
             "against the fitness://schema resource"
         )
+    if len(rows) > _RUN_SQL_ROW_CAP:
+        rows = rows[:_RUN_SQL_ROW_CAP]
+        return _text({
+            "rows": rows,
+            "count": len(rows),
+            "truncated": True,
+            "hint": f"row cap hit — showing the first {_RUN_SQL_ROW_CAP} "
+                    "of a larger result; add a LIMIT or aggregate to see the rest",
+        })
     return _text({"rows": rows, "count": len(rows)})
 
 
@@ -1268,6 +1342,256 @@ async def delete_user_note(args: dict) -> dict:
     if not ok:
         return _err(f"no note at line {line}")
     return _text({"deleted": True, "line": line})
+
+
+@tool(
+    "save_coach_memory",
+    "Write ONE line into your coach's journal — YOUR record of the "
+    "relationship, distinct from user-preference notes. Use it when "
+    "something in the conversation is worth remembering across sessions: "
+    "an excuse for a skipped session, a promise ('back on it Monday'), an "
+    "injury flag, a breakthrough. One dated line in your own coach voice, "
+    "under 240 chars. Skip routine Q&A. The journal is capped at 60 "
+    "entries (oldest pruned) and feeds every future brief and report card.",
+    {
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "The memory line, <=240 chars, coach voice.",
+            },
+            "date": {
+                "type": "string",
+                "description": "ISO date the memory is about; defaults to today.",
+            },
+        },
+        "required": ["text"],
+    },
+)
+async def save_coach_memory(args: dict) -> dict:
+    text = (args.get("text") or "").strip()
+    entry_date = args.get("date")
+    if entry_date is not None and not _DATE_RE.match(str(entry_date)):
+        return _err(f"malformed date '{entry_date}', expected YYYY-MM-DD")
+    try:
+        entry = journal.save_entry(text, source="chat", entry_date=entry_date)
+    except ValueError as e:
+        return _err(str(e))
+    return _text({"saved": True, **entry})
+
+
+@tool(
+    "list_coach_memories",
+    "Read your coach's journal (newest first) — what you've written down "
+    "about the relationship. Use when the user asks 'what do you remember', "
+    "before saving a new memory (avoid duplicates — escalate instead), or "
+    "to ground a callback. Returns entry_ids for delete_coach_memory.",
+    {
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "integer",
+                "description": "Only entries about the trailing N days.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max entries returned (default 50).",
+            },
+        },
+        "required": [],
+    },
+)
+async def list_coach_memories(args: dict) -> dict:
+    days = args.get("days")
+    limit = args.get("limit")
+    if limit is None:
+        limit = 50
+    if days is not None and (not isinstance(days, int) or days <= 0):
+        return _err("days must be a positive integer")
+    if not isinstance(limit, int) or limit <= 0:
+        return _err("limit must be a positive integer")
+    entries = journal.list_entries(days=days, limit=min(limit, journal.JOURNAL_CAP))
+    return _text({"memories": entries, "count": len(entries)})
+
+
+@tool(
+    "delete_coach_memory",
+    "Remove one journal entry by entry_id (from list_coach_memories). Use "
+    "when the user tells you to forget something, or when an entry turned "
+    "out to be wrong. Confirm with the user first if the target is ambiguous.",
+    {"entry_id": int},
+)
+async def delete_coach_memory(args: dict) -> dict:
+    entry_id = args.get("entry_id")
+    if entry_id is None or not isinstance(entry_id, int):
+        return _err("entry_id is required")
+    if not journal.delete_entry(entry_id):
+        return _err(f"no journal entry with entry_id {entry_id}")
+    return _text({"deleted": True, "entry_id": entry_id})
+
+
+def _spec_payload(spec: personality.PersonalitySpec) -> dict:
+    return {
+        "base_profile": spec.base_profile,
+        "identity": spec.identity,
+        "catchphrases": list(spec.catchphrases),
+        "principles": list(spec.principles),
+        "never_do": list(spec.never_do),
+        "intensity": dict(spec.intensity),
+        "updated_at": spec.updated_at,
+    }
+
+
+@tool(
+    "get_coach_personality",
+    "The live coach personality: active profile, the tuned spec (or the "
+    "profile-file seed if never tuned), the five numeric dials, and journal "
+    "size. Call before update_coach_personality so an edit patches what is "
+    "actually there. `customized` says whether a tuned spec is in force; "
+    "`base_profile_mismatch` means a spec exists but was tuned for a "
+    "DIFFERENT profile (ignored until you switch back or reset).",
+    {},
+)
+async def get_coach_personality(_args: dict) -> dict:
+    profile = coach.resolve_coach_profile()
+    stored = personality.parse_spec(db.get_setting(personality.SPEC_KEY))
+    effective = profile.spec or personality.seed_from_profile(profile)
+    with db.connect() as conn:
+        journal_count = conn.execute(
+            "SELECT COUNT(*) FROM coach_journal").fetchone()[0]
+    return _text({
+        "profile": profile.name,
+        "customized": profile.spec is not None,
+        "base_profile_mismatch": (
+            stored is not None and stored.base_profile != profile.name),
+        "spec": _spec_payload(effective),
+        "dials": {
+            "harshness": profile.harshness,
+            "warmth": profile.warmth,
+            "push": profile.push,
+            "roast_threshold": profile.roast_threshold,
+            "praise_threshold": profile.praise_threshold,
+        },
+        "intensity_levels": list(personality.INTENSITY_LEVELS),
+        "known_topics": sorted(personality.TOPIC_WHITELIST),
+        "journal_entries": journal_count,
+        "memory_enabled": memory.memory_enabled(),
+    })
+
+
+_DIAL_FIELDS = {"harshness": (0, 10), "warmth": (0, 10), "push": (0, 10)}
+_THRESH_FIELDS = {"roast_threshold": (0.0, 1.20), "praise_threshold": (0.0, 1.20)}
+
+
+@tool(
+    "update_coach_personality",
+    "Tune the coach's personality conversationally — the agent-owned write "
+    "path (there is no UI). All fields optional: `identity` replaces the "
+    "persona prose; add/remove_catchphrase, add/remove_principle, "
+    "add/remove_never_do edit the lists; `set_intensity` maps topic slugs "
+    "(e.g. step_goal_nagging, quality_day_misses — 'medium' clears an "
+    "override) to off|low|medium|high|brutal; harshness/warmth/push (0-10) "
+    "and roast/praise_threshold (0-1.20) write the numeric dials; "
+    "`reset: true` discards the tuned spec (with no other fields = back to "
+    "the shipped profile). The first tuning call seeds the spec from the "
+    "active profile. Takes effect on the next prompt render — no restart.",
+    {
+        "type": "object",
+        "properties": {
+            "identity": {"type": "string", "description": "Replacement persona prose (<=4000 chars)."},
+            "add_catchphrase": {"type": "string"},
+            "remove_catchphrase": {"type": "string"},
+            "add_principle": {"type": "string"},
+            "remove_principle": {"type": "string"},
+            "add_never_do": {"type": "string"},
+            "remove_never_do": {"type": "string"},
+            "set_intensity": {
+                "type": "object",
+                "description": "topic slug -> off|low|medium|high|brutal",
+            },
+            "harshness": {"type": "integer"},
+            "warmth": {"type": "integer"},
+            "push": {"type": "integer"},
+            "roast_threshold": {"type": "number"},
+            "praise_threshold": {"type": "number"},
+            "reset": {"type": "boolean"},
+        },
+        "required": [],
+    },
+)
+async def update_coach_personality(args: dict) -> dict:
+    reset = bool(args.get("reset"))
+    dial_args = {}
+    errors: list[str] = []
+    for key, (lo, hi) in _DIAL_FIELDS.items():
+        if key in args:
+            v = args[key]
+            if not isinstance(v, int) or not (lo <= v <= hi):
+                errors.append(f"{key} must be an integer {lo}-{hi}")
+            else:
+                dial_args[f"coach_{key}"] = str(v)
+    for key, (lo, hi) in _THRESH_FIELDS.items():
+        if key in args:
+            v = args[key]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not (lo <= v <= hi):
+                errors.append(f"{key} must be a number {lo}-{hi}")
+            else:
+                dial_args[f"coach_{key}"] = str(float(v))
+
+    spec_patch = {k: v for k, v in args.items()
+                  if k in personality.PATCH_FIELDS}
+    clean_patch, patch_errors = personality.validate_patch(spec_patch)
+    errors.extend(patch_errors)
+    unknown = set(args) - personality.PATCH_FIELDS - set(_DIAL_FIELDS) \
+        - set(_THRESH_FIELDS) - {"reset"}
+    for key in sorted(unknown):
+        errors.append(f"unknown field '{key}'")
+    if errors:
+        return _err(
+            "; ".join(errors),
+            editable_fields=sorted(
+                personality.PATCH_FIELDS | set(_DIAL_FIELDS)
+                | set(_THRESH_FIELDS) | {"reset"}),
+            intensity_levels=list(personality.INTENSITY_LEVELS),
+        )
+    if not reset and not clean_patch and not dial_args:
+        return _err("nothing to update — pass at least one editable field")
+
+    for key, value in dial_args.items():
+        db.set_setting(key, value)
+
+    profile = coach.resolve_coach_profile()
+    if reset and not clean_patch:
+        # Back to stock: drop the stored spec outright.
+        with db.connect() as conn:
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (personality.SPEC_KEY,))
+        return _text({"updated": True, "reset": True,
+                      "profile": profile.name, "customized": False,
+                      "dials_changed": sorted(dial_args)})
+
+    if clean_patch:
+        base = (personality.seed_from_profile(profile) if reset
+                else (profile.spec or personality.seed_from_profile(profile)))
+        new_spec = personality.apply_patch(base, clean_patch)
+        new_spec = replace_dataclass(
+            new_spec,
+            base_profile=profile.name,
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        raw = personality.spec_to_json(new_spec)
+        if len(raw.encode("utf-8")) > personality.SPEC_MAX_BYTES:
+            return _err(
+                f"personality spec would exceed {personality.SPEC_MAX_BYTES} "
+                "bytes — trim the identity or the lists first")
+        db.set_setting(personality.SPEC_KEY, raw)
+        return _text({"updated": True, "profile": profile.name,
+                      "customized": True, "spec": _spec_payload(new_spec),
+                      "dials_changed": sorted(dial_args)})
+
+    return _text({"updated": True, "profile": profile.name,
+                  "customized": profile.spec is not None,
+                  "dials_changed": sorted(dial_args)})
 
 
 @tool(
@@ -1356,11 +1680,21 @@ async def log_observation(args: dict) -> dict:
     return _text({"logged": True, "observation": dict(row)})
 
 
+# Default row cap on list_observations. Observations are the daily-logging
+# surface (weight, RPE, soreness, mood), so an unbounded SELECT * would dump a
+# year+ of rows into the reply once logging is at cadence. Mirrors
+# query_workouts' default-50 pattern; run_sql stays the full-history escape hatch.
+_LIST_OBSERVATIONS_DEFAULT_LIMIT = 100
+
 _LIST_OBSERVATIONS_SCHEMA = {
     "type": "object",
     "properties": {
         "days": {"type": "integer", "description": "Only observations from the last N days."},
         "obs_type": {"type": "string", "description": "Filter to one obs_type."},
+        "limit": {
+            "type": "integer",
+            "description": f"Max rows, most recent first (default {_LIST_OBSERVATIONS_DEFAULT_LIMIT}).",
+        },
     },
     "required": [],
 }
@@ -1369,7 +1703,9 @@ _LIST_OBSERVATIONS_SCHEMA = {
 @tool(
     "list_observations",
     "List logged observations, most recent first. Optional filters: days "
-    "lookback and obs_type.",
+    f"lookback and obs_type. Capped at {_LIST_OBSERVATIONS_DEFAULT_LIMIT} rows "
+    "by default (pass limit for more); when the cap is hit the payload carries "
+    "\"truncated\": true — narrow with days/obs_type or raise limit.",
     _LIST_OBSERVATIONS_SCHEMA,
 )
 async def list_observations(args: dict) -> dict:
@@ -1385,13 +1721,21 @@ async def list_observations(args: dict) -> dict:
         where.append("obs_type = ?")
         params.append(args["obs_type"])
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    limit = int(args.get("limit") or _LIST_OBSERVATIONS_DEFAULT_LIMIT)
     with db.connect() as conn:
+        # Fetch one past the cap so a full page is distinguishable from a
+        # clipped larger set — same truncation-signal shape as run_sql.
         rows = conn.execute(
             f"SELECT * FROM observations {where_sql} "
-            "ORDER BY observed_on DESC, observation_id DESC",
-            params,
+            "ORDER BY observed_on DESC, observation_id DESC LIMIT ?",
+            (*params, limit + 1),
         ).fetchall()
-    return _text({"observations": [dict(r) for r in rows], "count": len(rows)})
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    payload = {"observations": [dict(r) for r in rows], "count": len(rows)}
+    if truncated:
+        payload["truncated"] = True
+    return _text(payload)
 
 
 @tool(
@@ -1781,10 +2125,18 @@ async def update_plan_workout(args: dict) -> dict:
     except ValueError as e:
         return _err(str(e))
 
+    # Echo the whole prescription that was written, so the model can confirm
+    # the change from the tool result without a follow-up read. duration_min is
+    # the graded field for tempo/interval days (per this tool's own
+    # description), so target_duration_sec MUST be in the echo — via the
+    # duration_seconds key _augment_workout formats into duration_formatted,
+    # mirroring the distance_meters/avg_pace_sec_per_km remaps beside it. seq
+    # tells the user which session of a double day was edited.
     return _text(_augment_workout({
-        "date": row["date"], "type": row["type"],
+        "date": row["date"], "type": row["type"], "seq": row["seq"],
         "distance_meters": row["target_distance_m"],
         "avg_pace_sec_per_km": row["target_pace_sec_per_km"],
+        "duration_seconds": row["target_duration_sec"],
         "description": row["description"],
     }))
 
@@ -2020,7 +2372,10 @@ _PROGRESS_SCHEMA = {
     "Day-by-day progress of the ACTIVE training plan: every prescribed "
     "workout with its graded verdict (done | partial | missed | compliant | "
     "pending), plus goal, days-to-race, adherence %, projected finish, goal "
-    "gap, and this week's planned/actual mileage. The `workouts` list is "
+    "gap, and this week's mileage. this_week.week_actual_mi is total ON-FOOT "
+    "miles (run + walk — easy days count prescribed walking by design); "
+    "week_run_mi + week_walk_mi split it, and week_run_mi matches the brief "
+    "PDF's plan-strip headline. The `workouts` list is "
     "windowed by default (14 days back from the data frontier, 7 days "
     "forward from today — today is always in-window even under a stale "
     "frontier) — pass full=true for the complete list across the whole plan "
@@ -2110,9 +2465,16 @@ async def get_training_plan_progress(args: dict) -> dict:
     target_time_seconds = detail.get("target_time_seconds")
     goal_gap = plans.goal_gap(predicted_finish_seconds, target_time_seconds)
     rollup = weekly_rollup(detail["workouts"], today)
+    # week_actual_mi is total ON-FOOT miles (run + walk) — easy/recovery days
+    # count prescribed walking by design (CLAUDE.md). The brief PDF's plan strip
+    # headlines RUN miles instead, so expose the run/walk split here (already on
+    # the rollup) so the two surfaces reconcile: week_run_mi + week_walk_mi ==
+    # week_actual_mi, and week_run_mi is the PDF strip's headline number.
     this_week = {
         "week_planned_mi": rollup["week_planned_mi"],
         "week_actual_mi": rollup["week_actual_mi"],
+        "week_run_mi": rollup["week_run_mi"],
+        "week_walk_mi": rollup["week_walk_mi"],
         "slips": rollup["slips"],
     }
 
@@ -2132,14 +2494,47 @@ async def get_training_plan_progress(args: dict) -> dict:
     })
 
 
+def _save_brief_input_schema() -> dict:
+    """Advertise the real Brief JSON Schema as the tool's input contract, not an
+    opaque ``{"brief": dict}``.
+
+    Derived from the pydantic ``Brief`` model so it can never drift from what the
+    server validates. Two adjustments make the advertised contract match what a
+    caller must actually supply:
+
+    * ``$defs`` are hoisted to the top level so the nested ``$ref``s (Takeaway,
+      TakeawayMetric, and the tone/metric enums) resolve — a client reading the
+      schema sees the exact takeaway shape and enum values instead of grepping
+      ``schemas.py`` for them (which the agent had to do on 2026-07-22).
+    * ``brief.required`` is narrowed to ``["takeaways"]`` because
+      ``briefs.save_brief`` stamps ``date``/``user_name``/``generated_at``
+      server-side before validation — advertising them as required would force
+      the caller to invent values the server discards.
+    """
+    brief_schema = Brief.model_json_schema()
+    defs = brief_schema.pop("$defs", {})
+    brief_schema["required"] = ["takeaways"]
+    return {
+        "type": "object",
+        "properties": {"brief": brief_schema},
+        "required": ["brief"],
+        "$defs": defs,
+    }
+
+
+_SAVE_BRIEF_INPUT_SCHEMA = _save_brief_input_schema()
+
+
 @tool(
     "save_brief",
-    "Persist a composed daily brief. Pass the brief as JSON matching the Brief "
-    "schema (a `takeaways` list; date/user_name/generated_at are stamped "
-    "server-side). The server validates against the schema and atomically "
-    "writes briefings/<today>.json — invalid briefs are rejected. Use this "
-    "after composing the brief via the `brief` prompt.",
-    {"brief": dict},
+    "Persist a composed daily brief. Pass `brief` as a JSON object matching the "
+    "Brief schema in this tool's inputSchema — a `takeaways` list (1-5 items), "
+    "each with headline, summary, tone (positive/caution/critical/neutral), an "
+    "optional metric ({metric, days}), and optional markdown `details`. "
+    "date/user_name/generated_at are stamped server-side — omit them. The server "
+    "validates and atomically writes briefings/<today>.json; invalid briefs are "
+    "rejected. Use after composing the brief via the `brief` prompt.",
+    _SAVE_BRIEF_INPUT_SCHEMA,
 )
 async def save_brief(args: dict) -> dict:
     # Thin wrapper over briefs.save_brief (the single integrity gate). DROP the
@@ -2303,6 +2698,63 @@ async def _auto_open(path: Path) -> None:
         await asyncio.sleep(1.5)
     except Exception:
         LOG.warning("auto-open failed for %s", path, exc_info=True)
+
+
+def _content_tag(data: bytes) -> str:
+    """A short content hash for a rendered artifact's filename.
+
+    Content-addressing the filename fixes a real trust bug: artifacts are
+    written to a per-process tmp dir and auto-opened with macOS `open`, but
+    `open` RE-FOCUSES an already-open Preview window for a path it has seen
+    rather than reloading the bytes. A deterministic `brief-<date>.pdf` name
+    therefore showed a stale render on every re-generate — a user read
+    yesterday's-looking page and concluded the data pipeline was stale
+    (observed 2026-07-22). Suffixing the name with the content hash means
+    changed content always lands on a NEW filename (a genuinely fresh window),
+    while identical content reuses the same file (idempotent — refocusing is
+    correct when the bytes match).
+
+    Use this on artifact bytes ONLY when the renderer is byte-reproducible
+    (matplotlib's PNG writer is). PDFs must go through `_render_tag` instead:
+    WeasyPrint's byte stream is NOT reproducible — see that docstring."""
+    return hashlib.sha256(data).hexdigest()[:8]
+
+
+def _render_tag(*parts: object) -> str:
+    """`_content_tag` for PDFs: hash the render's logical INPUTS, not its bytes.
+
+    WeasyPrint's PDF serialization is not byte-reproducible — the same HTML
+    string rendered twice in one process can produce different bytes depending
+    on interpreter allocation state (measured 2026-07-23: ~50% of paired
+    renders diverged on Linux CI/Docker; macOS's allocator usually masks it,
+    which is why 0.28.2's bytes-hash looked stable locally). Hashing the PDF
+    bytes therefore broke the "identical content reuses one filename" half of
+    the contract at random. Hashing what we ASKED the renderer to draw keeps
+    both halves deterministic on every platform.
+
+    Each part is either raw bytes (chart PNGs — themselves content) or a
+    JSON-serializable structure, canonicalized with sort_keys. The app version
+    and resolved brand theme are always mixed in, so a release that changes
+    layout or a brand-file change still lands on a fresh filename rather than
+    refocusing a stale-looking window."""
+    from local_fitness.agent import branding
+
+    h = hashlib.sha256()
+    h.update(_APP_VERSION.encode())
+    h.update(json.dumps(branding.load_theme(), sort_keys=True, default=str).encode())
+    for p in parts:
+        if isinstance(p, (bytes, bytearray)):
+            h.update(bytes(p))
+        else:
+            h.update(json.dumps(p, sort_keys=True, default=str).encode())
+        h.update(b"\x1f")
+    return h.hexdigest()[:8]
+
+
+try:
+    _APP_VERSION = importlib.metadata.version("local-fitness")
+except importlib.metadata.PackageNotFoundError:  # uninstalled source tree
+    _APP_VERSION = "0"
 
 
 def _write_atomic(reports_dir: Path, final_name: str, data: bytes) -> Path:
@@ -2486,6 +2938,14 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["goal_type"],
                 notes_text=notes.render_for_prompt(),
                 user_name=config.user_name(),
+                # Keyed to the brief's own date (like the whole section), with
+                # that brief's own reflection excluded so reflect can't bust
+                # this cache (see memory.render_memory_for_prompt).
+                memory_text=memory.render_memory_for_prompt(
+                    today=target_date,
+                    exclude_source_key=("brief", target_date),
+                    user_name=config.user_name(),
+                ),
             )
         except Exception:
             LOG.warning(
@@ -2497,6 +2957,7 @@ async def generate_brief_report(args: dict) -> dict:
                 plan_section["last_7_days"],
                 plan_section["days_to_race"],
                 plan_section["goal_type"],
+                target_date=target_date,
             )
         plan_section["today"]["coaching_line"] = coaching_line
 
@@ -2557,7 +3018,12 @@ async def generate_brief_report(args: dict) -> dict:
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
     try:
-        final_path = _write_atomic(reports_dir, f"brief-{target_date}.pdf", pdf_bytes)
+        tag = _render_tag(
+            trial.model_dump(mode="json"), plan_section, omitted,
+            *(trial_charts[k] for k in sorted(trial_charts)),
+        )
+        final_path = _write_atomic(
+            reports_dir, f"brief-{target_date}-{tag}.pdf", pdf_bytes)
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
@@ -2625,18 +3091,23 @@ async def generate_chart(args: dict) -> dict:
     except Exception as e:
         return _err(f"chart render failed: {e}")
 
-    # {today} is computed here, not a tool argument — it exists in the
-    # filename only to distinguish chart runs across days. The idempotent-
-    # overwrite guarantee (identical metric/chart_type/days -> identical
-    # file) therefore holds only within a single calendar day.
-    today = date.today().isoformat()
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
+    # Content-address the filename with the same tag the two PDF tools use
+    # (0.28.2): macOS `open` REFOCUSES an already-open Preview window for a path
+    # it has seen rather than reloading the bytes, so a day-deterministic
+    # `chart-...-<date>.png` name showed a STALE chart when the same
+    # metric/chart_type/days re-rendered after an intra-day sync. The content
+    # tag makes changed bytes land on a NEW filename (a genuinely fresh window)
+    # while identical bytes reuse one file (idempotent — refocusing is correct
+    # when the bytes match). See _content_tag and the PDF paths above.
     try:
         final_path = _write_atomic(
-            reports_dir, f"chart-{metric}-{chart_type}-{days}d-{today}.png", png_bytes
+            reports_dir,
+            f"chart-{metric}-{chart_type}-{days}d-{_content_tag(png_bytes)}.png",
+            png_bytes,
         )
     except ValueError:
         return _err("resolved path escaped reports directory")
@@ -2725,15 +3196,64 @@ async def workout_report_card(args: dict) -> dict:
     # fallback — a missing credential or a dead stream costs the phrasing, never
     # the card, since every grade in it was already computed in Python.
     profile = coach.resolve_coach_profile()
-    try:
-        card["coach_read"] = await workout_coach.generate_read_cached(
-            profile, card, notes_text=notes.render_for_prompt(),
-            user_name=config.user_name())
-    except Exception:
-        LOG.warning(
-            "workout read generation failed for activity %s, using fallback",
-            inputs["activity"]["activity_id"], exc_info=True)
-        card["coach_read"] = workout_coach.fallback_read(card)
+    _activity_key = str(inputs["activity"]["activity_id"])
+    _user_name = config.user_name()
+    # Resolved ONCE into locals and threaded byte-identically into both the
+    # key and the generator — any drift and the fast-path key never matches.
+    _notes_text = notes.render_for_prompt()
+    # THIS card's own journal entries are excluded: without that, reflecting
+    # on the card would change its next prompt, bust the read cache, and
+    # regenerate on every render forever.
+    _memory_text = memory.render_memory_for_prompt(
+        exclude_source_key=("report_card", _activity_key),
+        user_name=_user_name,
+    )
+    # Fast path: the stored card doubles as a per-activity read cache. On a
+    # key match the stored parsed read is reused as-is — no SDK call — and
+    # read_key stays non-NULL so save_card's guarded UPSERT sees an equal key
+    # and no-ops (the row stays byte-identical; this render's recomputed
+    # grades never land under the stored render's words).
+    read_key: str | None = workout_coach.read_cache_key(
+        profile, card, notes_text=_notes_text, user_name=_user_name,
+        memory_text=_memory_text)
+    _stored = card_store.load_read(inputs["activity"]["activity_id"])
+    if (_stored and _stored[0] == read_key
+            and card_store.read_is_complete(_stored[1])):
+        card["coach_read"] = _stored[1]
+        LOG.info("workout read reused from the stored card (key match)")
+    else:
+        try:
+            card["coach_read"] = await workout_coach.generate_read_cached(
+                profile, card, notes_text=_notes_text, user_name=_user_name,
+                memory_text=_memory_text)
+        except Exception:
+            LOG.warning(
+                "workout read generation failed for activity %s, using fallback",
+                inputs["activity"]["activity_id"], exc_info=True)
+            card["coach_read"] = workout_coach.fallback_read(card)
+            # Fallback-ness is known ONLY from this except branch — the
+            # template and a real read are structurally identical dicts. A
+            # NULL key means "not the coach's voice": never reused by the
+            # fast path, never allowed to overwrite a real-read row.
+            read_key = None
+
+    # Auto-reflect (fire-and-forget): the coach may write this session into
+    # its journal. has_event makes the common case — re-rendering a card —
+    # skip even task creation, so a re-render never pays an SDK call and can
+    # never double-write (the DB unique index backstops the race regardless).
+    # The task reference is held module-side; asyncio only weakly references
+    # scheduled tasks and an unreferenced one can be GC'd mid-flight.
+    if memory.memory_enabled() and not journal.has_event("report_card", _activity_key):
+        _task = asyncio.create_task(reflect.reflect_after_report_card(card))
+        _REFLECT_TASKS.add(_task)
+        _task.add_done_callback(_REFLECT_TASKS.discard)
+
+    # Persist the card as a dated snapshot (both formats). save_card never
+    # raises, and key identity decides the write: an equal-key render is a
+    # byte-identical no-op, a fallback never overwrites a real-read row.
+    # to_thread keeps its busy_timeout wait off the event loop, mirroring the
+    # PDF renders below.
+    await asyncio.to_thread(card_store.save_card, card, read_cache_key=read_key)
     payload = {
         "markdown": report_card.render_markdown(card),
         "activity_id": inputs["activity"]["activity_id"],
@@ -2776,20 +3296,31 @@ async def workout_report_card(args: dict) -> dict:
 
     try:
         async with visuals.RENDER_LOCK:
-            pdf_bytes = await asyncio.to_thread(
+            pdf_bytes, pages = await asyncio.to_thread(
                 visuals.render_report_card_pdf, card, split_chart
             )
     except Exception as e:
         return _err(f"PDF render failed: {e}")
+    if pages != 1:
+        # The card has no droppable content (unlike the brief's takeaway tail),
+        # so the density ladder is the only lever and it's exhausted. Never let
+        # a PDF spill silently (CLAUDE.md) — a warning is the honest signal that
+        # this card's splits + coach read outgrew even the densest rung.
+        LOG.warning(
+            "report card for activity %s still %d pages at the densest preset",
+            inputs["activity"]["activity_id"], pages,
+        )
+        payload["pages"] = pages
 
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)
     except OSError as e:
         return _err(f"could not prepare reports directory: {e}")
     try:
+        tag = _render_tag(card, split_chart or b"")
         final_path = _write_atomic(
             reports_dir,
-            f"report-card-{inputs['activity']['activity_id']}.pdf",
+            f"report-card-{inputs['activity']['activity_id']}-{tag}.pdf",
             pdf_bytes,
         )
     except ValueError:
@@ -2797,6 +3328,131 @@ async def workout_report_card(args: dict) -> dict:
     await _auto_open(final_path)
     payload["path"] = str(final_path)
     return _text(payload)
+
+
+# Shared text both card-query tool descriptions carry: the stored card is a
+# dated snapshot, and the honest labeling of what graded_at does (and does
+# not) promise is the load-bearing part — see the 2026-07-23 design doc.
+_CARD_SNAPSHOT_NOTE = (
+    "This is the stored snapshot as graded on graded_at — the most recent "
+    "render whose read differed (a distinct prompt-key render), so graded_at "
+    "can lag more recent renders whose inputs hashed identically. Grades "
+    "reflect the plan active at that render, not a retroactive regrade, and "
+    "a fresh live render may show a slightly different grade."
+)
+
+
+@tool(
+    "list_report_cards",
+    "Past workout report cards (stored snapshots), newest run first. One call "
+    "answers 'how have my quality days trended' — each row carries the "
+    "overall grade, GPA and the four metric grades without re-grading "
+    "anything. Filter by date range and/or intent_class "
+    "(easy|long|quality|steady). Use get_report_card for one card's full "
+    "detail and the coach's read. History accumulates as cards are rendered "
+    "(no backfill), so older activities may have no row. "
+    + _CARD_SNAPSHOT_NOTE,
+    {
+        "type": "object",
+        "properties": {
+            "start_date": {
+                "type": "string",
+                "description": "Earliest workout date, YYYY-MM-DD inclusive.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Latest workout date, YYYY-MM-DD inclusive.",
+            },
+            "intent_class": {
+                "type": "string",
+                "enum": ["easy", "long", "quality", "steady"],
+                "description": "Only cards of this workout class.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max cards returned (default 20).",
+            },
+        },
+        "required": [],
+    },
+)
+async def list_report_cards(args: dict) -> dict:
+    for field in ("start_date", "end_date"):
+        value = args.get(field)
+        if value is not None and not _DATE_RE.match(str(value)):
+            return _err(f"malformed {field} '{value}', expected YYYY-MM-DD")
+    intent_class = args.get("intent_class")
+    if intent_class is not None and intent_class not in card_store.INTENT_CLASSES:
+        return _err(
+            f"unknown intent_class '{intent_class}'",
+            allowed=list(card_store.INTENT_CLASSES))
+    limit = args.get("limit")
+    if limit is None:
+        limit = 20
+    if not isinstance(limit, int) or limit <= 0:
+        return _err("limit must be a positive integer")
+    rows = card_store.list_cards(
+        start_date=args.get("start_date"), end_date=args.get("end_date"),
+        intent_class=intent_class, limit=limit)
+    cards = [
+        {
+            "activity_id": r["activity_id"],
+            "date": r["activity_date"],
+            "graded_at": r["graded_at"],
+            "intent": r["intent"],
+            "intent_class": r["intent_class"],
+            "overall": r["overall_grade"],
+            "gpa": r["gpa"],
+            "capped_by": r["capped_by"],
+            "grades": {
+                "distance": r["distance_grade"],
+                "pace": r["pace_grade"],
+                "hr": r["hr_grade"],
+                "load": r["load_grade"],
+            },
+        }
+        for r in rows
+    ]
+    return _text({"cards": cards, "count": len(cards)})
+
+
+@tool(
+    "get_report_card",
+    "One stored workout report card by activity_id: the full graded snapshot, "
+    "the coach's verbal read from that render, and a preformatted `markdown` "
+    "card (render it to the user VERBATIM — it is already formatted). "
+    + _CARD_SNAPSHOT_NOTE + " Use list_report_cards to find activity_ids.",
+    {"activity_id": int},
+)
+async def get_report_card(args: dict) -> dict:
+    activity_id = args.get("activity_id")
+    if activity_id is None or not isinstance(activity_id, int):
+        return _err("activity_id is required")
+    loaded = card_store.load_card(activity_id)
+    if loaded is None:
+        return _err(
+            f"no stored report card for activity {activity_id} yet — a card "
+            "is stored whenever it is rendered from a local session "
+            "(workout_report_card is stdio-only and cannot be called over "
+            "the network)",
+            activity_id=activity_id)
+    try:
+        markdown = report_card.render_markdown(loaded["card"])
+    except Exception:
+        # A stored snapshot that predates a renderer change must still be
+        # retrievable — the structured card is the data, markdown is sugar.
+        LOG.warning(
+            "stored card for activity %s failed to render markdown",
+            activity_id, exc_info=True)
+        markdown = None
+    return _text({
+        "activity_id": loaded["activity_id"],
+        "date": loaded["activity_date"],
+        "graded_at": loaded["graded_at"],
+        "card": loaded["card"],
+        "markdown": markdown,
+        "coach_read": loaded["card"].get("coach_read"),
+    })
 
 
 ALL_TOOLS = [
@@ -2819,6 +3475,11 @@ ALL_TOOLS = [
     list_user_notes,
     update_user_note,
     delete_user_note,
+    save_coach_memory,
+    list_coach_memories,
+    delete_coach_memory,
+    get_coach_personality,
+    update_coach_personality,
     daily_snapshot,
     log_observation,
     list_observations,
@@ -2835,6 +3496,8 @@ ALL_TOOLS = [
     get_training_plan_progress,
     save_brief,
     generate_chart,
+    list_report_cards,
+    get_report_card,
 ]
 
 # Registered ONLY here, never merged into ALL_TOOLS — wired into run_stdio()

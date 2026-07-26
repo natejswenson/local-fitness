@@ -1,0 +1,271 @@
+"""The deterministic relationship ledger — pure functions on fabricated dicts
+(never real data, per CLAUDE.md) plus one divider integration case."""
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+from local_fitness import db
+from local_fitness.agent import ledger
+
+TODAY = "2026-07-23"
+
+
+def _w(day: str, verdict: str, wtype: str = "easy", seq: int = 1,
+       target_m: float | None = None, actual_m: float | None = None) -> dict:
+    return {"date": day, "verdict": verdict, "type": wtype, "seq": seq,
+            "target_distance_m": target_m, "actual_distance_m": actual_m}
+
+
+# --- plan_adherence_facts ---------------------------------------------------
+
+
+def test_plan_facts_empty_graded_list_is_all_zero():
+    facts = ledger.plan_adherence_facts([], TODAY)
+    assert facts == {
+        "miss_streak": 0, "done_streak": 0, "misses_14d": 0,
+        "quality_misses_28d": 0, "last_miss": None,
+    }
+
+
+def test_plan_facts_miss_streak_counts_consecutive_misses():
+    graded = [
+        _w("2026-07-20", "missed", "interval"),
+        _w("2026-07-21", "missed"),
+        _w("2026-07-22", "missed"),
+    ]
+    facts = ledger.plan_adherence_facts(graded, TODAY)
+    assert facts["miss_streak"] == 3
+    assert facts["done_streak"] == 0
+    assert facts["last_miss"] == {"date": "2026-07-22", "type": "easy"}
+
+
+def test_plan_facts_rest_days_are_neutral_partial_breaks_both():
+    graded = [
+        _w("2026-07-18", "done"),
+        _w("2026-07-19", "compliant", "rest"),   # rest: neither breaks nor counts
+        _w("2026-07-20", "done"),
+        _w("2026-07-21", "compliant", "rest"),
+        _w("2026-07-22", "done"),
+    ]
+    assert ledger.plan_adherence_facts(graded, TODAY)["done_streak"] == 3
+
+    graded.insert(2, _w("2026-07-19", "partial", seq=2))
+    facts = ledger.plan_adherence_facts(graded, TODAY)
+    assert facts["done_streak"] == 2  # partial on the 19th stops the walk
+
+
+def test_plan_facts_pending_and_future_workouts_are_ignored():
+    graded = [
+        _w("2026-07-22", "done"),
+        _w("2026-07-23", "pending"),
+        _w("2026-07-25", "missed"),   # future relative to TODAY
+    ]
+    facts = ledger.plan_adherence_facts(graded, TODAY)
+    assert facts["done_streak"] == 1
+    assert facts["misses_14d"] == 0
+    assert facts["last_miss"] is None
+
+
+def test_plan_facts_window_edges_and_quality_counting():
+    graded = [
+        _w("2026-07-09", "missed", "tempo"),     # 14 days back — outside 14d
+        _w("2026-07-10", "missed", "interval"),  # 13 days back — inside
+        _w("2026-06-25", "missed", "race"),      # 28 days back — outside 28d
+        _w("2026-06-26", "missed", "tempo"),     # 27 days back — inside
+        _w("2026-07-22", "done"),
+    ]
+    facts = ledger.plan_adherence_facts(graded, TODAY)
+    assert facts["misses_14d"] == 1
+    # quality misses: interval(7-10) + tempo(6-26) inside 28d; tempo(7-09) also
+    # inside 28d though outside 14d
+    assert facts["quality_misses_28d"] == 3
+
+
+# --- step_streak_facts ------------------------------------------------------
+
+
+def _steps(days_back_to_steps: dict[int, int], today: str = TODAY) -> list[dict]:
+    t = date.fromisoformat(today)
+    return [
+        {"date": (t - timedelta(days=back)).isoformat(), "steps": steps}
+        for back, steps in days_back_to_steps.items()
+    ]
+
+
+def test_step_facts_hit_streak_through_yesterday_excludes_today():
+    rows = _steps({0: 500, 1: 10000, 2: 10500, 3: 12000, 4: 4000})
+    facts = ledger.step_streak_facts(rows, 10000, TODAY)
+    # Today's 500 (a partial count) must not read as a miss.
+    assert facts["current_hit_streak"] == 3
+    assert facts["current_miss_streak"] == 0
+    assert facts["streak_ended"] is None
+
+
+def test_step_facts_exactly_at_goal_counts_as_hit():
+    rows = _steps({1: 10000})
+    assert ledger.step_streak_facts(rows, 10000, TODAY)["current_hit_streak"] == 1
+
+
+def test_step_facts_streak_ended_needs_three_hits_before_the_miss():
+    # 12-day streak, then 2 misses ending yesterday.
+    rows = _steps({b: 4000 for b in (1, 2)} | {b: 11000 for b in range(3, 15)})
+    facts = ledger.step_streak_facts(rows, 10000, TODAY)
+    assert facts["current_miss_streak"] == 2
+    assert facts["streak_ended"] == {"date": "2026-07-21", "length": 12}
+
+    # Only 2 hits before the miss — too short to mourn.
+    short = _steps({1: 4000, 2: 11000, 3: 11000})
+    assert ledger.step_streak_facts(short, 10000, TODAY)["streak_ended"] is None
+
+
+def test_step_facts_gap_in_data_breaks_a_streak():
+    rows = _steps({1: 11000, 2: 11000, 4: 11000})  # day 3 missing
+    assert ledger.step_streak_facts(rows, 10000, TODAY)["current_hit_streak"] == 2
+
+
+def test_step_facts_best_streak_and_degenerate_inputs():
+    rows = _steps({b: 11000 for b in range(1, 6)} | {6: 100}
+                  | {b: 11000 for b in range(7, 15)})
+    facts = ledger.step_streak_facts(rows, 10000, TODAY)
+    assert facts["current_hit_streak"] == 5
+    assert facts["best_streak_60d"] == 8
+    assert ledger.step_streak_facts([], 10000, TODAY)["best_streak_60d"] == 0
+    assert ledger.step_streak_facts(rows, 0, TODAY)["current_hit_streak"] == 0
+
+
+# --- observation_patterns ---------------------------------------------------
+
+
+def _obs(day: str, obs_type: str, num: float | None = None,
+         text: str | None = None) -> dict:
+    return {"observed_on": day, "obs_type": obs_type,
+            "value_num": num, "value_text": text}
+
+
+def test_observation_patterns_thresholds_are_edges():
+    rows = [
+        _obs("2026-07-20", "mood", 2),    # counts (<=2)
+        _obs("2026-07-21", "mood", 2),
+        _obs("2026-07-22", "mood", 3),    # does not count
+        _obs("2026-07-20", "soreness", 7),  # counts (>=7)
+        _obs("2026-07-21", "soreness", 6),  # does not
+    ]
+    patterns = {p["pattern"]: p for p in ledger.observation_patterns(rows, TODAY)}
+    assert patterns["low_mood"]["count"] == 2
+    assert patterns["low_mood"]["last_date"] == "2026-07-21"
+    assert "high_soreness" not in patterns  # single reading is not a pattern
+
+
+def test_observation_patterns_injury_counts_from_one():
+    rows = [_obs("2026-07-22", "injury", text="right knee")]
+    patterns = ledger.observation_patterns(rows, TODAY)
+    assert patterns == [{
+        "pattern": "injury_logged", "obs_type": "injury", "count": 1,
+        "window_days": 30, "last_date": "2026-07-22",
+    }]
+
+
+def test_observation_patterns_window_excludes_day_30_and_future():
+    rows = [
+        _obs("2026-06-23", "injury", text="old"),    # exactly 30 back — out
+        _obs("2026-07-25", "injury", text="future"),  # future — out
+    ]
+    assert ledger.observation_patterns(rows, TODAY) == []
+
+
+# --- notable_results --------------------------------------------------------
+
+
+def test_notables_quality_done_and_overachieve_boundary():
+    graded = [
+        _w("2026-07-21", "done", "interval"),
+        _w("2026-07-20", "done", "easy", target_m=5000, actual_m=5500),   # exactly 1.10
+        _w("2026-07-19", "done", "easy", target_m=5000, actual_m=5400),   # under
+        _w("2026-07-18", "missed", "tempo"),
+        _w("2026-07-01", "done", "race"),  # 22 days back — outside 14d
+    ]
+    notables = ledger.notable_results(graded, TODAY)
+    assert notables == [
+        {"date": "2026-07-21", "type": "interval", "kind": "quality_done"},
+        {"date": "2026-07-20", "type": "easy", "kind": "overachieved"},
+    ]
+
+
+# --- render_ledger_block ----------------------------------------------------
+
+
+def test_render_empty_ledger_is_empty_string():
+    led = ledger.compute_ledger(
+        ledger.plan_adherence_facts([], TODAY),
+        ledger.step_streak_facts([], 10000, TODAY),
+        [], [], TODAY)
+    assert ledger.render_ledger_block(led, "Alex") == ""
+
+
+def test_render_ledger_pins_the_receipt_lines():
+    led = {
+        "as_of": TODAY,
+        "plan": {"miss_streak": 0, "done_streak": 0, "misses_14d": 2,
+                 "quality_misses_28d": 1,
+                 "last_miss": {"date": "2026-07-19", "type": "interval"}},
+        "steps": {"current_hit_streak": 0, "current_miss_streak": 2,
+                  "best_streak_60d": 12,
+                  "streak_ended": {"date": "2026-07-20", "length": 12}},
+        "patterns": [{"pattern": "high_soreness", "obs_type": "soreness",
+                      "count": 4, "window_days": 30, "last_date": "2026-07-22"}],
+        "notables": [{"date": "2026-07-21", "type": "interval",
+                      "kind": "quality_done"}],
+    }
+    block = ledger.render_ledger_block(led, "Alex")
+    assert "- Plan: 2 missed sessions in the last 14 days (last: Jul 19 interval)." in block
+    assert "- Quality days: 1 skipped in the last 28 days." in block
+    assert "- Steps: a 12-day goal streak ended Jul 20." in block
+    assert "- Soreness logged at 7/10 or above 4x in 30 days (last: Jul 22)." in block
+    assert "- Jul 21: interval day done as prescribed." in block
+
+
+def test_render_ledger_streak_line_variants():
+    hit = {"current_hit_streak": 5, "current_miss_streak": 0,
+           "best_streak_60d": 9, "streak_ended": None}
+    block = ledger.render_ledger_block(
+        {"as_of": TODAY, "plan": {}, "steps": hit, "patterns": [],
+         "notables": []}, "Alex")
+    assert "goal hit 5 days running (through yesterday); best in 60 days is 9." in block
+
+    streaky = {"miss_streak": 3, "done_streak": 0, "misses_14d": 3,
+               "quality_misses_28d": 0, "last_miss": {"date": "2026-07-22",
+                                                      "type": "easy"}}
+    block = ledger.render_ledger_block(
+        {"as_of": TODAY, "plan": streaky, "steps": {}, "patterns": [],
+         "notables": []}, "Alex")
+    assert "- Plan: 3 prescribed sessions missed in a row." in block
+
+
+# --- persistence divider ----------------------------------------------------
+
+
+def test_compute_relationship_ledger_from_a_seeded_db(tmp_path, monkeypatch):
+    """The divider wires real tables to the pure functions: steps rows and an
+    observation land in the ledger with the values pinned."""
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('daily_step_goal', '8000')")
+        for back in range(1, 5):
+            conn.execute(
+                "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)",
+                ((today - timedelta(days=back)).isoformat(), 9000),
+            )
+        conn.execute(
+            "INSERT INTO observations (observed_on, created_at, obs_type, "
+            "value_text) VALUES (?, ?, 'injury', 'left calf')",
+            ((today - timedelta(days=2)).isoformat(), "2026-07-21T08:00:00"),
+        )
+    led = ledger.compute_relationship_ledger(db_path=p)
+    assert led["steps"]["current_hit_streak"] == 4
+    assert led["patterns"][0]["pattern"] == "injury_logged"
+    assert led["plan"] == ledger.plan_adherence_facts([], led["as_of"])
+    assert "goal hit 4 days running" in ledger.render_ledger_block(led, "Alex")

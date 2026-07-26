@@ -366,7 +366,9 @@ def test_progress_goal_gap_and_this_week_and_formatted_fields(seeded):
     assert body["target_time_seconds"] == 3000
     assert body["target_time_formatted"] == "50:00"
     assert body["goal_gap"] == {"gap_seconds": 300.0, "gap_pct": 10.0, "on_pace": False}
-    assert set(body["this_week"]) == {"week_planned_mi", "week_actual_mi", "slips"}
+    assert set(body["this_week"]) == {
+        "week_planned_mi", "week_actual_mi", "week_run_mi", "week_walk_mi", "slips",
+    }
 
 
 def test_progress_goal_gap_none_without_projection(seeded):
@@ -555,6 +557,20 @@ def test_update_plan_workout_duration_min_sets_graded_field(seeded):
     assert row["target_duration_sec"] == 1800
 
 
+def test_update_plan_workout_echoes_duration_and_seq_it_wrote(seeded):
+    # The confirmation payload must carry the duration just written (the graded
+    # field for tempo/interval) so the model can confirm the edit from the tool
+    # result — not re-query or confirm blind. Pre-fix the echo dropped both
+    # target_duration_sec and seq.
+    d = _active_double_day(seeded)
+    body, err = call(tools.update_plan_workout,
+                     {"date": d, "seq": 2, "duration_min": 40})
+    assert not err
+    assert body["seq"] == 2                       # which session of the double day
+    assert body["duration_seconds"] == 2400       # the value actually written
+    assert body["duration_formatted"] == "40:00"  # formatted for the reply
+
+
 def test_update_plan_workout_rest_defaults_description(seeded):
     # MED-2: a rest-flip without a new description must not leave the old
     # hard-run prose on the rest day.
@@ -638,7 +654,12 @@ def test_plan_chart_daily_renders_plan_rows(seeded):
     assert "plan vs actual · last 14d" in text
     assert f"{date.today().isoformat()[5:]} easy" in text
     assert "░" in text  # planned distance renders as plan cells
-    assert "█ run vs ░ short of plan" in text  # legend present
+    # Legend labels the bar by what it actually plots: on-foot miles (run +
+    # walk), NOT run-only — the bar sums actual_distance_m, which counts
+    # prescribed walking on easy days by design. Mislabeling it "run" was the
+    # 0.27.0 label-vs-measurement bug re-surfacing on this surface.
+    assert "█ on-foot mi vs ░ short of plan" in text
+    assert "█ run vs" not in text
 
 
 def test_plan_chart_weekly_mode(seeded):

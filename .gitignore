@@ -34,3 +34,6 @@ reports/
 
 # Claude Code local runtime state
 .claude/
+
+# one-off image strays (e.g. LinkedIn banners) must never land in the repo
+/*.png

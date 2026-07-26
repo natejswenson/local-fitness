@@ -14,6 +14,7 @@ Design: ``docs/plans/2026-06-16-fitness-mcp-server-design.md``.
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date
 from typing import Any
@@ -25,12 +26,14 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .. import config, db
-from ..agent import brief_planner, briefs, coach, prompts
+from ..agent import brief_planner, briefs, coach, memory, prompts
 from ..agent import tools as agent_tools
 from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
 from ..agent.schemas import Brief
 from ..agent.status import assemble_status
+
+_LOG = logging.getLogger(__name__)
 
 # MCP resource URIs. The schema doc and the latest brief are the two read-only
 # resources advertised to clients; the coach prompt is the one slash-command.
@@ -215,8 +218,12 @@ def _latest_brief_markdown() -> str:
 def _coach_prompt(arguments: dict[str, str] | None) -> types.GetPromptResult:
     """The running-coach persona pre-filled with today's snapshot."""
     # The persona ALREADY embeds the user's saved notes via
-    # render_for_prompt(); do NOT append them again here.
-    persona = prompts.system_prompt(_user_name(), coach.resolve_coach_profile())
+    # render_for_prompt(); do NOT append them again here. Memory is resolved
+    # here (fail-silent, "" when disabled/empty) because the prompt builders
+    # are pure — see prompts.system_prompt's memory_text note.
+    persona = prompts.system_prompt(
+        _user_name(), coach.resolve_coach_profile(),
+        memory.render_memory_for_prompt(user_name=_user_name()))
     snapshot = _render_status(assemble_status())
     text = (
         f"{persona}\n\n"
@@ -269,7 +276,9 @@ def _brief_prompt() -> types.GetPromptResult:
     profile = coach.resolve_coach_profile()
     recent_briefs_summary = briefs._recent_briefs_summary()
     context = brief_planner.assemble_brief_context()
-    system = prompts.brief_v2_system_prompt(user_name, profile)
+    system = prompts.brief_v2_system_prompt(
+        user_name, profile,
+        memory.render_memory_for_prompt(compact=True, user_name=user_name))
     user = prompts.brief_v2_user_prompt(
         context, user_name, _daily_step_goal(), recent_briefs_summary, profile,
         persist_via_tool=True,
@@ -396,10 +405,22 @@ def _install_coach_persona(instance: Server) -> None:
     def _with_coach_persona(*args, **kwargs):
         try:
             instance.instructions = prompts.system_prompt(
-                _user_name(), coach.resolve_coach_profile()
+                _user_name(), coach.resolve_coach_profile(),
+                memory.render_memory_for_prompt(user_name=_user_name()),
             )
         except Exception:
-            instance.instructions = None  # fail-open: never break the handshake
+            # Fail-open: never break the handshake. But a persistent failure
+            # (corrupt user_notes, a settings-table problem) silently strips
+            # the ENTIRE rendering contract — lead-with-answer, table shape,
+            # miles, the coach voice — from every future session, and without a
+            # log there's no signal pointing at why. Sibling fail-open paths
+            # (notes.py, branding.py) all log; this one didn't. Synchronous log
+            # only — the RACE-FREE note above forbids an await here.
+            _LOG.warning(
+                "coach persona resolution failed; serving no MCP instructions",
+                exc_info=True,
+            )
+            instance.instructions = None
         return _orig(*args, **kwargs)
 
     instance.create_initialization_options = _with_coach_persona
@@ -416,8 +437,12 @@ def build_server(extra_tools: list | None = None) -> Server:
     ``extra_tools`` is forwarded to ``agent_tools.make_server()`` — ONLY
     ``run_stdio()`` passes ``LOCAL_ONLY_TOOLS`` here. ``build_session_manager()``
     below calls this argument-free, which is the load-bearing line that keeps
-    the local-only tools (generate_brief_report, generate_chart) off the
-    streamable-HTTP /mcp/ transport. If a future edit ever passes
+    ``agent_tools.LOCAL_ONLY_TOOLS`` (see its definition for the current
+    membership and the rule that decides it: a tool handing back a filesystem
+    path a remote caller can't retrieve is local-only) off the streamable-HTTP
+    /mcp/ transport. Today that set is generate_brief_report + workout_report_card
+    (both write PDFs); generate_chart is NOT in it — it moved into ALL_TOOLS
+    once it returned an inline image block. If a future edit ever passes
     ``LOCAL_ONLY_TOOLS`` there too "for consistency", the HTTP transport
     silently regains tools this whole boundary exists to keep off it."""
     instance = agent_tools.make_server(extra_tools=extra_tools)["instance"]
@@ -455,12 +480,12 @@ def build_session_manager(
 
 
 async def run_stdio() -> None:
-    """Serve the same tools over stdio (local, auth-free), PLUS the
-    local-only PDF/chart tools (generate_brief_report, generate_chart) —
-    reachable here and ONLY here, never over the streamable-HTTP /mcp/
-    transport (see build_server's extra_tools note and the design doc).
-    No HTTP, so the Host/Origin and trailing-slash gotchas of the HTTP path
-    do not apply."""
+    """Serve the same tools over stdio (local, auth-free), PLUS
+    ``agent_tools.LOCAL_ONLY_TOOLS`` — the PDF-writing tools
+    (generate_brief_report + workout_report_card) — reachable here and ONLY
+    here, never over the streamable-HTTP /mcp/ transport (see build_server's
+    extra_tools note and the design doc). No HTTP, so the Host/Origin and
+    trailing-slash gotchas of the HTTP path do not apply."""
     from mcp.server.stdio import stdio_server
 
     server = build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)

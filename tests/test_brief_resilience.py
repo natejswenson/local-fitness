@@ -91,6 +91,11 @@ def _install_stream(monkeypatch, script):
 
     monkeypatch.setattr(briefing, "generate_streaming", fake_stream)
     monkeypatch.setenv("LOCAL_FITNESS_BRIEF_RETRY_DELAY_S", "0")
+    # The post-save auto-reflect hook is not under test here (and must not
+    # touch the real DB from a test) — tests that ARE about the hook re-patch
+    # this with a recorder.
+    from local_fitness.agent import reflect
+    monkeypatch.setattr(reflect, "reflect_after_brief_sync", lambda brief: None)
     return calls
 
 
@@ -163,3 +168,51 @@ def test_resilience_knobs_parse_and_fall_back(monkeypatch):
     assert briefing._stream_idle_timeout_s() == briefing._DEFAULT_STREAM_IDLE_TIMEOUT_S
     assert briefing._brief_max_attempts() == briefing._DEFAULT_MAX_ATTEMPTS
     assert briefing._brief_retry_delay_s() == briefing._DEFAULT_RETRY_DELAY_S
+
+
+# --- post-save auto-reflect hook (0.30.0) ------------------------------------
+
+def test_generate_and_save_reflects_exactly_once_after_a_saved_brief(monkeypatch):
+    """The coach journal write-back fires with the SAVED brief — after
+    persistence, once, and only on success."""
+    from local_fitness.agent import reflect
+
+    calls = _install_stream(monkeypatch, [
+        [{"type": "error", "message": "stream died"}],
+        [{"type": "done", "brief": {"date": "2026-07-19", "takeaways": []}}],
+    ])
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_MAX_ATTEMPTS", "3")
+    reflected = []
+    monkeypatch.setattr(reflect, "reflect_after_brief_sync", reflected.append)
+    briefing.generate_and_save()
+    assert calls["n"] == 2
+    assert reflected == [{"date": "2026-07-19", "takeaways": []}]
+
+
+def test_reflect_failure_never_costs_the_brief(monkeypatch):
+    from local_fitness.agent import reflect
+
+    _install_stream(monkeypatch, [
+        [{"type": "done", "brief": {"date": "2026-07-19"}}],
+    ])
+
+    def boom(brief):
+        raise RuntimeError("reflect exploded")
+
+    monkeypatch.setattr(reflect, "reflect_after_brief_sync", boom)
+    path = briefing.generate_and_save()  # must not raise
+    assert path.name == "2026-07-19.json"
+
+
+def test_failed_brief_never_reflects(monkeypatch):
+    from local_fitness.agent import reflect
+
+    _install_stream(monkeypatch, [
+        [{"type": "error", "message": "dead"}],
+    ])
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_MAX_ATTEMPTS", "1")
+    reflected = []
+    monkeypatch.setattr(reflect, "reflect_after_brief_sync", reflected.append)
+    with pytest.raises(ValueError):
+        briefing.generate_and_save()
+    assert reflected == []

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import tempfile
 from pathlib import Path
 
@@ -484,7 +485,8 @@ def test_instructions_reflect_live_profile():
     instr = server.create_initialization_options().instructions
     assert instr and "mcp__fitness__" in instr
     assert all(j in instr for j in ("CTL", "ATL", "TSB"))  # jargon translation retained
-    assert any(m in instr.lower() for m in ("no excuse", "this is on you", "relentless"))
+    assert any(m in instr.lower() for m in
+               ("that's on you", "the log doesn't lie", "accountability mirror"))
 
 
 def test_instructions_change_between_calls():
@@ -497,10 +499,10 @@ def test_instructions_change_between_calls():
     db.set_setting("coach_profile", "supportive", db_path=p)
     supp = server.create_initialization_options().instructions
     assert hard != supp
-    assert "no excuse" not in supp.lower()
+    assert "the log doesn't lie" not in supp.lower()
 
 
-def test_instructions_fail_open_on_resolve_error(monkeypatch):
+def test_instructions_fail_open_on_resolve_error(monkeypatch, caplog):
     _seed_db()
     server = mcp_server.build_server()
 
@@ -508,8 +510,15 @@ def test_instructions_fail_open_on_resolve_error(monkeypatch):
         raise RuntimeError("db down")
 
     monkeypatch.setattr(mcp_server.coach, "resolve_coach_profile", _boom)
-    opts = server.create_initialization_options()  # must not raise
+    with caplog.at_level(logging.WARNING, logger="local_fitness.web.mcp_server"):
+        opts = server.create_initialization_options()  # must not raise
     assert opts.instructions is None
+    # Fail-open must be OBSERVABLE — a silent None strip left the maintainer no
+    # signal. The warning names the failure so the degradation is diagnosable.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("coach persona resolution failed" in r.message for r in warnings)
+    # The exception is attached (exc_info) so the root cause is in the log.
+    assert any(r.exc_info for r in warnings)
 
 
 def test_read_brief_resource_stale_brief_carries_warning_banner(monkeypatch, tmp_path):

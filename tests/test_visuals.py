@@ -560,7 +560,7 @@ def test_render_report_card_pdf_no_word_paints_past_the_printable_area():
     # Every section carries the long paragraph — the worst case the hero cell
     # can be asked to hold.
     card["coach_read"] = {key: long_read for key, _ in workout_coach.READ_SECTIONS}
-    pdf = visuals.render_report_card_pdf(card, None)
+    pdf, _pages = visuals.render_report_card_pdf(card, None)
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         margin_pt = 1.5 * 28.35  # @page margin: 1.5cm
         offenders = []
@@ -571,6 +571,65 @@ def test_render_report_card_pdf_no_word_paints_past_the_printable_area():
                 for w in page.extract_words() if w["x1"] > right_edge + 0.5
             ]
     assert offenders == []
+
+
+def _report_card_with_splits(n_splits: int, long_read: bool = True) -> dict:
+    """A graded card carrying `n_splits` mile splits (and, by default, the
+    four-paragraph worst-case coach read) — the input shape that outgrows the
+    density ladder. Split HR climbs across the run so the chart is non-degenerate."""
+    from local_fitness.agent import report_card as rc
+    from local_fitness.agent import workout_coach
+
+    splits = [
+        {"activity_id": 1, "split_index": i, "distance_meters": 1609.344,
+         "duration_seconds": 540 + i * 5, "avg_hr": 130 + i,
+         "avg_pace_sec_per_km": 335 + i * 3, "elevation_gain_meters": 10 + i}
+        for i in range(n_splits)
+    ]
+    card = rc.build_card(
+        {"activity_id": 1, "date": "2026-07-19", "activity_name": "Long Run",
+         "activity_type": "running", "distance_meters": 1609.344 * n_splits,
+         "duration_seconds": 540 * n_splits, "avg_pace_sec_per_km": 348,
+         "avg_hr": 142, "training_load": 90},
+        splits,
+        {"type": "long", "target_distance_m": 1609.344 * n_splits,
+         "target_pace_sec_per_km": 360, "seq": 1},
+        {"mode": "rolling_60d", "n": 12, "pool": "running",
+         "median_distance_m": 1609.344 * n_splits, "median_pace_sec_per_km": 360.0,
+         "median_hr": 146.0, "median_load": 88.0},
+        {"ctl": 57.0, "atl": 87.0, "tsb": -30.0},
+    )
+    if long_read:
+        read = (
+            "You held pace through the whole distance and every split says so, "
+            "cruising within a few seconds of target from the first mile to the "
+            "last without the late fade a long run usually shows. That is the "
+            "aerobic base doing its job on a hard prescription."
+        )
+        card["coach_read"] = {key: read for key, _ in workout_coach.READ_SECTIONS}
+    return card
+
+
+def test_render_report_card_pdf_returns_page_count():
+    """render_report_card_pdf mirrors render_brief_pdf's `(bytes, page_count)`
+    contract — a small card fits one page and says so."""
+    pdf, pages = visuals.render_report_card_pdf(
+        _report_card_with_splits(2), None)
+    assert pages == 1
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        assert len(doc.pages) == 1
+
+
+def test_report_card_reports_overflow_rather_than_silently_spilling():
+    """A long run's worth of mile splits plus the four-paragraph coach read
+    exhausts the density ladder. The card has nothing to drop, so the contract
+    is that render_report_card_pdf SAYS so (page_count > 1) instead of quietly
+    emitting two pages — the signal workout_report_card logs. Measured through
+    the real chart+layout pipeline, not eyeballed."""
+    card = _report_card_with_splits(20)
+    split_chart = visuals.render_split_hr_png(card)
+    _pdf, pages = visuals.render_report_card_pdf(card, split_chart)
+    assert pages > 1
 
 
 # --- the one-page guarantee ------------------------------------------------

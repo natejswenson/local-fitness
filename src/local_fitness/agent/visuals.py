@@ -1386,7 +1386,9 @@ def _build_report_card_html(
 </html>"""
 
 
-def render_report_card_pdf(card: dict, split_chart: bytes | None = None) -> bytes:
+def render_report_card_pdf(
+    card: dict, split_chart: bytes | None = None
+) -> tuple[bytes, int]:
     """Render a built report card into a single-page PDF.
 
     Takes the already-built card dict and pre-rendered chart bytes rather than
@@ -1397,7 +1399,12 @@ def render_report_card_pdf(card: dict, split_chart: bytes | None = None) -> byte
     onto a second page (measured on activity 23685126977). It now shares the
     brief's density ladder: the card has no droppable content, so the ladder is
     the whole mechanism rather than a first stage.
+
+    Returns `(pdf_bytes, page_count)` — mirroring `render_brief_pdf`. Unlike the
+    brief there is nothing to drop, so a `page_count > 1` cannot be fixed here;
+    it is surfaced to the caller (which logs it) rather than being discarded,
+    because CLAUDE.md's contract is that a PDF never spills silently.
     """
     return fit_one_page(
         lambda preset: _build_report_card_html(card, split_chart, preset)
-    )[0]
+    )[:2]

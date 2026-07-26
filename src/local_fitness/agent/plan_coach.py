@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from datetime import date
 from pathlib import Path
 
 from .. import config
@@ -36,12 +37,50 @@ from .grounding import GroundingFlag
 
 _LOG = logging.getLogger(__name__)
 
-_VERDICT_PHRASE = {
-    "done": "You hit yesterday's session clean.",
-    "partial": "Yesterday came up short of the prescription.",
-    "missed": "Yesterday was a skip.",
-    "compliant": "Yesterday was a scheduled rest day.",
+# Verdict wording is date-relative: the graded day being referred to can be
+# the report's own date (an evening re-render after today's run synced and
+# graded), yesterday, or — when the data frontier lags — several days back.
+# A single hardcoded "Yesterday" mislabels the first and third cases, and the
+# fallback's whole contract is that only WORDING degrades, never facts.
+_VERDICT_PHRASE_TODAY = {
+    "done": "Today's session is already in the book.",
+    "partial": "Today's session came up short of the prescription.",
+    "missed": "Today's session is a skip so far.",
+    "compliant": "Today is a scheduled rest day.",
 }
+# ``{ref}`` is "Yesterday" or an absolute date like "Jul 8".
+_VERDICT_PHRASE_PRIOR = {
+    "done": "{ref} you hit the session clean.",
+    "partial": "{ref} came up short of the prescription.",
+    "missed": "{ref} was a skip.",
+    "compliant": "{ref} was a scheduled rest day.",
+}
+
+
+def _relative_day(prior_date: str | None, target_date: str | None) -> str:
+    """How to refer to a graded day relative to the report's date: ``"Today"``,
+    ``"Yesterday"``, or an absolute ``"Jul 8"``. Falls back to the absolute
+    date whenever the relationship can't be computed (missing/malformed date,
+    no target), so the wording is never *wrong* about which day it means — only
+    less familiar. Returns ``""`` only when there is no usable prior date at
+    all, in which case the caller omits the verdict phrase entirely."""
+    if not prior_date:
+        return ""
+    try:
+        pd = date.fromisoformat(prior_date)
+    except (ValueError, TypeError):
+        return ""
+    if target_date:
+        try:
+            delta = (date.fromisoformat(target_date) - pd).days
+        except (ValueError, TypeError):
+            delta = None
+        if delta is not None:
+            if delta <= 0:
+                return "Today"
+            if delta == 1:
+                return "Yesterday"
+    return f"{pd:%b} {pd.day}"
 
 # Mirrors system_prompt's "Translate technical metrics on first use" bullet
 # (prompts.py) — always included so the PDF coaching line honors the same
@@ -74,6 +113,7 @@ def build_prompt(
     goal_type: str,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
 ) -> tuple[str, str]:
     """Assemble the ``(system_prompt, user_prompt)`` pair for the coaching
     line. Pure string assembly — no I/O, no randomness, fully unit-testable.
@@ -86,6 +126,11 @@ def build_prompt(
     coaching line exactly as it already is in chat/brief. The
     metric-translation block is appended unconditionally, independent of
     ``notes_text``.
+
+    ``memory_text`` follows the identical convention for the coach's memory
+    (``memory.render_memory_for_prompt()`` output) — passed in, not resolved,
+    because this prompt's hash is ``generate_coaching_line_cached``'s cache
+    key and a builder that did I/O would break caching.
     """
     system_prompt = (
         f"You are {user_name}'s running coach, writing ONE short paragraph (2-4 "
@@ -95,6 +140,9 @@ def build_prompt(
         "Output ONLY the coaching paragraph itself — no headline, no "
         'markdown, no quotation marks, no preamble like "Here\'s your line".'
     )
+    memory_section = prompts.coach_memory_block(user_name, memory_text)
+    if memory_section:
+        system_prompt += f"\n\n{memory_section}"
     notes_section = prompts.user_notes_block(user_name, notes_text)
     if notes_section:
         system_prompt += f"\n\n{notes_section}"
@@ -134,6 +182,7 @@ async def generate_coaching_line(
     timeout: float = 30.0,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
 ) -> str:
     """Claude-generated coaching line prepping the athlete for today's run.
 
@@ -158,7 +207,7 @@ async def generate_coaching_line(
 
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        notes_text=notes_text, user_name=user_name,
+        notes_text=notes_text, user_name=user_name, memory_text=memory_text,
     )
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -229,6 +278,7 @@ async def generate_coaching_line_cached(
     timeout: float = 30.0,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
+    memory_text: str | None = None,
     cache_path: Path | None = None,
 ) -> str:
     """``generate_coaching_line`` behind a single-entry disk cache.
@@ -245,6 +295,7 @@ async def generate_coaching_line_cached(
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, notes_text=notes_text, user_name=user_name,
+        memory_text=memory_text,
     )
     key = hashlib.sha256(
         "\x00".join([system_prompt, user_prompt, model or "default"]).encode("utf-8")
@@ -257,7 +308,7 @@ async def generate_coaching_line_cached(
     line = await generate_coaching_line(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, model=model, timeout=timeout, notes_text=notes_text,
-        user_name=user_name,
+        user_name=user_name, memory_text=memory_text,
     )
     _write_cached_line(path, key, line)
     return line
@@ -268,6 +319,7 @@ def fallback_coaching_line(
     last_7_days: list[dict],
     days_to_race: int | None,
     goal_type: str,
+    target_date: str | None = None,
 ) -> str:
     """Deterministic, template-based coaching line — used only when
     ``generate_coaching_line`` fails. Pure: identical inputs always
@@ -278,11 +330,26 @@ def fallback_coaching_line(
     including them rendered the same instruction three times over
     ("easy · 4.0 mi @ 9:39/mi" / "Easy 4mi. Keep HR under 140." / "Today: easy
     4.0 mi @ 9:39/mi. Easy 4mi. Keep HR under 140."). A coaching line's job is
-    the part the prescription does not already say."""
+    the part the prescription does not already say.
+
+    ``target_date`` (the report's own date) makes the graded-day reference
+    correct: ``last_7_days`` includes ``target_date`` itself, and a run that
+    has already synced+graded ``done`` on the report's date is the first
+    non-pending entry — so a hardcoded "Yesterday" credited today's run to
+    yesterday. When omitted, the day is named by its absolute date, which is
+    never wrong about which day it means."""
     prior = next((d for d in last_7_days if d.get("verdict") != "pending"), None)
     parts: list[str] = []
     if prior is not None:
-        phrase = _VERDICT_PHRASE.get(prior["verdict"])
+        ref = _relative_day(prior.get("date"), target_date)
+        verdict = prior["verdict"]
+        if ref == "Today":
+            phrase = _VERDICT_PHRASE_TODAY.get(verdict)
+        elif ref:
+            template = _VERDICT_PHRASE_PRIOR.get(verdict)
+            phrase = template.format(ref=ref) if template else None
+        else:
+            phrase = None  # no usable date — omit rather than assert a wrong day
         if phrase:
             parts.append(phrase)
 

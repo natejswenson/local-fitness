@@ -155,16 +155,36 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
     return rows
 
 
-def _training_load(baseline: dict[str, Any] | None) -> dict[str, Any]:
-    """CTL/ATL/TSB from the latest baselines row + a plain-English read."""
+def _training_load(baseline: dict[str, Any] | None, today: str) -> dict[str, Any]:
+    """CTL/ATL/TSB from the latest baselines row + a plain-English read.
+
+    Carries the row's own ``as_of`` date and ``baseline_stale_days`` (days
+    between ``today`` and that row, floored at 0) so a downstream surface can
+    say "as of Monday" and flag a frozen data frontier. TSB decays daily even
+    with zero workouts (ATL's 7-day EWMA fades faster than CTL's 42-day one),
+    so a stale baselines row served as *current* reports the wrong freshness
+    and zone — the same orphaned-data failure the brief-side
+    ``latest_brief_date``/``brief_stale_days`` fields exist to expose.
+    """
     if not baseline:
         return {"ctl": None, "atl": None, "tsb": None,
+                "as_of": None, "baseline_stale_days": None,
                 "interpretation": "no training-load data yet"}
     tsb = baseline.get("tsb")
+    as_of = baseline.get("date")
+    stale_days: int | None = None
+    if as_of:
+        try:
+            stale_days = max(
+                0, (date.fromisoformat(today) - date.fromisoformat(as_of)).days)
+        except ValueError:
+            stale_days = None
     return {
         "ctl": baseline.get("ctl"),
         "atl": baseline.get("atl"),
         "tsb": tsb,
+        "as_of": as_of,
+        "baseline_stale_days": stale_days,
         "interpretation": _tsb_interpretation(tsb),
     }
 
@@ -239,12 +259,18 @@ def assemble_status(today: str | None = None) -> dict[str, Any]:
     ``brief_stale_days`` (days between ``today`` and the newest saved brief;
     0 = today's brief exists, ``None`` = no briefs on disk — >0 means the
     nightly generation has been failing).
+
+    ``training_load`` additionally carries ``as_of`` (the date of the baselines
+    row the CTL/ATL/TSB came from) and ``baseline_stale_days`` (days between
+    ``today`` and that row; 0 = current, ``None`` = no baselines yet). A frozen
+    data frontier makes the served TSB/zone drift from reality, so this is the
+    baselines-side mirror of the brief-staleness fields above.
     """
     today = today or date.today().isoformat()
     with db.connect() as conn:
         baseline = _baseline_row(conn, today)
         metrics = _metric_rows(conn, today, baseline)
-        training_load = _training_load(baseline)
+        training_load = _training_load(baseline, today)
         recent_workouts = _recent_workouts(conn)
 
     user_notes = [n.text for n in notes.read_notes() if n.text]

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import zipfile
-from datetime import datetime
+import os
+import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -344,8 +346,11 @@ def _act_member(name="DI_CONNECT/DI-Connect-Fitness/me_0_summarizedActivities.js
 
 
 def _sample_activity(**overrides):
-    # local epoch ms for 2026-03-10 (some local time); > 1e11 so it's used.
-    ts = int(datetime(2026, 3, 10, 7, 30, 0).timestamp() * 1000)
+    # Garmin's startTimeLocal is a LOCAL epoch: the value that reads as the local
+    # wall-clock (07:30 on 2026-03-10) when decoded AS UTC. Encode it that way
+    # (tz=utc) so the fixture is host-tz-independent and matches the real format;
+    # > 1e11 so the code uses it as a local epoch.
+    ts = int(datetime(2026, 3, 10, 7, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
     act = {
         "activityId": 111,
         "startTimeLocal": ts,
@@ -482,6 +487,34 @@ def test_activities_begin_timestamp_fallback_and_no_timestamp(fresh_db, tmp_path
     a2 = _activities(fresh_db, 777)
     assert a2["date"] == ""
     assert a2["start_time"] is None
+
+
+def test_early_morning_activity_does_not_roll_back_a_day_under_western_tz(
+    fresh_db, tmp_path
+):
+    # Regression: startTimeLocal is a LOCAL epoch (reads as local wall-clock when
+    # decoded as UTC). Decoding it with datetime.fromtimestamp() applies the host
+    # tz offset a second time, so on a UTC-6 host a 05:30 activity landed at 23:30
+    # the PREVIOUS day. Pin the host tz to America/Chicago (independent of the
+    # machine's real tz) and assert a 05:30-local run stays on its own date.
+    local_epoch_ms = int(
+        datetime(2026, 1, 15, 5, 30, 0, tzinfo=timezone.utc).timestamp() * 1000
+    )
+    act = _sample_activity(activityId=999, startTimeLocal=local_epoch_ms)
+    original_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Chicago"  # UTC-6 in January
+    time.tzset()
+    try:
+        backfill.backfill(_make_zip(tmp_path, {_act_member(): [act]}))
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+    row = _activities(fresh_db, 999)
+    assert row["date"] == "2026-01-15"  # NOT 2026-01-14
+    assert row["start_time"].startswith("2026-01-15T05:30")
 
 
 def test_activities_skips_nondict_and_missing_id(fresh_db, tmp_path):
