@@ -10,11 +10,11 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date as date_cls, datetime, timedelta
+from datetime import date as date_cls
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator
-
 
 _LOG = logging.getLogger(__name__)
 

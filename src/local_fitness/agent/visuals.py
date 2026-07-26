@@ -23,8 +23,9 @@ import asyncio
 import base64
 import html
 import io
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Sequence
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .schemas import Brief
@@ -119,7 +120,7 @@ def fit_one_page(
     image_cache: dict = {}
     doc = None
     index = 0
-    for index, preset in enumerate(presets):
+    for index, preset in enumerate(presets):  # noqa: B007 — index is read AFTER the loop (returned rung)
         doc = weasyprint.HTML(
             string=build_html(preset), url_fetcher=_report_url_fetcher()
         ).render(font_config=font_config, cache=image_cache)
@@ -740,7 +741,7 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
 
 
 def _build_html(
-    brief: "Brief",
+    brief: Brief,
     charts: dict[str, bytes],
     plan_section: dict | None,
     density: dict | None = None,
@@ -822,7 +823,7 @@ def _build_html(
 
 
 def render_brief_pdf(
-    brief: "Brief",
+    brief: Brief,
     charts: dict[str, bytes],
     plan_section: dict | None = None,
     omitted: int = 0,
@@ -1370,7 +1371,7 @@ def _build_report_card_html(
     # directly under the GPA/distance/pace line. The masthead title names the
     # run and carries nothing else. Omitted entirely when absent rather than
     # left as an empty block.
-    from .workout_coach import READ_SECTIONS
+    from .report_card import READ_SECTIONS
 
     read = card.get("coach_read") or {}
     coach_html = "".join(

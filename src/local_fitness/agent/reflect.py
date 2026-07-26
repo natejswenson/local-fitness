@@ -188,8 +188,8 @@ async def _reflect(source: str, source_key: str, entry_date: str | None,
     """The shared pipeline. Never raises past its own boundary."""
     if not memory.memory_enabled():
         return
-    from . import coach
     from .. import db
+    from . import coach
 
     # ONE connection for the whole read phase (0.36.0 — was ~6 opens: the
     # has_event probe, the profile resolve x2, user_name, the ledger, the

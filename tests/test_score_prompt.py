@@ -8,6 +8,7 @@ from __future__ import annotations
 import types
 
 import score_prompt
+
 from local_fitness.agent import prompts, schemas
 
 

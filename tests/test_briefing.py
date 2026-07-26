@@ -34,14 +34,9 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from local_fitness import db
-from local_fitness import notes
-from local_fitness.agent import briefing
-from local_fitness.agent import briefs
-from local_fitness.agent import coach
-from local_fitness.agent import prompts
+from local_fitness import db, notes
+from local_fitness.agent import briefing, briefs, coach, prompts
 from local_fitness.agent.schemas import Brief, BriefContext
-
 
 # --- _iter_partial_takeaways: the streaming partial-JSON parser ------------
 #
@@ -814,7 +809,7 @@ def test_local_model_gemma4_gets_tightened_schema_and_higher_temperature(stream_
     calls: list[dict] = []
     monkeypatch.setattr(
         briefing.local_model, "generate_local_completion",
-        lambda sp, up, *, format=None, temperature=None, **kw: (  # noqa: A002
+        lambda sp, up, *, format=None, temperature=None, **kw: (  # noqa: A002, A006 — mirrors the SDK kwarg
             calls.append({"format": format, "temperature": temperature})
             or _brief_json([_takeaway()])))
 

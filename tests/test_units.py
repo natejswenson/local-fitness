@@ -12,7 +12,6 @@ import pytest
 
 from local_fitness.agent import units
 
-
 # --- to_miles --------------------------------------------------------------
 
 def test_to_miles_none_in_none_out():

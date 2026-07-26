@@ -83,7 +83,7 @@ def test_bar_chart_flat_series_is_sign_consistent():
     # no asymmetry where positive fills and negative goes blank.
     pos = charts.render_bar_chart(["a", "b"], [5.0, 5.0]).split("\n")
     neg = charts.render_bar_chart(["a", "b"], [-5.0, -5.0]).split("\n")
-    for p, n in zip(pos, neg):
+    for p, n in zip(pos, neg, strict=True):
         assert p.count("🟦") + p.count("🟩") + p.count("🟨") + p.count("🟧") + p.count("🟥") == \
                n.count("🟦") + n.count("🟩") + n.count("🟨") + n.count("🟧") + n.count("🟥")
 

@@ -79,11 +79,13 @@ __all__ = [
     "render_markdown", "reference_line", "bin_hr_trace", "expected_text",
     "actual_text", "hr_band_bounds", "hr_expectation",
     "is_running_effort", "fastest_rep_split", "fastest_rep_split_pace",
+    "READ_SECTIONS",
     "load_report_card_inputs", "rolling_reference",
 ]
 
-# 1 international mile, exactly — matches units.py's constant.
-MILE_M = 1609.344
+# 1 international mile, exactly — units.py owns the constant (0.38.0);
+# the local name survives because the module uses it ~everywhere.
+MILE_M = units.METERS_PER_MILE
 # How close a lap must be to a mile before we call the column "Mile" rather
 # than "Lap". Garmin auto-lap lands within a few meters; a manual-lap workout
 # can be anything, and mislabeling laps as miles is a lie on the card.
@@ -843,6 +845,20 @@ def build_card(
 
 # --- markdown rendering ----------------------------------------------------
 
+#: The four coach-read paragraphs, in card order. The key is what the model
+#: labels its output with; the label is what the reader sees above each
+#: paragraph. Lives HERE (0.38.0, formerly workout_coach.READ_SECTIONS)
+#: because it is the card's contract — render_markdown, visuals and
+#: card_store all consume it, and housing it in workout_coach forced each of
+#: them to import from the module that judges the card rather than the one
+#: that defines it. workout_coach re-exports it unchanged.
+READ_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("distance", "DISTANCE"),
+    ("pace", "PACE"),
+    ("hr", "HEART RATE"),
+    ("load", "TRAINING LOAD"),
+)
+
 _METRIC_LABELS = [
     ("distance", "Distance"), ("pace", "Pace"),
     ("hr", "Avg HR"), ("load", "Training Load"),
@@ -941,7 +957,7 @@ def _delta_text(key: str, metric: dict) -> str:
         # to refuse.
         return "—"
     if key == "pace":
-        diff = round((actual - expected) * 1.609344)
+        diff = round((actual - expected) * units.KM_PER_MILE)
         if abs(diff) < 1:
             return "on target"
         return f"{abs(diff)}s/mi {'slower' if diff > 0 else 'faster'}"
@@ -1031,8 +1047,6 @@ def render_markdown(card: dict) -> str:
     # per metric, which is where a reader actually checks it.
     read = card.get("coach_read") or {}
     if read:
-        from .workout_coach import READ_SECTIONS
-
         for key, label in READ_SECTIONS:
             if read.get(key):
                 lines += [f"**{label.title()}** — {read[key]}", ""]

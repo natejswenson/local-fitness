@@ -27,7 +27,14 @@ import pytest
 
 from local_fitness import db, plans
 from local_fitness.agent import (
-    branding, interpret, journal, report_card, tools, units, visuals)
+    branding,
+    interpret,
+    journal,
+    report_card,
+    tools,
+    units,
+    visuals,
+)
 from local_fitness.ingest import daily as daily_ingest_mod
 
 

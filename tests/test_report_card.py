@@ -1372,3 +1372,19 @@ def test_exclusion_count_covers_only_mislabelled_rows(bimodal_db):
     # not counted as mislabelled.
     assert ref["excluded_other_mode"] == 12
     assert ref["n"] == 8
+
+
+def test_report_card_imports_without_workout_coach():
+    """0.38.0 (M1): READ_SECTIONS lives here now — report_card must be fully
+    importable without workout_coach ever entering sys.modules (the old
+    direction forced lazy imports in three consumers)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; from local_fitness.agent import report_card; "
+        "assert report_card.READ_SECTIONS[0] == ('distance', 'DISTANCE'); "
+        "sys.exit(1 if 'local_fitness.agent.workout_coach' in sys.modules else 0)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True)
+    assert proc.returncode == 0, proc.stderr.decode()

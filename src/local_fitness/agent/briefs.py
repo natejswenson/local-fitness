@@ -261,7 +261,9 @@ def _extract_json(text: str) -> dict:
         try:
             return _salvage_takeaways(_LOOSE_DECODER.decode(cleaned[start : end + 1]))
         except json.JSONDecodeError as e:
-            raise ValueError(f"could not parse JSON from agent response: {e}\n\n{cleaned[:500]}")
+            raise ValueError(
+                f"could not parse JSON from agent response: {e}\n\n{cleaned[:500]}"
+            ) from e
     raise ValueError(f"no JSON found in agent response: {cleaned[:500]}")
 
 

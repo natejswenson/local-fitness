@@ -217,7 +217,7 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **37 tools over stdio** (35 over HTTP — two are
+Once connected you get **45 tools over stdio** (43 over HTTP — two are
 local-only, see below), **2 prompts**, and **2 resources**.
 
 📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool
@@ -241,6 +241,8 @@ is a map; that directory is the documentation.
 - **Workouts** — `query_workouts`, `get_workout_detail`, and
   `workout_report_card`, which *grades* one session — distance, pace, HR and
   training load each get a letter from one shared band table, plus an overall.
+  Every render is stored, so `list_report_cards` / `get_report_card` read the
+  graded history back (JSON, so both transports) without re-grading anything.
 - **Charts** — `chart` (inline ASCII/emoji), `generate_chart` (matplotlib PNG
   returned as an inline image block), `plan_chart` (**the** scheduled-vs-actual
   view — don't hand-roll it).
@@ -255,6 +257,15 @@ is a map; that directory is the documentation.
   injected into the system prompt) and `log_observation` / `list_observations` /
   `delete_observation` (timestamped RPE, soreness, weight, mood, feeling,
   injury, notes).
+- **Coach memory** — `save_coach_memory` / `list_coach_memories` /
+  `recall_coach_memories` / `delete_coach_memory`. The coach's own journal, the
+  half a query can't produce: the newest 60 lines ride every prompt, older ones
+  archive rather than vanish, and `recall_coach_memories` keyword-searches the
+  whole thing. `delete_coach_memory` is the only real deletion.
+- **Coach personality** — `get_coach_personality` / `update_coach_personality`
+  tune the voice conversationally (persona prose, signature lines, per-topic
+  intensity, five numeric dials). There is no UI; the agent owns the writes,
+  same as training plans.
 - **Data & escape hatches** — `sync_garmin_data` (a capped Garmin pull +
   baseline recompute, so an MCP-only client can freshen the DB without the CLI)
   and `run_sql` (**read-only**, enforced at the SQLite engine — any write/DDL

@@ -27,7 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .. import config
@@ -297,7 +297,7 @@ def _write_cached_line(path: Path, key: str, line: str) -> None:
         entries = _load_cache_entries(path)
         entries[key] = {
             "line": line,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
         }
         while len(entries) > CACHE_MAX_ENTRIES:
             # Missing ts (a migrated v1 entry) sorts oldest — first out.
@@ -505,4 +505,9 @@ def ground_coaching_line(text: str, plan_section: dict) -> list[GroundingFlag]:
                     nearest_metric=near_name, delta=round(x - near_val, 2)))
         return flags
     except Exception:
+        # Advisory-only signal, so degrading to "no flags" is right — but
+        # silently, it was the one fail-open in the module without a log
+        # line (every sibling warns with exc_info).
+        _LOG.warning("coaching-line grounding check failed (ignored)",
+                     exc_info=True)
         return []

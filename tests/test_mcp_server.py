@@ -10,13 +10,11 @@ import asyncio
 import json
 import logging
 import tempfile
+from datetime import date as _dt_date
 from pathlib import Path
 
-from mcp import types
-
-from datetime import date as _dt_date
-
 import pytest
+from mcp import types
 
 from local_fitness import db
 from local_fitness.agent import tools as agent_tools
@@ -440,9 +438,8 @@ def test_allowed_hosts_default_includes_served_host(monkeypatch):
 # --- Integration: mount + lifespan + auth + Host (F3, auth, 421) ----------
 
 def _make_app(token: str | None, hosts: list[str]):
-    from contextlib import asynccontextmanager
-
     import secrets
+    from contextlib import asynccontextmanager
 
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, PlainTextResponse

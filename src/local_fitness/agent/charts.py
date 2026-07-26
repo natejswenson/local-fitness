@@ -98,7 +98,7 @@ def render_bar_chart(
     denom = hi if (zero_based and hi > 0) else span
     label_w = max((len(s) for s in labels), default=0)
     lines = [title] if title else []
-    for lab, v in zip(labels, values):
+    for lab, v in zip(labels, values, strict=True):
         # A flat (all-equal) series fills every bar regardless of sign — matches
         # how render_combo_chart plants a flat series at full height. Without this
         # a flat *negative* series ((v-lo)/span == 0) would render empty bars
@@ -288,7 +288,7 @@ def render_calendar(
     """
     if not values:
         return f"{title}\n{_NO_DATA}" if title else _NO_DATA
-    by_date = {date.fromisoformat(d): v for d, v in zip(dates, values)}
+    by_date = {date.fromisoformat(d): v for d, v in zip(dates, values, strict=True)}
     lo, hi, span = _norm(values)
     start, end = min(by_date), max(by_date)
 

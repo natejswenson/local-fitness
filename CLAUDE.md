@@ -110,7 +110,18 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
   (85% coverage gate), a separate perf-benchmark regression gate (see
-  below), and `ruff`, the prompt scorer. A separate `docker-build` job
+  below), and `ruff`, the prompt scorer. **Ruff's ruleset is explicit**
+  (0.38.0 — `[tool.ruff.lint] select` in `pyproject.toml`, currently
+  `E4,E7,E9,F,I,UP,B,A`; before that it silently ran defaults while the
+  code carried `noqa`s for rules that weren't on). The exclusions are
+  documented in the config itself: never enable `ARG` (MCP handlers take
+  `_args` by contract), and enable `BLE` + `RUF100` only TOGETHER after
+  triaging the ~30 broad-except sites (RUF100 alone flags the existing
+  BLE001 noqas as unused). **`tests/test_docs_drift.py` makes docs/mcp
+  tested surface**: every tool in `ALL_TOOLS`/`LOCAL_ONLY_TOOLS` must have
+  a page, no orphan pages, and the README tool counts must match
+  `len()` of the registries — adding a tool without its page fails the
+  build. A separate `docker-build` job
   compiles the full image (no push) so a base-image bump or `Dockerfile`
   change can't silently break `docker compose up --build` while CI stays
   green — but a green `docker-build` only proves the image *compiles*, not

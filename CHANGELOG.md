@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-26
+
+Maintainability pass (batch 4 of 4 from the 2026-07-26 audit): the lint
+gate becomes real, the docs become tested surface, and the one structural
+inversion that forced seven lazy imports is undone. No behavior changes.
+
+### Changed
+- **`READ_SECTIONS` moved to `report_card`** — its true home (it is the
+  card's contract; `render_markdown`, `visuals` and `card_store` all
+  consume it). Housing it in `workout_coach` forced every `report_card`
+  reach in that module into a lazy import; the move deletes seven of them
+  plus four pure-indirection wrapper functions. `workout_coach` re-exports
+  the name, so importers are unaffected; a subprocess test pins that
+  `report_card` now imports without `workout_coach`.
+- **Ruff runs an explicit ruleset** (`E4,E7,E9,F,I,UP,B,A`) — the repo
+  carried `noqa: BLE001` comments for a rule that was never enabled (ruff
+  ran defaults-only, so the blind-except gate reviewers assumed existed
+  didn't). ~75 violations fixed: import sorting, pyupgrade modernization,
+  `zip(..., strict=True)` on same-length series (length drift now errors
+  instead of silently clipping a chart), a `raise ... from e`, a frozen
+  `GradingConfig` default singleton. `BLE`+`RUF100` deferred as a
+  documented pair (30 broad-except sites need per-site triage); `ARG`
+  deliberately never (MCP handlers take `_args` by contract).
+- **Docs are tested surface.** README claimed 37 tools; the truth was 45.
+  Eight missing pages written (the whole coach-memory, personality and
+  report-card-store surface — including `recall_coach_memories`, the tool
+  the coach is told to call before claiming it doesn't remember), and
+  `tests/test_docs_drift.py` now fails the build on a missing page, an
+  orphan page, or a stale count.
+- Six plan-validation tests upgraded from `assert err` truthiness to
+  pinned messages (two boundary checks could previously swap without a
+  test noticing); dead `plans._foot_duration` deleted; the mile constants
+  are `units.METERS_PER_MILE`/`KM_PER_MILE` (public, single source —
+  `interpret`'s private copy stays for its stdlib-only contract, pinned
+  equal by test); `plan_coach`'s one silent fail-open now logs like its
+  siblings; a stale `units.format_hm` docstring stopped claiming the
+  dependency points the wrong way.
+
 ## [0.37.0] - 2026-07-26
 
 UX pass (batch 3 of 4 from the 2026-07-26 audit): forgiving inputs, honest

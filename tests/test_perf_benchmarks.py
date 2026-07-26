@@ -33,12 +33,11 @@ import asyncio
 from datetime import date, timedelta
 
 import pytest
+from perf_fixture import build_perf_fixture_db
 
 from local_fitness import db
 from local_fitness.agent import brief_planner, tools
 from local_fitness.agent.status import assemble_status
-
-from perf_fixture import build_perf_fixture_db
 
 _TODAY = date(2026, 7, 9)
 
@@ -162,6 +161,7 @@ def test_days_since_last_run_none_when_run_predates_bound(tmp_path):
     bound reads as `days_since_last_run is None`, not the true (larger) day
     count and not a crash."""
     from perf_fixture import build_perf_fixture_db as _unused  # noqa: F401
+
     from local_fitness import db as db_mod
 
     p = tmp_path / "stale_run.db"

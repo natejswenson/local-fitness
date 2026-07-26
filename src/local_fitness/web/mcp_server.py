@@ -30,8 +30,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .. import config, db, notes
 from ..agent import brief_planner, briefs, coach, memory, prompts
 from ..agent import tools as agent_tools
-from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
+from ..agent.render import render_table
 from ..agent.schemas import Brief
 from ..agent.status import assemble_status
 

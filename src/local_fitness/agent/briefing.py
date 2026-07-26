@@ -29,18 +29,21 @@ from claude_agent_sdk import (
 )
 from pydantic import ValidationError
 
-from .. import config, db
-from .. import notes
-from . import brief_planner
-from . import briefs
-from . import coach
-from . import grounding
-from . import local_model
-from . import memory
-from . import opencode_model
-from . import prompts
+from .. import config, db, notes
+from . import (
+    brief_planner,
+    briefs,
+    coach,
+    grounding,
+    local_model,
+    memory,
+    opencode_model,
+    prompts,
+)
 from . import tools as agent_tools
 from .briefs import (
+    _FENCE_OPEN_RE,
+    _LOOSE_DECODER,
     DEFAULT_BRIEFINGS_DIR,
     _extract_json,
     _recent_briefs_summary,
@@ -50,7 +53,6 @@ from .briefs import (
     load_today,
     save_brief,
 )
-from .briefs import _FENCE_OPEN_RE, _LOOSE_DECODER
 from .render import fix_table_row_breaks
 from .schemas import Brief
 
