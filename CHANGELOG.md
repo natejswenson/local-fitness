@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-07-26
+
+Past report cards become part of the coach's standing memory, without
+touching the raw-card-injection rule that protects the plan/workout-coach
+prompt-hash caches.
+
+### Added
+- **Trailing-3-week report-card aggregate** in the relationship ledger
+  (`ledger.report_card_facts`): count of graded workouts, average GPA,
+  base-letter grade distribution, and a rising/falling/flat trend
+  (`interpret.pct_change` + `delta_direction` over a recent-vs-earlier
+  split). Flows into `memory_text` on every voice surface via the existing
+  ledger block. Computed ONLY over cards with `activity_date` strictly
+  before today — the same as-of-yesterday discipline `step_streak_facts`
+  already uses — so grading today's workout never changes today's memory
+  and never busts the render that produced it.
+- **Standing chat directive**: the coach now calls `list_report_cards` /
+  `get_report_card` proactively for grade or trend questions, grounded by
+  a rule against stating any letter grade or GPA that didn't come from a
+  tool call or the memory section's computed line.
+
+### Changed
+- `card_store.py`'s "never inject raw cards" rule now names its one
+  sanctioned exception (the deterministic, as-of-yesterday aggregate above)
+  without weakening the rule for anything else — see the module docstring
+  and `CLAUDE.md`.
+
+### Known residual
+- Grading a *prior-day* workout mid-day flips `memory_text` once that day
+  (bounded, self-converging — the aggregate is idempotent under re-saves,
+  same order of magnitude as an existing intra-day journal write). Not
+  fully closed in this release; a `first_graded_at` column is the deferred
+  watertight fix if it ever proves annoying in practice.
+
 ## [0.33.0] - 2026-07-25
 
 The coach stops forgetting: the journal archives instead of deleting, and a

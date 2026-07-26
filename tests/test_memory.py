@@ -6,7 +6,7 @@ from datetime import date, timedelta
 import pytest
 
 from local_fitness import db
-from local_fitness.agent import journal, ledger, memory
+from local_fitness.agent import card_store, journal, ledger, memory
 
 
 @pytest.fixture
@@ -109,6 +109,65 @@ def test_archived_entries_never_reach_injection(mdb):
     text = memory.render_memory_for_prompt(user_name="Alex")
     assert "the one that gets archived" not in text
     assert "hot memory" in text
+
+
+def _minimal_card(activity_id: int, activity_date: str, gpa: float,
+                   grade: str) -> dict:
+    return {
+        "activity": {"activity_id": activity_id, "date": activity_date},
+        "overall": {"grade": grade, "gpa": gpa, "capped_by": None},
+        "metrics": {},
+        "intent": "easy", "intent_class": "easy", "intent_source": "plan",
+        "coach_read": None,
+    }
+
+
+def test_card_aggregate_lands_in_memory_text(mdb):
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    two_back = (date.today() - timedelta(days=2)).isoformat()
+    card_store.save_card(
+        _minimal_card(1, yesterday, 3.5, "A"), read_cache_key="k1", db_path=mdb)
+    card_store.save_card(
+        _minimal_card(2, two_back, 3.0, "B"), read_cache_key="k2", db_path=mdb)
+    text = memory.render_memory_for_prompt(user_name="Alex")
+    assert "Report cards:" in text
+
+
+def test_saving_a_card_for_today_leaves_memory_text_byte_identical(mdb):
+    # Seed enough back-dated cards to clear the render floor first.
+    for i in range(1, 4):
+        d = (date.today() - timedelta(days=i)).isoformat()
+        card_store.save_card(
+            _minimal_card(i, d, 3.0, "B"), read_cache_key=f"k{i}", db_path=mdb)
+    before = memory.render_memory_for_prompt(user_name="Alex")
+    today = date.today().isoformat()
+    card_store.save_card(
+        _minimal_card(99, today, 4.0, "A"), read_cache_key="k99", db_path=mdb)
+    after = memory.render_memory_for_prompt(user_name="Alex")
+    assert before == after
+
+
+def test_prior_day_card_flips_memory_once_then_converges(mdb):
+    for i in range(1, 4):
+        d = (date.today() - timedelta(days=i)).isoformat()
+        card_store.save_card(
+            _minimal_card(i, d, 3.0, "B"), read_cache_key=f"k{i}", db_path=mdb)
+    m1 = memory.render_memory_for_prompt(user_name="Alex")
+
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    card_store.save_card(
+        _minimal_card(50, yesterday, 4.0, "A"),
+        read_cache_key="first-key", db_path=mdb)
+    m2 = memory.render_memory_for_prompt(user_name="Alex")
+    assert m2 != m1
+
+    # Re-render of the same card (a different read_cache_key, same grades)
+    # must not move the aggregate any further.
+    card_store.save_card(
+        _minimal_card(50, yesterday, 4.0, "A"),
+        read_cache_key="second-key", db_path=mdb)
+    m3 = memory.render_memory_for_prompt(user_name="Alex")
+    assert m3 == m2
 
 
 def test_resolver_never_raises(mdb, monkeypatch):
