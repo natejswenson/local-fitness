@@ -620,6 +620,99 @@ def test_rolling_reference_handles_a_malformed_date():
     assert rc.rolling_reference(_Conn(), {"date": "nope"})["mode"] == "insufficient_data"
 
 
+class TracingConn:
+    """Records the SQL each `execute` issues AND the column names SQLite
+    actually returned for it, then delegates everything else to the real
+    connection. The description is the honest answer to "did raw_json leave
+    SQLite" — a `not in` check on the caller's dict can't tell a column that
+    was never fetched from one that was fetched and popped."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def execute(self, sql, params=()):
+        cur = self._conn.execute(sql, params)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        self.calls.append((sql, cols))
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def sql_for(self, table: str) -> str:
+        """The one SELECT issued against `table`. Fails loudly on 0 or 2+, so
+        a refactor that splits or drops the query can't quietly pass."""
+        hits = [sql for sql, _ in self.calls
+                if f"FROM {table}" in sql and sql.lstrip().upper().startswith("SELECT")]
+        assert len(hits) == 1, f"expected one SELECT on {table}, got {len(hits)}"
+        return hits[0]
+
+    def columns_for(self, table: str) -> list[str]:
+        return next(cols for sql, cols in self.calls if f"FROM {table}" in sql)
+
+
+def test_activity_columns_is_every_activities_column_except_raw_json(rc_db):
+    """The frozen list must stay exhaustive. A column added to db.SCHEMA (or by
+    an init_schema ALTER, like `source`) and not added here would be silently
+    unreadable everywhere the whole-row fetch is used — this fails the build
+    instead. raw_json is the one deliberate omission."""
+    with db.connect(rc_db) as conn:
+        actual = [r["name"] for r in conn.execute("PRAGMA table_info(activities)")]
+    assert list(rc._ACTIVITY_COLUMNS) == [c for c in actual if c != "raw_json"]
+    assert "raw_json" in actual                     # ...and it really is a column
+    assert "source" in rc._ACTIVITY_COLUMNS         # the ALTER-added one
+
+
+def test_select_activity_never_fetches_raw_json_on_any_branch(rc_db):
+    """raw_json is ~50 KB of preserved Garmin payload per row. All three
+    resolution branches used to `SELECT *` and hand it back for the caller to
+    pop — decoded out of SQLite only to be discarded."""
+    today = date.today().isoformat()
+    for kwargs in ({"activity_id": 1}, {"target_date": today}, {}):
+        with db.connect(rc_db) as conn:
+            tracer = TracingConn(conn)
+            row = rc._select_activity(
+                tracer, kwargs.get("activity_id"), kwargs.get("target_date"))
+        sql, cols = tracer.calls[0]
+        assert "SELECT *" not in sql, kwargs
+        assert "raw_json" not in cols, kwargs
+        assert cols == list(rc._ACTIVITY_COLUMNS), kwargs
+        assert row["activity_id"] == 1              # branch still resolves
+
+
+def test_load_report_card_inputs_hands_back_no_raw_json_and_never_popped_one(rc_db):
+    """The pop in load_report_card_inputs is gone, so this is now a claim about
+    the query rather than about cleanup after it: the key is absent because it
+    was never selected."""
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "UPDATE activities SET raw_json = ? WHERE activity_id = 1",
+            ('{"big": "' + "x" * 5000 + '"}',),
+        )
+        tracer = TracingConn(conn)
+        inputs = rc.load_report_card_inputs(tracer)
+    assert "raw_json" not in inputs["activity"]
+    assert "raw_json" not in tracer.columns_for("activities")
+    # The rest of the row is intact — pruning dropped exactly one column.
+    assert inputs["activity"]["activity_name"] == "Morning Run"
+    assert inputs["activity"]["training_load"] == 100
+
+
+def test_default_activity_lookup_is_served_by_the_ordering_index(rc_db):
+    """`ORDER BY date DESC, start_time DESC` against the single-column
+    idx_activities_date forced a USE TEMP B-TREE — SQLite materializing and
+    sorting the whole activities table to return one row. Explain the SQL the
+    code actually issued, not a copy of it."""
+    with db.connect(rc_db) as conn:
+        tracer = TracingConn(conn)
+        rc._select_activity(tracer, None, None)
+        sql = tracer.sql_for("activities")
+        plan = " ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql))
+    assert "idx_activities_date_start" in plan
+    assert "TEMP B-TREE" not in plan
+
+
 def test_load_inputs_defaults_to_the_most_recent_activity(rc_db):
     with db.connect(rc_db) as conn:
         inputs = rc.load_report_card_inputs(conn)

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -246,26 +247,68 @@ def list_cards(
         return [dict(r) for r in conn.execute(sql, params)]
 
 
+# json_extract pulls ONLY the coach_read fragment rather than handing Python
+# the whole card_json snapshot to decode — the render fast path needs four
+# paragraphs, not the metrics/splits/reference/HR tree around them, and a
+# stored card is the largest row in the schema.
+#
+# The json_valid() guard is load-bearing, not defensive dressing: SQLite's
+# json_extract RAISES "malformed JSON" on a corrupt card_json, which would
+# turn a corrupt row into a whole-lookup miss (None) — but the contract is
+# that the KEY still comes back, with an unusable read (key, None), so a
+# corrupt row's next render regenerates and re-saves under the same key
+# instead of being treated as absent. json_valid returns 0 instead of
+# raising, so the corrupt case lands on SQL NULL and keeps the key.
+_READ_SQL = """
+SELECT read_cache_key,
+       CASE WHEN json_valid(card_json)
+            THEN json_extract(card_json, '$.coach_read') END AS read_json
+FROM report_cards WHERE activity_id = ?
+"""
+
+
+def _read_row(conn, activity_id: int):
+    return conn.execute(_READ_SQL, (int(activity_id),)).fetchone()
+
+
+def _decode_read(raw: object) -> dict | None:
+    """A ``$.coach_read`` fragment → the read dict, or ``None``.
+
+    SQLite hands back JSON *text* for an object (hence the decode) and SQL
+    NULL when the path is absent or the row was unparseable. Anything that
+    isn't a decodable object is ``None`` — the same fail-silent shape
+    ``_decode_card`` has, so display-side corruption stays a cache miss."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        read = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return read if isinstance(read, dict) else None
+
+
 def load_read(
-    activity_id: int, *, db_path: Path | None = None
+    activity_id: int, *, db_path: Path | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[str | None, dict | None] | None:
     """``(read_cache_key, coach_read)`` for the stored row, or ``None``.
 
     The render fast path's lookup, so it is fail-silent end to end: any
     error — a missing table, a locked DB, a corrupt row — is a miss, never
-    a failed render."""
+    a failed render. A corrupt ``card_json`` makes ``json_extract`` itself
+    raise, which lands in the same except and is still a miss.
+
+    Accepts an already-open ``conn`` so the report-card path can share the
+    one connection it already holds (mirrors ``db.get_setting``)."""
     try:
-        with db.connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT read_cache_key, card_json FROM report_cards "
-                "WHERE activity_id = ?",
-                (int(activity_id),),
-            ).fetchone()
+        if conn is not None:
+            row = _read_row(conn, activity_id)
+        else:
+            with db.connect(db_path) as c:
+                row = _read_row(c, activity_id)
         if row is None:
             return None
-        card = _decode_card(row["card_json"])
-        read = card.get("coach_read") if card else None
-        return (row["read_cache_key"], read if isinstance(read, dict) else None)
+        return (row["read_cache_key"], _decode_read(row["read_json"]))
     except Exception:
         _LOG.warning(
             "report-card read lookup failed for activity %s (treated as a "

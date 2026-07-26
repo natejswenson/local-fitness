@@ -16,9 +16,21 @@ from mcp import types
 
 from datetime import date as _dt_date
 
+import pytest
+
 from local_fitness import db
 from local_fitness.agent import tools as agent_tools
 from local_fitness.web import mcp_server
+
+
+@pytest.fixture(autouse=True)
+def _isolate_persona_cache():
+    """The persona memo + its data_version monitor are module-global; without
+    a per-test reset, a hit cached against one test's tmp DB leaks into the
+    next (and the monitor would watch a dead file)."""
+    mcp_server._persona_cache_clear()
+    yield
+    mcp_server._persona_cache_clear()
 
 
 def _seed_db() -> Path:
@@ -573,3 +585,110 @@ def test_read_brief_resource_todays_brief_has_no_stale_banner(monkeypatch, tmp_p
     md = mcp_server._latest_brief_markdown()
     assert "STALE" not in md
     assert "Fresh" in md
+
+
+# --------------------------------------------------------------------------- #
+# 0.36.0 persona memo (S1)
+# --------------------------------------------------------------------------- #
+def _count_profile_resolves(monkeypatch):
+    calls = []
+    real = mcp_server.coach.resolve_coach_profile
+
+    def counting(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(mcp_server.coach, "resolve_coach_profile", counting)
+    return calls
+
+
+def test_persona_resolved_once_across_stateless_handshakes(monkeypatch):
+    """The whole point of the memo: N handshakes with nothing changed = ONE
+    live resolution (was one full 6-connect resolve per request)."""
+    _seed_db()
+    server = mcp_server.build_server()
+    calls = _count_profile_resolves(monkeypatch)
+    first = server.create_initialization_options().instructions
+    second = server.create_initialization_options().instructions
+    third = server.create_initialization_options().instructions
+    assert first == second == third
+    assert first is not None and "running coach" in first
+    assert len(calls) == 1
+
+
+def test_persona_reresolves_after_a_journal_write(monkeypatch):
+    """Any DB commit bumps data_version on the monitor connection — the memo
+    must not serve a persona whose memory block predates a new journal entry."""
+    p = _seed_db()
+    server = mcp_server.build_server()
+    calls = _count_profile_resolves(monkeypatch)
+    before = server.create_initialization_options().instructions
+    from local_fitness.agent import journal
+
+    journal.save_entry("Nate said the 5k goal moved to October.",
+                       source="chat", db_path=p)
+    after = server.create_initialization_options().instructions
+    assert len(calls) == 2  # second handshake missed and re-resolved
+    assert "October" in after and "October" not in before
+
+
+def test_persona_reresolves_after_a_notes_file_change(monkeypatch, tmp_path):
+    """Notes are file-backed — invisible to data_version — so the key carries
+    the notes file's (mtime_ns, size)."""
+    _seed_db()
+    notes_file = tmp_path / "user_notes.md"
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(notes_file))
+    server = mcp_server.build_server()
+    calls = _count_profile_resolves(monkeypatch)
+    server.create_initialization_options()
+    notes_file.write_text("- [2026-07-26T10:00:00] go easy on hill weeks\n")
+    server.create_initialization_options()
+    assert len(calls) == 2
+
+
+def test_persona_reresolves_on_day_rollover(monkeypatch):
+    """The ledger's as-of-yesterday facts move at midnight with zero DB
+    writes — the date rides in the key so the memo can't outlive the day."""
+    _seed_db()
+    server = mcp_server.build_server()
+    calls = _count_profile_resolves(monkeypatch)
+    server.create_initialization_options()
+
+    class _Tomorrow(_dt_date):
+        @classmethod
+        def today(cls):
+            return _dt_date(2027, 1, 1)
+
+    monkeypatch.setattr(mcp_server, "date", _Tomorrow)
+    server.create_initialization_options()
+    assert len(calls) == 2
+
+
+def test_persona_missing_db_never_caches_and_still_hands_shakes(monkeypatch, tmp_path):
+    """Fresh-clone path: no DB file → key is None → live resolve every time,
+    never a crash, never a cache entry pinned to nothing."""
+    db.DEFAULT_DB_PATH = tmp_path / "never_created.db"
+    server = mcp_server.build_server()
+    opts = server.create_initialization_options()  # must not raise
+    assert mcp_server._PERSONA_CACHE["key"] is None
+    assert opts is not None
+
+
+def test_persona_failure_is_not_cached(monkeypatch):
+    """A failed resolve must stay fail-open AND retry on the next handshake —
+    caching the failure would strip the coach voice until restart."""
+    _seed_db()
+    server = mcp_server.build_server()
+    real = mcp_server.coach.resolve_coach_profile
+    state = {"boom": True}
+
+    def flaky(*a, **k):
+        if state["boom"]:
+            raise RuntimeError("transient db hiccup")
+        return real(*a, **k)
+
+    monkeypatch.setattr(mcp_server.coach, "resolve_coach_profile", flaky)
+    assert server.create_initialization_options().instructions is None
+    state["boom"] = False
+    recovered = server.create_initialization_options().instructions
+    assert recovered is not None and "running coach" in recovered

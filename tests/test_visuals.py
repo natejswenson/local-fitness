@@ -891,3 +891,39 @@ def test_chart_is_a_band_not_a_square():
     """The height cap only buys page room if the figure is wide and short."""
     w, h = visuals.CHART_FIGSIZE
     assert w / h > 2.5
+
+
+def test_fit_one_page_decodes_each_asset_once_across_rungs(monkeypatch):
+    """0.36.0 (S10): the shared image cache must stop per-rung re-decodes —
+    a 3-rung fit used to re-fetch/re-decode every data: chart and the
+    @font-face TTF at each rung. The fetcher is only consulted on a cache
+    miss, so a multi-rung walk fetching the same data: URL once IS the
+    behavior under test."""
+    fetches: list[str] = []
+    real_factory = visuals._report_url_fetcher
+
+    def counting_factory():
+        real = real_factory()
+
+        def fetcher(url):
+            fetches.append(url[:40])
+            return real(url)
+
+        return fetcher
+
+    monkeypatch.setattr(visuals, "_report_url_fetcher", counting_factory)
+    # A real 1x1 PNG as a data: URI, embedded at every rung; tall body so the
+    # ladder walks all three rungs.
+    png_b64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+               "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+
+    def build(preset):
+        rows = "".join("<p>line</p>" for _ in range(120))
+        return (f"<html><head><style>@page {{ size: A4; margin: 1.5cm; }}"
+                f"body {{ font-size: {preset['body_pt']}pt; }}"
+                f"p {{ margin: 0; }}</style></head><body>"
+                f'<img src="data:image/png;base64,{png_b64}">{rows}</body></html>')
+
+    _pdf, pages, index = visuals.fit_one_page(build)
+    assert index == 2  # the ladder genuinely walked all three rungs
+    assert len(fetches) == 1  # ...but the image was fetched/decoded ONCE

@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-07-26
+
+Speed pass (batch 2 of 4 from the 2026-07-26 audit): fewer connections,
+fewer queries, fewer sleeps, shared render caches. No behavior changes —
+every payload byte-identical except the two additions noted.
+
+### Changed
+- **The HTTP persona is memoized.** Stateless `/mcp/` mode resolved the full
+  coach persona (6 DB opens + a complete relationship-ledger compute, ~5× the
+  cost of the tool call it wrapped) on **every request**. Now memoized behind
+  a `(today, db_path, PRAGMA data_version, notes-file stat)` key on a
+  dedicated read-only monitor connection — any DB commit, notes edit, or day
+  rollover re-resolves; failures and the fresh-clone no-DB path are never
+  cached (fail-open preserved).
+- **Sync fast-path.** `daily.pull` no longer re-fetches HR zones/splits (or
+  pays their 0.3 s throttle) for past activities whose details are already
+  stored — the repeated-detail-call shape that trips Garmin's 429; today's
+  activities always re-fetch (still finalizing). The day loop shares one
+  connection with per-day commit/rollback, never sleeps after the final day,
+  and scans the historical gap once instead of twice.
+- **`baselines.recompute` is single-pass.** The per-day AVG scan + duplicate
+  SD scan (3 statements/day; a backdated manual workout could issue ~2,200)
+  became one fetch + one pure rolling-window walk + one `executemany` — 3
+  statements total, bit-identical output (pinned against the retired SQL
+  reference in tests). `log_manual_workout`/`delete_manual_workout` now run
+  it via `asyncio.to_thread` instead of blocking the event loop.
+- **`recovery_pattern` dropped its N+1** (~953 point queries on a year of
+  running → 3 range queries, identical thresholds and rounding).
+- **One read connection through the card/report/reflect pipelines.**
+  `workout_report_card` (was ~8 opens), `generate_brief_report`, `reflect`,
+  and `get_coach_personality` (4 opens + two COUNT scans → 1 open + one
+  aggregate) each share a single connection for their read phase; writes keep
+  their own (worker-thread same-thread rule).
+- **Query pruning + a new index.** `SELECT *` no longer drags `raw_json`
+  blobs (50 KB/activity row, 16.5 KB/daily row) through the report-card
+  activity pick (7.7 ms → ~0.2 ms before indexing), the status metric window,
+  or `get_workout_detail`; new `idx_activities_date_start` serves the
+  `date DESC, start_time DESC` sorts (applies automatically via
+  `init_schema`).
+- **Render caches.** `fit_one_page` shares one FontConfiguration + image
+  cache across density rungs (was: re-decode ~124 KB of chart base64 + re-parse
+  a 140 KB TTF per rung); `plan_coach`'s disk cache is multi-entry (v2 format,
+  32 entries — alternating two brief dates no longer thrashes a 30 s SDK call;
+  v1 files read as a hit); `coach.load_profile` is lru_cached;
+  `card_store.load_read` extracts the read via `json_extract` instead of
+  decoding the whole stored card; the V2 brief no longer computes-and-discards
+  the full memory render; `import tools` no longer pays garminconnect's 28 ms
+  (deferred into `sync_garmin_data`).
+
+### Added
+- `recovery_pattern.n_skipped_no_baseline` — workouts that matched the filter
+  but had no usable baseline row were silently dropped; now counted.
+
 ## [0.35.0] - 2026-07-26
 
 Accuracy pass from the 2026-07-26 three-axis audit: wrong numbers stop

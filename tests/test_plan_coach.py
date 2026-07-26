@@ -4,6 +4,7 @@ generator (Claude call + deterministic fallback).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -563,7 +564,65 @@ def test_corrupt_cache_file_is_ignored_and_rewritten(monkeypatch, tmp_path):
     line = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
     assert line == "Clean line."
     assert calls["n"] == 1
-    # Cache healed: the entry now round-trips.
+    # Cache healed: the entry now round-trips, in the v2 multi-entry shape.
     import json as _json
-    entry = _json.loads(cache.read_text(encoding="utf-8"))
-    assert entry["line"] == "Clean line."
+    data = _json.loads(cache.read_text(encoding="utf-8"))
+    assert data["version"] == 2
+    assert [e["line"] for e in data["entries"].values()] == ["Clean line."]
+
+
+# --------------------------------------------------------------------------- #
+# 0.36.0 multi-entry cache (S5)
+# --------------------------------------------------------------------------- #
+def test_two_alternating_keys_both_stay_cached(monkeypatch, tmp_path):
+    """THE thrash case the v2 format exists for: rendering two brief dates
+    alternately must not evict each other (single-entry 'latest key wins'
+    made every alternation a live SDK call)."""
+    fake, calls = _fake_generator(["Line for easy.", "Line for long."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+    args_a = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+    today_long = {"type": "long", "distance_mi": 10.0,
+                  "pace_min_per_mi": "10:15", "description": ""}
+    args_b = (_PROFILE, today_long, _LAST_7_DAYS, 83, 12, "10k")
+
+    a1 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_a, cache_path=cache))
+    b1 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_b, cache_path=cache))
+    a2 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_a, cache_path=cache))
+    b2 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_b, cache_path=cache))
+    assert (a1, b1) == (a2, b2) == ("Line for easy.", "Line for long.")
+    assert calls["n"] == 2  # exactly one generation per distinct key
+
+
+def test_v1_single_entry_file_reads_as_a_hit(monkeypatch, tmp_path):
+    """An upgrade must keep the v1 file's one hit — regenerating on the first
+    post-upgrade render would be a silent SDK call for a line we have."""
+    fake, calls = _fake_generator(["Should never generate."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+    import hashlib
+    system_prompt, user_prompt = plan_coach.build_prompt(*args)
+    key = hashlib.sha256(
+        "\x00".join([system_prompt, user_prompt, "default"]).encode("utf-8")
+    ).hexdigest()
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"key": key, "line": "V1 cached line."}))
+
+    line = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert line == "V1 cached line."
+    assert calls["n"] == 0
+
+
+def test_cache_evicts_oldest_ts_at_the_cap(tmp_path):
+    entries = {
+        f"key{i}": {"line": f"line {i}", "ts": f"2026-07-{i + 1:02d}T00:00:00+00:00"}
+        for i in range(plan_coach.CACHE_MAX_ENTRIES)
+    }
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"version": 2, "entries": entries}))
+    plan_coach._write_cached_line(cache, "fresh", "the newest line")
+    kept = plan_coach._load_cache_entries(cache)
+    assert len(kept) == plan_coach.CACHE_MAX_ENTRIES
+    assert "fresh" in kept
+    assert "key0" not in kept  # oldest ts evicted
+    assert "key1" in kept

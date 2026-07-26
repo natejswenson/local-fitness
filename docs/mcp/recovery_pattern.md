@@ -30,6 +30,7 @@ the last year.
 | Key | Meaning |
 |---|---|
 | `n_workouts_matched` | Count of workouts that matched the filters **and** had a usable baseline row on their own date (see gotchas — this is not the raw filter count). |
+| `n_skipped_no_baseline` | (0.36.0) Workouts that cleared the filters but were dropped for want of a usable baseline row — so "3 matched" is readable: 3 of 3 and 3 of 40 no longer print identically. |
 | `avg_recovery_days_body_battery` | Mean days to body-battery recovery across matched workouts that recovered inside 7 days, 2 dp. `null` when none did. |
 | `avg_recovery_days_rhr` | Same for RHR, 2 dp. `null` when none did. |
 | `recent_workouts` | The **10 most recent** matched workouts, ordered **oldest → newest** (the tail of a date-ascending list). |
