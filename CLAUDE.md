@@ -361,7 +361,13 @@ These are settled — don't redesign without a reason.
   `plans.build_plan_detail`'s verdicts — never re-grading), step-goal streaks
   computed **as-of-yesterday** (today's partial count must never flip the block
   intra-day — that stability is what keeps the prompt-hash caches valid),
-  observation repeat-patterns, and notable results. Layer 2 is the coach's own
+  observation repeat-patterns, notable results, and (0.34.0) a trailing-3-week
+  report-card aggregate (`report_card_facts`: count, avg GPA, base-letter
+  grade distribution, rising/falling trend via `interpret.pct_change` +
+  `delta_direction`) computed ONLY over cards whose `activity_date` is
+  strictly before today — the same as-of-yesterday discipline as step
+  streaks, so grading today's run can never change today's `memory_text`.
+  Layer 2 is the coach's own
   journal (`agent/journal.py`, `coach_journal` table — 60-entry HOT cap
   **archived on write, never deleted** since 0.33.0, 240-char lines, partial
   unique index on `(source, source_key, seq)`). The archive is searchable:
@@ -726,9 +732,23 @@ These are settled — don't redesign without a reason.
   assumptions: **no delete/prune path exists** (`load_read` reads outside
   the UPSERT's guard — a pruning tool would open a corrupting window; don't
   add one without revisiting the fast path), and **stored cards are never
-  injected into `render_memory_for_prompt`** (would bust the prompt-hash
-  caches and re-open the self-render cascade `exclude_source_key` guards
-  against — a v2 injection needs a parallel exclusion first). Design:
+  injected into `render_memory_for_prompt` as rows or prose** (would bust
+  the prompt-hash caches and re-open the self-render cascade). The 0.34.0
+  ledger fact (`ledger.report_card_facts`) is the one sanctioned exception
+  and defines what a "parallel exclusion" means here: a deterministic
+  AGGREGATE (numbers only, never `card_json`/`coach_read`), restricted to
+  `activity_date < today`, and idempotent under re-saves (an equal-key
+  re-render rewrites identical grades, so re-rendering a card cannot move
+  the aggregate — bounding the one residual: grading a PRIOR-day workout
+  mid-day flips memory once that day, costing at most one extra generation
+  before the stored-key fast path re-converges; same magnitude as an
+  intra-day journal write). A future injection of anything else — raw
+  rows, prose, or a `graded_at`-scoped fact (`graded_at` mutates on every
+  distinct-key re-render, so a fact keyed on it would change when a card is
+  merely *viewed*) — still needs its own exclusion analysis first. If the
+  prior-day flip ever proves annoying, the watertight v3 is a
+  `first_graded_at` column set on INSERT only (the `init_schema` ALTER
+  pattern), filtered `< today`. Design:
   `docs/plans/2026-07-23-report-card-persistence-design.md`.
 - **Per-sample HR traces are fetched on demand, never backfilled**
   (`ingest/details.py`, 0.25.0). `get_activity_details` returns ~1700 samples

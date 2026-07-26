@@ -22,11 +22,19 @@ Load-bearing assumptions, do not regress:
     ``load_read`` *outside* that guard; a concurrent pruning delete would
     turn that benign window corrupting. A future GC tool must revisit the
     fast path first.
-  * **Never inject these rows into ``render_memory_for_prompt``.** Memory
-    text is inside the plan/workout-coach prompt hashes, and
-    ``exclude_source_key`` is journal-scoped — folding cards in would bust
-    those caches on every write and re-open the self-render cascade. A v2
-    that wants injection must build a parallel exclusion first.
+  * **Never inject these rows into ``render_memory_for_prompt`` as prose or
+    raw rows.** Memory text is inside the plan/workout-coach prompt hashes,
+    and ``exclude_source_key`` is journal-scoped — folding cards in would
+    bust those caches on every write and re-open the self-render cascade.
+    The ONE sanctioned exception (0.34.0) is ``ledger.report_card_facts``:
+    a deterministic AGGREGATE (count/mean GPA/grade distribution/trend —
+    numbers only, never ``card_json``/``coach_read``) restricted to
+    ``activity_date`` strictly before today, and idempotent under
+    equal-grade re-saves — that cutoff+idempotence pair IS its "parallel
+    exclusion". Any other injection (raw rows, prose, or a ``graded_at``-
+    scoped fact — ``graded_at`` mutates on every distinct-key re-render, so
+    a fact keyed on it would change when a card is merely *viewed*) still
+    needs its own exclusion analysis first.
 
 Pure half (``card_row``, ``read_is_complete``) works on plain dicts and
 never reads the clock or the DB; the persistence half stamps ``graded_at``
