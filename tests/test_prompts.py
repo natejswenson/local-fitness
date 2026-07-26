@@ -390,6 +390,21 @@ def test_memory_block_carries_the_grounding_contract():
     assert prompts.coach_memory_block("Alex", "") == ""
 
 
+def test_system_prompt_carries_capture_and_recall_instructions(no_saved_notes):
+    """The MCP instructions payload must keep both halves of conversation
+    memory: the capture directive (save durable facts + session notes) and
+    the retrieval directive (search before claiming not to remember) —
+    either one silently dropping breaks 'the coach remembers'."""
+    text = prompts.system_prompt("Alex", coach.resolve_coach_profile())
+    assert "save_coach_memory" in text
+    assert "recall_coach_memories" in text
+    assert "session note" in text
+    normalized = " ".join(text.split())
+    assert "Never say you don't remember without searching" in normalized
+    # Retrieval stays grounded, like the injected block's contract.
+    assert "never cite a memory the search didn't return" in normalized
+
+
 # --- source guard: no personal name in executable prompt text ---------------
 
 _PROMPT_MODULES = (
