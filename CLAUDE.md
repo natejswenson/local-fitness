@@ -134,7 +134,17 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   never locally on Nate's Mac (`Darwin-CPython-3.12-64bit` would never
   match, turning every subsequent `validate` run into a hard failure).
   Rebaseline only when intentionally resetting the comparison floor after
-  a further perf improvement, not routinely.
+  a further perf improvement, not routinely — with ONE more legitimate
+  trigger (first hit 2026-07-26): **runner-fleet drift**. GitHub's ubuntu
+  runners are a mix of CPU models, and a baseline captured on one
+  generation slowly stops describing the fleet — unchanged dev code was
+  reading +13.7% against the July-9 floor, so ANY PR was one slow runner
+  draw from a false failure. The tell that it's drift and not a real
+  regression: (1) a local before/after A/B of the touched path is at
+  parity, and (2) the last passing validate run on UNCHANGED code already
+  shows a double-digit margin. Confirm both, then recapture via the
+  workflow dispatched on `main` (pre-PR code = the honest floor) and
+  hand-promote the artifact to the committed `0001_*.json`.
 - **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
   manual prefix today, `/devlog` skill (auto from git commits) going
   forward.
