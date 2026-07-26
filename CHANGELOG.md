@@ -6,6 +6,80 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-07-26
+
+Accuracy pass from the 2026-07-26 three-axis audit: wrong numbers stop
+reaching the coach's voice. First of four planned batches (accuracy →
+speed → UX → maintainability).
+
+### Fixed
+- **`sync_garmin_data` no longer reports a healthy sync as an error, and
+  recomputes baselines whenever new data lands.** `daily.pull` returns
+  `partial` whenever any gap remains back to 2020-09-01, so a single missing
+  historical day made every sync return `is_error: true` *and* skip the
+  CTL/ATL/TSB recompute — fresh workouts landed while training load silently
+  froze. Only hard failures (`auth_failure`, `not_configured`, `failure`,
+  `interrupted`) are errors now; the recompute triggers on
+  `days_pulled > 0 or activities_loaded > 0`. The payload gains a
+  deterministic one-line `sync_state` read and a countable `days_failed`
+  (also added to `daily.pull`'s return dict), and the error payload no longer
+  drops `deferred_count`/`gap_days_remaining`.
+- **Brief signals judge runs by measured pace, not Garmin's label.**
+  `days_since_last_run`, `runs_14d`, `runs_prior_14d` and `recent_te` now
+  gate on `interpret.is_running_effort` (on-foot checked first — pace alone
+  would promote a fast bike ride), falling back to the activity-type label
+  only for paceless rows. Walking-desk sessions file as `treadmill_running`,
+  so the planner previously saw a run every day and the brief could never
+  say "you haven't actually run in eight days."
+- **Report card's reference line can no longer contradict its own grades.**
+  A plan-graded card with thin comparable history printed "Not enough
+  comparable history to grade" directly under a real overall grade; the
+  disclaimer is now scoped to the metrics it actually applies to ("HR and
+  training load ungraded — only 2 comparable activities…").
+- **The card's "setting up for" block gets its numbers back.**
+  `workout_coach._describe_prescription` read display keys that upcoming
+  plan rows never carry, silently dropping every distance/pace/duration from
+  the prompt. It now converts the stored `target_*` columns. One-time read
+  regeneration per card on next render (prompt-hash cache bust).
+- **Double days grade the session the prescription was written for.** The
+  date-branch of `workout_report_card` picked the day's *last* session while
+  grading against the primary (lowest-seq) prescription — a PM shakeout got
+  graded against the AM long-run target. It now takes the day's first
+  session, and `other_activities_on_date` carries
+  `{activity_id, activity_type, distance_mi, start_time}` instead of bare
+  ids so the model can offer to grade the other one.
+- **Manual-lap interval sessions stop being graded at warmup pace.** The
+  quality-day splits exception filtered to "full" splits — defined relative
+  to the workout's own longest lap, which on a 2-mile-warmup-then-800s
+  session is the warmup. `fastest_rep_split` (formerly
+  `fastest_full_split_pace`) now selects by a 300 m distance floor
+  (`QUALITY_MIN_SPLIT_M`) so the fastest rep-sized split is graded; with no
+  qualifying split it returns n/a with a stated reason, never warmup pace.
+
+### Added
+- **`get_brief_context` gained continuity and freshness.** The handler now
+  passes the last seven saved briefs in, so `continuity` is populated over
+  MCP instead of permanently `[]`, and `BriefContext` carries
+  `data_frontier`, `baseline_stale_days`, `brief_stale_days` and `tsb_zone`
+  — surfacing the orphaned-sync state that was invisible from the tool
+  surface. All four fields are optional and ride the existing single DB
+  connection (the ==1-connect perf gate still holds).
+- **Riegel projection names its basis.** `predicted_finish_seconds` now
+  ships with `projection_basis` ({distance_mi, pace_min_per_mi, date,
+  extrapolation_ratio}) and `projection_confidence`
+  (`interpret.riegel_confidence`: high ≤1.5×, medium ≤3×, low beyond).
+  `best_recent_effort` is pace-gated (a mislabeled walking-pad session can
+  no longer be the "best effort") and prefers efforts ≥ goal/4, falling
+  back to the 2 km floor — labeled low-confidence — rather than dropping
+  the projection.
+- **Adherence splits out rest days.** `sessions_adherence_pct` (rest
+  excluded) and `rest_days_counted` join the untouched `adherence_pct` in
+  plan status/progress payloads, the brief-PDF plan strip, and the
+  plan-coach prompt — a week of 3 kept rest days + 4 skipped runs no longer
+  headlines as 43% without the 0% session number beside it.
+- **`last_graded` says which day.** `_slim_workout` now carries `date` and
+  `seq`, so "you missed your long run" can say when.
+
 ## [0.34.0] - 2026-07-26
 
 Past report cards become part of the coach's standing memory, without

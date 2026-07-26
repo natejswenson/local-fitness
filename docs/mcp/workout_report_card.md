@@ -34,7 +34,7 @@ structurally cannot see it.
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `activity_id` | integer | no | — | Grade this exact activity. **Overrides `date`.** Bypasses the `distance_meters > 0` filter, so a strength session can be requested explicitly and comes back with `n/a` where metrics are missing. |
-| `date` | string | no | — | `YYYY-MM-DD`; grades that day's primary session (latest `start_time` with distance and duration > 0). Malformed dates error before any DB access. |
+| `date` | string | no | — | `YYYY-MM-DD`; grades that day's primary session — the **first** `start_time` with distance and duration > 0. First, not last, because the prescription it gets graded against is the day's lowest `seq`, i.e. the morning session; taking the last one paired an evening shakeout with the morning's long-run target. Malformed dates error before any DB access. |
 | `format` | string | no | `both` | `both` \| `table` \| `pdf`. `table` skips the PDF **and** skips the on-demand HR-trace fetch, keeping the call purely local and fast. |
 
 With neither `activity_id` nor `date`, it grades the most recent logged activity
@@ -73,7 +73,7 @@ Two band-width multipliers exist:
 |---|---|
 | `plan` | The active plan's prescribed workout for that date. **Distance and pace only** — `plan_workouts` has no HR or load column, so those two always fall back to the rolling reference. A `rest` prescription is an intent signal only; its null targets never grade anything. |
 | `rolling_60d` | Trailing-60-day **medians** over comparable activities, computed on the fly. Median, not mean, because the history carries real training-load outliers. Not the `baselines` table — that holds no per-workout aggregates at all. |
-| `insufficient_data` | Fewer than `MIN_REFERENCE_ACTIVITIES` (**5**) comparable activities even after widening. Grading against noise is worse than not grading: the card returns n/a and says so. |
+| `insufficient_data` | Fewer than `MIN_REFERENCE_ACTIVITIES` (**5**) comparable activities even after widening. Grading against noise is worse than not grading: the affected metrics return n/a and the card says so. **The two modes compose** — a thin rolling pool does not stop the plan from grading distance and pace, so the disclaimer is scoped to the metrics it applies to ("HR and training load ungraded — only 2 comparable activities…") instead of printing a blanket "not enough comparable history to grade" under two letters the plan just graded. |
 
 The rolling window **ends the day before** the graded activity, so a workout can
 never move its own goalposts.
@@ -166,7 +166,7 @@ everything else is metadata for the caller's own logic.
 | `reference` | The reference *mode* — `plan` never appears here; this is `rolling_60d` or `insufficient_data`, since the mode belongs to the rolling pool. Whether the plan supplied targets is visible in `markdown`'s reference line. |
 | `intent` / `intent_source` | e.g. `"interval"` / `"plan"`, or `"easy"` / `"inferred"`. |
 | `splits_available` | False for the ~88% of history that was backfilled. |
-| `other_activities_on_date` | Present only on a double day: the other activity ids, so the second session isn't silently hidden. |
+| `other_activities_on_date` | Present only on a double day, so the other session isn't silently hidden. Each entry is `{activity_id, activity_type, distance_mi, start_time}` — enough to say *which* session went ungraded, which a bare id could not. |
 | `path` | Present unless `format="table"`. |
 
 Errors: `no matching activity found` (with the `activity_id` / `date` echoed),
@@ -241,15 +241,24 @@ table only and not the PDF, `workout_report_card(format="table")`.
   for clearing a bar set by walking. A paceless row has an unknown mode and
   joins neither pool. The count of excluded rows is disclosed in the card's
   reference line.
-- **Quality-day pace is graded on the FASTEST FULL SPLIT** — the single
+- **Quality-day pace is graded on the FASTEST REP-SIZED SPLIT** — the single
   documented exception to "no grade reads `activity_splits`". A plan's interval
   pace describes the *reps*, while `avg_pace_sec_per_km` averages in the warmup,
   the recovery jogs and the cooldown; comparing them is not a strict rubric but
-  an arithmetic guarantee of an F for every correctly-executed session. Where
-  splits are missing it returns **n/a with a stated reason** and its weight
+  an arithmetic guarantee of an F for every correctly-executed session. Where no
+  split qualifies it returns **n/a with a stated reason** and its weight
   redistributes — it never falls back to the comparison it exists to avoid.
-  Partial (trailing-fragment) splits are excluded, since a 90-metre fragment
-  would win every time.
+- **Rep-sized means `distance_meters >= QUALITY_MIN_SPLIT_M` (300 m), not "not
+  partial".** `label_splits` calls a split partial relative to the workout's own
+  *longest* lap, and on a manually-lapped session the longest lap is the warmup:
+  a 1600 m warmup followed by 800 m reps marks every rep partial, leaving the
+  warmup as the only "full" split — so the reps were graded at warmup pace, a
+  guaranteed F on exactly the sessions this exception exists to grade fairly. The
+  floor still solves what the partial filter was there for (a 90-metre trailing
+  fragment posts an absurd pace and would win every time), and it sits under a
+  standard 400 m rep. A slower warmup simply loses `min()`. When the graded split
+  is shorter than the workout's full lap the card says "best split" rather than
+  "best mile" — the label has to match what was actually measured.
 - **Everything else about splits is presentation-only.** Only 87 of 747
   activities have them — the daily-sync ingest path writes them, backfill never
   did — so a splits-dependent grade would be unavailable on ~88% of history and

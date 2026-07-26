@@ -446,6 +446,7 @@ def test_pull_success_full_window(seeded_db, monkeypatch):
     assert res["days_pulled"] == 3  # today, -1, -2
     assert res["gap_days_remaining"] == 0
     assert res["deferred_count"] == 0
+    assert res["days_failed"] == 0
     assert res["last_date"] == today.isoformat()
     assert res["activities_loaded"] == 1
     # Activities pulled once across the bounding range.
@@ -492,6 +493,7 @@ def test_pull_partial_when_a_day_fails(seeded_db, monkeypatch):
 
     assert res["status"] == "partial"
     assert res["days_pulled"] == 2  # 3 targeted, 1 failed
+    assert res["days_failed"] == 1  # countable, not only prose in `error`
     assert bad_day in res["error"]
     assert "failed" in res["error"]
     run = _latest_run(seeded_db)
@@ -519,6 +521,7 @@ def test_pull_all_endpoints_fail_never_reports_success(seeded_db, monkeypatch):
     assert res["status"] != "success"
     assert res["status"] == "partial"
     assert res["days_pulled"] == 0  # nothing saved
+    assert res["days_failed"] == 3  # every targeted date failed
     assert res["gap_days_remaining"] == 3  # all three dates still missing
     assert "failed" in res["error"]
     # No rows written for any of the failed dates.
@@ -589,6 +592,7 @@ def test_pull_skipped_when_no_targets(seeded_db, monkeypatch):
     assert res["status"] == "skipped"
     assert res["days_pulled"] == 0
     assert res["gap_days_remaining"] == 0
+    assert res["days_failed"] == 0
     assert res["last_date"] == today.isoformat()
     # No ingest_runs row is created on the skipped path.
     with db.connect(seeded_db) as conn:

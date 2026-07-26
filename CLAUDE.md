@@ -134,7 +134,17 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   never locally on Nate's Mac (`Darwin-CPython-3.12-64bit` would never
   match, turning every subsequent `validate` run into a hard failure).
   Rebaseline only when intentionally resetting the comparison floor after
-  a further perf improvement, not routinely.
+  a further perf improvement, not routinely — with ONE more legitimate
+  trigger (first hit 2026-07-26): **runner-fleet drift**. GitHub's ubuntu
+  runners are a mix of CPU models, and a baseline captured on one
+  generation slowly stops describing the fleet — unchanged dev code was
+  reading +13.7% against the July-9 floor, so ANY PR was one slow runner
+  draw from a false failure. The tell that it's drift and not a real
+  regression: (1) a local before/after A/B of the touched path is at
+  parity, and (2) the last passing validate run on UNCHANGED code already
+  shows a double-digit margin. Confirm both, then recapture via the
+  workflow dispatched on `main` (pre-PR code = the honest floor) and
+  hand-promote the artifact to the committed `0001_*.json`.
 - **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
   manual prefix today, `/devlog` skill (auto from git commits) going
   forward.
@@ -342,7 +352,13 @@ These are settled — don't redesign without a reason.
   the label rather than vanishing from mileage. **`load_activities_by_date`
   MUST select `avg_pace_sec_per_km`**: without it every row falls back to the
   label and the whole gate is a silent no-op (it shipped that way for one
-  render before a live PDF caught it).
+  render before a live PDF caught it). Since 0.35.0 the brief planner's run
+  signals (`days_since_last_run`, `runs_14d`, `recent_te`) obey the same rule —
+  `brief_planner._running` checks on-foot FIRST, then pace, then label
+  fallback for paceless rows (on-foot-first is load-bearing: pace alone would
+  promote a fast bike ride to a run) — and so does `plans.best_recent_effort`,
+  which feeds the Riegel projection (there a paceless row is excluded rather
+  than label-fallbacked: an unverifiable pace can't be a "best effort").
 - **Analysis tools carry deterministic interpretation, not just raw numbers**
   (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
   SDK) housing every classifier the brief path already computed in tested
@@ -466,6 +482,14 @@ These are settled — don't redesign without a reason.
   allow-list) wraps `ingest.daily.pull(max_days=SYNC_MAX_DAYS)` +
   `ingest.baselines.recompute()` — a bite-sized, gap-aware pull, capped so a
   long absence doesn't turn one tool call into a multi-minute Garmin backfill.
+  **`partial` is a normal outcome, not an error** (0.35.0): `pull` returns
+  `partial` whenever any gap remains back to 2020, so treating it as an error
+  made every sync for a user with one missing historical day return
+  `is_error: true` AND skip the recompute — training load froze while fresh
+  workouts landed. Now only hard failures (`auth_failure`/`not_configured`/
+  `failure`/`interrupted`) are errors, the recompute fires whenever
+  `days_pulled or activities_loaded` is nonzero, and the payload carries a
+  deterministic one-line `sync_state` plus countable `days_failed`.
   Any MCP client wired to `fitness mcp-stdio` (Claude Desktop, opencode, etc.)
   can call it directly; before this tool existed, MCP-only clients had read
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
@@ -594,10 +618,16 @@ These are settled — don't redesign without a reason.
     `avg_pace_sec_per_km` averages in the warmup, recovery jogs and cooldown,
     so that comparison returns F for every correctly-executed interval session
     (measured 2026-07-21: a 6:58/mi prescription averaged 10:42/mi → F, while
-    its 4th mile ran 9:25 at 164 bpm). `fastest_full_split_pace` is the only
-    number that can answer "did you hit the reps". With no splits the metric
-    returns n/a **with a stated reason** and its weight redistributes — it
-    never falls back to the average-vs-rep comparison.
+    its 4th mile ran 9:25 at 164 bpm). `fastest_rep_split` (0.35.0; formerly
+    `fastest_full_split_pace`) is the only number that can answer "did you hit
+    the reps" — and it selects by a distance floor (`QUALITY_MIN_SPLIT_M` =
+    300 m), NOT the `partial` flag: partial is relative to the workout's own
+    longest lap, so a manually-lapped session (2-mile warmup, then 800 m reps)
+    marked every rep partial and graded the reps at warmup pace — a guaranteed
+    F on exactly the workouts this exception exists to grade fairly. With no
+    qualifying split the metric returns n/a **with a stated reason** and its
+    weight redistributes — it never falls back to the average-vs-rep
+    comparison, and never grades against warmup pace.
   - **A grade must never contradict the prose beside it.** Two live cases fixed
     2026-07-21: `load_deviation` was one-sided-low and uncapped, so a day at 81
     load against a 22 expectation printed **A+** directly above its own

@@ -294,6 +294,25 @@ def test_render_plan_section_html_stat_tile_exact_values():
     assert '<div class="value">11.1 mi / 17.0 mi</div>' in html_out
     assert '<div class="value">2</div>' in html_out
     assert '<div class="label">Slips</div>' in html_out
+    # No sessions number in this section -> the label is bare, exactly as before.
+    assert '<div class="label">Adherence</div>' in html_out
+
+
+def test_render_plan_section_html_sessions_adherence_rides_the_label():
+    """The compound value goes on the tiny dim label, never in the 1.25em/900
+    numeral slot that collided with its neighbour once already."""
+    section = dict(_PLAN_SECTION, sessions_adherence_pct=62, rest_days_counted=2)
+    html_out = visuals._render_plan_section_html(section)
+    assert '<div class="value">75%</div>' in html_out          # numeral untouched
+    assert '<div class="label">Adherence · 62% sessions</div>' in html_out
+
+
+def test_render_plan_section_html_zero_sessions_adherence_is_still_printed():
+    """`is not None`, not truthy — 0% is the number that most needs to sit
+    beside a flattering total."""
+    section = dict(_PLAN_SECTION, sessions_adherence_pct=0)
+    assert ('<div class="label">Adherence · 0% sessions</div>'
+            in visuals._render_plan_section_html(section))
 
 
 def test_render_plan_section_html_no_race_date_shows_goal_tile():
@@ -672,6 +691,21 @@ def test_brief_fits_one_page_at_realistic_takeaway_counts(n_takeaways, with_plan
         _brief(_realistic_takeaways(n_takeaways)),
         {str(i): png for i in range(n_takeaways)},
         _PLAN_SECTION if with_plan else None,
+    )
+    assert pages == 1
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        assert len(doc.pages) == 1
+
+
+@pytest.mark.parametrize("n_takeaways", [1, 2, 3])
+def test_brief_fits_one_page_with_the_sessions_adherence_sublabel(n_takeaways):
+    """The longer adherence label wraps to a second line inside its tile.
+    Measured, not assumed: that extra height must still land on one page."""
+    png = _chart_png()
+    pdf, pages = visuals.render_brief_pdf(
+        _brief(_realistic_takeaways(n_takeaways)),
+        {str(i): png for i in range(n_takeaways)},
+        dict(_PLAN_SECTION, sessions_adherence_pct=62, rest_days_counted=2),
     )
     assert pages == 1
     with pdfplumber.open(io.BytesIO(pdf)) as doc:

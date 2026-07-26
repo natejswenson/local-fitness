@@ -47,6 +47,40 @@ def test_build_prompt_includes_adherence_and_days_to_race():
     assert "71 days to the 10k." in user
 
 
+def test_build_prompt_names_the_rest_day_free_adherence_when_given_one():
+    """Both numbers, on one line: 75% counts four rest days at full credit
+    while only half the prescribed running happened."""
+    _, user = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k",
+        sessions_adherence_pct=50)
+    assert ("Plan adherence over the last graded stretch: 75%. Excluding rest "
+            "days, 50% of prescribed sessions.") in user
+
+
+def test_build_prompt_adherence_line_is_unchanged_without_the_sessions_number():
+    """None (an un-wired caller, or a window with no prescribed session) must
+    reproduce the previous line byte for byte — the prompt hash is the disk
+    cache's key."""
+    _, user = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+    assert "Plan adherence over the last graded stretch: 75%.\n" in user
+    assert "Excluding rest days" not in user
+    baseline = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k",
+        sessions_adherence_pct=None)
+    assert baseline == plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+
+
+def test_build_prompt_sessions_adherence_of_zero_is_still_stated():
+    """0 is the number that most needs saying — a falsy-check here would drop
+    'you ran none of it' and leave only the flattering total."""
+    _, user = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 43, 71, "10k",
+        sessions_adherence_pct=0)
+    assert "Excluding rest days, 0% of prescribed sessions." in user
+
+
 def test_build_prompt_no_race_date_uses_goal_only_phrasing():
     _, user = plan_coach.build_prompt(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, None, "base building")
     assert "days to the" not in user
@@ -389,6 +423,33 @@ def test_ground_coaching_line_passes_faithful_citations_including_pace_string():
     text = "Solid 75% adherence lately. Today's easy goes out around 9:23/mi."
     flags = plan_coach.ground_coaching_line(text, _PLAN_SECTION)
     assert flags == []
+
+
+def test_ground_coaching_line_accepts_a_faithful_sessions_adherence_citation():
+    # The sessions number joins the pool only when the plan section carries
+    # it — the same condition under which build_prompt puts it in the prompt.
+    section = {**_PLAN_SECTION, "sessions_adherence_pct": 50}
+    assert plan_coach.ground_coaching_line(
+        "75% overall, but 50% of the sessions you were actually given.",
+        section) == []
+
+
+def test_ground_coaching_line_flags_a_corrupted_sessions_adherence():
+    # 52% against a real 50%: past the EXACT band, inside NEARBY -> flagged,
+    # and attributed to the sessions number rather than to adherence_pct.
+    section = {**_PLAN_SECTION, "sessions_adherence_pct": 50}
+    flags = plan_coach.ground_coaching_line(
+        "Only 52% of your prescribed sessions got done.", section)
+    assert [(f.token, f.nearest_metric, f.delta) for f in flags] == [
+        ("52%", "sessions_adherence_pct", 2.0)]
+
+
+def test_ground_coaching_line_sessions_pool_entry_is_absent_when_unwired():
+    # Same prose, a section that never carried the number: 52 is now 30% off
+    # the nearest pool entry (75% adherence), which reads as an unrelated
+    # quantity and is ignored rather than misattributed.
+    assert plan_coach.ground_coaching_line(
+        "Only 52% of your prescribed sessions got done.", _PLAN_SECTION) == []
 
 
 def test_ground_coaching_line_empty_list_on_numberless_prose():

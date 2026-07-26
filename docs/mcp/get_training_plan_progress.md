@@ -65,6 +65,8 @@ window ending today, unrelated to the 14/7 one.
   "target_time_formatted": "1:45:00",
   "days_to_race": 75,
   "adherence_pct": 83,
+  "sessions_adherence_pct": 71,
+  "rest_days_counted": 9,
   "predicted_finish_seconds": 6612.4,
   "predicted_finish_formatted": "1:50:12",
   "goal_gap": {"gap_seconds": 312.4, "gap_pct": 4.96, "on_pace": false},
@@ -91,7 +93,11 @@ window ending today, unrelated to the 14/7 one.
 | `goal_type` / `race_date` / `target_time_seconds` / `target_time_formatted` | The plan's goal. Goal time is `null` on a "just finish" plan. |
 | `days_to_race` | `race_date − date.today()`. Negative after the race. |
 | `adherence_pct` | Whole plan, graded (non-`pending`) workouts only. `done`/`compliant` = 1.0, `partial` = 0.5, `missed` = 0. `null` when nothing has graded. |
-| `predicted_finish_seconds` / `_formatted` | Riegel projection (`t2 = t1 · (d2/d1)^1.06`) from the fastest qualifying run in the last `riegel_lookback_days` (default 120, ≥2 km, running only) onto `goal_distance_m`. `null` if either is missing. |
+| `sessions_adherence_pct` | The same calculation with **rest days dropped from both the numerator and the denominator** — adherence over prescribed sessions only. `null` when the graded window holds no non-rest workout. |
+| `rest_days_counted` | How many graded rest days sit inside `adherence_pct` — the size of the gap between the two percentages. |
+| `projection_basis` | `{distance_mi, pace_min_per_mi, date, extrapolation_ratio}` — the single run `predicted_finish_seconds` was computed from, and how far it reached (`goal ÷ effort`). **Absent, not `null`**, when there is no projection. |
+| `projection_confidence` | `high` (reach ≤ 1.5) / `medium` (≤ 3.0) / `low` (above). Absent alongside `projection_basis`. |
+| `predicted_finish_seconds` / `_formatted` | Riegel projection (`t2 = t1 · (d2/d1)^1.06`) from the fastest qualifying run in the last `riegel_lookback_days` (default 120, ≥2 km) onto `goal_distance_m`. "Run" is decided by **measured pace**, not by `activity_type` — see the gotcha below. `null` if either is missing. |
 | `goal_gap` | `{gap_seconds, gap_pct, on_pace}` — projected minus goal, so **positive means slower than goal**. `null` when `target_time_seconds` is missing or `<= 0`, or when there is no projection. |
 | `this_week` | Trailing 7 days ending **today**: `week_planned_mi`, `week_actual_mi`, `week_run_mi`, `week_walk_mi`, `slips` (count of `partial` + `missed`). `week_actual_mi` is total **on-foot** miles (run + walk — easy days count prescribed walking by design); `week_run_mi + week_walk_mi` split it, so the tool and the brief PDF reconcile. **`week_run_mi` is the number the brief PDF's plan strip headlines** (it shows run miles, not foot miles). `actual_mi` is suppressed on `pending` and `compliant` days, so an ungraded run does not inflate the actual. |
 | `workouts` | Windowed unless `full: true`. See below. |
@@ -162,6 +168,20 @@ a dump of the workout array.
   `actual_activity_types` (`running` / `walking` / `other`) tells you which it was.
 - **`predicted_finish_seconds` is `null` for a `custom` goal without `goal_distance_m`**, and for
   any athlete with no qualifying run (≥2 km, with a pace, running-type) in the lookback window.
+- **The projection basis is a MEASURED run, never a labelled one.** Garmin labels walking-desk
+  sessions `treadmill_running`, so a lookback window holding nothing but walking projected a race
+  off a 29:15/mi walk. The candidate pool is now gated on `interpret.is_running_effort` (a 13:00
+  mile), and a row with no pace at all is excluded rather than falling back to the label — the
+  deliberate difference from mileage counting, where a paceless row still counts. Consequence: a
+  lookback window with no real run now returns `null` instead of a flattering fiction.
+- **Riegel is an extrapolation, and `projection_confidence` is how you tell.** It returns an equally
+  confident-looking time whether the basis was a 20 km long run or a 2 km treadmill effort (a 10x
+  reach onto a half marathon). Quote a `low`-confidence projection with the caveat attached, or
+  don't quote it. The candidate pool prefers an effort of at least a quarter of race distance, but
+  **falls back to any qualifying run when nothing that long exists** — so a `low` reading means the
+  athlete has no long recent run, not that the tool malfunctioned.
+- **`projection_basis` / `projection_confidence` are ABSENT, not `null`, when there is no
+  projection.** Use `in` / `.get()`, not a null check.
 - **The window is not clamped to the plan.** A plan that ended last month returns an empty
   `workouts` list by default while every rollup still reports real numbers.
 

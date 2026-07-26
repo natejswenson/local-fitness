@@ -55,6 +55,12 @@ _PRIORITY = {"workout": 0, "steps": 1, "conditioning": 2, "recovery": 3, "wildca
 
 _LOOKBACK_DAYS = 14
 _RUNNING_TYPES = ("running", "trail_running", "treadmill_running", "track_running")
+# On-foot labels that are NOT labelled a run. Only used to decide which rows the
+# pace gate in `_running` is allowed to judge — see its docstring for why the
+# label (unreliable about run-vs-walk, reliable about foot-vs-wheel) still gets
+# the first word.
+_WALKING_TYPES = ("walking", "treadmill_walking", "hiking", "casual_walking")
+_ON_FOOT_TYPES = _RUNNING_TYPES + _WALKING_TYPES
 
 # Activities lookback for _compute_signals's run-history query: covers the
 # 28-day (2 * _LOOKBACK_DAYS) prior-window comparison plus slack, bounding a
@@ -460,8 +466,31 @@ def _workout_evidence(sig: Signals) -> str:
 
 
 # --- signal computation (DB reads) ----------------------------------------
-def _running(activity_type: str | None) -> bool:
-    return (activity_type or "").lower() in _RUNNING_TYPES
+def _running(activity: dict) -> bool:
+    """Did this activity involve RUNNING, judged by pace where pace exists?
+
+    Garmin's ``activity_type`` lies — a walking-desk session files as
+    ``treadmill_running`` — and this module used to classify on the label
+    alone, so every walk at the desk reset ``days_since_last_run`` and inflated
+    ``runs_14d``/``recent_te``. The brief could therefore never say "you
+    haven't actually run in eight days"; it saw a run every day.
+
+    Mirrors ``plans._ran``, including its ordering: ON-FOOT IS CHECKED FIRST
+    and that is load-bearing. The pace gate answers "run or walk", not "on foot
+    or not" — a bike ride's pace is around 2:00/mi, so gating on pace alone
+    would count a 30 km ride as a run. The label is unreliable about
+    run-vs-walk but perfectly reliable about foot-vs-wheel.
+
+    A paceless row (a manual entry, a bad sync) falls back to the label rather
+    than vanishing from the run history entirely.
+    """
+    at = (activity.get("activity_type") or "").lower()
+    if at not in _ON_FOOT_TYPES:
+        return False
+    mode = interpret.is_running_effort(activity.get("avg_pace_sec_per_km"))
+    if mode is not None:
+        return mode
+    return at in _RUNNING_TYPES
 
 
 def ctl_at_or_before(conn, anchor_date: str) -> float | None:
@@ -530,11 +559,15 @@ def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | N
 
     # Run history. Bounded — see _ACTIVITY_LOOKBACK_DAYS.
     activity_floor = (today_d - timedelta(days=_ACTIVITY_LOOKBACK_DAYS)).isoformat()
+    # avg_pace_sec_per_km is REQUIRED, not incidental: `_running` gates
+    # run-vs-walk on measured pace, and without this column every row falls
+    # back to the (wrong) activity_type label and the gate is a silent no-op —
+    # the same way shipping plans' gate without the column made it one.
     acts = [dict(r) for r in conn.execute(
-        "SELECT date, activity_type, aerobic_te FROM activities "
+        "SELECT date, activity_type, aerobic_te, avg_pace_sec_per_km FROM activities "
         "WHERE date <= ? AND date >= ? ORDER BY date DESC", (today, activity_floor),
     ).fetchall()]
-    runs = [a for a in acts if _running(a["activity_type"])]
+    runs = [a for a in acts if _running(a)]
     days_since = None
     if runs:
         days_since = (today_d - date.fromisoformat(runs[0]["date"])).days
@@ -708,6 +741,9 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
         sig = _compute_signals(conn, today, baseline, step_goal,
                                plan_today.get("today") if plan_today else None, days_to_race)
         workouts_14d = _workouts_payload(conn, today)
+        # Shares the open connection — this function is held to exactly ONE
+        # db.connect() open (tests/test_perf_benchmarks.py pins it).
+        data_frontier = db.last_known_daily_date(db_path, conn=conn)
 
     candidates = [
         _workout_candidate(sig, profile),
@@ -721,6 +757,12 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
 
     continuity = _continuity(recent_briefs)
 
+    # Brief freshness is a filesystem read (a directory listing of briefings/),
+    # not a DB read — safe to do outside the connection, and it must stay out
+    # of the connect-count budget above.
+    _latest_brief, brief_stale_days = status_mod._latest_brief_freshness(today)
+    tsb = training_load.get("tsb")
+
     return BriefContext(
         date=today, user_name=user_name, candidates=candidates,
         snapshot=_snapshot_values(metric_rows) + _baseline_values(baseline),
@@ -733,6 +775,13 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
         plan_today=plan_today,
         step_goal=step_goal,
         days_to_race=days_to_race,
+        data_frontier=data_frontier,
+        baseline_stale_days=training_load.get("baseline_stale_days"),
+        brief_stale_days=brief_stale_days,
+        # Left None (not the "no training-load data yet" sentence tsb_zone
+        # returns on None) so exclude_none keeps an empty zone out of the
+        # prompt entirely rather than rendering prose in a label field.
+        tsb_zone=interpret.tsb_zone(tsb) if tsb is not None else None,
     )
 
 

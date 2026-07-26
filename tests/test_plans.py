@@ -544,3 +544,283 @@ def test_workout_actuals_returns_foot_run_and_walk_in_one_pass():
 
 def test_workout_actuals_pace_is_none_without_foot_distance():
     assert plans._workout_actuals([])[3] is None
+
+
+# --- A7: the Riegel basis is a measured RUN, and it names itself -------------
+# Two separate failures, both live: `best_recent_effort` picked the fastest
+# LABEL-"running" row (so a window holding nothing but walking-desk sessions
+# projected a race off a 29:15/mi walk), and the projection it fed reached as
+# far as 21x with nothing on the page to say so.
+
+def _effort_row(distance_m, duration_s, pace, atype="running", date="2026-07-01"):
+    return {"date": date, "activity_type": atype, "distance_meters": distance_m,
+            "duration_seconds": duration_s, "avg_pace_sec_per_km": pace}
+
+
+def test_best_effort_refuses_to_project_from_walking_pad_sessions():
+    """The layoff case: a 120-day window can hold nothing but walking-desk
+    sessions, every one of them labelled `treadmill_running`. The old
+    label-only gate handed the fastest of THOSE to Riegel, projecting a half
+    marathon off a 29:15/mi walk. No basis is the correct answer."""
+    walks = [
+        _effort_row(5202.75, 5670, 1090.5, atype="treadmill_running"),
+        _effort_row(4000.0, 4800, 1200.0, atype="treadmill_running"),
+    ]
+    assert plans.select_best_effort(walks) is None
+
+
+def test_best_effort_picks_the_real_run_and_carries_its_date_and_pace():
+    rows = [
+        _effort_row(5202.75, 5670, 1090.5, atype="treadmill_running",
+                    date="2026-07-04"),                       # walking pad
+        _effort_row(9574.85, 3822, 399.2, atype="treadmill_running",
+                    date="2026-07-05"),                       # the real run
+        _effort_row(6000.0, 2400, 400.0, date="2026-07-06"),  # slower real run
+    ]
+    assert plans.select_best_effort(rows) == {
+        "distance_m": 9574.85, "time_s": 3822,
+        "date": "2026-07-05", "avg_pace_sec_per_km": 399.2,
+    }
+
+
+def test_best_effort_excludes_a_paceless_row_instead_of_trusting_the_label():
+    """Deliberately unlike `_ran`, where a paceless row falls back to the
+    label so real mileage isn't lost. Here dropping a row costs nothing (the
+    next-best effort takes over) while admitting a wrong one re-prices the
+    race."""
+    paceless = _effort_row(12000.0, 3000, None, date="2026-07-04")
+    real = _effort_row(6000.0, 2400, 400.0, date="2026-07-06")
+    assert plans.select_best_effort([paceless]) is None
+    assert plans.select_best_effort([paceless, real])["distance_m"] == 6000.0
+
+
+def test_best_effort_never_picks_a_bike_ride():
+    """A 30km ride paces at ~2:00/mi and would win every pace comparison
+    outright — the foot-vs-wheel label check has to run first."""
+    bike = _effort_row(30000.0, 3600, 120.0, atype="cycling")
+    real = _effort_row(6000.0, 2400, 400.0)
+    assert plans.select_best_effort([bike]) is None
+    assert plans.select_best_effort([bike, real])["distance_m"] == 6000.0
+
+
+def test_best_recent_effort_floors_distance_at_a_quarter_of_the_goal(tmp_path):
+    """A 3 km effort is a 7x reach onto a half marathon. With the goal known,
+    the shorter-but-faster run is not eligible to set the projection at all."""
+    import sqlite3
+    from local_fitness import db as db_mod
+
+    path = tmp_path / "t.db"
+    db_mod.init_schema(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "distance_meters, duration_seconds, avg_pace_sec_per_km) VALUES "
+            "(1, '2026-07-05', 'running', 3000.0, 900, 300.0),"
+            "(2, '2026-07-06', 'running', 6000.0, 2100, 350.0)")
+
+    # No goal given: the flat 2 km floor applies and the faster 3 km run wins.
+    assert plans.best_recent_effort("2026-07-01", db_path=path)["distance_m"] == 3000.0
+    # Half marathon: the floor rises to 5274.4 m and only the 6 km run qualifies.
+    best = plans.best_recent_effort("2026-07-01", db_path=path, goal_distance_m=21097.5)
+    assert best == {"distance_m": 6000.0, "time_s": 2100,
+                    "date": "2026-07-06", "avg_pace_sec_per_km": 350.0}
+
+
+def test_best_recent_effort_falls_back_when_nothing_clears_the_raised_floor(tmp_path):
+    """The floor is a preference, not a filter. Someone whose longest recent
+    run is 3 km still gets a projection — labelled `low` confidence at a 7x
+    reach, which beats a blank where the number should be."""
+    import sqlite3
+    from local_fitness import db as db_mod
+
+    path = tmp_path / "t.db"
+    db_mod.init_schema(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "distance_meters, duration_seconds, avg_pace_sec_per_km) VALUES "
+            "(1, '2026-07-05', 'running', 3000.0, 900, 300.0)")
+
+    best = plans.best_recent_effort("2026-07-01", db_path=path, goal_distance_m=21097.5)
+    assert best == {"distance_m": 3000.0, "time_s": 900,
+                    "date": "2026-07-05", "avg_pace_sec_per_km": 300.0}
+    detail = plans.build_plan_detail(
+        _riegel_plan(), frontier="2026-07-08", activities_by_date={},
+        best_effort=best)
+    assert detail["projection_basis"]["extrapolation_ratio"] == 7.0
+    assert detail["projection_confidence"] == "low"
+
+
+def test_best_recent_effort_fallback_still_refuses_a_walk(tmp_path):
+    """Falling back relaxes the DISTANCE floor, never the locomotion gate — a
+    walking-pad session is not a weak basis, it is the wrong kind of one."""
+    import sqlite3
+    from local_fitness import db as db_mod
+
+    path = tmp_path / "t.db"
+    db_mod.init_schema(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "distance_meters, duration_seconds, avg_pace_sec_per_km) VALUES "
+            "(1, '2026-07-05', 'treadmill_running', 5202.75, 5670, 1090.5)")
+    assert plans.best_recent_effort(
+        "2026-07-01", db_path=path, goal_distance_m=21097.5) is None
+
+
+def test_projection_basis_none_without_an_effort_or_a_goal():
+    effort = {"distance_m": 10000.0, "time_s": 3000, "date": "2026-07-01",
+              "avg_pace_sec_per_km": 300.0}
+    assert plans.projection_basis(None, 21097.5) is None
+    assert plans.projection_basis(effort, None) is None          # custom goal
+    assert plans.projection_basis({"distance_m": 0.0}, 21097.5) is None
+
+
+def _riegel_plan(goal_distance_m=21097.5):
+    return {
+        "plan_id": 1, "goal_type": "half", "race_date": "2026-09-14",
+        "goal_distance_m": goal_distance_m,
+        "workouts": [_wk(date="2026-07-01", target_distance_m=6000.0)],
+    }
+
+
+def test_build_plan_detail_states_what_the_projection_was_measured_from():
+    effort = {"distance_m": 10000.0, "time_s": 3000, "date": "2026-07-01",
+              "avg_pace_sec_per_km": 300.0}
+    detail = plans.build_plan_detail(
+        _riegel_plan(), frontier="2026-07-08", activities_by_date={},
+        best_effort=effort)
+    assert detail["predicted_finish_seconds"] == pytest.approx(6619.2, abs=0.1)
+    assert detail["projection_basis"] == {
+        "distance_mi": 6.21, "pace_min_per_mi": "8:03",
+        "date": "2026-07-01", "extrapolation_ratio": 2.1,
+    }
+    assert detail["projection_confidence"] == "medium"
+
+
+def test_a_two_km_effort_onto_a_half_marathon_is_low_confidence():
+    """The number that makes the projection readable: 10.5x reach. Riegel
+    still returns a time — it always does — so the confidence is the only
+    thing separating this from a measured result."""
+    effort = {"distance_m": 2000.0, "time_s": 600, "date": "2026-07-02",
+              "avg_pace_sec_per_km": 300.0}
+    detail = plans.build_plan_detail(
+        _riegel_plan(), frontier="2026-07-08", activities_by_date={},
+        best_effort=effort)
+    assert detail["projection_basis"]["extrapolation_ratio"] == 10.5
+    assert detail["projection_basis"]["distance_mi"] == 1.24
+    assert detail["projection_confidence"] == "low"
+    assert detail["predicted_finish_seconds"] == pytest.approx(7290.3, abs=0.1)
+
+
+@pytest.mark.parametrize("best_effort,goal_distance_m", [
+    (None, 21097.5),                                        # no qualifying run
+    ({"distance_m": 10000.0, "time_s": 3000}, None),        # custom goal
+])
+def test_build_plan_detail_omits_projection_fields_when_there_is_no_basis(
+        best_effort, goal_distance_m):
+    """Absent, never None-valued — a consumer must not be able to print
+    'basis: none' beside a real predicted time."""
+    detail = plans.build_plan_detail(
+        _riegel_plan(goal_distance_m), frontier="2026-07-08",
+        activities_by_date={}, best_effort=best_effort)
+    assert "projection_basis" not in detail
+    assert "projection_confidence" not in detail
+
+
+# --- A8: rest days inflate adherence, so name the sessions number ------------
+
+def _rest(date):
+    return _wk(date=date, type="rest", target_distance_m=None,
+               description="Rest day")
+
+
+def _mixed_rest_plan():
+    """4 rest days + 4 easy runs, two of which were run and two skipped."""
+    return {
+        "plan_id": 1, "goal_type": "half", "race_date": "2026-09-14",
+        "workouts": [
+            _rest("2026-07-01"), _wk(date="2026-07-02", target_distance_m=6000.0),
+            _rest("2026-07-03"), _wk(date="2026-07-04", target_distance_m=6000.0),
+            _rest("2026-07-05"), _wk(date="2026-07-06", target_distance_m=6000.0),
+            _rest("2026-07-07"), _wk(date="2026-07-08", target_distance_m=6000.0),
+        ],
+    }
+
+
+def test_rest_days_inflate_overall_adherence_but_not_the_sessions_number():
+    """Half the running went undone; the headline still reads 75% because four
+    rest days took full credit in both halves of the fraction."""
+    activities = {"2026-07-02": [_run(6000)], "2026-07-04": [_run(6000)]}
+    detail = plans.build_plan_detail(
+        _mixed_rest_plan(), frontier="2026-07-09", activities_by_date=activities)
+    assert [w["verdict"] for w in detail["workouts"]] == [
+        "compliant", "done", "compliant", "done",
+        "compliant", "missed", "compliant", "missed",
+    ]
+    assert detail["adherence_pct"] == 75          # unchanged, by design
+    assert detail["sessions_adherence_pct"] == 50
+    assert detail["rest_days_counted"] == 4
+
+
+def test_an_all_rest_stretch_has_no_sessions_adherence():
+    """None, not 0 — 0% would assert nothing got done when the truth is that
+    nothing was asked for."""
+    plan = {
+        "plan_id": 1, "goal_type": "half", "race_date": "2026-09-14",
+        "workouts": [_rest("2026-07-01"), _rest("2026-07-02")],
+    }
+    detail = plans.build_plan_detail(
+        plan, frontier="2026-07-09", activities_by_date={})
+    assert detail["adherence_pct"] == 100
+    assert detail["sessions_adherence_pct"] is None
+    assert detail["rest_days_counted"] == 2
+
+
+def test_sessions_adherence_ignores_pending_sessions():
+    """A run not yet at the data frontier is not a skip. It counts in neither
+    number, exactly as it doesn't in adherence_pct."""
+    plan = {
+        "plan_id": 1, "goal_type": "half", "race_date": "2026-09-14",
+        "workouts": [
+            _rest("2026-07-01"),
+            _wk(date="2026-07-02", target_distance_m=6000.0),   # done
+            _wk(date="2026-07-20", target_distance_m=6000.0),   # pending
+        ],
+    }
+    detail = plans.build_plan_detail(
+        plan, frontier="2026-07-09",
+        activities_by_date={"2026-07-02": [_run(6000)]})
+    assert detail["workouts"][2]["verdict"] == "pending"
+    assert detail["sessions_adherence_pct"] == 100
+    assert detail["rest_days_counted"] == 1
+
+
+def test_build_plan_status_carries_the_sessions_split_too():
+    activities = {"2026-07-02": [_run(6000)], "2026-07-04": [_run(6000)]}
+    status = plans.build_plan_status(
+        _mixed_rest_plan(), frontier="2026-07-09",
+        activities_by_date=activities, today="2026-07-09")
+    assert status["adherence_pct"] == 75
+    assert status["sessions_adherence_pct"] == 50
+    assert status["rest_days_counted"] == 4
+
+
+# --- A9: last_graded has to say WHICH day ------------------------------------
+
+def test_last_graded_carries_its_date_and_seq():
+    """A verdict with no date is a 'missed' that could be yesterday or three
+    weeks ago, and the coach has to guess."""
+    plan = {
+        "plan_id": 1, "goal_type": "10k", "race_date": "2026-09-14",
+        "workouts": [
+            _wk(date="2026-07-04", seq=2, target_distance_m=6000.0),
+            _wk(date="2026-07-20", target_distance_m=8000.0, type="tempo"),
+        ],
+    }
+    status = plans.build_plan_status(
+        plan, frontier="2026-07-09",
+        activities_by_date={"2026-07-04": [_run(6000)]}, today="2026-07-09")
+    assert status["last_graded"]["date"] == "2026-07-04"
+    assert status["last_graded"]["seq"] == 2
+    assert status["last_graded"]["verdict"] == "done"

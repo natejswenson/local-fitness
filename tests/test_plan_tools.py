@@ -366,6 +366,13 @@ def test_progress_goal_gap_and_this_week_and_formatted_fields(seeded):
     assert body["target_time_seconds"] == 3000
     assert body["target_time_formatted"] == "50:00"
     assert body["goal_gap"] == {"gap_seconds": 300.0, "gap_pct": 10.0, "on_pace": False}
+    # The projection names the run it came from. A 10 km effort onto a 10 km
+    # goal reaches nowhere at all, so this one is trustworthy and says so.
+    assert body["projection_basis"] == {
+        "distance_mi": 6.21, "pace_min_per_mi": "8:51",
+        "date": t.isoformat(), "extrapolation_ratio": 1.0,
+    }
+    assert body["projection_confidence"] == "high"
     assert set(body["this_week"]) == {
         "week_planned_mi", "week_actual_mi", "week_run_mi", "week_walk_mi", "slips",
     }
@@ -378,6 +385,11 @@ def test_progress_goal_gap_none_without_projection(seeded):
     assert body["predicted_finish_seconds"] is None
     assert body["predicted_finish_formatted"] is None
     assert body["goal_gap"] is None
+    # Absent, not None — build_plan_detail's omission has to survive the
+    # payload projection, or the tool would print a receipt for a time it
+    # never computed.
+    assert "projection_basis" not in body
+    assert "projection_confidence" not in body
 
 
 # --- 2e (Fix C) + 2d: per-workout mile/pace + target_duration_formatted -----

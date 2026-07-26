@@ -362,6 +362,7 @@ def pull(
             "error": None,
             "gap_days_remaining": 0,
             "deferred_count": 0,
+            "days_failed": 0,
         }
 
     # Most-recent-first so freshness wins. Fill yesterday before backfilling
@@ -498,4 +499,7 @@ def pull(
         "error": error,
         "gap_days_remaining": gap_days_remaining,
         "deferred_count": deferred_count,
+        # Countable form of what the error string only spells out in prose, so
+        # callers can classify a run without parsing it.
+        "days_failed": len(days_failed),
     }

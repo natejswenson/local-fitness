@@ -444,6 +444,50 @@ def test_reference_line_names_the_yardstick():
     assert "rolling median" in rc.reference_line(rolling_card)
 
 
+def test_reference_line_does_not_disclaim_what_the_plan_graded():
+    """A thin rolling pool used to print "not enough history to grade" directly
+    under two letters the plan had just graded. The disclaimer is now scoped to
+    the metrics it actually applies to."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        plan={"type": "easy", "target_distance_m": 10000,
+              "target_pace_sec_per_km": 310, "seq": 1},
+        reference={"mode": "insufficient_data", "n": 2, "pool": "running"},
+    )
+    assert card["metrics"]["distance"]["grade"] == "A+"     # graded off the plan
+    assert card["metrics"]["hr"]["grade"] is None           # no rolling median
+    line = rc.reference_line(card)
+    assert line == (
+        "Graded against your **training plan** for this date (intent: easy, "
+        "prescribed by your plan). HR and training load ungraded — only 2 "
+        "comparable activities in the last 60 days (need 5).")
+
+
+def test_scoped_caveat_counts_one_activity_in_the_singular():
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        plan={"type": "easy", "target_distance_m": 10000, "seq": 1},
+        reference={"mode": "insufficient_data", "n": 1, "pool": "running"},
+    )
+    # A by-feel prescription grades distance only, so pace joins the caveat.
+    assert rc.reference_line(card, markdown=False).endswith(
+        "Pace, HR and training load ungraded — only 1 comparable activity in "
+        "the last 60 days (need 5).")
+
+
+def test_reference_line_still_disclaims_when_the_plan_graded_nothing():
+    """The no-plan case is untouched: with nothing graded at all, the blanket
+    sentence is the honest one."""
+    card = card_for({"date": "2026-07-19", "distance_meters": 10000,
+                     "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+                    reference={"mode": "insufficient_data", "n": 3})
+    assert rc.reference_line(card) == (
+        "Not enough comparable history to grade — 3 similar activities in the "
+        "last 60 days (need 5).")
+
+
 def test_reference_line_drops_markdown_for_the_pdf():
     """The PDF escapes its HTML rather than rendering markdown, so leaving the
     asterisks in printed a literal `**training plan**` on the page."""
@@ -618,15 +662,54 @@ def test_load_inputs_by_date_and_miss(rc_db):
 
 
 def test_load_inputs_reports_other_activities_on_the_date(rc_db):
-    """A double-day must not silently hide its second session."""
+    """A double-day must not silently hide its second session — and a bare id
+    doesn't tell the reader which session went ungraded."""
+    today = date.today().isoformat()
     with db.connect(rc_db) as conn:
         conn.execute(
             "INSERT INTO activities (activity_id, date, start_time, activity_type, "
             "duration_seconds, distance_meters) VALUES (555, ?, ?, 'running', 1200, 5000)",
-            (date.today().isoformat(), date.today().isoformat() + " 05:00:00"),
+            (today, today + " 05:00:00"),
         )
         inputs = rc.load_report_card_inputs(conn)
-    assert 555 in inputs["other_activities_on_date"]
+    assert inputs["other_activities_on_date"] == [
+        {"activity_id": 555, "activity_type": "running", "distance_mi": 3.11,
+         "start_time": today + " 05:00:00"},
+    ]
+
+
+def test_date_branch_grades_the_first_session_of_a_double_day(rc_db):
+    """The prescription a date-selected card is graded against is the day's
+    lowest seq — the morning session — so taking the day's LAST activity paired
+    an evening shakeout with the morning's target and graded the wrong run."""
+    today = date.today().isoformat()
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "activity_name, duration_seconds, distance_meters, avg_hr, "
+            "avg_pace_sec_per_km, training_load) VALUES "
+            "(777, ?, ?, 'running', 'Evening Shakeout', 1200, 3200, 140, 380, 30)",
+            (today, today + " 18:30:00"),
+        )
+        inputs = rc.load_report_card_inputs(conn, target_date=today)
+    assert inputs["activity"]["activity_id"] == 1          # 07:00, not 18:30
+    assert inputs["other_activities_on_date"] == [
+        {"activity_id": 777, "activity_type": "running", "distance_mi": 1.99,
+         "start_time": today + " 18:30:00"},
+    ]
+
+
+def test_explicit_id_still_beats_the_first_session_rule(rc_db):
+    """Asking for one activity by id gets that activity, morning or not."""
+    today = date.today().isoformat()
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "duration_seconds, distance_meters) VALUES (777, ?, ?, 'running', 1200, 3200)",
+            (today, today + " 18:30:00"),
+        )
+        inputs = rc.load_report_card_inputs(conn, activity_id=777)
+    assert inputs["activity"]["activity_id"] == 777
 
 
 def test_load_inputs_picks_the_planned_workout_for_that_date(rc_db):
@@ -935,14 +1018,49 @@ def _mile_splits(*paces_sec_per_km):
     return rows
 
 
-def test_fastest_full_split_ignores_the_trailing_fragment():
+def test_fastest_rep_split_ignores_the_trailing_fragment():
     """A 90-metre fragment can post an absurd pace and would win every time."""
     labelled = rc.label_splits(_mile_splits(360.0, 300.0, 330.0))
-    assert rc.fastest_full_split_pace(labelled) == pytest.approx(300.0)
+    assert rc.fastest_rep_split_pace(labelled) == pytest.approx(300.0)
 
 
-def test_fastest_full_split_is_none_without_splits():
-    assert rc.fastest_full_split_pace(rc.label_splits([])) is None
+def test_fastest_rep_split_is_none_without_splits():
+    assert rc.fastest_rep_split_pace(rc.label_splits([])) is None
+
+
+def _manual_lap_splits():
+    """A manually-lapped interval session: one warmup lap, then 800m reps with
+    200m recovery jogs between them. The warmup is the LONGEST lap, so
+    label_splits flags every rep partial — which is exactly the shape that used
+    to hand the warmup's pace to the rep grade."""
+    rows = [{"split_index": 0, "distance_meters": 1600.0, "duration_seconds": 624,
+             "avg_hr": 130, "avg_pace_sec_per_km": 390.0}]
+    for i in range(4):
+        rows.append({"split_index": 1 + i * 2, "distance_meters": 800.0,
+                     "duration_seconds": 208, "avg_hr": 168,
+                     "avg_pace_sec_per_km": 260.0})
+        rows.append({"split_index": 2 + i * 2, "distance_meters": 200.0,
+                     "duration_seconds": 120, "avg_hr": 140,
+                     "avg_pace_sec_per_km": 600.0})
+    return rows
+
+
+def test_fastest_rep_split_takes_the_rep_not_the_warmup_lap():
+    """The manual-lap failure: every rep is "partial" against a 1600m warmup, so
+    the old full-splits-only rule left the 6:30/km warmup as the only
+    candidate."""
+    labelled = rc.label_splits(_manual_lap_splits())
+    assert all(r["partial"] for r in labelled["rows"][1:])   # reps and recoveries
+    assert rc.fastest_rep_split_pace(labelled) == pytest.approx(260.0)
+
+
+def test_fastest_rep_split_ignores_recovery_jogs_below_the_floor():
+    """The 200m recovery jogs are under QUALITY_MIN_SPLIT_M, so they can't win
+    the comparison even though they are the shortest rows present."""
+    short = [{"split_index": i, "distance_meters": 200.0, "duration_seconds": 60,
+              "avg_hr": 150, "avg_pace_sec_per_km": 300.0 - i} for i in range(4)]
+    assert rc.QUALITY_MIN_SPLIT_M == 300.0
+    assert rc.fastest_rep_split_pace(rc.label_splits(short)) is None
 
 
 def test_interval_pace_is_graded_on_the_fastest_split():
@@ -1001,6 +1119,47 @@ def test_interval_pace_is_na_without_splits_not_a_fabricated_f():
     assert pace["actual_display"] == "10:42/mi avg"
     assert "no splits recorded" in pace["note"]
     # ...and the weight redistributes rather than scoring pace as zero.
+    assert card["overall"]["graded_metrics"] == 3
+
+
+def test_manual_lap_interval_is_graded_on_the_rep_not_the_warmup():
+    """The manual-lap failure end to end: a 2-mile-warmup-then-800s session had
+    every rep flagged partial, so the rep grade read the 6:30/km warmup against
+    a 4:20/km target — a guaranteed F on a session that hit every rep."""
+    card = card_for(
+        {"date": "2026-07-21", "distance_meters": 5600, "duration_seconds": 2000,
+         "avg_pace_sec_per_km": 357.1, "avg_hr": 155, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 5600,
+              "target_pace_sec_per_km": 260.0, "seq": 1},
+        splits=_manual_lap_splits(),
+    )
+    pace = card["metrics"]["pace"]
+    assert pace["actual"] == pytest.approx(260.0)      # the 800m rep, not 390
+    assert pace["deviation"] == pytest.approx(0.0)
+    assert pace["grade"] == "A+"
+    # The 1600m warmup is mile-sized, so the split table's unit is "Mile" — but
+    # the graded rep is not a mile and the card must not say it was.
+    assert card["splits"]["unit"] == "Mile"
+    assert pace["actual_display"] == "6:58/mi best split"
+
+
+def test_interval_pace_is_na_when_no_split_is_rep_sized():
+    """Splits exist but none clears the floor — still n/a, and the note says
+    why rather than repeating the no-splits wording."""
+    tiny = [{"split_index": i, "distance_meters": 200.0, "duration_seconds": 60,
+             "avg_hr": 150, "avg_pace_sec_per_km": 300.0} for i in range(6)]
+    card = card_for(
+        {"date": "2026-07-21", "distance_meters": 9575, "duration_seconds": 3822,
+         "avg_pace_sec_per_km": 399.2, "avg_hr": 150, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 300.0, "seq": 1},
+        splits=tiny,
+    )
+    pace = card["metrics"]["pace"]
+    assert pace["grade"] is None
+    assert pace["note"] == ("interval day, no split long enough to be a rep — "
+                            "average pace can't be graded against a rep target")
+    assert pace["actual_display"] == "10:42/mi avg"
     assert card["overall"]["graded_metrics"] == 3
 
 
