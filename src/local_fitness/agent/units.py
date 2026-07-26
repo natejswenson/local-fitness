@@ -132,8 +132,10 @@ def format_hm(seconds: float | int | None) -> str | None:
     NOT ``format_duration``'s ``H:MM:SS`` — that reads as a run duration.
     The repo's deliberate sleep convention is hours-and-minutes: minutes are
     zero-padded at/over an hour (``"7h 05m"``, not ``"7h 5m"``) and the
-    sub-hour form drops the hour entirely (``"45m"``). Reproduces
-    ``brief_planner._hm``'s output exactly. ``None`` in, ``None`` out.
+    sub-hour form drops the hour entirely (``"45m"``). This is THE
+    definition — ``brief_planner._hm`` delegates here (the dependency once
+    pointed the other way; the old docstring still claimed it). ``None`` in,
+    ``None`` out.
     """
     if seconds is None:
         return None

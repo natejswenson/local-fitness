@@ -22,11 +22,16 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from .. import config, db
-from . import interpret
+from . import interpret, units
 from . import status as status_mod
-from . import units
 from .coach import CoachProfile, resolve_coach_profile
-from .schemas import BriefContext, CandidateTakeaway, GroundedValue, TakeawayMetric, Tone
+from .schemas import (
+    BriefContext,
+    CandidateTakeaway,
+    GroundedValue,
+    TakeawayMetric,
+    Tone,
+)
 
 # --- one named threshold block (the prompt's tuning knobs, now testable) ---
 # Each maps to a line in the mandate sections of ``prompts.briefing_prompt()``

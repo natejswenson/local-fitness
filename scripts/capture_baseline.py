@@ -64,8 +64,9 @@ _BASELINE_PATH = Path(__file__).resolve().parents[1] / "tests" / "evals" / "base
 
 def _schema_valid(brief: dict) -> bool:
     """True iff ``brief`` round-trips through the production ``Brief`` schema."""
-    from local_fitness.agent.schemas import Brief
     from pydantic import ValidationError
+
+    from local_fitness.agent.schemas import Brief
 
     try:
         Brief.model_validate(brief)

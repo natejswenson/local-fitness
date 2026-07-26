@@ -21,7 +21,7 @@ def _plan(**over):
     return base
 
 
-def _wk(date="2026-07-01", seq=1, week_index=1, type="easy",
+def _wk(date="2026-07-01", seq=1, week_index=1, type="easy",  # noqa: A002 — mirrors the plan_workouts column names
         target_distance_m=6000.0, description="6km easy", **over):
     w = dict(date=date, seq=seq, week_index=week_index, type=type,
              target_distance_m=target_distance_m, target_pace_sec_per_km=None,

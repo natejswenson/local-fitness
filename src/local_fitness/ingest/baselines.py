@@ -13,8 +13,9 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
+from collections.abc import Iterable
 from datetime import date, timedelta
-from typing import Any, Iterable
+from typing import Any
 
 from .. import db
 

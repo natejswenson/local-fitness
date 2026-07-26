@@ -31,8 +31,8 @@ import json
 import logging
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Mapping
 
 _LOG = logging.getLogger(__name__)
 

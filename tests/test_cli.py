@@ -395,8 +395,9 @@ def test_brief_failure_with_no_notify_stays_silent(runner, monkeypatch):
 def test_brief_if_missing_skips_when_todays_brief_exists(runner, monkeypatch, tmp_path):
     # Backstop-fire mode: today's brief on disk → no pull, no generation,
     # no notification, exit 0.
-    from local_fitness.agent import briefs
     from datetime import date as _date
+
+    from local_fitness.agent import briefs
     bdir = tmp_path / "briefings"
     bdir.mkdir()
     (bdir / f"{_date.today().isoformat()}.json").write_text("{}", encoding="utf-8")

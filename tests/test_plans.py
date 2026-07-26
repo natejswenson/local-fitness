@@ -5,10 +5,9 @@ import pytest
 
 from local_fitness import plans
 
-
 # --- helpers ---------------------------------------------------------------
 
-def _wk(date="2026-07-01", seq=1, week_index=1, type="easy",
+def _wk(date="2026-07-01", seq=1, week_index=1, type="easy",  # noqa: A002 — mirrors the plan_workouts column names
         target_distance_m=6000.0, target_pace_sec_per_km=None,
         target_duration_sec=None, description="6km easy"):
     return dict(date=date, seq=seq, week_index=week_index, type=type,
@@ -47,13 +46,13 @@ def test_validate_rejects_bad_workout_type():
 def test_validate_rejects_nonfinite_distance():
     err = plans.validate_plan_input("10k", "2026-09-14",
         workouts=[_wk(target_distance_m=float("inf"))], created_date="2026-06-15")
-    assert err
+    assert err == "workout 0: target_distance_m must be finite and non-negative"
 
 
 def test_validate_rejects_negative_numeric():
     err = plans.validate_plan_input("10k", "2026-09-14",
         workouts=[_wk(target_distance_m=-1.0)], created_date="2026-06-15")
-    assert err
+    assert err == "workout 0: target_distance_m must be finite and non-negative"
 
 
 def test_validate_rejects_wrong_typed_numeric_field():
@@ -82,7 +81,7 @@ def test_validate_rejects_non_string_description():
 def test_validate_rejects_bad_date():
     err = plans.validate_plan_input("10k", "2026-13-99",
         workouts=[_wk()], created_date="2026-06-15")
-    assert err
+    assert err == "race_date '2026-13-99' is not an ISO date"
 
 
 def test_validate_rejects_duplicate_date_seq():
@@ -102,19 +101,21 @@ def test_validate_allows_same_date_distinct_seq():
 def test_validate_rejects_workout_after_race():
     err = plans.validate_plan_input("10k", "2026-09-14",
         workouts=[_wk(date="2026-09-20")], created_date="2026-06-15")
-    assert err
+    # The boundary check must name the WINDOW, so this and the before-created
+    # case below can't silently swap under a refactor.
+    assert err == "workout 0: date 2026-09-20 outside [created, race_date]"
 
 
 def test_validate_rejects_workout_before_created():
     err = plans.validate_plan_input("10k", "2026-09-14",
         workouts=[_wk(date="2026-06-01")], created_date="2026-06-15")
-    assert err
+    assert err == "workout 0: date 2026-06-01 outside [created, race_date]"
 
 
 def test_validate_rejects_too_many():
     wks = [_wk(date=f"2026-07-{(i % 28) + 1:02d}", seq=i) for i in range(plans.MAX_WORKOUTS + 1)]
     err = plans.validate_plan_input("10k", "2026-09-14", workouts=wks, created_date="2026-06-15")
-    assert err
+    assert err == f"too many workouts ({plans.MAX_WORKOUTS + 1} > {plans.MAX_WORKOUTS})"
 
 
 def test_validate_accepts_good_plan():
@@ -495,6 +496,7 @@ def test_load_activities_by_date_selects_the_pace_the_gate_needs(tmp_path):
     """Regression: the gate shipped as a silent no-op because this query did
     not select avg_pace_sec_per_km, so every row fell back to the label."""
     import sqlite3
+
     from local_fitness import db as db_mod
 
     path = tmp_path / "t.db"
@@ -607,6 +609,7 @@ def test_best_recent_effort_floors_distance_at_a_quarter_of_the_goal(tmp_path):
     """A 3 km effort is a 7x reach onto a half marathon. With the goal known,
     the shorter-but-faster run is not eligible to set the projection at all."""
     import sqlite3
+
     from local_fitness import db as db_mod
 
     path = tmp_path / "t.db"
@@ -631,6 +634,7 @@ def test_best_recent_effort_falls_back_when_nothing_clears_the_raised_floor(tmp_
     run is 3 km still gets a projection — labelled `low` confidence at a 7x
     reach, which beats a blank where the number should be."""
     import sqlite3
+
     from local_fitness import db as db_mod
 
     path = tmp_path / "t.db"
@@ -655,6 +659,7 @@ def test_best_recent_effort_fallback_still_refuses_a_walk(tmp_path):
     """Falling back relaxes the DISTANCE floor, never the locomotion gate — a
     walking-pad session is not a weak basis, it is the wrong kind of one."""
     import sqlite3
+
     from local_fitness import db as db_mod
 
     path = tmp_path / "t.db"

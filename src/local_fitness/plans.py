@@ -45,6 +45,12 @@ class GradingConfig:
     pace_gated_locomotion: bool = True
 
 
+#: Shared default for the pure grading functions. GradingConfig is frozen,
+#: so one instance is safe as an argument default (B008's mutable-default
+#: hazard doesn't apply — this exists to say so explicitly).
+_DEFAULT_GRADING_CONFIG = GradingConfig()
+
+
 def resolve_grading_config(
     db_path=None, conn: sqlite3.Connection | None = None
 ) -> GradingConfig:
@@ -128,7 +134,7 @@ def _is_on_foot(activity_type: str | None) -> bool:
     return _is_running(activity_type) or _is_walking(activity_type)
 
 
-def _ran(activity: dict, cfg: GradingConfig = GradingConfig()) -> bool:
+def _ran(activity: dict, cfg: GradingConfig = _DEFAULT_GRADING_CONFIG) -> bool:
     """Did this activity involve RUNNING, judged by pace where pace exists?
 
     ``_is_running`` alone is a substring match on Garmin's label, and the label
@@ -165,7 +171,7 @@ def _parse_iso(value: str) -> _date | None:
 
 
 def _running_distance(
-    activities: list[dict], cfg: GradingConfig = GradingConfig()
+    activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
 ) -> float:
     """Distance (m) from RUNNING only — pace-gated, not label-gated (``_ran``).
 
@@ -177,7 +183,7 @@ def _running_distance(
 
 
 def _walking_distance(
-    activities: list[dict], cfg: GradingConfig = GradingConfig()
+    activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
 ) -> float:
     """The complement of ``_running_distance`` within on-foot activity, so run
     miles + walk miles always reconcile to foot miles."""
@@ -189,7 +195,7 @@ def _walking_distance(
 
 
 def _running_duration(
-    activities: list[dict], cfg: GradingConfig = GradingConfig()
+    activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
 ) -> float:
     """Duration (s) of RUNNING only — pace-gated for the same reason as
     ``_running_distance``, and it matters more here: duration is the graded
@@ -205,14 +211,6 @@ def _foot_distance(activities: list[dict]) -> float:
     easy/recovery grading and for surfaced actuals (a recovery walk counts)."""
     return sum(
         (a.get("distance_meters") or 0.0)
-        for a in activities
-        if _is_on_foot(a.get("activity_type"))
-    )
-
-
-def _foot_duration(activities: list[dict]) -> float:
-    return sum(
-        (a.get("duration_seconds") or 0.0)
         for a in activities
         if _is_on_foot(a.get("activity_type"))
     )
@@ -307,7 +305,7 @@ def validate_plan_input(
 # --- Task 1.2: type-aware adherence ---------------------------------------
 
 def classify_workout(
-    workout: dict, day_activities: list[dict], cfg: GradingConfig = GradingConfig()
+    workout: dict, day_activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
 ) -> str:
     """Grade one prescribed workout against that day's activities.
 
@@ -372,7 +370,7 @@ def classify_workout(
 
 def grade_workout(
     workout: dict, day_activities: list[dict], frontier: str | None,
-    cfg: GradingConfig = GradingConfig(),
+    cfg: GradingConfig = _DEFAULT_GRADING_CONFIG,
 ) -> str:
     """Grade a prescribed workout, holding not-yet-credited days as ``pending``.
 
@@ -508,7 +506,7 @@ def goal_gap(
 
 def weekly_mileage(
     workouts: list[dict], activities_by_date: dict[str, list[dict]],
-    cfg: GradingConfig = GradingConfig(),
+    cfg: GradingConfig = _DEFAULT_GRADING_CONFIG,
 ) -> list[dict]:
     """Planned vs. actual km per ``week_index`` (actual counts each date once).
 
@@ -1021,7 +1019,7 @@ def _rest_days_counted(graded_workouts: list[dict]) -> int:
 
 
 def _workout_actuals(
-    day_activities: list[dict], cfg: GradingConfig = GradingConfig()
+    day_activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
 ) -> tuple[float, float, float, float | None, list[str]]:
     """``(foot_m, run_m, walk_m, pace_sec_per_km, activity_types)`` for one day.
 
@@ -1058,7 +1056,7 @@ def build_plan_detail(
     frontier: str | None,
     activities_by_date: dict[str, list[dict]],
     best_effort: dict | None = None,
-    cfg: GradingConfig = GradingConfig(),
+    cfg: GradingConfig = _DEFAULT_GRADING_CONFIG,
 ) -> dict:
     """Assemble the full PlanDetail the tab renders (workouts graded, rollups).
 
@@ -1133,7 +1131,7 @@ def build_plan_status(
     frontier: str | None,
     activities_by_date: dict[str, list[dict]],
     today: str,
-    cfg: GradingConfig = GradingConfig(),
+    cfg: GradingConfig = _DEFAULT_GRADING_CONFIG,
 ) -> dict:
     """Structured status for the brief. Returns {'active': False} when no plan."""
     if plan is None:

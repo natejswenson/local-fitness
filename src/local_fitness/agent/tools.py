@@ -33,8 +33,19 @@ from pydantic import ValidationError
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
 from . import (
-    briefs, card_store, charts, coach, interpret, journal, memory, personality,
-    plan_coach, reflect, report_card, units, workout_coach,
+    briefs,
+    card_store,
+    charts,
+    coach,
+    interpret,
+    journal,
+    memory,
+    personality,
+    plan_coach,
+    reflect,
+    report_card,
+    units,
+    workout_coach,
 )
 from .schemas import Brief
 
@@ -156,7 +167,7 @@ def _validate_days(value: Any, name: str = "days", *, lo: int = 1, hi: int = 365
     return None
 
 
-def _validation_error_summary(e: "ValidationError") -> str:
+def _validation_error_summary(e: ValidationError) -> str:
     """A pydantic ValidationError as compact ``loc: msg`` pairs.
 
     The full repr is multi-line, carries a docs URL, and buries the two
@@ -524,7 +535,7 @@ def _bucket_weekly(
     otherwise. Returns (week_start_iso_dates, aggregated_values), weeks in
     chronological order. Same cumulative rule the calendar renderer uses."""
     buckets: dict[str, list[float]] = {}
-    for d, v in zip(dates, values):
+    for d, v in zip(dates, values, strict=True):
         day = date.fromisoformat(d)
         week_start = (day - timedelta(days=day.weekday())).isoformat()
         buckets.setdefault(week_start, []).append(v)
@@ -3260,7 +3271,7 @@ async def generate_brief_report(args: dict) -> dict:
             async with visuals.RENDER_LOCK:
                 png_bytes = await asyncio.to_thread(
                     visuals.render_chart_png,
-                    list(zip(m_dates, m_values)), "line", fmt, label,
+                    list(zip(m_dates, m_values, strict=True)), "line", fmt, label,
                 )
             charts_by_index[str(index)] = png_bytes
         except Exception:
@@ -3462,7 +3473,7 @@ async def generate_chart(args: dict) -> dict:
     try:
         async with visuals.RENDER_LOCK:
             png_bytes = await asyncio.to_thread(
-                visuals.render_chart_png, list(zip(dates, values)), chart_type, fmt
+                visuals.render_chart_png, list(zip(dates, values, strict=True)), chart_type, fmt
             )
     except Exception as e:
         return _err(f"chart render failed: {e}")

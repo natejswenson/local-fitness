@@ -11,11 +11,10 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pytest
+from eval_fixtures import SCENARIOS, build_fixture_db
 
 from local_fitness import db, plans
 from local_fitness.agent.status import assemble_status
-
-from eval_fixtures import SCENARIOS, build_fixture_db
 
 _FIXED = date(2026, 6, 26)
 

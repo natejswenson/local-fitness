@@ -10,6 +10,7 @@ real transformed values (tones, fired triggers, ordering), not stand-ins.
 """
 from __future__ import annotations
 
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -21,7 +22,6 @@ from local_fitness.agent import briefs
 from local_fitness.agent.coach import CoachProfile
 from local_fitness.agent.schemas import BriefContext, GroundedValue
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from eval_fixtures import build_fixture_db  # noqa: E402
 

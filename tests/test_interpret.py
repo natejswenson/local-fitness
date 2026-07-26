@@ -11,7 +11,6 @@ import pytest
 
 from local_fitness.agent import interpret
 
-
 # === tsb_zone ================================================================
 
 @pytest.mark.parametrize("tsb,expected", [
@@ -296,3 +295,12 @@ def test_interpret_imports_nothing_outside_stdlib():
     for banned in ("import sqlite3", "from .. import", "from . import",
                    "claude_agent_sdk", "from .schemas"):
         assert banned not in src, banned
+
+
+def test_km_per_mile_pinned_to_the_units_constant():
+    """interpret stays deliberately stdlib-only (its documented contract), so
+    it keeps a private copy of the mile factor rather than importing units —
+    this pin is what stops the two from drifting."""
+    from local_fitness.agent import units
+
+    assert interpret._KM_PER_MILE == units.KM_PER_MILE

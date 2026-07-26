@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .. import db
-from .workout_coach import READ_SECTIONS
+from .report_card import READ_SECTIONS
 
 _LOG = logging.getLogger(__name__)
 
