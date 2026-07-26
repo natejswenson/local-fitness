@@ -414,3 +414,45 @@ def test_coach_journal_injection_strings_are_stored_inertly(tmp_path, monkeypatc
         assert [r["text"] for r in rows] == [hostile]
         # settings untouched (no side-channel write).
         assert conn.execute("SELECT COUNT(*) c FROM settings").fetchone()["c"] == 0
+
+
+def test_recall_hostile_queries_are_inert(tmp_path, monkeypatch):
+    """recall_coach_memories feeds user text into an FTS5 MATCH — hostile
+    SQL/MATCH syntax must come back as a JSON response (possibly is_error for
+    unsearchable input), never an unhandled exception, and mutate nothing."""
+    import asyncio
+    import json
+
+    from local_fitness import db
+    from local_fitness.agent import tools as agent_tools
+
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+
+    stored = "'); DROP TABLE coach_journal; --"
+    asyncio.run(agent_tools.save_coach_memory.handler({"text": stored}))
+
+    hostile_queries = [
+        "'); DROP TABLE coach_journal; --",
+        'x" OR rowid=1; --',
+        "{text : a}",
+        "NEAR(a, 2) OR b",
+        'a"" AND ""b',
+    ]
+    for q in hostile_queries:
+        result = asyncio.run(
+            agent_tools.recall_coach_memories.handler({"query": q}))
+        json.loads(result["content"][0]["text"])  # always a JSON payload
+
+    with db.connect(p) as conn:
+        tables = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {"coach_journal", "coach_journal_fts"} <= tables
+
+    # The stored hostile row is findable as inert data through recall.
+    result = asyncio.run(
+        agent_tools.recall_coach_memories.handler({"query": "DROP TABLE"}))
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["count"] == 1
+    assert payload["matches"][0]["text"] == stored

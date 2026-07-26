@@ -1351,8 +1351,9 @@ async def delete_user_note(args: dict) -> dict:
     "something in the conversation is worth remembering across sessions: "
     "an excuse for a skipped session, a promise ('back on it Monday'), an "
     "injury flag, a breakthrough. One dated line in your own coach voice, "
-    "under 240 chars. Skip routine Q&A. The journal is capped at 60 "
-    "entries (oldest pruned) and feeds every future brief and report card.",
+    "under 240 chars. Skip routine Q&A. The newest 60 entries show "
+    "everywhere; older ones archive (searchable via recall_coach_memories), "
+    "never vanish. Feeds every future brief and report card.",
     {
         "type": "object",
         "properties": {
@@ -1385,7 +1386,9 @@ async def save_coach_memory(args: dict) -> dict:
     "Read your coach's journal (newest first) — what you've written down "
     "about the relationship. Use when the user asks 'what do you remember', "
     "before saving a new memory (avoid duplicates — escalate instead), or "
-    "to ground a callback. Returns entry_ids for delete_coach_memory.",
+    "to ground a callback. Returns entry_ids for delete_coach_memory. Set "
+    "include_archived to browse past the hot 60; use recall_coach_memories "
+    "to SEARCH the archive instead of paging through it.",
     {
         "type": "object",
         "properties": {
@@ -1397,6 +1400,10 @@ async def save_coach_memory(args: dict) -> dict:
                 "type": "integer",
                 "description": "Max entries returned (default 50).",
             },
+            "include_archived": {
+                "type": "boolean",
+                "description": "Also list archived entries (default false).",
+            },
         },
         "required": [],
     },
@@ -1404,13 +1411,16 @@ async def save_coach_memory(args: dict) -> dict:
 async def list_coach_memories(args: dict) -> dict:
     days = args.get("days")
     limit = args.get("limit")
+    include_archived = bool(args.get("include_archived", False))
     if limit is None:
         limit = 50
     if days is not None and (not isinstance(days, int) or days <= 0):
         return _err("days must be a positive integer")
     if not isinstance(limit, int) or limit <= 0:
         return _err("limit must be a positive integer")
-    entries = journal.list_entries(days=days, limit=min(limit, journal.JOURNAL_CAP))
+    cap = 200 if include_archived else journal.JOURNAL_CAP
+    entries = journal.list_entries(
+        days=days, limit=min(limit, cap), include_archived=include_archived)
     return _text({"memories": entries, "count": len(entries)})
 
 
@@ -1428,6 +1438,56 @@ async def delete_coach_memory(args: dict) -> dict:
     if not journal.delete_entry(entry_id):
         return _err(f"no journal entry with entry_id {entry_id}")
     return _text({"deleted": True, "entry_id": entry_id})
+
+
+@tool(
+    "recall_coach_memories",
+    "Search your ENTIRE coach journal by keyword — including entries "
+    "archived beyond the 60 recent ones in your memory section. Use BEFORE "
+    "answering anything about past conversations or older context ('didn't "
+    "we talk about...', an old injury, a past promise): search first, then "
+    "answer only from what comes back — never cite a memory the search "
+    "didn't return. Best matches first; archived entries are flagged.",
+    {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Keywords to search for, e.g. 'knee pain' or "
+                    "'marathon goal'."),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max matches returned (default 8, max 25).",
+            },
+        },
+        "required": ["query"],
+    },
+)
+async def recall_coach_memories(args: dict) -> dict:
+    query = (args.get("query") or "").strip()
+    if not query:
+        return _err("query is required")
+    if len(query) > 200:
+        return _err("query too long (max 200 chars)")
+    limit = args.get("limit")
+    if limit is None:
+        limit = 8
+    if not isinstance(limit, int) or limit <= 0:
+        return _err("limit must be a positive integer")
+    try:
+        matches, mode = journal.search_entries(query, limit=min(limit, 25))
+    except ValueError as e:
+        return _err(str(e))
+    for m in matches:
+        m["archived"] = bool(m["archived"])
+    return _text({
+        "query": query,
+        "matches": matches,
+        "count": len(matches),
+        "search": mode,
+    })
 
 
 def _spec_payload(spec: personality.PersonalitySpec) -> dict:
@@ -1458,7 +1518,11 @@ async def get_coach_personality(_args: dict) -> dict:
     effective = profile.spec or personality.seed_from_profile(profile)
     with db.connect() as conn:
         journal_count = conn.execute(
-            "SELECT COUNT(*) FROM coach_journal").fetchone()[0]
+            "SELECT COUNT(*) FROM coach_journal WHERE archived = 0"
+        ).fetchone()[0]
+        archived_count = conn.execute(
+            "SELECT COUNT(*) FROM coach_journal WHERE archived = 1"
+        ).fetchone()[0]
     return _text({
         "profile": profile.name,
         "customized": profile.spec is not None,
@@ -1475,6 +1539,7 @@ async def get_coach_personality(_args: dict) -> dict:
         "intensity_levels": list(personality.INTENSITY_LEVELS),
         "known_topics": sorted(personality.TOPIC_WHITELIST),
         "journal_entries": journal_count,
+        "journal_archived": archived_count,
         "memory_enabled": memory.memory_enabled(),
     })
 
@@ -3478,6 +3543,7 @@ ALL_TOOLS = [
     save_coach_memory,
     list_coach_memories,
     delete_coach_memory,
+    recall_coach_memories,
     get_coach_personality,
     update_coach_personality,
     daily_snapshot,

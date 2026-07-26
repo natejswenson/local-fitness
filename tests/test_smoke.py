@@ -49,7 +49,9 @@ def test_tool_schemas_well_formed():
     # +get/update_coach_personality (0.31.0 tunable personality spec)
     # +list_report_cards/get_report_card (0.32.0 persisted card snapshots —
     # shared surface: pure JSON, no filesystem path)
-    assert len(agent_tools.ALL_TOOLS) == 42
+    # +recall_coach_memories (0.33.0 FTS5 search over the whole journal,
+    # archive included — pure JSON, shared surface)
+    assert len(agent_tools.ALL_TOOLS) == 43
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description
