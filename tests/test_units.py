@@ -105,3 +105,39 @@ def test_display_units_defaults_to_miles(monkeypatch):
 def test_display_units_honors_env_and_lowercases(monkeypatch):
     monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "KM")
     assert units.display_units() == "km"
+
+
+# --------------------------------------------------------------------------- #
+# 0.37.0: public constants + inverse helpers (U1/M7a)
+# --------------------------------------------------------------------------- #
+def test_from_miles_inverts_to_miles():
+    assert units.from_miles(6.0) == 9656.064
+    assert units.to_miles(units.from_miles(6.0)) == 6.0
+    assert units.from_miles(None) is None
+    assert units.from_miles(0) == 0.0
+
+
+def test_parse_pace_accepts_mss_strings():
+    assert units.parse_pace_min_per_mi("9:39") == 579.0
+    assert units.parse_pace_min_per_mi(" 8:05 ") == 485.0
+    assert units.parse_pace_min_per_mi("10:00") == 600.0
+
+
+def test_parse_pace_bare_number_is_decimal_minutes_not_mss():
+    """THE trap this parser exists to close: 9.39 is 9:23/mi, not 9:39."""
+    assert units.parse_pace_min_per_mi(9.65) == 579.0
+    assert units.parse_pace_min_per_mi(9.39) == pytest.approx(563.4)
+    assert units.parse_pace_min_per_mi(9.39) != units.parse_pace_min_per_mi("9:39")
+
+
+def test_parse_pace_rejects_garbage():
+    for bad in ("9:75", "abc", "", "9:5", "-3:00", -1, 0, None):
+        assert units.parse_pace_min_per_mi(bad) is None, bad
+
+
+def test_pace_round_trip_through_storage_units():
+    """"9:39" → sec/mi → sec/km (stored) → formatted back to "9:39"."""
+    sec_per_mi = units.parse_pace_min_per_mi("9:39")
+    stored = units.pace_sec_per_mi_to_sec_per_km(sec_per_mi)
+    assert stored == pytest.approx(359.77, abs=0.01)
+    assert units.format_pace_min_per_mi(stored) == "9:39"

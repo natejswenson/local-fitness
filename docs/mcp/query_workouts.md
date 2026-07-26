@@ -1,6 +1,6 @@
 # `query_workouts`
 
-> List activity rows with optional filters, most recent first. **Availability:** stdio + HTTP
+> List activity rows with optional filters, most recent first, as `{workouts, count, truncated}`. **Availability:** stdio + HTTP
 
 ## What it does
 
@@ -18,17 +18,40 @@ is "how did that run go" rather than "what did I do", use `workout_report_card`
 |---|---|---|---|---|
 | `activity_type` | string | no | — | Substring match — compiled to SQL `activity_type LIKE '%value%'`. `'run'` matches both `running` and `treadmill_running`. |
 | `days` | integer | no | — (no date filter) | Trailing window: `date >= today - days`. Bounds-checked to 1–3650; a non-int or out-of-range value is a hard error. |
-| `min_distance_km` | number | no | — | `distance_meters >= value * 1000`. Kilometres, even though display units are miles. |
-| `min_duration_min` | integer | no | — | `duration_seconds >= value * 60`. |
-| `limit` | integer | no | `50` | Max rows. No upper cap is enforced. |
+| `min_distance_mi` | number | no | — | **Miles** — the app's display unit. `distance_meters >= value * 1609.344`. |
+| `min_distance_km` | number | no | — | **Deprecated** alias in kilometres (`value * 1000`). Still accepted; `min_distance_mi` wins if both are given. |
+| `min_duration_min` | integer | no | — | `duration_seconds >= value * 60`. A non-numeric value returns `min_duration_min must be an integer` rather than raising. |
+| `limit` | integer | no | `50` | Max rows, **validated 1–500**. A non-int (including `true`, `50.0`) or out-of-range value is a hard error. |
 
 All filters are AND-ed. With no arguments at all the tool returns the 50 most
 recent activities of any type.
 
+**Distance is in miles now.** `min_distance_mi` was added in 0.37.0 because this
+is a miles-display app end to end: "runs over 5 miles" sent as
+`min_distance_km: 5` filtered at 5 km — 3.1 mi — and quietly returned a pile of
+short walks alongside the runs. `min_distance_km` still works so nothing breaks,
+but the native param is miles. Passing both is not an error; miles wins.
+
 ## Returns
 
-A JSON **array** (not an object) of workout rows, sorted `date DESC,
-start_time DESC`. Each row carries these columns straight from `activities`:
+An **object** — `{"workouts": [...], "count": n, "truncated": bool}`.
+
+> **Breaking change (0.37.0).** This used to be a bare JSON array. Anything that
+> indexed the result directly (`result[0]`) now needs `result["workouts"][0]`.
+
+| Key | Meaning |
+|---|---|
+| `workouts` | The rows, sorted `date DESC, start_time DESC`. At most `limit` of them. |
+| `count` | `len(workouts)` — what you got back, **not** how many matched. |
+| `truncated` | `true` when more rows matched than `limit` returned. |
+
+`truncated` comes from a `limit + 1` fetch: the tool asks SQLite for one row
+more than it intends to return, drops the extra, and reports its existence. So
+`truncated: false` is a real guarantee that you are looking at the complete
+match set, and `truncated: true` means re-ask with a bigger `limit` or a
+narrower filter before answering "that's all of them".
+
+Each row in `workouts` carries these columns straight from `activities`:
 
 `activity_id`, `date`, `activity_type`, `activity_name`, `duration_seconds`,
 `distance_meters`, `avg_hr`, `max_hr`, `avg_pace_sec_per_km`,
@@ -44,27 +67,31 @@ when it has a real value:
 | `duration_formatted` | `"M:SS"` under an hour, `"H:MM:SS"` at or over. |
 
 ```json
-[
-  {
-    "activity_id": 21044837291,
-    "date": "2026-07-19",
-    "activity_type": "running",
-    "activity_name": "Morning Run",
-    "duration_seconds": 3120,
-    "distance_meters": 9012.3,
-    "avg_hr": 141,
-    "max_hr": 163,
-    "avg_pace_sec_per_km": 346.2,
-    "elevation_gain_meters": 58.0,
-    "aerobic_te": 3.1,
-    "anaerobic_te": 0.2,
-    "training_load": 88.0,
-    "distance_mi": 5.6,
-    "pace_min_per_mi": "9:17",
-    "duration_formatted": "52:00"
-  },
-  …
-]
+{
+  "workouts": [
+    {
+      "activity_id": 21044837291,
+      "date": "2026-07-19",
+      "activity_type": "running",
+      "activity_name": "Morning Run",
+      "duration_seconds": 3120,
+      "distance_meters": 9012.3,
+      "avg_hr": 141,
+      "max_hr": 163,
+      "avg_pace_sec_per_km": 346.2,
+      "elevation_gain_meters": 58.0,
+      "aerobic_te": 3.1,
+      "anaerobic_te": 0.2,
+      "training_load": 88.0,
+      "distance_mi": 5.6,
+      "pace_min_per_mi": "9:17",
+      "duration_formatted": "52:00"
+    },
+    …
+  ],
+  "count": 12,
+  "truncated": false
+}
 ```
 
 The raw columns are never dropped in favour of the formatted ones —
@@ -79,13 +106,17 @@ The raw columns are never dropped in favour of the formatted ones —
 ```
 
 ```json
-[
-  {"activity_id": 21044837291, "date": "2026-07-19", "activity_type": "running",
-   "distance_mi": 5.6, "pace_min_per_mi": "9:17", "avg_hr": 141, "training_load": 88.0},
-  {"activity_id": 21038112004, "date": "2026-07-17", "activity_type": "treadmill_running",
-   "distance_mi": 1.4, "pace_min_per_mi": "22:41", "avg_hr": 92, "training_load": 9.0},
-  …
-]
+{
+  "workouts": [
+    {"activity_id": 21044837291, "date": "2026-07-19", "activity_type": "running",
+     "distance_mi": 5.6, "pace_min_per_mi": "9:17", "avg_hr": 141, "training_load": 88.0},
+    {"activity_id": 21038112004, "date": "2026-07-17", "activity_type": "treadmill_running",
+     "distance_mi": 1.4, "pace_min_per_mi": "22:41", "avg_hr": 92, "training_load": 9.0},
+    …
+  ],
+  "count": 6,
+  "truncated": false
+}
 ```
 
 Note the second row: a 22:41/mi "run" at 92 bpm is a walking-desk session, not a
@@ -108,15 +139,32 @@ run. See below.
 - **Windows are anchored to `date.today()`, not the data frontier.** If the last
   Garmin sync was three days ago, `days=7` really covers four days of data. Call
   `sync_garmin_data` first when freshness matters.
-- **Falsy arguments are silently ignored.** The handler tests `args.get(...)`
-  truthiness, so `days=0`, `min_distance_km=0`, `min_duration_min=0` and
-  `limit=0` all behave as "not supplied" (`limit=0` falls back to 50).
+- **Check `truncated` before saying "that's everything".** The default `limit`
+  is 50, so "show me all my runs this year" used to come back as a silently
+  clipped 50 rows that read exactly like a complete answer. The flag exists to
+  make that visible — treat `truncated: true` as "you have not seen the whole
+  set yet".
+- **`limit` is capped at 500, and `limit: -1` is now an error.** It used to
+  reach SQLite as `LIMIT -1`, which SQLite reads as *no limit* — an unbounded
+  dump of the whole `activities` table into model context. `limit: 0` errors
+  too (it used to fall back to 50). Both come back as
+  `limit must be between 1 and 500`; a non-integer gets
+  `limit must be an integer between 1 and 500`.
+- **Falsy `days` and `min_duration_min` are still silently ignored.** The
+  handler tests `args.get(...)` truthiness for those two, so `days=0` and
+  `min_duration_min=0` behave as "not supplied". `min_distance_mi`/
+  `min_distance_km` no longer do — an explicit `0` is honoured as a
+  `distance_meters >= 0` filter, which is a no-op but not a silent one.
 - **Manually-logged workouts are included and not labelled.** The `source`
   column isn't in the SELECT list, so the only tell that a row came from
   [`log_manual_workout`](log_manual_workout.md) is its **negative**
   `activity_id`.
-- `min_distance_km` / `min_duration_min` are coerced with bare `float()` /
-  `int()` — a non-numeric value raises rather than returning a clean tool error.
+- **Bad filter values return errors, not tracebacks.** A non-numeric
+  `min_distance_mi` / `min_distance_km` returns
+  `<param> must be a number`, a negative one `<param> must be non-negative`,
+  and a non-numeric `min_duration_min` returns
+  `min_duration_min must be an integer`. These used to be bare `float()` /
+  `int()` coercions that raised at the caller.
 
 ## See also
 

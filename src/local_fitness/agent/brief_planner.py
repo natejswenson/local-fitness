@@ -29,14 +29,19 @@ from .coach import CoachProfile, resolve_coach_profile
 from .schemas import BriefContext, CandidateTakeaway, GroundedValue, TakeawayMetric, Tone
 
 # --- one named threshold block (the prompt's tuning knobs, now testable) ---
-# Each maps to a line in agent/prompts.py:381-489. Tune here, not in prose.
+# Each maps to a line in the mandate sections of ``prompts.briefing_prompt()``
+# — the "# Workout mandate" / "# Steps mandate" / "# Conditioning mandate" /
+# "# HR & recovery mandate" headings in its returned prose. Tune here, not in
+# prose. (Anchors are heading text, not line numbers: line numbers rot.)
 _TRIGGERS = {
-    # Conditioning mandate (prompts.py:398-430)
+    # briefing_prompt, "# Conditioning mandate": "Include a conditioning
+    # takeaway when ANY of these are true"
     "ctl_change_pct": 5.0,       # CTL moved >5% over 14d (up or down)
     "run_count_delta": 3,        # 14d run count materially != prior 14d (|Δ| ≥ 3)
     "run_gap_days": 5,           # 5+ days since the last run
     "te_collapse": 1.0,          # recent runs all "filler" (aerobic TE < 1.0)
-    # HR & recovery mandate (prompts.py:443-478)
+    # briefing_prompt, "# HR & recovery mandate": "Include an HR/recovery
+    # takeaway when the picture should change what {user_name} does today"
     "rhr_elevated_bpm": 3,       # RHR ≥ 3 bpm above baseline ...
     "rhr_elevated_days": 3,      # ... for 3+ days
     "sleep_score_low": 65,       # sleep score under 65
@@ -50,7 +55,8 @@ _TRIGGERS = {
     "tsb_very_fatigued": interpret.TSB_VERY_FATIGUED,  # TSB < -20 = very fatigued
 }
 
-# Fixed priority — the prompt's order (prompts.py:251-271). Lower = earlier.
+# Fixed priority — the prompt's order: briefing_prompt's numbered list under
+# "# Step 2 — focus areas (priority order)". Lower = earlier.
 _PRIORITY = {"workout": 0, "steps": 1, "conditioning": 2, "recovery": 3, "wildcard": 4}
 
 _LOOKBACK_DAYS = 14
@@ -101,7 +107,7 @@ class Signals:
     days_to_race: int | None = None
 
 
-# --- conditioning predicates (prompts.py:398-430) --------------------------
+# --- conditioning predicates (briefing_prompt, "# Conditioning mandate") ---
 def ctl_shifted(ctl_pct_change_14d: float | None) -> bool:
     """CTL has changed more than ±5% in the last 14 days."""
     return ctl_pct_change_14d is not None and abs(ctl_pct_change_14d) > _TRIGGERS["ctl_change_pct"]
@@ -131,7 +137,7 @@ def conditioning_fires(sig: Signals) -> bool:
     )
 
 
-# --- recovery predicates (prompts.py:443-478) ------------------------------
+# --- recovery predicates (briefing_prompt, "# HR & recovery mandate") ------
 def rhr_elevated(rhr_today: float | None, baseline_mean: float | None, days_elevated: int) -> bool:
     """RHR ≥ 3 bpm above baseline AND has been for 3+ days."""
     if rhr_today is None or baseline_mean is None:
@@ -185,7 +191,8 @@ def recovery_fires(sig: Signals) -> bool:
 
 def recovery_all_green(sig: Signals) -> bool:
     """All recovery signals green AND nothing else flagged → roll into workout,
-    do NOT write a standalone 'you're fine' card (prompts.py:475-478)."""
+    do NOT write a standalone 'you're fine' card (briefing_prompt, "# HR &
+    recovery mandate": 'DO NOT write a standalone "you're fine" takeaway')."""
     return rhr_green(sig.rhr_today, sig.rhr_baseline_mean, sig.sleep_score_today, sig.stress_7d_avg) \
         and not rhr_elevated(sig.rhr_today, sig.rhr_baseline_mean, sig.rhr_days_elevated) \
         and not sleep_poor(sig.sleep_today_seconds, sig.sleep_baseline_mean, sig.sleep_score_today) \
@@ -193,7 +200,8 @@ def recovery_all_green(sig: Signals) -> bool:
         and not recovery_anomaly(sig.anomalies)
 
 
-# --- advisory tone (prompts.py:308-478) — generator may override -----------
+# --- advisory tone (the "Tone rules" branch lists under each briefing_prompt
+# mandate heading) — generator may override -----------------------------------
 def _mv(metrics: list[GroundedValue], name: str, default: float | None = None) -> float | None:
     for m in metrics:
         if m.name == name:
@@ -202,7 +210,8 @@ def _mv(metrics: list[GroundedValue], name: str, default: float | None = None) -
 
 
 def _workout_tone(metrics: list[GroundedValue]) -> Tone:
-    """Workout tone branches (prompts.py:308-345)."""
+    """Workout tone branches (briefing_prompt, "# Workout mandate" →
+    "Tone rules — pick based on what the data actually says")."""
     tsb = _mv(metrics, "tsb")
     ctl_pct = _mv(metrics, "ctl_pct_change_14d")
     days_since_run = _mv(metrics, "days_since_last_run")
@@ -215,15 +224,19 @@ def _workout_tone(metrics: list[GroundedValue]) -> Tone:
     if (ctl_pct is not None and ctl_pct < -_TRIGGERS["ctl_change_pct"]) and \
             (days_since_run is not None and days_since_run >= _TRIGGERS["run_gap_days"]):
         return "critical"
-    # Fresh OR recovery-green light → celebrate, push (prompts.py:310-316: a green
-    # light is driven by recovery being clear, not TSB alone).
+    # Fresh OR recovery-green light → celebrate, push (briefing_prompt's
+    # "Celebrate the green light" branch: a green light is driven by recovery
+    # being clear — "RHR is right at baseline, body battery topped out at 82" —
+    # not TSB alone).
     if (tsb is not None and tsb > _TRIGGERS["tsb_fresh"]) or rhr_green_flag:
         return "positive"
     return "neutral"
 
 
 def _conditioning_tone(metrics: list[GroundedValue]) -> Tone:
-    """Conditioning tone branches (prompts.py:410-430)."""
+    """Conditioning tone branches (briefing_prompt, "# Conditioning mandate" →
+    the "Tone rules" list: "Trending up" / "Stalled" / "Sliding" / "Long
+    absence")."""
     ctl_pct = _mv(metrics, "ctl_pct_change_14d")
     days_since_run = _mv(metrics, "days_since_last_run")
     if days_since_run is not None and days_since_run >= _TRIGGERS["run_gap_days"]:
@@ -236,7 +249,9 @@ def _conditioning_tone(metrics: list[GroundedValue]) -> Tone:
 
 
 def _recovery_tone(metrics: list[GroundedValue]) -> Tone:
-    """Recovery tone branches (prompts.py:448-478)."""
+    """Recovery tone branches (briefing_prompt, "# HR & recovery mandate" →
+    the bulleted signal list starting "RHR 3+ bpm above baseline for 3+
+    days")."""
     rhr_delta = _mv(metrics, "rhr_delta_bpm")
     days_elevated = _mv(metrics, "rhr_days_elevated", 0) or 0
     sleep_score = _mv(metrics, "sleep_score")
@@ -259,7 +274,9 @@ def _recovery_tone(metrics: list[GroundedValue]) -> Tone:
 
 
 def _steps_tone(frac_of_goal: float, avg_frac_of_goal: float, includes_harsh: bool) -> Tone:
-    """Steps tone branches (prompts.py:386-394 + the harsh/soft missed block)."""
+    """Steps tone branches (briefing_prompt, "# Steps mandate" — the
+    "Yesterday hit goal ..." branches plus the `{steps_missed_block}`
+    harsh/soft substitution)."""
     if frac_of_goal >= 1.0:
         return "positive" if avg_frac_of_goal >= 1.0 else "caution"
     # Missed goal: harshness gate decides critical vs caution (coach.includes_harsh_block).

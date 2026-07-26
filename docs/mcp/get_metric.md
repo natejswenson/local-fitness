@@ -1,20 +1,28 @@
 # `get_metric`
 
-> Raw daily values for one metric over the last N days, oldest-first. **Availability:** stdio + HTTP
+> Raw daily values for one metric over the last N days, oldest-first, with the 60-day baseline attached. **Availability:** stdio + HTTP
 
 ## What it does
 
-The rawest read in the surface: one column out of `daily_metrics` over a window,
-with no interpretation attached. Reach for it when you need the actual series —
-to eyeball specific days or feed the numbers into your own arithmetic. Days
-with no reading are dropped and reported as a `days_with_data` vs `days_window`
-count, so a sparse metric doesn't pad the payload with null rows.
+The rawest read in the surface: one column out of `daily_metrics` over a window.
+Reach for it when you need the actual series — to eyeball specific days or feed
+the numbers into your own arithmetic. Days with no reading are dropped and
+reported as a `days_with_data` vs `days_window` count, so a sparse metric
+doesn't pad the payload with null rows.
 
-When *not* to use it: if the question is "is this going up or down / is today
-normal", call [`get_metric_trend`](get_metric_trend.md) instead — it returns the
-slope, the baseline distance, and the deterministic `slope_direction` /
-`vs_baseline` classifications rather than making you derive them. If the question
-is visual, call [`chart`](chart.md) or [`generate_chart`](generate_chart.md).
+Since 0.37.0 the raw series no longer travels alone: for `rhr` and
+`sleep_seconds` the payload carries the 60-day baseline and the latest value's
+signed distance from it, and every payload carries a `vs_baseline` read. That is
+the same interpretation [`get_metric_trend`](get_metric_trend.md) attaches,
+mirrored exactly — the house rule is that deterministic interpretation rides
+along with the numbers, and without it "is 52 high?" cost a second tool call
+against the sibling.
+
+When *not* to use it: if the question is "is this going up or down", call
+`get_metric_trend` instead — it adds the least-squares slope and the
+`slope_direction` classification, which this tool does not compute. If the
+question is visual, call [`chart`](chart.md) or
+[`generate_chart`](generate_chart.md).
 
 ## Parameters
 
@@ -33,10 +41,25 @@ Allowed `metric` values (`tools.DAILY_NUMERIC_METRICS`):
 
 ## Returns
 
-An object: the metric, the requested window, a `days_with_data` count, and a
-`values` array of `{date, value}` objects sorted oldest-first. Days with no
-reading (NULL) are dropped, so `days_with_data` vs `days_window` tells you how
-much of the window actually had data. No mean, baseline, or interpretation.
+An object: the metric, the requested window, a `days_with_data` count, a
+`values` array of `{date, value}` objects sorted oldest-first, and the baseline
+block. Days with no reading (NULL) are dropped, so `days_with_data` vs
+`days_window` tells you how much of the window actually had data. Still no mean
+and no slope — for those, use `get_metric_trend`.
+
+| Key | Meaning |
+|---|---|
+| `metric`, `days_window` | Echo of the inputs. |
+| `days_with_data` | `len(values)` — rows that actually had a reading. |
+| `values` | `{date, value}` oldest-first, plus `value_formatted` on duration metrics. |
+| `baseline_60day_mean` | 60-day mean from the newest `baselines` row that has one. **`rhr` / `sleep_seconds` only**, and only when the window returned at least one value. |
+| `baseline_60day_sd` | Its standard deviation. Same two metrics, same condition. |
+| `current_vs_baseline_sd` | `(last value - baseline_mean) / baseline_sd`, rounded to 2. Omitted when the SD is 0 or absent. |
+| `vs_baseline` | `interpret.baseline_position` — `elevated` (> +1 SD), `suppressed` (< -1 SD), `normal`, or `no data`. **Always present.** |
+
+The bands are strict: exactly ±1.0 SD reads as `normal`. `current_vs_baseline_sd`
+is measured against the **last** entry in `values` — the most recent reading in
+the window, which is not necessarily today if the metric was missing yesterday.
 
 ```json
 {
@@ -48,7 +71,24 @@ much of the window actually had data. No mean, baseline, or interpretation.
     {"date": "2026-07-17", "value": 55},
     "…",
     {"date": "2026-07-21", "value": 54}
-  ]
+  ],
+  "baseline_60day_mean": 51.2,
+  "baseline_60day_sd": 2.9,
+  "current_vs_baseline_sd": 0.97,
+  "vs_baseline": "normal"
+}
+```
+
+For a metric with no baseline columns, the three numeric fields are absent and
+`vs_baseline` still comes back — as `"no data"`:
+
+```json
+{
+  "metric": "steps",
+  "days_window": 7,
+  "days_with_data": 7,
+  "values": ["…"],
+  "vs_baseline": "no data"
 }
 ```
 
@@ -97,9 +137,16 @@ get_metric(metric="rhr", days=7)
     {"date": "2026-07-19", "value": 59},
     {"date": "2026-07-20", "value": 54},
     {"date": "2026-07-21", "value": 54}
-  ]
+  ],
+  "baseline_60day_mean": 51.2,
+  "baseline_60day_sd": 2.9,
+  "current_vs_baseline_sd": 0.97,
+  "vs_baseline": "normal"
 }
 ```
+
+Seven readings, the latest one about 1 SD above the 60-day mean — inside the
+normal band. Phrase `vs_baseline`; don't re-derive it from the 54.
 
 ## Gotchas
 
@@ -119,13 +166,22 @@ get_metric(metric="rhr", days=7)
   companion.** `sleep_seconds` rows include `value_formatted` (`"7h 33m"`) —
   speak that, never the raw `25200`. Non-duration metrics have no
   `value_formatted`; their raw value is already speakable.
-- **No baseline context.** "54" means nothing without the 60-day mean; pair this
-  with [`daily_snapshot`](daily_snapshot.md) or use `get_metric_trend`, which
-  attaches the baseline for `rhr` and `sleep_seconds`.
+- **`vs_baseline: "no data"` is a missing-baseline signal, not "unremarkable".**
+  It is what you get for the 16 metrics with no `*_60day_mean` column in
+  `baselines`, and also for an empty window or a zero SD. Only `rhr` and
+  `sleep_seconds` (`tools.BASELINE_METRICS`) can ever return a real band.
+- **The baseline is the newest one on file, not the one from the window's end.**
+  It is a single `ORDER BY date DESC LIMIT 1` read, so a long window's values are
+  compared against today's baseline rather than each day's own. That is the
+  opposite of [`find_anomalies`](find_anomalies.md), which joins each day to its
+  own rolling baseline.
+- **Still no mean and no slope.** The baseline block answers "is the latest
+  reading normal", not "is this drifting". `get_metric_trend` is the one that
+  fits a line.
 
 ## See also
 
-- [`get_metric_trend`](get_metric_trend.md) — mean, slope, baseline distance, and the classifications.
+- [`get_metric_trend`](get_metric_trend.md) — the same baseline block plus the mean, the least-squares slope, and `slope_direction`.
 - [`chart`](chart.md) — a terminal chart of the same series.
 - [`daily_snapshot`](daily_snapshot.md) — today's value with its baseline delta.
 - [`training_load_status`](training_load_status.md) — for `ctl` / `atl` / `tsb`.

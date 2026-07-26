@@ -74,7 +74,7 @@ Three tools overlap here; the distinction is on each page.
 
 | Tool | Use it for |
 |---|---|
-| [`query_workouts`](query_workouts.md) | List/filter sessions |
+| [`query_workouts`](query_workouts.md) | List/filter sessions — returns `{workouts, count, truncated}` |
 | [`get_workout_detail`](get_workout_detail.md) | One session in full, including splits where they exist |
 | [`workout_report_card`](workout_report_card.md) | 📄 **Graded** report card for one session — letters, not adjectives |
 | [`log_manual_workout`](log_manual_workout.md) | ✍️ Record a non-Garmin session (feeds CTL/ATL/TSB) |
@@ -182,8 +182,23 @@ payloads rather than leaving the model to apply a legend by hand. The rule is
 repo-wide: **the LLM phrases a judgment, it never derives one tested Python can
 compute.**
 
-**Display units are miles.** Distances and pace render as `mi` and `min/mi`
-alongside the raw SI values (`LOCAL_FITNESS_DISPLAY_UNITS`).
+**Display units are miles — on the way in as well as out.** Distances and pace
+render as `mi` and `min/mi` alongside the raw SI values
+(`LOCAL_FITNESS_DISPLAY_UNITS`), and distance *filters* take miles too:
+[`query_workouts`](query_workouts.md) and
+[`recovery_pattern`](recovery_pattern.md) grew `min_distance_mi` in 0.37.0, with
+`min_distance_km` kept as a deprecated alias (miles wins if both are given).
+
+**Lists say when they were clipped.** Every tool with a `limit` fetches one row
+past it and signals `truncated` when more matched —
+[`query_workouts`](query_workouts.md),
+[`list_observations`](list_observations.md), `list_coach_memories`,
+`list_report_cards`, and [`run_sql`](run_sql.md) at its 500-row cap. Never
+answer "that's all of them" without checking it. Note the two shapes:
+`query_workouts`, `list_coach_memories` and `list_report_cards` always carry the
+key (`true` or `false`), while `list_observations` and `run_sql` add it **only
+when clipped**,
+so its absence there is the complete-set signal.
 
 **Charts render in the reply.** When a tool produces a chart, paste the full
 output into the message in a fenced code block. A chart left in a collapsed tool

@@ -763,3 +763,37 @@ def test_plan_workouts_duplicate_day_rejected_by_db(seeded):
             conn.execute(
                 "INSERT INTO plan_workouts (plan_id, date, seq, week_index, type, description) "
                 "VALUES (?, ?, 1, 1, 'easy', 'dupe')", (pid, d))
+
+
+def test_update_plan_workout_pace_accepts_mss_and_number_disagrees(seeded):
+    """0.37.0, THE 9.39 != "9:39" trap pinned at the tool boundary: the
+    string form is the display format; a bare number is DECIMAL minutes."""
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": d, "pace_min_per_mi": "9:39"})
+    assert not err
+    assert body["pace_min_per_mi"] == "9:39"  # echo round-trips the string
+    with db.connect(seeded) as conn:
+        stored = conn.execute(
+            "SELECT target_pace_sec_per_km FROM plan_workouts WHERE date=?", (d,)
+        ).fetchone()[0]
+    assert stored == pytest.approx(579.0 / 1.609344)
+
+    body2, err2 = call(tools.update_plan_workout, {"date": d, "pace_min_per_mi": 9.39})
+    assert not err2
+    assert body2["pace_min_per_mi"] == "9:23"  # decimal minutes — NOT 9:39
+
+
+def test_update_plan_workout_pace_rejects_garbage_and_implausible(seeded):
+    d = _active_plan(seeded)
+    for bad, frag in (("9:75", 'must be "M:SS"'), ("abc", 'must be "M:SS"'),
+                      (-2, 'must be "M:SS"'), (45.0, "outside the plausible"),
+                      (1.0, "outside the plausible")):
+        body, err = call(tools.update_plan_workout, {"date": d, "pace_min_per_mi": bad})
+        assert err, bad
+        assert frag in body["error"], (bad, body["error"])
+
+
+def test_update_plan_workout_rejects_impossible_calendar_date(seeded):
+    _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": "2026-02-30", "type": "easy"})
+    assert err and "must be a valid YYYY-MM-DD" in body["error"]

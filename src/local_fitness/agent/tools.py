@@ -156,6 +156,46 @@ def _validate_days(value: Any, name: str = "days", *, lo: int = 1, hi: int = 365
     return None
 
 
+def _validation_error_summary(e: "ValidationError") -> str:
+    """A pydantic ValidationError as compact ``loc: msg`` pairs.
+
+    The full repr is multi-line, carries a docs URL, and buries the two
+    fields that actually failed — the model needs ``takeaways.0.tone:
+    Input should be ...``, nothing else."""
+    try:
+        pairs = [
+            f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}"
+            for err in e.errors()
+        ]
+        return "; ".join(pairs) or str(e)
+    except Exception:
+        return str(e)
+
+
+def _validate_date(value: Any, name: str = "date") -> str | None:
+    """Validate a user-supplied ISO date; error string or ``None`` when valid.
+
+    ``date.fromisoformat``, not a shape regex: the retired ``_DATE_RE``
+    accepted ``2026-13-45`` and ``2026-02-30`` — impossible dates that then
+    hit SQL as strings and matched nothing, indistinguishable from a real
+    empty window. One helper, one message, replacing the two idioms
+    (regex + "malformed date" vs try/except + "invalid date") that had grown
+    side by side in this module. Mirrors ``_validate_days``' return contract.
+    """
+    if not isinstance(value, str):
+        return f"{name} must be a YYYY-MM-DD date string"
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return f"{name} must be a valid YYYY-MM-DD date (got {value!r})"
+    # fromisoformat also accepts e.g. "2026-07-26T10:00" on newer Pythons and
+    # compact forms like "20260726"; hold the tool surface to the one shape
+    # every date column stores.
+    if len(value) != 10:
+        return f"{name} must be a valid YYYY-MM-DD date (got {value!r})"
+    return None
+
+
 def _augment_workout(w: dict) -> dict:
     """Attach mile / formatted convenience fields ALONGSIDE the raw columns.
 
@@ -231,6 +271,17 @@ async def get_metric(args: dict) -> dict:
             f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date",
             (cutoff,),
         ).fetchall()
+        # Same latest-baseline fetch as get_metric_trend (mirrored exactly):
+        # without it, "is 52 high?" on a raw-values payload needed a second
+        # tool call — the sibling attaches the read, this one didn't (the
+        # interpret.py house rule: deterministic interpretation rides along).
+        baseline = None
+        if metric in BASELINE_METRICS:
+            baseline = conn.execute(
+                f"SELECT {metric}_60day_mean AS m, {metric}_60day_sd AS sd "
+                f"FROM baselines WHERE {metric}_60day_mean IS NOT NULL "
+                f"ORDER BY date DESC LIMIT 1"
+            ).fetchone()
     # Formatted companion for duration-shaped metrics — the coach voice never
     # speaks raw seconds ("25200 seconds"); attach the "7h 33m" shape at the
     # payload boundary, same discipline get_metric_trend/compare_periods follow.
@@ -243,12 +294,24 @@ async def get_metric(args: dict) -> dict:
             if formatted is not None:
                 row["value_formatted"] = formatted
         values.append(row)
-    return _text({
+    payload = {
         "metric": metric,
         "days_window": days,
         "days_with_data": len(values),
         "values": values,
-    })
+    }
+    current_vs_baseline_sd = None
+    if values and baseline and baseline["m"] is not None:
+        payload["baseline_60day_mean"] = baseline["m"]
+        payload["baseline_60day_sd"] = baseline["sd"]
+        if baseline["sd"]:
+            current_vs_baseline_sd = round(
+                (values[-1]["value"] - baseline["m"]) / baseline["sd"], 2)
+            payload["current_vs_baseline_sd"] = current_vs_baseline_sd
+    # ALWAYS attached, mirroring get_metric_trend: "no data" whenever the SD
+    # distance is unavailable (non-baselined metric, empty window, zero SD).
+    payload["vs_baseline"] = interpret.baseline_position(current_vs_baseline_sd)
+    return _text(payload)
 
 
 @tool(
@@ -658,17 +721,58 @@ _QUERY_WORKOUTS_SCHEMA = {
     "properties": {
         "activity_type": {"type": "string", "description": "Substring match, e.g. 'running'"},
         "days": {"type": "integer", "description": "Look back this many days"},
-        "min_distance_km": {"type": "number"},
+        "min_distance_mi": {"type": "number", "description": "Minimum distance in MILES (the app's display unit)"},
+        "min_distance_km": {"type": "number", "description": "(deprecated — use min_distance_mi; mi wins if both given)"},
         "min_duration_min": {"type": "integer"},
-        "limit": {"type": "integer", "description": "Max rows, default 50"},
+        "limit": {"type": "integer", "description": "Max rows 1-500, default 50"},
     },
     "required": [],
 }
 
 
+def _min_distance_meters(args: dict) -> float | None | str:
+    """Resolve the min-distance filter to meters, or an error string.
+
+    ``min_distance_mi`` is the native param (this is a miles-display app —
+    "runs over 5 miles" sent as ``min_distance_km: 5`` silently filtered at
+    5 km); ``min_distance_km`` stays accepted as a deprecated alias, miles
+    winning when both are given. Non-numeric values error instead of raising
+    a raw ValueError at the user."""
+    for key, to_meters in (("min_distance_mi", units.from_miles),
+                           ("min_distance_km", lambda v: v * 1000.0)):
+        raw = args.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return f"{key} must be a number"
+        if value < 0:
+            return f"{key} must be non-negative"
+        return to_meters(value)
+    return None
+
+
+def _validate_limit(args: dict, *, default: int = 50, hi: int = 500) -> int | str:
+    """A positive bounded row limit, or an error string. ``limit: -1``
+    previously reached SQLite as ``LIMIT -1`` — which means NO limit, an
+    unbounded table dump into model context; non-numeric raised raw."""
+    raw = args.get("limit")
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return f"limit must be an integer between 1 and {hi}"
+    if not (1 <= raw <= hi):
+        return f"limit must be between 1 and {hi}"
+    return raw
+
+
 @tool(
     "query_workouts",
-    "List workouts with optional filters (activity_type substring, days lookback, distance/duration mins). Returns most recent first.",
+    "List workouts with optional filters (activity_type substring, days "
+    "lookback, min distance in miles, min duration). Returns "
+    "{workouts, count, truncated} — most recent first; truncated=true means "
+    "more rows matched than the limit returned.",
     _QUERY_WORKOUTS_SCHEMA,
 )
 async def query_workouts(args: dict) -> dict:
@@ -683,23 +787,37 @@ async def query_workouts(args: dict) -> dict:
             return _err(err)
         where.append("date >= ?")
         params.append((date.today() - timedelta(days=args["days"])).isoformat())
-    if args.get("min_distance_km"):
+    min_meters = _min_distance_meters(args)
+    if isinstance(min_meters, str):
+        return _err(min_meters)
+    if min_meters is not None:
         where.append("distance_meters >= ?")
-        params.append(float(args["min_distance_km"]) * 1000)
+        params.append(min_meters)
     if args.get("min_duration_min"):
+        try:
+            min_duration = int(args["min_duration_min"])
+        except (TypeError, ValueError):
+            return _err("min_duration_min must be an integer")
         where.append("duration_seconds >= ?")
-        params.append(int(args["min_duration_min"]) * 60)
+        params.append(min_duration * 60)
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-    limit = int(args.get("limit") or 50)
+    limit = _validate_limit(args)
+    if isinstance(limit, str):
+        return _err(limit)
     with db.connect() as conn:
+        # limit+1 fetch: the extra row is the truncation signal (the
+        # list_observations pattern) — without it "show me all my runs this
+        # year" silently answered from a clipped 50.
         rows = conn.execute(
             f"""SELECT activity_id, date, activity_type, activity_name, duration_seconds,
                        distance_meters, avg_hr, max_hr, avg_pace_sec_per_km,
                        elevation_gain_meters, aerobic_te, anaerobic_te, training_load
                 FROM activities {where_sql} ORDER BY date DESC, start_time DESC LIMIT ?""",
-            (*params, limit),
+            (*params, limit + 1),
         ).fetchall()
-    return _text([_augment_workout(dict(r)) for r in rows])
+    truncated = len(rows) > limit
+    workouts = [_augment_workout(dict(r)) for r in rows[:limit]]
+    return _text({"workouts": workouts, "count": len(workouts), "truncated": truncated})
 
 
 @tool(
@@ -800,6 +918,18 @@ def _compare_periods_sum(conn, metric: str, args: dict) -> dict:
     },
 )
 async def compare_periods(args: dict) -> dict:
+    # Validate all four dates + ordering BEFORE any query: a malformed or
+    # reversed range compares as strings in SQL and returns {"n": 0} —
+    # indistinguishable from a genuinely empty window, so the model reads
+    # "no data" where the truth is "bad input".
+    for field in ("period_a_start", "period_a_end", "period_b_start", "period_b_end"):
+        if msg := _validate_date(args.get(field), field):
+            return _err(msg)
+    for label in ("a", "b"):
+        if args[f"period_{label}_start"] > args[f"period_{label}_end"]:
+            return _err(
+                f"period_{label}_start must be on or before period_{label}_end "
+                f"(got {args[f'period_{label}_start']} > {args[f'period_{label}_end']})")
     metric = args["metric"]
     if metric in _COMPARE_SUM_METRICS:
         with db.connect() as conn:
@@ -880,7 +1010,17 @@ async def find_anomalies(args: dict) -> dict:
     err = _validate_days(days, name="lookback_days")
     if err:
         return _err(err)
-    threshold = float(args.get("sd_threshold") or 2.0)
+    raw_threshold = args.get("sd_threshold")
+    try:
+        # None → default. `or` would also default an EXPLICIT 0 — which must
+        # error (0 marks every day an anomaly), not silently become 2.0.
+        threshold = 2.0 if raw_threshold is None else float(raw_threshold)
+    except (TypeError, ValueError):
+        return _err("sd_threshold must be a number between 0.5 and 10")
+    # Bounded: 0 or negative marks EVERY day an anomaly; a huge value is a
+    # silent no-op. Both read as data problems rather than input problems.
+    if not (0.5 <= threshold <= 10):
+        return _err("sd_threshold must be between 0.5 and 10")
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     with db.connect() as conn:
         rows = conn.execute(
@@ -1019,7 +1159,12 @@ async def sync_garmin_data(_args: dict) -> dict:
 
 @tool(
     "training_load_status",
-    "Current CTL/ATL/TSB plus 30-day history. TSB > 5 fresh, -10..5 neutral, < -10 fatigued, < -20 very fatigued.",
+    # Band prose is BUILT from the interpret constants so the description can
+    # never drift from the classifier actually attached to the payload (the
+    # identical duplication was already removed from correlate's legend once).
+    f"Current CTL/ATL/TSB plus 30-day history. TSB > {interpret.TSB_FRESH:g} fresh, "
+    f"{interpret.TSB_FATIGUED:g}..{interpret.TSB_FRESH:g} neutral, "
+    f"< {interpret.TSB_FATIGUED:g} fatigued, < {interpret.TSB_VERY_FATIGUED:g} very fatigued.",
     {},
 )
 async def training_load_status(_args: dict) -> dict:
@@ -1148,7 +1293,8 @@ _RECOVERY_SCHEMA = {
     "type": "object",
     "properties": {
         "activity_type": {"type": "string"},
-        "min_distance_km": {"type": "number"},
+        "min_distance_mi": {"type": "number", "description": "Minimum distance in MILES"},
+        "min_distance_km": {"type": "number", "description": "(deprecated — use min_distance_mi)"},
         "min_duration_min": {"type": "integer"},
         "lookback_days": {"type": "integer", "description": "Default 365"},
     },
@@ -1167,9 +1313,12 @@ async def recovery_pattern(args: dict) -> dict:
     if args.get("activity_type"):
         where.append("activity_type LIKE ?")
         params.append(f"%{args['activity_type']}%")
-    if args.get("min_distance_km"):
+    min_meters = _min_distance_meters(args)
+    if isinstance(min_meters, str):
+        return _err(min_meters)
+    if min_meters is not None:
         where.append("distance_meters >= ?")
-        params.append(float(args["min_distance_km"]) * 1000)
+        params.append(min_meters)
     if args.get("min_duration_min"):
         where.append("duration_seconds >= ?")
         params.append(int(args["min_duration_min"]) * 60)
@@ -1327,19 +1476,22 @@ async def run_sql(args: dict) -> dict:
         rows = await asyncio.to_thread(_run_sql_blocking, q)
     except sqlite3.OperationalError as e:
         # "interrupted" is the deadline abort; "readonly database" is a write
-        # attempt that slipped past the denylist. Don't leak the raw string —
-        # OperationalError is also what a mistyped table/column raises, so
-        # this branch (not the generic sqlite3.Error one) carries the
-        # schema-resource pointer.
+        # attempt that slipped past the denylist.
         if "interrupt" in str(e).lower():
             return _err("query exceeded time budget")
+        # The sqlite message IS included (0.37.0 — a deliberate reversal of
+        # the earlier "don't leak the raw string" stance): the query was
+        # authored by the MODEL, so "no such column: sleep_hours" leaks only
+        # the model's own typo and is the entire signal needed for a one-shot
+        # correction. The read-only URI gate means no write-channel detail
+        # can appear here. Withholding it produced blind same-shape retries.
         return _err(
-            "query failed: invalid query — check table/column names "
+            f"query failed: {e} — check table/column names "
             "against the fitness://schema resource"
         )
-    except sqlite3.Error:
+    except sqlite3.Error as e:
         return _err(
-            "query failed: invalid query — check table/column names "
+            f"query failed: {e} — check table/column names "
             "against the fitness://schema resource"
         )
     if len(rows) > _RUN_SQL_ROW_CAP:
@@ -1465,8 +1617,8 @@ async def delete_user_note(args: dict) -> dict:
 async def save_coach_memory(args: dict) -> dict:
     text = (args.get("text") or "").strip()
     entry_date = args.get("date")
-    if entry_date is not None and not _DATE_RE.match(str(entry_date)):
-        return _err(f"malformed date '{entry_date}', expected YYYY-MM-DD")
+    if entry_date is not None and (msg := _validate_date(entry_date)):
+        return _err(msg)
     try:
         entry = journal.save_entry(text, source="chat", entry_date=entry_date)
     except ValueError as e:
@@ -1512,9 +1664,12 @@ async def list_coach_memories(args: dict) -> dict:
     if not isinstance(limit, int) or limit <= 0:
         return _err("limit must be a positive integer")
     cap = 200 if include_archived else journal.JOURNAL_CAP
+    effective = min(limit, cap)
     entries = journal.list_entries(
-        days=days, limit=min(limit, cap), include_archived=include_archived)
-    return _text({"memories": entries, "count": len(entries)})
+        days=days, limit=effective + 1, include_archived=include_archived)
+    truncated = len(entries) > effective
+    entries = entries[:effective]
+    return _text({"memories": entries, "count": len(entries), "truncated": truncated})
 
 
 @tool(
@@ -1813,10 +1968,9 @@ async def log_observation(args: dict) -> dict:
     # Validate the user-supplied date BEFORE any write — mirror log_manual_workout.
     # A malformed string sorts wrong; a future date is silently excluded from the
     # days-filtered list_observations lookback.
-    try:
-        parsed_date = date.fromisoformat(observed_on)
-    except ValueError:
-        return _err(f"invalid date '{observed_on}', expected YYYY-MM-DD")
+    if msg := _validate_date(observed_on):
+        return _err(msg)
+    parsed_date = date.fromisoformat(observed_on)
     if parsed_date > date.today():
         return _err("date cannot be in the future")
     created_at = datetime.now().isoformat()
@@ -1945,10 +2099,9 @@ async def log_manual_workout(args: dict) -> dict:
     workout_date = args.get("date") or date.today().isoformat()
     # Validate the user-supplied date BEFORE any write — a malformed string must
     # not commit the activity row and then raise in the post-insert lookback.
-    try:
-        parsed_date = date.fromisoformat(workout_date)
-    except ValueError:
-        return _err(f"invalid date '{workout_date}', expected YYYY-MM-DD")
+    if msg := _validate_date(workout_date):
+        return _err(msg)
+    parsed_date = date.fromisoformat(workout_date)
     # A non-positive duration would store garbage duration_seconds; reject it
     # before any write.
     try:
@@ -2219,7 +2372,13 @@ _UPDATE_WORKOUT_SCHEMA = {
         "date": {"type": "string", "description": "ISO YYYY-MM-DD of the day to re-prescribe in the ACTIVE plan"},
         "type": {"type": "string", "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"]},
         "distance_mi": {"type": "number", "description": "target distance in miles (omit for rest / by-feel)"},
-        "pace_min_per_mi": {"type": "number", "description": "target pace in min/mi, e.g. 9.65 for 9:39/mi"},
+        "pace_min_per_mi": {
+            "type": ["string", "number"],
+            "description": 'target pace per mile as "M:SS" (e.g. "9:39" — '
+                           "preferred). A bare number is DECIMAL minutes: "
+                           "9.65 is 9:39/mi, while 9.39 is 9:23/mi — do not "
+                           "copy a display string as a number.",
+        },
         "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
         "description": {"type": "string", "description": "prose prescription for the day"},
         "seq": {"type": "integer", "description": "intra-day session on a double day: 1 = first/AM (default), 2 = second/PM"},
@@ -2240,10 +2399,8 @@ _UPDATE_WORKOUT_SCHEMA = {
 )
 async def update_plan_workout(args: dict) -> dict:
     date_str = args.get("date")
-    try:
-        date.fromisoformat(date_str)
-    except (ValueError, TypeError):
-        return _err("date must be ISO YYYY-MM-DD")
+    if msg := _validate_date(date_str):
+        return _err(msg)
 
     fields: dict = {}
     wtype = args.get("type")
@@ -2252,10 +2409,24 @@ async def update_plan_workout(args: dict) -> dict:
             return _err(f"unknown type '{wtype}'", allowed=sorted(plans.WORKOUT_TYPES))
         fields["type"] = wtype
     if args.get("distance_mi") is not None:
-        fields["target_distance_m"] = float(args["distance_mi"]) * 1609.344
+        fields["target_distance_m"] = units.from_miles(float(args["distance_mi"]))
     if args.get("pace_min_per_mi") is not None:
-        # min/mi → sec/km: minutes*60 sec/mi, then /1.609344 km-per-mile.
-        fields["target_pace_sec_per_km"] = float(args["pace_min_per_mi"]) * 60.0 / 1.609344
+        # "M:SS" string (preferred, round-trips the app's own display format)
+        # or decimal minutes. The parse exists because a model copying the
+        # display string "9:39" as the float 9.39 silently prescribed
+        # 9:23/mi — a 16 s/mi error invisible in the echo.
+        sec_per_mi = units.parse_pace_min_per_mi(args["pace_min_per_mi"])
+        if sec_per_mi is None:
+            return _err(
+                'pace_min_per_mi must be "M:SS" (e.g. "9:39") or decimal '
+                "minutes (9.65 = 9:39/mi)")
+        # Sanity bound: 3:00–30:00/mi. Catches transposed args and
+        # unit-confused numbers before they land on the active plan.
+        if not (180.0 <= sec_per_mi <= 1800.0):
+            return _err(
+                f"pace_min_per_mi of {units.format_pace_min_per_mi(units.pace_sec_per_mi_to_sec_per_km(sec_per_mi))}/mi "
+                "is outside the plausible 3:00–30:00/mi range")
+        fields["target_pace_sec_per_km"] = units.pace_sec_per_mi_to_sec_per_km(sec_per_mi)
     if args.get("duration_min") is not None:
         fields["target_duration_sec"] = round(float(args["duration_min"]) * 60)
     if args.get("description") is not None:
@@ -2721,7 +2892,7 @@ async def save_brief(args: dict) -> dict:
     try:
         result = briefs.save_brief(args["brief"])
     except ValidationError as e:
-        return _err(f"brief failed schema validation: {e}")
+        return _err(f"brief failed schema validation: {_validation_error_summary(e)}")
     return _text({"saved": True, "date": result["date"], "path": result["path"]})
 
 
@@ -2762,8 +2933,6 @@ async def get_brief_context(_args: dict) -> dict:
 # no-file-retrieval problem that still applies to a PDF.
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _EPHEMERAL_DIR_PID_RE = re.compile(r"^local-fitness-reports-(\d+)-")
 _EPHEMERAL_DIR_MAX_AGE_SECONDS = 24 * 60 * 60  # longer than any plausible single session
@@ -3061,8 +3230,8 @@ def _build_plan_section(target_date: str) -> dict | None:
 )
 async def generate_brief_report(args: dict) -> dict:
     target_date = args["date"]
-    if not _DATE_RE.match(target_date):
-        return _err(f"malformed date '{target_date}', expected YYYY-MM-DD")
+    if msg := _validate_date(target_date):
+        return _err(msg)
 
     brief_path = briefs.DEFAULT_BRIEFINGS_DIR / f"{target_date}.json"
     if not brief_path.exists():
@@ -3070,7 +3239,7 @@ async def generate_brief_report(args: dict) -> dict:
     try:
         brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
     except ValidationError as e:
-        return _err(f"brief failed schema validation: {e}")
+        return _err(f"brief failed schema validation: {_validation_error_summary(e)}")
 
     from . import visuals  # lazy: defers matplotlib/weasyprint import cost
 
@@ -3206,8 +3375,12 @@ async def generate_brief_report(args: dict) -> dict:
                     break
                 kept = kept[:-1]
                 omitted += 1
-    except Exception as e:
-        return _err(f"PDF render failed: {e}")
+    except Exception:
+        # Raw WeasyPrint/cairo internals belong in the server log, not in
+        # model context — the model can't act on a cairo traceback, and it
+        # reads it out at the user.
+        LOG.warning("PDF render failed", exc_info=True)
+        return _err("PDF render failed — see the server log for the traceback")
     if pages != 1:
         # A single takeaway that still overflows is a content bug upstream
         # (a runaway `details` block), not something to paper over silently.
@@ -3369,8 +3542,8 @@ _REPORT_CARD_SCHEMA = {
 )
 async def workout_report_card(args: dict) -> dict:
     target_date = args.get("date")
-    if target_date is not None and not _DATE_RE.match(str(target_date)):
-        return _err(f"malformed date '{target_date}', expected YYYY-MM-DD")
+    if target_date is not None and (msg := _validate_date(target_date)):
+        return _err(msg)
     fmt = args.get("format") or "both"
     if fmt not in _REPORT_CARD_FORMATS:
         return _err(f"unknown format '{fmt}'", allowed=sorted(_REPORT_CARD_FORMATS))
@@ -3523,8 +3696,12 @@ async def workout_report_card(args: dict) -> dict:
             pdf_bytes, pages = await asyncio.to_thread(
                 visuals.render_report_card_pdf, card, split_chart
             )
-    except Exception as e:
-        return _err(f"PDF render failed: {e}")
+    except Exception:
+        # Raw WeasyPrint/cairo internals belong in the server log, not in
+        # model context — the model can't act on a cairo traceback, and it
+        # reads it out at the user.
+        LOG.warning("PDF render failed", exc_info=True)
+        return _err("PDF render failed — see the server log for the traceback")
     if pages != 1:
         # The card has no droppable content (unlike the brief's takeaway tail),
         # so the density ladder is the only lever and it's exhausted. Never let
@@ -3603,21 +3780,23 @@ _CARD_SNAPSHOT_NOTE = (
 async def list_report_cards(args: dict) -> dict:
     for field in ("start_date", "end_date"):
         value = args.get(field)
-        if value is not None and not _DATE_RE.match(str(value)):
-            return _err(f"malformed {field} '{value}', expected YYYY-MM-DD")
+        if value is not None and (msg := _validate_date(value, field)):
+            return _err(msg)
     intent_class = args.get("intent_class")
     if intent_class is not None and intent_class not in card_store.INTENT_CLASSES:
         return _err(
             f"unknown intent_class '{intent_class}'",
             allowed=list(card_store.INTENT_CLASSES))
-    limit = args.get("limit")
-    if limit is None:
-        limit = 20
-    if not isinstance(limit, int) or limit <= 0:
-        return _err("limit must be a positive integer")
+    limit = _validate_limit(args, default=20)
+    if isinstance(limit, str):
+        return _err(limit)
+    # limit+1 fetch — the extra row is the truncation signal (see
+    # query_workouts / list_observations for the pattern).
     rows = card_store.list_cards(
         start_date=args.get("start_date"), end_date=args.get("end_date"),
-        intent_class=intent_class, limit=limit)
+        intent_class=intent_class, limit=limit + 1)
+    truncated = len(rows) > limit
+    rows = rows[:limit]
     cards = [
         {
             "activity_id": r["activity_id"],
@@ -3637,7 +3816,7 @@ async def list_report_cards(args: dict) -> dict:
         }
         for r in rows
     ]
-    return _text({"cards": cards, "count": len(cards)})
+    return _text({"cards": cards, "count": len(cards), "truncated": truncated})
 
 
 @tool(

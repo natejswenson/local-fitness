@@ -52,19 +52,34 @@ Absence of `truncated` means the result is complete (even at exactly 500 rows �
 the tool fetches 501 to tell "exactly 500 matched" from "the cap clipped more").
 
 On failure the tool returns an MCP error payload (`is_error: true`) with one of a
-small, deliberately non-leaky set of messages:
+small set of messages:
 
 | Condition | Message |
 |---|---|
 | Doesn't start with `select`/`with` | `read-only: only SELECT/WITH queries permitted` |
 | Denylisted keyword present | `forbidden keyword: <kw>` |
 | Exceeded the 5s budget | `query exceeded time budget` |
-| Anything else SQLite raised | `query failed: invalid query — check table/column names against the fitness://schema resource` |
+| Anything else SQLite raised | `query failed: <the SQLite message> — check table/column names against the fitness://schema resource` |
 
-That last message covers a bad column name, a bad table name, a syntax error, a
+**The SQLite detail is included as of 0.37.0** — a deliberate reversal of the
+earlier "never surface the raw string" stance. So a mistyped column now reads:
+
+```json
+{"error": "query failed: no such column: sleep_hours — check table/column names against the fitness://schema resource"}
+```
+
+rather than the old generic `query failed: invalid query — …`. The reasoning:
+the query was authored by the *model*, so the SQLite message leaks nothing but
+the model's own typo, and `no such column: sleep_hours` is the entire signal
+needed to fix it in one shot. Withholding it produced blind same-shape retries —
+the caller could see that something was wrong but not which of `sleep_hours`,
+`daily_metrics` or the `GROUP BY` was the problem. The read-only URI connection
+is what keeps this safe: no write-channel detail can reach this branch.
+
+That branch still covers a bad column name, a bad table name, a syntax error, a
 multi-statement string, and a write that slipped past the denylist and hit the
-read-only connection (`attempt to write a readonly database`) — the raw SQLite
-string is never surfaced.
+read-only connection (`attempt to write a readonly database`) — you now see
+which one it was.
 
 ## Example
 
@@ -119,7 +134,13 @@ Abridged output:
   server. The query runs in a worker thread (`asyncio.to_thread`), so even a
   within-budget heavy query never blocks the event loop.
 - **One statement only.** `SELECT 1; SELECT 2` raises inside `sqlite3` and comes
-  back as the generic `query failed` message.
+  back as a `query failed:` error carrying SQLite's own complaint
+  (`You can only execute one statement at a time.`).
+- **Read the SQLite detail before retrying.** The message names the offending
+  column or table; a second attempt at the same shape will fail the same way.
+  If it says `no such column`, check `fitness://schema` — the column may exist
+  under a different name (`sleep_seconds`, not `sleep_hours`) or on a different
+  table.
 - **The advertised schema is a subset of what's actually queryable.**
   `QUERYABLE_SCHEMA` in `agent/tools.py` is the single source of truth for both
   the tool description and the `fitness://schema` MCP resource, and it advertises
