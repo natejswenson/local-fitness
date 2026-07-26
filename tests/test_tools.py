@@ -333,19 +333,23 @@ def test_chart_excluded_from_brief_toolset(seeded):
 
 
 def test_query_workouts_filters(seeded):
+    # 0.37.0 envelope: {workouts, count, truncated}, and the native filter
+    # unit is MILES (min_distance_mi) — the km alias stays accepted below.
     payload, err = call(
         tools.query_workouts,
-        {"activity_type": "run", "days": 30, "min_distance_km": 5, "min_duration_min": 10, "limit": 10},
+        {"activity_type": "run", "days": 30, "min_distance_mi": 3.1, "min_duration_min": 10, "limit": 10},
     )
     assert not err
-    assert len(payload) == 1
-    assert payload[0]["activity_id"] == 1
+    assert payload["count"] == 1
+    assert payload["truncated"] is False
+    assert payload["workouts"][0]["activity_id"] == 1
 
 
 def test_query_workouts_no_filters(seeded):
     payload, err = call(tools.query_workouts, {})
     assert not err
-    assert len(payload) >= 1
+    assert payload["count"] >= 1
+    assert len(payload["workouts"]) == payload["count"]
 
 
 def test_get_workout_detail_found(seeded):
@@ -402,7 +406,7 @@ def test_compare_periods_unknown(seeded):
 
 
 def test_find_anomalies(seeded):
-    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.1})
+    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.5})
     assert not err
     assert payload["metric"] == "rhr"
     assert isinstance(payload["anomalies"], list)
@@ -601,7 +605,7 @@ def test_correlate_pearson_r_none_when_zero_variance_skips_rounding(tmp_path, mo
 
 
 def test_find_anomalies_sd_distance_and_direction(seeded):
-    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.1})
+    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.5})
     assert not err
     assert payload["anomalies"]
     for row in payload["anomalies"]:
@@ -1158,7 +1162,7 @@ def test_log_observation_malformed_date(seeded):
         {"obs_type": "weight", "value": 165, "date": "not-a-date"},
     )
     assert err
-    assert "invalid date" in _payload["error"]
+    assert "must be a valid YYYY-MM-DD" in _payload["error"]
     assert not _obs_rows(seeded)  # nothing inserted
 
 
@@ -1994,7 +1998,7 @@ def test_generate_brief_report_malformed_date_no_file_io(monkeypatch):
     for bad in ("2026/07/08", "../../../etc/passwd", "20260708", "2026-7-8", ""):
         payload, err = call(tools.generate_brief_report, {"date": bad})
         assert err
-        assert "malformed date" in payload["error"]
+        assert "must be a valid YYYY-MM-DD" in payload["error"]
     assert not tools.subprocess.run.called
 
 
@@ -2893,7 +2897,10 @@ def test_run_sql_invalid_query_points_at_schema_resource(seeded, monkeypatch):
     monkeypatch.setattr(tools, "_run_sql_blocking", boom)
     payload, err = call(tools.run_sql, {"query": "SELECT 1"})
     assert err
-    assert "query failed: invalid query" in payload["error"]
+    # 0.37.0: the sqlite message rides along (it names only the model's own
+    # SQL identifiers — the read-only gate keeps anything else out), because
+    # "invalid query" alone produced blind same-shape retries.
+    assert "query failed: boom" in payload["error"]
     assert "fitness://schema" in payload["error"]
 
 
@@ -3109,7 +3116,7 @@ def test_report_card_malformed_date_never_touches_the_db(rc_seeded, monkeypatch)
     monkeypatch.setattr(tools.db, "connect", boom)
     payload, err = call(tools.workout_report_card, {"date": "07-19-2026"})
     assert err
-    assert "malformed date" in payload["error"]
+    assert "must be a valid YYYY-MM-DD" in payload["error"]
 
 
 def test_report_card_bad_format_is_an_error(rc_seeded, monkeypatch):
@@ -3866,9 +3873,9 @@ def test_report_card_save_failure_never_fails_the_render(
 def test_list_report_cards_empty_and_bad_args(seeded):
     payload, err = call(tools.list_report_cards, {})
     assert not err
-    assert payload == {"cards": [], "count": 0}
+    assert payload == {"cards": [], "count": 0, "truncated": False}
     payload, err = call(tools.list_report_cards, {"start_date": "07-01-2026"})
-    assert err and "malformed start_date" in payload["error"]
+    assert err and "start_date must be a valid YYYY-MM-DD" in payload["error"]
     payload, err = call(tools.list_report_cards, {"intent_class": "tempo"})
     assert err
     assert payload["allowed"] == ["easy", "long", "quality", "steady"]
@@ -4045,3 +4052,130 @@ def test_get_coach_personality_opens_one_connection(seeded, monkeypatch):
     # The single-aggregate rewrite still reports both journal counts.
     assert payload["journal_entries"] == 0
     assert payload["journal_archived"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 0.37.0 UX pass: input validation, envelopes, error detail, interpretation
+# --------------------------------------------------------------------------- #
+def test_compare_periods_rejects_reversed_and_impossible_dates(seeded):
+    """Reversed/malformed ranges used to return {"n": 0} — unreadable as
+    'bad input' vs 'genuinely empty window'."""
+    base = {"metric": "rhr", "period_a_start": "2026-07-10", "period_a_end": "2026-07-01",
+            "period_b_start": "2026-06-01", "period_b_end": "2026-06-10"}
+    payload, err = call(tools.compare_periods, base)
+    assert err
+    assert "period_a_start must be on or before period_a_end" in payload["error"]
+
+    bad = dict(base, period_a_start="2026-13-45", period_a_end="2026-07-10")
+    payload, err = call(tools.compare_periods, bad)
+    assert err
+    assert "period_a_start must be a valid YYYY-MM-DD" in payload["error"]
+
+
+def test_find_anomalies_sd_threshold_bounds(seeded):
+    for bad in (0, -1, 0.4, 11, "two"):
+        payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": bad})
+        assert err, bad
+        assert "sd_threshold must be" in payload["error"]
+    _payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.5})
+    assert not err
+
+
+def test_query_workouts_min_distance_mi_and_km_alias(seeded):
+    # 10 km activity: 6.22 mi excludes it, 6.0 mi... 10000m = 6.21mi so 6.3 excludes.
+    payload, err = call(tools.query_workouts, {"min_distance_mi": 6.3})
+    assert not err and payload["count"] == 0
+    payload, err = call(tools.query_workouts, {"min_distance_mi": 6.0})
+    assert not err and payload["count"] == 1
+    # km alias still accepted; mi wins when both are given.
+    payload, err = call(tools.query_workouts, {"min_distance_km": 9.5})
+    assert not err and payload["count"] == 1
+    payload, err = call(tools.query_workouts,
+                        {"min_distance_mi": 6.3, "min_distance_km": 1.0})
+    assert not err and payload["count"] == 0  # mi (excluding) won
+    payload, err = call(tools.query_workouts, {"min_distance_mi": "fast"})
+    assert err and "min_distance_mi must be a number" in payload["error"]
+
+
+def test_query_workouts_limit_validation_and_truncation(seeded):
+    payload, err = call(tools.query_workouts, {"limit": -1})
+    assert err and "limit must be" in payload["error"]
+    payload, err = call(tools.query_workouts, {"limit": "ten"})
+    assert err and "limit must be" in payload["error"]
+    # Add a second activity, then limit=1 → truncated.
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "duration_seconds, distance_meters) VALUES (2, ?, 'running', 1200, 3000)",
+            ((date.today() - timedelta(days=1)).isoformat(),))
+    payload, err = call(tools.query_workouts, {"limit": 1})
+    assert not err
+    assert payload["count"] == 1 and payload["truncated"] is True
+
+
+def test_list_coach_memories_truncated_flag(seeded):
+    for i in range(3):
+        journal.save_entry(f"memory number {i}", source="chat")
+    payload, err = call(tools.list_coach_memories, {"limit": 2})
+    assert not err
+    assert payload["count"] == 2 and payload["truncated"] is True
+    payload, err = call(tools.list_coach_memories, {"limit": 10})
+    assert not err
+    assert payload["count"] == 3 and payload["truncated"] is False
+
+
+def test_run_sql_error_carries_the_sqlite_detail(seeded):
+    payload, err = call(tools.run_sql, {"query": "SELECT sleep_hours FROM daily_metrics"})
+    assert err
+    assert "no such column: sleep_hours" in payload["error"]
+    assert "fitness://schema" in payload["error"]
+
+
+def test_save_brief_validation_error_is_compact_loc_msg_pairs(seeded):
+    payload, err = call(tools.save_brief, {"brief": {
+        "takeaways": [{"headline": "x", "summary": "y", "tone": "smug",
+                       "details": "z"}]}})
+    assert err
+    msg = payload["error"]
+    assert "takeaways.0.tone" in msg
+    assert "https://errors.pydantic.dev" not in msg  # the noise is gone
+
+
+def test_report_card_pdf_failure_returns_stable_reason_and_logs(rc_seeded, reports_tmp, monkeypatch, caplog):
+    from local_fitness.agent import visuals
+
+    def boom(*_a, **_k):
+        raise RuntimeError("cairo exploded with a 40-line traceback")
+
+    monkeypatch.setattr(visuals, "render_report_card_pdf", boom)
+    with caplog.at_level(logging.WARNING, logger="local_fitness.agent.tools"):
+        payload, err = call(tools.workout_report_card, {})
+    assert err
+    assert payload["error"] == "PDF render failed — see the server log for the traceback"
+    assert "cairo exploded" not in payload["error"]
+    assert any(r.exc_info for r in caplog.records)  # the traceback IS in the log
+
+
+def test_get_metric_attaches_vs_baseline_for_baselined_metrics(seeded):
+    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 14})
+    assert not err
+    # seeded: baseline mean 52.0 sd 2.0; newest value 50 → exactly -1.0 SD.
+    assert payload["baseline_60day_mean"] == 52.0
+    assert payload["current_vs_baseline_sd"] == -1.0
+    assert payload["vs_baseline"] == "normal"
+
+
+def test_get_metric_vs_baseline_no_data_for_non_baselined(seeded):
+    payload, err = call(tools.get_metric, {"metric": "steps", "days": 14})
+    assert not err
+    assert "current_vs_baseline_sd" not in payload
+    assert payload["vs_baseline"] == "no data"
+
+
+def test_training_load_status_description_renders_interpret_constants():
+    # The registered description must carry the rendered band numbers from
+    # interpret — built, not hand-written, so they can't drift from the
+    # classifier attached to the payload.
+    text = tools.training_load_status.description
+    assert f"TSB > {interpret.TSB_FRESH:g} fresh" in text
+    assert f"< {interpret.TSB_VERY_FATIGUED:g} very fatigued" in text

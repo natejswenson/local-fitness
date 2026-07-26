@@ -97,15 +97,38 @@ def _render_status(status: dict[str, Any]) -> str:
             read = ""
         rows.append([name, value_str, read])
     lines.append(render_table(["Metric", "Value", "Read"], rows))
+    # A table of nothing but dashes is what "no daily_metrics row for today
+    # yet" looks like from here — indistinguishable, without a line saying so,
+    # from a genuinely flat day. assemble_status always emits one row per
+    # DAILY_NUMERIC_METRICS, so all-None values IS the missing-row case.
+    if metrics and all(m.get("value") is None for m in metrics):
+        lines.append("")
+        lines.append(
+            f"No Garmin data for {status.get('date', '')} yet — run "
+            "sync_garmin_data to refresh."
+        )
     lines.append("")
 
-    # Training-load read.
+    # Training-load read. The as_of date rides along because CTL/ATL/TSB come
+    # from the latest baselines row on/before today, which may be days old —
+    # and TSB decays daily even with zero workouts, so an undated read of a
+    # stale row states the wrong freshness with full confidence.
     tl = status.get("training_load") or {}
     lines.append("## Training load")
+    as_of = tl.get("as_of")
+    as_of_str = f" (as of {as_of})" if as_of else ""
     lines.append(
         f"CTL (fitness): {tl.get('ctl')} · ATL (fatigue): {tl.get('atl')} · "
-        f"TSB (freshness): {tl.get('tsb')} — {tl.get('interpretation', '')}"
+        f"TSB (freshness): {tl.get('tsb')}{as_of_str} — "
+        f"{tl.get('interpretation', '')}"
     )
+    baseline_stale = tl.get("baseline_stale_days")
+    if isinstance(baseline_stale, int) and baseline_stale > 0:
+        lines.append(
+            f"⚠ Training load is {baseline_stale} day(s) stale (newest "
+            f"baselines: {as_of}) — TSB decays daily, so the freshness read "
+            "above is out of date. Run sync_garmin_data to refresh."
+        )
     lines.append("")
 
     # Recent workouts (miles / formatted convenience fields from status.py).

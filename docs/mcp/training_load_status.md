@@ -39,6 +39,15 @@ planner and this tool agree by construction):
 | < -10 | `fatigued` |
 | < -20 | `very fatigued` |
 
+The tool's own MCP description recites those same numbers — *"TSB > 5 fresh,
+-10..5 neutral, < -10 fatigued, < -20 very fatigued"* — and as of 0.37.0 that
+sentence is **built from `interpret.TSB_FRESH` / `TSB_FATIGUED` /
+`TSB_VERY_FATIGUED`** with an f-string rather than typed out. The numbers a
+caller reads in the tool list can no longer drift from the classifier that
+produced `tsb_zone` in the payload. (`correlate`'s legend string had the same
+duplication removed for the same reason.) Retuning a band is a one-line edit to
+`interpret.py` — but this page's table is hand-written, so update it here too.
+
 ## Parameters
 
 Takes no parameters.

@@ -19,10 +19,24 @@ The magnitude of the difference is classified in Python
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `metric` | string | yes | — | One of `DAILY_NUMERIC_METRICS` (read from `daily_metrics`), `"training_load"` (read from `activities`), or `"distance_meters"` (read from `activities`, SUM branch). Anything else is a hard error listing the allowed set. |
-| `period_a_start` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** |
-| `period_a_end` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** |
-| `period_b_start` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** |
-| `period_b_end` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** |
+| `period_a_start` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** Validated — see below. |
+| `period_a_end` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** Must be on or after `period_a_start`. |
+| `period_b_start` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** Validated — see below. |
+| `period_b_end` | string | yes | — | ISO `YYYY-MM-DD`. **Inclusive.** Must be on or after `period_b_start`. |
+
+All four dates are checked **before any query runs** (0.37.0). Each must be a
+real calendar date in exactly the `YYYY-MM-DD` shape — parsed with
+`date.fromisoformat`, so `2026-02-30` and `2026-13-01` are rejected, as are
+`"2026-07-26T10:00"` and `"20260726"`, which `fromisoformat` itself would
+otherwise accept. Then each period's start must be on or before its end.
+
+```json
+{"error": "period_a_start must be a valid YYYY-MM-DD date (got '2026-02-30')"}
+```
+
+```json
+{"error": "period_b_start must be on or before period_b_end (got 2026-06-20 > 2026-05-22)"}
+```
 
 Allowed daily metrics: `sleep_seconds`, `sleep_score`, `sleep_deep_seconds`,
 `sleep_rem_seconds`, `sleep_light_seconds`, `sleep_awake_seconds`, `rhr`,
@@ -115,10 +129,17 @@ Read: down 2.3 bpm (−4.5%), and the effect is **large** — not noise.
 
 ## Gotchas
 
-- **Dates are not validated.** They go straight into a SQLite string comparison.
-  A malformed or reversed range doesn't error — it quietly matches zero rows and
-  comes back as `{"n": 0, "mean": null, "sd": null}`. Check `n` before believing
-  a `null`.
+- **`n: 0` now genuinely means "empty window".** Before 0.37.0 the dates went
+  straight into a SQLite string comparison, so a malformed or reversed range
+  quietly matched zero rows and came back as
+  `{"n": 0, "mean": null, "sd": null}` — identical to a real window with no
+  data, and the model read "no data" where the truth was "bad input". All four
+  dates and both orderings are now validated up front, so a `null` mean is a
+  fact about the data, not a typo. It is still worth checking `n` before
+  reporting a mean, but you no longer have to suspect your own arguments.
+- **Reversed ranges error rather than returning nothing.** `period_a_start`
+  after `period_a_end` is rejected by name, so you find out which period you
+  flipped.
 - **Both ends are inclusive** (`date >= start AND date <= end`), so a 30-day
   window is `start` .. `start + 29`.
 - **`distance_meters` sums *all* activities, with no type filter.** Walking-desk

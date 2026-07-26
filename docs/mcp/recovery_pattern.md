@@ -18,7 +18,8 @@ day RHR falls back to **≤ 103%** of its 60-day baseline. Reach for this over
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `activity_type` | string | no | — | Substring match — SQL `activity_type LIKE '%value%'`. |
-| `min_distance_km` | number | no | — | `distance_meters >= value * 1000`. Kilometres. |
+| `min_distance_mi` | number | no | — | **Miles** — the app's display unit. `distance_meters >= value * 1609.344`. |
+| `min_distance_km` | number | no | — | **Deprecated** alias in kilometres (`value * 1000`). Still accepted; `min_distance_mi` wins if both are given. |
 | `min_duration_min` | integer | no | — | `duration_seconds >= value * 60`. |
 | `lookback_days` | integer | no | `365` | `date >= today - lookback_days`. Bounds-checked 1–3650. |
 
@@ -74,7 +75,7 @@ for them.
 > "How long does it take me to recover from a run over 10 miles?"
 
 ```json
-{"activity_type": "running", "min_distance_km": 16, "lookback_days": 365}
+{"activity_type": "running", "min_distance_mi": 10, "lookback_days": 365}
 ```
 
 ```json
@@ -108,12 +109,19 @@ for them.
   substring filter also matches `treadmill_running`, which is what Nate's
   walking-desk sessions log as — in one 60-day window that pool was 16 real runs
   against 30 walking-pad sessions. Recovery after a 20-minute walk is not
-  recovery after a run, so pair the type filter with `min_distance_km` /
+  recovery after a run, so pair the type filter with `min_distance_mi` /
   `min_duration_min`, or filter by pace in [`query_workouts`](query_workouts.md)
   first and inspect ids individually.
-- **Falsy arguments are ignored.** `min_distance_km=0`, `min_duration_min=0`,
-  `lookback_days=0` all read as "not supplied" (`lookback_days` falls back to
-  365).
+- **Distance is in miles now.** `min_distance_mi` was added in 0.37.0 because
+  this is a miles-display app: "runs over 10 miles" sent as
+  `min_distance_km: 10` filtered at 6.2 mi. `min_distance_km` still works as a
+  deprecated alias.
+- **`min_duration_min=0` and `lookback_days=0` are still ignored** as "not
+  supplied" (`lookback_days` falls back to 365). `min_distance_mi=0` /
+  `min_distance_km=0` no longer are — an explicit `0` is honoured as a
+  `distance_meters >= 0` filter, a no-op but not a silent one. A non-numeric or
+  negative distance now returns a clean `min_distance_mi must be a number` /
+  `must be non-negative` error instead of raising.
 - **This is the most expensive read tool in the set.** There is no `limit`: it
   runs one baseline query plus up to seven `daily_metrics` point-queries *per
   matched workout*. A 365-day unfiltered call over a multi-year DB is hundreds

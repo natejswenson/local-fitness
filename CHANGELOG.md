@@ -6,6 +6,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-07-26
+
+UX pass (batch 3 of 4 from the 2026-07-26 audit): forgiving inputs, honest
+truncation, actionable errors, staleness surfaced.
+
+### Changed
+- **`query_workouts` returns an envelope** — `{"workouts", "count",
+  "truncated"}` instead of a bare array (breaking for payload-shape
+  consumers). "Show me all my runs this year" no longer silently answers
+  from a clipped 50: the `limit+1` fetch sets `truncated`. `limit` is
+  validated 1–500 (`-1` used to reach SQLite as LIMIT -1 — an unbounded
+  table dump into context). `list_report_cards` and `list_coach_memories`
+  gained the same `truncated` flag.
+- **`update_plan_workout` pace accepts `"M:SS"`** (preferred) or decimal
+  minutes, with the trap documented in the schema: a model copying the
+  display string "9:39" as the float 9.39 silently prescribed 9:23/mi — a
+  16 s/mi error invisible in the echo. Implausible paces (outside
+  3:00–30:00/mi) are rejected.
+- **One real date validator.** `date.fromisoformat` replaces the shape
+  regex that accepted `2026-13-45`/`2026-02-30` (impossible dates matched
+  nothing in SQL — unreadable as "bad input" vs "empty window"), unifying
+  the two error-message idioms across every dated tool. `compare_periods`
+  additionally rejects reversed ranges; `find_anomalies` bounds
+  `sd_threshold` to 0.5–10 (an explicit 0 — every day an anomaly — now
+  errors instead of silently becoming the default).
+- **Errors say what the model can act on.** `run_sql` carries the SQLite
+  detail ("no such column: sleep_hours" — the model's own typo, the whole
+  correction signal; a deliberate reversal of the earlier don't-leak
+  stance, safe under the read-only URI gate). Pydantic failures compact to
+  `loc: msg` pairs instead of the multi-line repr with a docs URL. PDF
+  render failures return one stable line and put the raw traceback in the
+  server log where it belongs.
+- **`min_distance_mi`** on `query_workouts`/`recovery_pattern` — this is a
+  miles-display app, and "runs over 5 miles" sent as `min_distance_km: 5`
+  filtered at 5 km. The km param stays as a deprecated alias (mi wins).
+- **The `/coach` snapshot flags stale training load** — CTL/ATL/TSB now
+  render with `as of <date>` plus a warning line when the baselines row
+  lags (TSB decays daily, so a five-day-old row misstates freshness with
+  full confidence), and an all-empty day says "No Garmin data for … yet"
+  instead of a silent table of dashes.
+
+### Added
+- **`get_metric` attaches the baseline read** (`baseline_60day_mean`,
+  `current_vs_baseline_sd`, `vs_baseline`) for baselined metrics, mirroring
+  `get_metric_trend` — "is 52 high?" no longer costs a second call.
+- `units.from_miles`, `units.parse_pace_min_per_mi`,
+  `units.pace_sec_per_mi_to_sec_per_km`; `METERS_PER_MILE`/`KM_PER_MILE`
+  are public.
+- `training_load_status`'s TSB band description is generated from the
+  `interpret` constants (can't drift from the classifier).
+
 ## [0.36.0] - 2026-07-26
 
 Speed pass (batch 2 of 4 from the 2026-07-26 audit): fewer connections,

@@ -91,6 +91,109 @@ def test_render_status_falls_back_to_raw_value_when_unformatted():
     assert "9000" in text
 
 
+# --- U6: the snapshot must date its training load and flag a frozen frontier
+
+_STALE_WARNING = (
+    "⚠ Training load is 5 day(s) stale (newest baselines: 2026-07-21) — "
+    "TSB decays daily, so the freshness read above is out of date. "
+    "Run sync_garmin_data to refresh."
+)
+
+
+def _status_with_load(training_load: dict, *, metrics: list | None = None) -> dict:
+    return {
+        "date": "2026-07-26",
+        "metrics": metrics if metrics is not None else [
+            {"metric": "steps", "value": 9000, "treatment": "raw"},
+        ],
+        "training_load": training_load,
+        "recent_workouts": [],
+    }
+
+
+def test_render_status_dates_training_load_and_warns_when_baselines_are_stale():
+    # A 5-day-old baselines row served undated reads as today's freshness.
+    text = mcp_server._render_status(_status_with_load({
+        "ctl": 40.0, "atl": 45.0, "tsb": -5.0,
+        "as_of": "2026-07-21", "baseline_stale_days": 5,
+        "interpretation": "slightly fatigued",
+    }))
+    assert (
+        "CTL (fitness): 40.0 · ATL (fatigue): 45.0 · TSB (freshness): -5.0 "
+        "(as of 2026-07-21) — slightly fatigued"
+    ) in text
+    assert _STALE_WARNING in text
+
+
+def test_render_status_dates_training_load_without_warning_when_current():
+    text = mcp_server._render_status(_status_with_load({
+        "ctl": 40.0, "atl": 45.0, "tsb": -5.0,
+        "as_of": "2026-07-26", "baseline_stale_days": 0,
+        "interpretation": "slightly fatigued",
+    }))
+    assert "(as of 2026-07-26)" in text
+    assert "⚠ Training load is" not in text
+    assert "sync_garmin_data" not in text
+
+
+def test_render_status_omits_as_of_and_warning_when_no_baselines_row():
+    # The empty-DB payload: as_of/baseline_stale_days are both None, so the
+    # line must render exactly as it did before this field existed.
+    text = mcp_server._render_status(_status_with_load({
+        "ctl": None, "atl": None, "tsb": None,
+        "as_of": None, "baseline_stale_days": None,
+        "interpretation": "no training-load data yet",
+    }))
+    assert (
+        "CTL (fitness): None · ATL (fatigue): None · TSB (freshness): None "
+        "— no training-load data yet"
+    ) in text
+    assert "as of" not in text
+    assert "⚠ Training load is" not in text
+
+
+def test_render_status_explains_an_all_dashes_metrics_table():
+    # assemble_status emits one row per metric even with no daily_metrics row
+    # for today, so all-None values IS "Garmin hasn't synced today".
+    text = mcp_server._render_status(_status_with_load(
+        {"ctl": 40.0, "atl": 45.0, "tsb": -5.0, "as_of": "2026-07-26",
+         "baseline_stale_days": 0, "interpretation": "slightly fatigued"},
+        metrics=[
+            {"metric": "steps", "value": None, "treatment": "trend_arrow",
+             "arrow": None},
+            {"metric": "rhr", "value": None, "treatment": "baseline_delta",
+             "baseline": 53.0, "delta_pct": None, "arrow": None},
+        ],
+    ))
+    assert (
+        "No Garmin data for 2026-07-26 yet — run sync_garmin_data to refresh."
+    ) in text
+
+
+def test_render_status_has_no_missing_data_line_when_any_metric_has_a_value():
+    text = mcp_server._render_status(_status_with_load(
+        {"ctl": 40.0, "atl": 45.0, "tsb": -5.0, "as_of": "2026-07-26",
+         "baseline_stale_days": 0, "interpretation": "slightly fatigued"},
+        metrics=[
+            {"metric": "steps", "value": 9000, "treatment": "raw"},
+            {"metric": "rhr", "value": None, "treatment": "baseline_delta",
+             "baseline": 53.0, "delta_pct": None, "arrow": None},
+        ],
+    ))
+    assert "No Garmin data for" not in text
+
+
+def test_render_status_has_no_missing_data_line_when_metrics_list_is_empty():
+    # An empty list is a different (degenerate) payload than "rows, all None";
+    # the explanatory line would be guessing, so it must not appear.
+    text = mcp_server._render_status(_status_with_load(
+        {"ctl": None, "atl": None, "tsb": None, "as_of": None,
+         "baseline_stale_days": None, "interpretation": "no training-load data yet"},
+        metrics=[],
+    ))
+    assert "No Garmin data for" not in text
+
+
 # --- prompts: coach + brief both advertised and resolve -------------------
 
 def test_list_prompts_includes_coach_and_brief():

@@ -21,11 +21,69 @@ from __future__ import annotations
 
 import os
 
-# 1 international mile = 1609.344 meters, exactly.
-_METERS_PER_MILE = 1609.344
+# 1 international mile = 1609.344 meters, exactly. Public since 0.37.0 —
+# these two are THE constants; redeclarations elsewhere are being retired
+# (report_card.MILE_M, interpret._KM_PER_MILE point back here or are pinned
+# equal by test).
+METERS_PER_MILE = 1609.344
 # sec/km → sec/mi: one mile is 1.609344 km, so a per-km pace covers that
 # many km in one mile.
-_KM_PER_MILE = 1.609344
+KM_PER_MILE = 1.609344
+# Backward-compat aliases for the pre-0.37.0 private names.
+_METERS_PER_MILE = METERS_PER_MILE
+_KM_PER_MILE = KM_PER_MILE
+
+
+def from_miles(miles: float | None) -> float | None:
+    """Miles → meters — :func:`to_miles`'s inverse, same null contract.
+
+    NOT rounded: the result is a stored quantity (plan targets, filters),
+    not a display value, and rounding meters would move a 6.0 mi
+    prescription by feet for nothing."""
+    if miles is None:
+        return None
+    return float(miles) * METERS_PER_MILE
+
+
+def parse_pace_min_per_mi(value: str | float | int | None) -> float | None:
+    """A user/model-supplied per-mile pace → seconds per MILE, or ``None``.
+
+    Accepts the two shapes an agent plausibly sends:
+
+    * ``"M:SS"`` (e.g. ``"9:39"`` → 579) — the app's own display format,
+      round-tripping :func:`format_pace_min_per_mi`'s output. Seconds must
+      be two digits under 60.
+    * a bare number — DECIMAL minutes (``9.65`` → 579). This is the trap
+      the string form exists to close: ``9.39`` is 9:23, NOT 9:39, and a
+      model copying a display string as a float silently re-prescribes a
+      16 s/mi faster pace. Callers should say so in their schema docs.
+
+    Anything else (malformed string, non-positive, ``"9:75"``) → ``None`` —
+    the caller decides whether that's an error or an omitted field."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        import re
+
+        m = re.fullmatch(r"\s*(\d{1,2}):([0-5]\d)\s*", value)
+        if not m:
+            return None
+        total = int(m.group(1)) * 60 + int(m.group(2))
+        return float(total) if total > 0 else None
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        return None
+    if minutes <= 0:
+        return None
+    return minutes * 60.0
+
+
+def pace_sec_per_mi_to_sec_per_km(sec_per_mi: float | None) -> float | None:
+    """Seconds-per-mile → seconds-per-km (the stored unit). Null-safe."""
+    if not sec_per_mi:
+        return None
+    return sec_per_mi / KM_PER_MILE
 
 
 def to_miles(meters: float | None) -> float | None:

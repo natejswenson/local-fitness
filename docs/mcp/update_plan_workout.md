@@ -52,10 +52,10 @@ between "adjust today's run" and "silently rewrite the plan's structure".
 
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `date` | string | yes | — | ISO `YYYY-MM-DD` of a day that **already exists** in the active plan. |
+| `date` | string | yes | — | ISO `YYYY-MM-DD` of a day that **already exists** in the active plan. Parsed with `date.fromisoformat`, so an impossible calendar date (`2026-02-30`, `2026-13-01`) is a hard error, not a lookup that matches nothing. |
 | `type` | string | no | unchanged | `easy` \| `long` \| `tempo` \| `interval` \| `rest` \| `race` \| `cross`. |
-| `distance_mi` | number | no | unchanged | Miles. Converted to metres (`× 1609.344`). |
-| `pace_min_per_mi` | number | no | unchanged | Decimal min/mi, e.g. `9.65` for ~9:39/mi. Converted to sec/km (`× 60 ÷ 1.609344`). |
+| `distance_mi` | number | no | unchanged | Miles. Converted to metres (`units.from_miles`, `× 1609.344`). |
+| `pace_min_per_mi` | string \| number | no | unchanged | **`"M:SS"` preferred** — `"9:39"`. A bare number is *decimal minutes*: `9.65` is 9:39/mi. Bounded to 3:00–30:00/mi. See the trap below. |
 | `duration_min` | number | no | unchanged | Minutes. Converted to seconds and rounded. The **graded** field for `tempo`/`interval`. |
 | `description` | string | no | unchanged | Prose prescription. |
 | `seq` | integer | no | `1` | Intra-day session: 1 = first/AM, 2 = second/PM. Must be a positive int. |
@@ -67,6 +67,30 @@ required — a call with only `date` errors with `nothing to update`.
 `target_duration_sec`, and defaults `description` to `"Rest day"` unless you pass one. Without that,
 a day flipped to rest would keep its old hard-run prose, which surfaces in every plan payload and
 in the brief PDF.
+
+### Pace: send `"9:39"`, not `9.39`
+
+`pace_min_per_mi` takes two shapes, and one of them is a trap:
+
+| You send | Stored as | Reads back as |
+|---|---|---|
+| `"9:39"` | 579 sec/mi | `9:39` ✅ |
+| `9.65` | 579 sec/mi | `9:39` ✅ |
+| `9.39` | 563.4 sec/mi | `9:23` ❌ |
+
+A bare number is **decimal minutes**, so `9.39` means 9 minutes plus 0.39 of a minute — 9:23/mi,
+16 s/mi faster than the 9:39 you meant. This was a real failure mode: the tool's own reply echoes
+`pace_min_per_mi` as a formatted `"M:SS"` string, so a model that copied a display string into the
+float field prescribed a harder run and saw nothing wrong in the confirmation. `"M:SS"` round-trips
+the app's own display format — prefer it and the ambiguity disappears.
+
+The string form is strict (`units.parse_pace_min_per_mi`): one or two digits of minutes, a colon,
+exactly two digits of seconds under 60. `"9:5"`, `"9:75"` and `"0:00"` are all rejected.
+
+Both shapes are then **bounds-checked to 3:00–30:00/mi** before anything is written. That catches
+transposed arguments and unit-confused numbers — a sec/km value sent as min/mi, or `distance_mi`
+and `pace_min_per_mi` swapped — while they are still input errors rather than a bad prescription
+sitting on the active plan.
 
 ## Returns
 
@@ -111,6 +135,21 @@ Errors:
 {"error": "unknown type 'recovery'", "allowed": ["cross", "easy", "interval", "long", "race", "rest", "tempo"]}
 ```
 
+```json
+{"error": "date must be a valid YYYY-MM-DD date (got '2026-02-30')"}
+```
+
+```json
+{"error": "pace_min_per_mi must be \"M:SS\" (e.g. \"9:39\") or decimal minutes (9.65 = 9:39/mi)"}
+```
+
+```json
+{"error": "pace_min_per_mi of 2:30/mi is outside the plausible 3:00–30:00/mi range"}
+```
+
+The out-of-range message formats the pace it *parsed*, so a mistyped value shows you what the tool
+thought you asked for.
+
 ## Example
 
 > "Move Saturday's long run to Sunday."
@@ -122,7 +161,7 @@ That is **two** calls — the tool cannot change a workout's date:
 ```
 ```json
 {"date": "2026-07-26", "type": "long", "distance_mi": 12,
- "pace_min_per_mi": 10.35, "description": "Long run 12 mi, moved from Saturday."}
+ "pace_min_per_mi": "10:21", "description": "Long run 12 mi, moved from Saturday."}
 ```
 
 First call returns:
@@ -144,6 +183,12 @@ Second returns the re-prescribed Sunday, as above.
   day cannot gain one while active.
 - **Imperial in, metric stored — the inverse of `propose_training_plan`.** This tool takes miles and
   min/mi; `propose`/`revise` take metres and sec/km. Mixing them up is the most common mistake here.
+- **`9.39` is not `9:39`.** A bare `pace_min_per_mi` is decimal minutes, so copying a displayed
+  `"9:39"` in as a float silently prescribes 9:23/mi — and the reply's formatted echo looks fine.
+  Send the `"M:SS"` string. See [Pace](#pace-send-939-not-939) above.
+- **The date has to be a real day on the calendar.** `2026-02-30` and `2026-13-01` error up front
+  instead of running an `UPDATE` that matches nothing and reporting "no workout on that date" — the
+  two failures used to be indistinguishable.
 - **The response echoes the whole prescription.** Setting `duration_min` writes
   `target_duration_sec` and the payload now carries it back as `duration_seconds` plus a formatted
   `duration_formatted` (and `seq` for which session was edited), so a duration change confirms from
