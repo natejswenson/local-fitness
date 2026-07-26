@@ -69,7 +69,7 @@ window ending today, unrelated to the 14/7 one.
   "rest_days_counted": 9,
   "predicted_finish_seconds": 6612.4,
   "predicted_finish_formatted": "1:50:12",
-  "goal_gap": {"gap_seconds": 312.4, "gap_pct": 4.96, "on_pace": false},
+  "goal_gap": {"gap_seconds": 312, "gap_pct": 5.0, "gap_formatted": "+5:12", "on_pace": false},
   "this_week": {"week_planned_mi": 28.5, "week_actual_mi": 24.1, "week_run_mi": 21.8, "week_walk_mi": 2.3, "slips": 1},
   "workouts": [
     {
@@ -98,7 +98,7 @@ window ending today, unrelated to the 14/7 one.
 | `projection_basis` | `{distance_mi, pace_min_per_mi, date, extrapolation_ratio}` — the single run `predicted_finish_seconds` was computed from, and how far it reached (`goal ÷ effort`). **Absent, not `null`**, when there is no projection. |
 | `projection_confidence` | `high` (reach ≤ 1.5) / `medium` (≤ 3.0) / `low` (above). Absent alongside `projection_basis`. |
 | `predicted_finish_seconds` / `_formatted` | Riegel projection (`t2 = t1 · (d2/d1)^1.06`) from the fastest qualifying run in the last `riegel_lookback_days` (default 120, ≥2 km) onto `goal_distance_m`. "Run" is decided by **measured pace**, not by `activity_type` — see the gotcha below. `null` if either is missing. |
-| `goal_gap` | `{gap_seconds, gap_pct, on_pace}` — projected minus goal, so **positive means slower than goal**. `null` when `target_time_seconds` is missing or `<= 0`, or when there is no projection. |
+| `goal_gap` | `{gap_seconds, gap_pct, gap_formatted, on_pace}` — projected minus goal, so **positive means slower than goal** (`gap_formatted` is the signed duration, e.g. `"+5:12"`; whole seconds / 1-dp percent since 0.38.1). `null` when `target_time_seconds` is missing or `<= 0`, or when there is no projection. |
 | `this_week` | Trailing 7 days ending **today**: `week_planned_mi`, `week_actual_mi`, `week_run_mi`, `week_walk_mi`, `slips` (count of `partial` + `missed`). `week_actual_mi` is total **on-foot** miles (run + walk — easy days count prescribed walking by design); `week_run_mi + week_walk_mi` split it, so the tool and the brief PDF reconcile. **`week_run_mi` is the number the brief PDF's plan strip headlines** (it shows run miles, not foot miles). `actual_mi` is suppressed on `pending` and `compliant` days, so an ungraded run does not inflate the actual. |
 | `workouts` | Windowed unless `full: true`. See below. |
 
@@ -127,7 +127,7 @@ Abridged:
   "active": true, "goal_type": "half", "days_to_race": 75,
   "adherence_pct": 83,
   "predicted_finish_formatted": "1:50:12",
-  "goal_gap": {"gap_seconds": 312.4, "gap_pct": 4.96, "on_pace": false},
+  "goal_gap": {"gap_seconds": 312, "gap_pct": 5.0, "gap_formatted": "+5:12", "on_pace": false},
   "this_week": {"week_planned_mi": 28.5, "week_actual_mi": 24.1, "week_run_mi": 21.8, "week_walk_mi": 2.3, "slips": 1},
   "workouts": [
     {"date": "2026-06-29", "type": "easy", "target_distance_mi": 5.0,

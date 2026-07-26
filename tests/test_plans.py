@@ -350,9 +350,27 @@ def test_goal_gap_none_when_target_time_negative():
 def test_goal_gap_positive_when_slower_than_goal():
     gap = plans.goal_gap(3100.0, 3000)
     assert gap is not None
-    assert gap["gap_seconds"] == 100.0
-    assert gap["gap_pct"] == pytest.approx(3.3333, rel=1e-3)
+    assert gap["gap_seconds"] == 100
+    assert gap["gap_pct"] == 3.3
+    assert gap["gap_formatted"] == "+1:40"
     assert gap["on_pace"] is False
+
+
+def test_goal_gap_rounds_at_the_payload_boundary():
+    """A live payload shipped gap_seconds=186.44919632676692 — derived
+    numbers round at the boundary like everything else, and the
+    duration-shaped one carries its formatted companion."""
+    gap = plans.goal_gap(3186.4491963267669, 3000.0)
+    assert gap["gap_seconds"] == 186
+    assert gap["gap_pct"] == 6.2
+    assert gap["gap_formatted"] == "+3:06"
+    faster = plans.goal_gap(2853.5, 3000.0)
+    assert faster["gap_seconds"] == -146  # round(-146.5) banker's -> -146
+    assert faster["gap_formatted"] == "-2:26"
+    assert faster["on_pace"] is True
+    dead_even = plans.goal_gap(3000.0, 3000.0)
+    assert dead_even["gap_formatted"] == "0:00"
+    assert dead_even["on_pace"] is True
 
 
 def test_goal_gap_negative_when_faster_than_goal():
@@ -366,7 +384,8 @@ def test_goal_gap_negative_when_faster_than_goal():
 def test_goal_gap_on_pace_true_at_exact_boundary():
     # predicted finish == target time -> gap 0, on_pace True (<=, inclusive).
     gap = plans.goal_gap(3000.0, 3000)
-    assert gap == {"gap_seconds": 0.0, "gap_pct": 0.0, "on_pace": True}
+    assert gap == {"gap_seconds": 0, "gap_pct": 0.0,
+                   "gap_formatted": "0:00", "on_pace": True}
 
 
 def test_weekly_mileage_rollup():

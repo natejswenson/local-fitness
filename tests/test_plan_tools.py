@@ -365,7 +365,7 @@ def test_progress_goal_gap_and_this_week_and_formatted_fields(seeded):
     assert body["predicted_finish_formatted"] == "55:00"
     assert body["target_time_seconds"] == 3000
     assert body["target_time_formatted"] == "50:00"
-    assert body["goal_gap"] == {"gap_seconds": 300.0, "gap_pct": 10.0, "on_pace": False}
+    assert body["goal_gap"] == {"gap_seconds": 300, "gap_pct": 10.0, "gap_formatted": "+5:00", "on_pace": False}
     # The projection names the run it came from. A 10 km effort onto a 10 km
     # goal reaches nowhere at all, so this one is trustworthy and says so.
     assert body["projection_basis"] == {

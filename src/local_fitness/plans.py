@@ -495,11 +495,19 @@ def goal_gap(
     """
     if predicted_finish_s is None or target_time_s is None or target_time_s <= 0:
         return None
-    gap_seconds = predicted_finish_s - target_time_s
-    gap_pct = gap_seconds / target_time_s * 100
+    # Rounded at the payload boundary like every derived number (a live
+    # payload shipped gap_seconds=186.44919632676692); whole seconds and one
+    # decimal of percent are the honest precision for a race projection.
+    gap_seconds = round(predicted_finish_s - target_time_s)
+    gap_pct = round(gap_seconds / target_time_s * 100, 1)
     return {
         "gap_seconds": gap_seconds,
         "gap_pct": gap_pct,
+        # Signed duration companion ("+3:06" = that much SLOWER than goal) —
+        # the coach voice never speaks raw seconds, and every duration-shaped
+        # payload number carries its formatted form.
+        "gap_formatted": ("+" if gap_seconds > 0 else "-" if gap_seconds < 0 else "")
+        + (units.format_duration(abs(gap_seconds)) or "0:00"),
         "on_pace": gap_seconds <= 0,
     }
 
