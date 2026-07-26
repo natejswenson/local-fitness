@@ -124,6 +124,28 @@ UPCOMING_WINDOW_DAYS = 7
 # every extra row is prompt the model pays to read.
 MAX_CONTEXT_ACTIVITIES = 5
 
+# Every `activities` column EXCEPT `raw_json` — the whole-row read list, and the
+# single definition of it (`tools.get_workout_detail` imports this one rather
+# than keeping a second copy). `raw_json` is the preserved Garmin payload, ~50 KB
+# per row, and nothing downstream of a whole-row fetch reads it: both call sites
+# used to `SELECT *` and then pop the key back off, which is 50 KB decoded out of
+# SQLite and thrown away per activity. `source` is here because init_schema's
+# guarded ALTER guarantees it (see db.init_schema) — a DB that skipped
+# init_schema is out of contract for every other table too.
+# tests/test_report_card.py pins this against PRAGMA table_info, so a new column
+# in db.SCHEMA fails the build instead of silently going unread.
+_ACTIVITY_COLUMNS: tuple[str, ...] = (
+    "activity_id", "date", "start_time", "activity_type", "activity_name",
+    "duration_seconds", "moving_seconds", "distance_meters", "avg_hr",
+    "max_hr", "avg_pace_sec_per_km", "elevation_gain_meters",
+    "elevation_loss_meters", "calories", "aerobic_te", "anaerobic_te",
+    "training_load", "avg_cadence", "vo2_max_estimate", "weather_temp_c",
+    "weather_conditions", "source",
+)
+# Interpolated into SQL, never parameterized — these are frozen identifiers from
+# the constant above, not user input (the whitelist-not-f-string rule).
+_ACTIVITY_SELECT = ", ".join(_ACTIVITY_COLUMNS)
+
 # The one band table. `d` is a non-negative relative deviation; every metric
 # reduces to one, which is why there is exactly one grader.
 GRADE_BANDS: tuple[tuple[float, str], ...] = (
@@ -1221,16 +1243,19 @@ def _select_activity(
     """
     if activity_id is not None:
         return conn.execute(
-            "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE activity_id = ?",
+            (activity_id,),
         ).fetchone()
     if target_date:
         return conn.execute(
-            "SELECT * FROM activities WHERE date = ? AND distance_meters > 0 "
-            "AND duration_seconds > 0 ORDER BY start_time ASC LIMIT 1",
+            f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE date = ? "
+            "AND distance_meters > 0 AND duration_seconds > 0 "
+            "ORDER BY start_time ASC LIMIT 1",
             (target_date,),
         ).fetchone()
     return conn.execute(
-        "SELECT * FROM activities WHERE distance_meters > 0 AND duration_seconds > 0 "
+        f"SELECT {_ACTIVITY_SELECT} FROM activities "
+        "WHERE distance_meters > 0 AND duration_seconds > 0 "
         "ORDER BY date DESC, start_time DESC LIMIT 1"
     ).fetchone()
 
@@ -1253,8 +1278,8 @@ def load_report_card_inputs(
     row = _select_activity(conn, activity_id, target_date)
     if row is None:
         return None
+    # No raw_json to strip — _select_activity never fetched it (_ACTIVITY_COLUMNS).
     activity = dict(row)
-    activity.pop("raw_json", None)
     aid = activity["activity_id"]
 
     splits = [dict(r) for r in conn.execute(

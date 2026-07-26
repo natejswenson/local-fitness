@@ -32,7 +32,6 @@ from pydantic import ValidationError
 
 from .. import config, db, notes, plans
 from ..ingest import baselines as baselines_mod
-from ..ingest import daily as daily_ingest
 from . import (
     briefs, card_store, charts, coach, interpret, journal, memory, personality,
     plan_coach, reflect, report_card, units, workout_coach,
@@ -711,8 +710,13 @@ async def query_workouts(args: dict) -> dict:
 async def get_workout_detail(args: dict) -> dict:
     aid = int(args["activity_id"])
     with db.connect() as conn:
+        # Explicit columns, not SELECT *: raw_json is ~50 KB of preserved Garmin
+        # payload that this response has always popped straight back off.
+        # report_card owns the one list (see report_card._ACTIVITY_COLUMNS).
         act = conn.execute(
-            "SELECT * FROM activities WHERE activity_id = ?", (aid,)
+            f"SELECT {report_card._ACTIVITY_SELECT} FROM activities "
+            "WHERE activity_id = ?",
+            (aid,),
         ).fetchone()
         if not act:
             return _err("activity not found", activity_id=aid)
@@ -725,8 +729,8 @@ async def get_workout_detail(args: dict) -> dict:
             "SELECT * FROM activity_splits WHERE activity_id = ? ORDER BY split_index",
             (aid,),
         ).fetchall()]
+    # No raw_json pop — the SELECT above never fetched it.
     activity = _augment_workout(dict(act))
-    activity.pop("raw_json", None)
     return _text({"activity": activity, "hr_zones": zones, "splits": splits})
 
 
@@ -987,6 +991,12 @@ def _sync_state(result: dict, *, recomputed: bool) -> str:
     {},
 )
 async def sync_garmin_data(_args: dict) -> dict:
+    # Deferred import: garminconnect drags requests (~28 ms measured) into
+    # every `import tools` — every stdio session start, every server boot —
+    # and this tool is its ONLY consumer. Tests patch
+    # local_fitness.ingest.daily.pull directly (same module object).
+    from ..ingest import daily as daily_ingest
+
     result = await asyncio.to_thread(daily_ingest.pull, max_days=SYNC_MAX_DAYS)
     status = result.get("status")
     # Recompute on any landed data, not just a clean `success`: activities can
@@ -1148,7 +1158,7 @@ _RECOVERY_SCHEMA = {
 
 @tool(
     "recovery_pattern",
-    "After workouts matching the filter, how many days does body battery max and RHR typically take to return to within 95% / 103% of baseline? Returns averages and the 10 most-recent matched workouts.",
+    "After workouts matching the filter, how many days does body battery max and RHR typically take to return to within 95% / 103% of baseline? Returns averages, the 10 most-recent matched workouts, and how many were skipped for want of a baseline.",
     _RECOVERY_SCHEMA,
 )
 async def recovery_pattern(args: dict) -> dict:
@@ -1181,49 +1191,73 @@ async def recovery_pattern(args: dict) -> dict:
             f"FROM activities WHERE {where_sql} ORDER BY date",
             params,
         ).fetchall()]
-        results = []
-        for w in workouts:
-            wdate = date.fromisoformat(w["date"])
-            baseline = conn.execute(
-                "SELECT body_battery_max_60day_mean AS bb, rhr_60day_mean AS rhr "
-                "FROM baselines WHERE date = ?",
-                (w["date"],),
-            ).fetchone()
-            if not baseline or baseline["bb"] is None:
+        # Two range loads instead of a point query per workout per day. The old
+        # shape was 1 baselines lookup + up to 7 daily_metrics probes for EVERY
+        # matched workout — on a year of running that is ~950 round trips for a
+        # payload of ten rows. Both lookup tables are keyed by date, so one
+        # BETWEEN each covers every workout and the offsets resolve in Python.
+        baselines_by_date: dict[str, dict] = {}
+        metrics_by_date: dict[str, dict] = {}
+        if workouts:
+            w_dates = [w["date"] for w in workouts]
+            lo, hi = min(w_dates), max(w_dates)
+            # Recovery is probed at offsets +1..+7, so the metrics window runs
+            # one week past the last workout; baselines are read at the workout
+            # date itself.
+            metrics_hi = (date.fromisoformat(hi) + timedelta(days=7)).isoformat()
+            metrics_lo = (date.fromisoformat(lo) + timedelta(days=1)).isoformat()
+            baselines_by_date = {r["date"]: dict(r) for r in conn.execute(
+                "SELECT date, body_battery_max_60day_mean AS bb, rhr_60day_mean AS rhr "
+                "FROM baselines WHERE date BETWEEN ? AND ?",
+                (lo, hi),
+            ).fetchall()}
+            metrics_by_date = {r["date"]: dict(r) for r in conn.execute(
+                "SELECT date, body_battery_max, rhr FROM daily_metrics "
+                "WHERE date BETWEEN ? AND ?",
+                (metrics_lo, metrics_hi),
+            ).fetchall()}
+
+    results = []
+    n_skipped_no_baseline = 0
+    for w in workouts:
+        wdate = date.fromisoformat(w["date"])
+        baseline = baselines_by_date.get(w["date"])
+        if not baseline or baseline["bb"] is None:
+            n_skipped_no_baseline += 1
+            continue
+        bb_recovery = None
+        rhr_recovery = None
+        for offset in range(1, 8):
+            row = metrics_by_date.get((wdate + timedelta(days=offset)).isoformat())
+            if not row:
                 continue
-            bb_recovery = None
-            rhr_recovery = None
-            for offset in range(1, 8):
-                d = (wdate + timedelta(days=offset)).isoformat()
-                row = conn.execute(
-                    "SELECT body_battery_max, rhr FROM daily_metrics WHERE date = ?",
-                    (d,),
-                ).fetchone()
-                if not row:
-                    continue
-                if (
-                    bb_recovery is None
-                    and row["body_battery_max"]
-                    and row["body_battery_max"] >= baseline["bb"] * 0.95
-                ):
-                    bb_recovery = offset
-                if (
-                    rhr_recovery is None
-                    and baseline["rhr"]
-                    and row["rhr"]
-                    and row["rhr"] <= baseline["rhr"] * 1.03
-                ):
-                    rhr_recovery = offset
-            results.append(_augment_workout({
-                **w,
-                "recovery_days_to_bb_baseline": bb_recovery,
-                "recovery_days_to_rhr_baseline": rhr_recovery,
-            }))
+            if (
+                bb_recovery is None
+                and row["body_battery_max"]
+                and row["body_battery_max"] >= baseline["bb"] * 0.95
+            ):
+                bb_recovery = offset
+            if (
+                rhr_recovery is None
+                and baseline["rhr"]
+                and row["rhr"]
+                and row["rhr"] <= baseline["rhr"] * 1.03
+            ):
+                rhr_recovery = offset
+        results.append(_augment_workout({
+            **w,
+            "recovery_days_to_bb_baseline": bb_recovery,
+            "recovery_days_to_rhr_baseline": rhr_recovery,
+        }))
 
     bb_vals = [r["recovery_days_to_bb_baseline"] for r in results if r["recovery_days_to_bb_baseline"]]
     rhr_vals = [r["recovery_days_to_rhr_baseline"] for r in results if r["recovery_days_to_rhr_baseline"]]
     return _text({
         "n_workouts_matched": len(results),
+        # Workouts that cleared the filter but had no usable baselines row for
+        # their own date. These were always dropped silently, which made
+        # "3 matched" unreadable — 3 of 3 and 3 of 40 printed identically.
+        "n_skipped_no_baseline": n_skipped_no_baseline,
         "avg_recovery_days_body_battery": round(sum(bb_vals) / len(bb_vals), 2) if bb_vals else None,
         "avg_recovery_days_rhr": round(sum(rhr_vals) / len(rhr_vals), 2) if rhr_vals else None,
         "recent_workouts": results[-10:],
@@ -1572,16 +1606,19 @@ def _spec_payload(spec: personality.PersonalitySpec) -> dict:
     {},
 )
 async def get_coach_personality(_args: dict) -> dict:
-    profile = coach.resolve_coach_profile()
-    stored = personality.parse_spec(db.get_setting(personality.SPEC_KEY))
-    effective = profile.spec or personality.seed_from_profile(profile)
+    # ONE connection for the whole tool (was 4: resolve_coach_profile opened
+    # two on its own, get_setting a third, the counts a fourth), and ONE pass
+    # over coach_journal instead of two full COUNT(*) scans.
     with db.connect() as conn:
-        journal_count = conn.execute(
-            "SELECT COUNT(*) FROM coach_journal WHERE archived = 0"
-        ).fetchone()[0]
-        archived_count = conn.execute(
-            "SELECT COUNT(*) FROM coach_journal WHERE archived = 1"
-        ).fetchone()[0]
+        profile = coach.resolve_coach_profile(conn=conn)
+        stored = personality.parse_spec(
+            db.get_setting(personality.SPEC_KEY, conn=conn))
+        journal_count, archived_count = conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN archived = 0 THEN 1 END), 0), "
+            "       COALESCE(SUM(CASE WHEN archived = 1 THEN 1 END), 0) "
+            "FROM coach_journal"
+        ).fetchone()
+    effective = profile.spec or personality.seed_from_profile(profile)
     return _text({
         "profile": profile.name,
         "customized": profile.spec is not None,
@@ -1959,17 +1996,19 @@ async def log_manual_workout(args: dict) -> dict:
 
     # Widen the lookback so a BACKDATED workout rewrites its OWN date's baseline
     # row (and everything forward), not just the default 90-day window forward.
-    from ..ingest import baselines
     wdate = date.fromisoformat(workout_date)
-    lookback = max(baselines.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
+    lookback = max(baselines_mod.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
     # The activity row is ALREADY committed (db.connect() committed on block
     # exit). recompute() runs on a fresh connection; if it raises (transient
     # "database is locked", a bad stored date, ...) we must NOT propagate — a
     # bare raise reads as a tool failure and a blind retry would insert a SECOND
     # workout, double-counting load. Return a partial-success so the caller can
-    # tell the row landed and skip the retry.
+    # tell the row landed and skip the retry. to_thread, not a bare call:
+    # recompute is seconds of DB work on a wide lookback and this is an async
+    # handler — a sync call parks the whole event loop (sync_garmin_data
+    # already does it right).
     try:
-        baselines.recompute(lookback_days=lookback)
+        await asyncio.to_thread(baselines_mod.recompute, lookback_days=lookback)
     except Exception as e:  # noqa: BLE001 — row is committed; never re-raise here
         return _text({
             "logged": True,
@@ -2016,14 +2055,14 @@ async def delete_manual_workout(args: dict) -> dict:
         conn.execute("DELETE FROM activities WHERE activity_id = ?", (aid,))
 
     # (4) Recompute with the same widened lookback covering that date.
-    from ..ingest import baselines
     wdate = date.fromisoformat(workout_date)
-    lookback = max(baselines.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
+    lookback = max(baselines_mod.RECOMPUTE_LOOKBACK_DAYS, (date.today() - wdate).days + 1)
     # The delete is ALREADY committed. recompute() runs on a fresh connection;
     # if it raises, don't propagate a bare exception that implies the delete
-    # failed — the row is gone. Return a partial-success instead.
+    # failed — the row is gone. Return a partial-success instead. to_thread
+    # for the same event-loop reason as log_manual_workout above.
     try:
-        baselines.recompute(lookback_days=lookback)
+        await asyncio.to_thread(baselines_mod.recompute, lookback_days=lookback)
     except Exception as e:  # noqa: BLE001 — delete is committed; never re-raise
         return _text({
             "deleted": True,
@@ -3077,7 +3116,21 @@ async def generate_brief_report(args: dict) -> dict:
         plan_section = None
 
     if plan_section is not None and plan_section["today"] is not None:
-        profile = coach.resolve_coach_profile()
+        # ONE connection for the whole pre-render resolution (was 6: the
+        # profile resolve opened two, user_name one per call and it was called
+        # TWICE, the memory resolve two more). Resolved into locals here and
+        # threaded into the generator below — the await stays outside the
+        # block, and `_user_name` is now computed once so the prompt (and
+        # therefore plan_coach's disk-cache key) is byte-identical to before.
+        with db.connect() as conn:
+            profile = coach.resolve_coach_profile(conn=conn)
+            _user_name = config.user_name(conn=conn)
+            _memory_text = memory.render_memory_for_prompt(
+                conn=conn,
+                today=target_date,
+                exclude_source_key=("brief", target_date),
+                user_name=_user_name,
+            )
         try:
             coaching_line = await plan_coach.generate_coaching_line_cached(
                 profile,
@@ -3091,15 +3144,11 @@ async def generate_brief_report(args: dict) -> dict:
                 # the prompt — and so the disk cache key — exactly as it was.
                 sessions_adherence_pct=plan_section.get("sessions_adherence_pct"),
                 notes_text=notes.render_for_prompt(),
-                user_name=config.user_name(),
+                user_name=_user_name,
                 # Keyed to the brief's own date (like the whole section), with
                 # that brief's own reflection excluded so reflect can't bust
                 # this cache (see memory.render_memory_for_prompt).
-                memory_text=memory.render_memory_for_prompt(
-                    today=target_date,
-                    exclude_source_key=("brief", target_date),
-                    user_name=config.user_name(),
-                ),
+                memory_text=_memory_text,
             )
         except Exception:
             LOG.warning(
@@ -3327,6 +3376,14 @@ async def workout_report_card(args: dict) -> dict:
         return _err(f"unknown format '{fmt}'", allowed=sorted(_REPORT_CARD_FORMATS))
     activity_id = args.get("activity_id")
 
+    # ONE connection for every read this tool makes (was ~8: the inputs load,
+    # then resolve_coach_profile ×2, user_name, the memory/ledger resolve ×2,
+    # load_read and has_event each opening their own). Everything inside is
+    # synchronous and local — the SDK call, the PDF render and save_card all
+    # stay OUTSIDE the block. save_card in particular MUST keep opening its
+    # own connection: it runs on a worker thread via asyncio.to_thread, and
+    # sqlite3 connections are same-thread-checked.
+    #
     # The per-sample HR trace is only worth resolving for the PDF (it can reach
     # the network on a cache miss, and the markdown card has nowhere to plot
     # it). format='table' therefore stays a purely local, no-network read.
@@ -3335,42 +3392,55 @@ async def workout_report_card(args: dict) -> dict:
             conn, activity_id=activity_id, target_date=target_date,
             hr_trace=fmt != "table",
         )
-    if inputs is None:
-        return _err(
-            "no matching activity found", activity_id=activity_id, date=target_date)
+        if inputs is None:
+            return _err(
+                "no matching activity found", activity_id=activity_id,
+                date=target_date)
 
-    card = report_card.build_card(
-        inputs["activity"], inputs["splits"], inputs["plan_workout"],
-        inputs["reference"], inputs["context"], inputs.get("hr_samples"),
-        inputs.get("recent_activities"), inputs.get("upcoming_workouts"),
-    )
+        card = report_card.build_card(
+            inputs["activity"], inputs["splits"], inputs["plan_workout"],
+            inputs["reference"], inputs["context"], inputs.get("hr_samples"),
+            inputs.get("recent_activities"), inputs.get("upcoming_workouts"),
+        )
 
-    # The coach's verbal read leads the card. Claude-generated behind the same
-    # single-entry disk cache plan_coach uses, with a deterministic template
-    # fallback — a missing credential or a dead stream costs the phrasing, never
-    # the card, since every grade in it was already computed in Python.
-    profile = coach.resolve_coach_profile()
-    _activity_key = str(inputs["activity"]["activity_id"])
-    _user_name = config.user_name()
-    # Resolved ONCE into locals and threaded byte-identically into both the
-    # key and the generator — any drift and the fast-path key never matches.
-    _notes_text = notes.render_for_prompt()
-    # THIS card's own journal entries are excluded: without that, reflecting
-    # on the card would change its next prompt, bust the read cache, and
-    # regenerate on every render forever.
-    _memory_text = memory.render_memory_for_prompt(
-        exclude_source_key=("report_card", _activity_key),
-        user_name=_user_name,
-    )
-    # Fast path: the stored card doubles as a per-activity read cache. On a
-    # key match the stored parsed read is reused as-is — no SDK call — and
-    # read_key stays non-NULL so save_card's guarded UPSERT sees an equal key
-    # and no-ops (the row stays byte-identical; this render's recomputed
-    # grades never land under the stored render's words).
-    read_key: str | None = workout_coach.read_cache_key(
-        profile, card, notes_text=_notes_text, user_name=_user_name,
-        memory_text=_memory_text)
-    _stored = card_store.load_read(inputs["activity"]["activity_id"])
+        # The coach's verbal read leads the card. Claude-generated behind the
+        # same single-entry disk cache plan_coach uses, with a deterministic
+        # template fallback — a missing credential or a dead stream costs the
+        # phrasing, never the card, since every grade in it was already
+        # computed in Python.
+        profile = coach.resolve_coach_profile(conn=conn)
+        _activity_key = str(inputs["activity"]["activity_id"])
+        _user_name = config.user_name(conn=conn)
+        # Resolved ONCE into locals and threaded byte-identically into both the
+        # key and the generator — any drift and the fast-path key never matches.
+        _notes_text = notes.render_for_prompt()
+        # THIS card's own journal entries are excluded: without that, reflecting
+        # on the card would change its next prompt, bust the read cache, and
+        # regenerate on every render forever.
+        _memory_text = memory.render_memory_for_prompt(
+            conn=conn,
+            exclude_source_key=("report_card", _activity_key),
+            user_name=_user_name,
+        )
+        # Fast path: the stored card doubles as a per-activity read cache. On a
+        # key match the stored parsed read is reused as-is — no SDK call — and
+        # read_key stays non-NULL so save_card's guarded UPSERT sees an equal
+        # key and no-ops (the row stays byte-identical; this render's
+        # recomputed grades never land under the stored render's words).
+        read_key: str | None = workout_coach.read_cache_key(
+            profile, card, notes_text=_notes_text, user_name=_user_name,
+            memory_text=_memory_text)
+        _stored = card_store.load_read(
+            inputs["activity"]["activity_id"], conn=conn)
+        # Hoisted onto the shared connection with the other reads. Safe to
+        # decide here rather than after the read: reflect is the only writer
+        # of ("report_card", <this id>) entries, it is fired below, and its
+        # own has_event pre-check plus idx_journal_event still backstop the
+        # race. Short-circuit order is preserved — with memory disabled the
+        # journal is never touched.
+        _should_reflect = memory.memory_enabled() and not journal.has_event(
+            "report_card", _activity_key, conn=conn)
+
     if (_stored and _stored[0] == read_key
             and card_store.read_is_complete(_stored[1])):
         card["coach_read"] = _stored[1]
@@ -3397,7 +3467,7 @@ async def workout_report_card(args: dict) -> dict:
     # never double-write (the DB unique index backstops the race regardless).
     # The task reference is held module-side; asyncio only weakly references
     # scheduled tasks and an unreferenced one can be GC'd mid-flight.
-    if memory.memory_enabled() and not journal.has_event("report_card", _activity_key):
+    if _should_reflect:
         _task = asyncio.create_task(reflect.reflect_after_report_card(card))
         _REFLECT_TASKS.add(_task)
         _task.add_done_callback(_REFLECT_TASKS.discard)

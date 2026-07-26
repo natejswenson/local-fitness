@@ -97,18 +97,32 @@ def fit_one_page(
     from the winning `Document` rather than re-rendering it — `render()` then
     `write_pdf()` on the same object is the whole reason this doesn't call
     `HTML.write_pdf()` directly.
+
+    One ``FontConfiguration`` + one image ``cache`` dict are shared across
+    the rungs (0.36.0): with neither, every rung got a fresh empty cache and
+    a fresh font config, so a 3-rung fit re-decoded ~124 KB of base64 chart
+    PNGs and re-parsed/re-registered a ~140 KB @font-face TTF twice for
+    nothing — density changes scalars in the stylesheet, never the assets.
+    Both are PER CALL, not module-global, deliberately: WeasyPrint writes a
+    temp font file per registered face, and a process-lifetime
+    FontConfiguration on a long-running server would accumulate them without
+    bound; per-call keeps the growth bounded at rungs-per-render and lets GC
+    reclaim the temp files with the config.
     """
     import weasyprint
+    from weasyprint.text.fonts import FontConfiguration
 
     if not presets:
         raise ValueError("presets must not be empty")
 
+    font_config = FontConfiguration()
+    image_cache: dict = {}
     doc = None
     index = 0
     for index, preset in enumerate(presets):
         doc = weasyprint.HTML(
             string=build_html(preset), url_fetcher=_report_url_fetcher()
-        ).render()
+        ).render(font_config=font_config, cache=image_cache)
         if len(doc.pages) == 1:
             break
     return doc.write_pdf(), len(doc.pages), index

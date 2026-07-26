@@ -27,7 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .. import config
@@ -255,27 +255,58 @@ def _cache_path() -> Path:
     return db.DEFAULT_DB_PATH.parent / "plan_coach_cache.json"
 
 
-def _read_cached_line(path: Path, key: str) -> str | None:
-    """The cached line if ``path`` holds an entry for exactly ``key``; else
-    None. Tolerates a missing/corrupt cache file — never raises."""
+#: Multi-entry cache cap (0.36.0). The old single-entry "latest key wins"
+#: shape thrashed the moment two different brief dates alternated — every
+#: render of A evicted B and vice versa, each miss a live SDK call on a 30 s
+#: budget. 32 entries is a month of dates with room for plan edits.
+CACHE_MAX_ENTRIES = 32
+
+
+def _load_cache_entries(path: Path) -> dict[str, dict]:
+    """The cache file's entries, tolerating every historical shape: the v2
+    ``{"version": 2, "entries": {...}}`` dict, the retired v1 single-entry
+    ``{"key": ..., "line": ...}`` (read as one entry so an upgrade keeps its
+    hit), and missing/corrupt files (empty). Never raises."""
     try:
-        entry = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(entry, dict) and entry.get("key") == key:
-            line = entry.get("line")
-            if isinstance(line, str) and line:
-                return line
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        pass
-    return None
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("version") == 2 and isinstance(data.get("entries"), dict):
+        return {
+            k: v for k, v in data["entries"].items()
+            if isinstance(v, dict) and isinstance(v.get("line"), str) and v["line"]
+        }
+    if isinstance(data.get("key"), str) and isinstance(data.get("line"), str):
+        return {data["key"]: {"line": data["line"], "ts": ""}}
+    return {}
+
+
+def _read_cached_line(path: Path, key: str) -> str | None:
+    """The cached line for exactly ``key``, else None. Never raises."""
+    entry = _load_cache_entries(path).get(key)
+    return entry["line"] if entry else None
 
 
 def _write_cached_line(path: Path, key: str, line: str) -> None:
-    """Best-effort single-entry cache write (latest key wins). A cache write
+    """Best-effort v2 multi-entry cache write, capped at
+    ``CACHE_MAX_ENTRIES`` by evicting the oldest ``ts``. A cache write
     failure must never fail the PDF render — swallow and log."""
     try:
+        entries = _load_cache_entries(path)
+        entries[key] = {
+            "line": line,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        while len(entries) > CACHE_MAX_ENTRIES:
+            # Missing ts (a migrated v1 entry) sorts oldest — first out.
+            oldest = min(entries, key=lambda k: entries[k].get("ts") or "")
+            del entries[oldest]
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"key": key, "line": line}), encoding="utf-8")
+        tmp.write_text(
+            json.dumps({"version": 2, "entries": entries}), encoding="utf-8")
         tmp.replace(path)
     except OSError:
         _LOG.warning("plan_coach cache write failed (ignored)", exc_info=True)

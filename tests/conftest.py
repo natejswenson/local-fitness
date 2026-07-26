@@ -67,3 +67,26 @@ def _no_live_garmin_calls(monkeypatch):
     from local_fitness.ingest import details
 
     monkeypatch.setattr(details, "fetch_hr_samples", lambda *a, **k: [])
+
+
+@pytest.fixture(autouse=True)
+def _fresh_profile_cache():
+    """Drop ``coach.load_profile``'s memo around every test.
+
+    The cache keys on the profile NAME only, while the read resolves through
+    module-level ``coach._PROFILE_DIR`` — so a test that repoints that dir
+    (``test_coach.py::test_missing_profile_dir_falls_back``) or writes a
+    profile file would otherwise pin its result for every later test in the
+    same process, in any file. Cleared before AND after so neither direction
+    of leakage is possible.
+
+    Suite-wide (not test_coach-local) precisely because the pollution crosses
+    files: `test_prompts`, `test_personality`, `test_reflect` and
+    `test_plan_coach` all call ``load_profile`` and would silently read a
+    fallback persona.
+    """
+    from local_fitness.agent import coach
+
+    coach.load_profile.cache_clear()
+    yield
+    coach.load_profile.cache_clear()

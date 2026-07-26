@@ -28,6 +28,7 @@ import pytest
 from local_fitness import db, plans
 from local_fitness.agent import (
     branding, interpret, journal, report_card, tools, units, visuals)
+from local_fitness.ingest import daily as daily_ingest_mod
 
 
 def test_text_emits_compact_json():
@@ -1526,7 +1527,7 @@ def test_sync_garmin_data_success_recomputes_baselines(monkeypatch):
         calls["lookback_days"] = lookback_days
         return 90
 
-    monkeypatch.setattr(tools.daily_ingest, "pull", fake_pull)
+    monkeypatch.setattr(daily_ingest_mod, "pull", fake_pull)
     monkeypatch.setattr(tools.baselines_mod, "recompute", fake_recompute)
 
     payload, err = call(tools.sync_garmin_data, {})
@@ -1545,7 +1546,7 @@ def test_sync_garmin_data_success_recomputes_baselines(monkeypatch):
 
 def test_sync_garmin_data_skipped_does_not_recompute(monkeypatch):
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
             "status": "skipped", "days_pulled": 0, "activities_loaded": 0,
             "last_date": "2026-07-06", "error": None,
@@ -1573,7 +1574,7 @@ def test_sync_garmin_data_partial_is_not_an_error_and_recomputes(monkeypatch):
     """
     calls = {}
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
             "status": "partial", "days_pulled": 3, "activities_loaded": 0,
             "last_date": "2026-07-25",
@@ -1606,7 +1607,7 @@ def test_sync_garmin_data_recomputes_when_only_activities_landed(monkeypatch):
     # wellness day, so days_pulled alone is the wrong recompute trigger.
     calls = {}
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
             "status": "partial", "days_pulled": 0, "activities_loaded": 2,
             "last_date": None, "error": "1 day(s) still missing",
@@ -1631,7 +1632,7 @@ def test_sync_garmin_data_recomputes_when_only_activities_landed(monkeypatch):
 @pytest.mark.parametrize("status", ["auth_failure", "not_configured", "failure", "interrupted"])
 def test_sync_garmin_data_hard_failures_are_errors(monkeypatch, status):
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
             "status": status, "days_pulled": 0, "activities_loaded": 0,
             "last_date": None, "error": f"mfa_required: {status} detail",
@@ -1655,7 +1656,7 @@ def test_sync_garmin_data_hard_failure_without_error_string_still_errors(monkeyp
     # `interrupted` can close a run with error=None; the tool must not fall
     # through to a success payload just because the string is empty.
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
             "status": "interrupted", "days_pulled": 0, "activities_loaded": 0,
             "last_date": None, "error": None,
@@ -3924,3 +3925,123 @@ def test_card_query_tools_are_shared_not_local_only():
     local_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
     assert {"list_report_cards", "get_report_card"} <= all_names
     assert not {"list_report_cards", "get_report_card"} & local_names
+
+
+def test_importing_tools_does_not_import_garminconnect():
+    """S7 (0.36.0): the garminconnect -> requests chain (~28 ms measured) must
+    stay out of `import tools` — every stdio session start pays it otherwise.
+    sync_garmin_data is its only consumer and imports it in its body."""
+    import sys
+
+    code = (
+        "import sys; import local_fitness.agent.tools; "
+        "sys.exit(1 if 'garminconnect' in sys.modules else 0)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True)
+    assert proc.returncode == 0, proc.stderr.decode()
+
+
+# --------------------------------------------------------------------------- #
+# 0.36.0 speed pass: recovery_pattern range queries + connect counts
+# --------------------------------------------------------------------------- #
+def _count_connects(monkeypatch):
+    counts = {"n": 0}
+    orig = db.connect
+
+    def counting(*a, **k):
+        counts["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(db, "connect", counting)
+    return counts
+
+
+def test_recovery_pattern_counts_workouts_skipped_for_missing_baseline(
+    tmp_path, monkeypatch
+):
+    """A matched workout whose date has no baselines row was silently dropped
+    — '3 matched' printed identically for 3-of-3 and 3-of-40."""
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i, has_baseline in ((10, True), (20, False), (30, True)):
+            d = (today - timedelta(days=i)).isoformat()
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, activity_type, "
+                "duration_seconds, distance_meters, training_load) "
+                "VALUES (?, ?, 'running', 3600, 10000, 80)",
+                (i, d),
+            )
+            if has_baseline:
+                conn.execute(
+                    "INSERT INTO baselines (date, body_battery_max_60day_mean, "
+                    "rhr_60day_mean) VALUES (?, 88.0, 52.0)",
+                    (d,),
+                )
+                conn.execute(
+                    "INSERT INTO daily_metrics (date, body_battery_max, rhr) "
+                    "VALUES (?, 90, 50)",
+                    ((today - timedelta(days=i - 1)).isoformat(),),
+                )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running"})
+    assert not err
+    assert payload["n_workouts_matched"] == 2
+    assert payload["n_skipped_no_baseline"] == 1
+    # The two survivors both recovered on day +1 (bb 90 >= 0.95*88).
+    assert payload["avg_recovery_days_body_battery"] == 1.0
+
+
+def test_recovery_pattern_issues_range_queries_not_per_workout_probes(
+    seeded, monkeypatch
+):
+    """The N+1 rewrite: 1 workouts query + 2 range loads, total — the old
+    shape issued 1 baselines + up to 7 daily_metrics probes PER workout
+    (~953 statements on a year of running)."""
+    executed: list[str] = []
+    orig = db.connect
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def traced(*a, **k):
+        with orig(*a, **k) as conn:
+            class _T:
+                def execute(self, sql, *ar, **kw):
+                    executed.append(sql.strip().split()[0].upper() + " " + sql[:60])
+                    return conn.execute(sql, *ar, **kw)
+
+                def __getattr__(self, name):
+                    return getattr(conn, name)
+
+            yield _T()
+
+    monkeypatch.setattr(db, "connect", traced)
+    payload, err = call(tools.recovery_pattern, {"activity_type": "run"})
+    assert not err
+    selects = [s for s in executed if s.startswith("SELECT")]
+    assert len(selects) == 3  # workouts + baselines range + metrics range
+
+
+def test_workout_report_card_read_phase_opens_at_most_three_connections(
+    rc_seeded, reports_tmp, monkeypatch
+):
+    """S8: the read pipeline (inputs, profile, user_name, memory, stored
+    read, has_event) shares ONE connection; only save_card (worker thread —
+    sqlite3 same-thread check) and reflect's read block open their own.
+    Was ~8."""
+    counts = _count_connects(monkeypatch)
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert counts["n"] <= 3
+
+
+def test_get_coach_personality_opens_one_connection(seeded, monkeypatch):
+    counts = _count_connects(monkeypatch)
+    payload, err = call(tools.get_coach_personality, {})
+    assert not err
+    assert counts["n"] == 1
+    # The single-aggregate rewrite still reports both journal counts.
+    assert payload["journal_entries"] == 0
+    assert payload["journal_archived"] == 0

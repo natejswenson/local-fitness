@@ -629,9 +629,14 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
     memory_compact = memory.render_memory_for_prompt(
         compact=True, today=_today_iso,
         exclude_source_key=("brief", _today_iso), user_name=user_name)
-    memory_full = memory.render_memory_for_prompt(
-        today=_today_iso, exclude_source_key=("brief", _today_iso),
-        user_name=user_name)
+
+    def _memory_full() -> str:
+        # Resolved lazily (0.36.0): only the V1 rollback branch reads the
+        # full variant, so the default V2 path was paying a second ledger
+        # compute + 2 connects per brief and discarding it.
+        return memory.render_memory_for_prompt(
+            today=_today_iso, exclude_source_key=("brief", _today_iso),
+            user_name=user_name)
     # The BriefContext, kept for the post-stream advisory grounding check.
     # Stays None unless a branch below assembles one — V2 always does (it's
     # also the toolless generation input); V1 does too since 4b, but SOLELY
@@ -730,7 +735,7 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
             # — and therefore its behavior — unchanged. Chat + the web agent keep
             # the full set via allowed_tool_names().
             allowed_tools=agent_tools.read_only_tool_names(),
-            system_prompt=prompts.system_prompt(user_name, coach_profile, memory_full),
+            system_prompt=prompts.system_prompt(user_name, coach_profile, _memory_full()),
             model=model,
             permission_mode="bypassPermissions",
             max_turns=20,

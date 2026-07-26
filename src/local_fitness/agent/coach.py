@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 from .. import config, db
@@ -147,9 +148,22 @@ def _coerce_thresh(fm: dict, key: str, default: float) -> float:
         return default
 
 
+@lru_cache(maxsize=8)
 def load_profile(name: str) -> CoachProfile:
     """Load a profile by name. Unknown name → adaptive. Missing/malformed file,
-    or empty body → the in-code fallback (never raises)."""
+    or empty body → the in-code fallback (never raises).
+
+    Memoized (``maxsize=8`` ≥ ``len(PROFILE_NAMES)``, so the shipped set never
+    evicts): every voice surface resolves a profile, and each resolution
+    re-read and re-parsed the same few-KB ``.md`` off disk. ``CoachProfile`` is
+    a frozen dataclass, so a shared instance can't be mutated by a caller.
+
+    The cost is that an EDITED profile file is invisible to a running process.
+    That is correct for the app (the files are tracked code, changed only by a
+    deploy) but a hazard for tests that write profile files or repoint
+    ``_PROFILE_DIR`` — those must call ``load_profile.cache_clear()``; the
+    autouse fixture in ``tests/conftest.py`` does it for the whole suite.
+    """
     name = (name or "").strip().lower()
     if name not in PROFILE_NAMES:
         name = DEFAULT_PROFILE

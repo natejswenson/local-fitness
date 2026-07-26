@@ -474,7 +474,30 @@ These are settled — don't redesign without a reason.
   non-interactive 06:30 job may hit a login/MFA and fail; the remedy is to
   re-seed with an interactive `uv run fitness pull`. `~/.garminconnect` is
   outside the repo; `Path.home()` resolves from `HOME`, so the launchd job and
-  the seeding shell must share the same `HOME`.
+  the seeding shell must share the same `HOME`. **Activity details are
+  fetched once, not per pull** (0.36.0): `_ingest_activity_range` pre-checks
+  stored `activity_hr_zones`/`activity_splits` ids and, for an activity dated
+  before wall-clock today with BOTH present, refreshes only the summary row
+  (INSERT OR REPLACE — the freshness feature) and skips the two detail calls
+  plus their 0.3 s throttle. Today's activities always re-fetch (laps may
+  still be finalizing — that guard is load-bearing). The day loop shares ONE
+  connection with per-day commit/rollback (a failed day rolls back only its
+  own writes), and only sleeps BETWEEN days.
+- **The HTTP persona is memoized behind a `data_version` key** (0.36.0). In
+  stateless mode every `/mcp/` request re-resolved the full persona (6
+  connects + a whole ledger compute — ~5× the tool call it wrapped).
+  `mcp_server._with_coach_persona` now memoizes on
+  `(today, db_path, PRAGMA data_version, notes-file (mtime_ns, size))` — a
+  dedicated read-only monitor connection reads `data_version`, which bumps on
+  ANY other connection's commit (settings UPSERTs and journal archived-flips
+  UPDATE in place, so rowid-style keys would miss them; that's why it's NOT
+  MAX(rowid)). The notes stat covers the file-backed notes data_version can't
+  see; the date covers the ledger's as-of-yesterday facts. No-DB/error →
+  key None → resolve live, never cache (fresh-clone fail-open preserved);
+  failures are never cached. Env-var changes still need a restart, as before
+  the memo. The monitor conn must NEVER write (data_version only reports
+  OTHER connections' commits) and re-opens if `db.get_db_path()` changes.
+  `_persona_cache_clear()` resets it (tests use an autouse fixture).
 - **Path defaults**: `db.py`, `notes.py`, `briefing.py` all resolve to
   `_PROJECT_ROOT / ...` when env vars are unset.
 - **MCP tool surface can trigger a Garmin sync, not just read.** `agent/tools.py`'s
