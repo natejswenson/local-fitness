@@ -7,6 +7,7 @@ new fields later without re-pulling from Garmin.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -14,6 +15,8 @@ from datetime import date as date_cls, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
+
+_LOG = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -255,6 +258,35 @@ CREATE TABLE IF NOT EXISTS report_cards (
 CREATE INDEX IF NOT EXISTS idx_report_cards_date ON report_cards(activity_date);
 """
 
+# Kept OUT of SCHEMA on purpose: `executescript` aborts the whole script on
+# the first error, so a SQLite build without FTS5 would brick every table
+# creation if the virtual table lived in SCHEMA. This script runs in its own
+# guarded try in `init_schema` — no FTS5, no recall index, app still boots.
+# The triggers live here WITH the vtable so they can never exist without it
+# (a trigger against a missing table would fail every journal INSERT).
+# Note the update trigger fires on `UPDATE OF text` only — the archive flip
+# (`archived = 1`) never churns the index.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS coach_journal_fts USING fts5(
+    text,
+    content='coach_journal',
+    content_rowid='entry_id',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS coach_journal_fts_ai AFTER INSERT ON coach_journal BEGIN
+    INSERT INTO coach_journal_fts(rowid, text) VALUES (new.entry_id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS coach_journal_fts_ad AFTER DELETE ON coach_journal BEGIN
+    INSERT INTO coach_journal_fts(coach_journal_fts, rowid, text)
+    VALUES ('delete', old.entry_id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS coach_journal_fts_au AFTER UPDATE OF text ON coach_journal BEGIN
+    INSERT INTO coach_journal_fts(coach_journal_fts, rowid, text)
+    VALUES ('delete', old.entry_id, old.text);
+    INSERT INTO coach_journal_fts(rowid, text) VALUES (new.entry_id, new.text);
+END;
+"""
+
 
 def get_db_path() -> Path:
     path = DEFAULT_DB_PATH
@@ -317,6 +349,38 @@ def init_schema(db_path: Path | None = None) -> None:
         if hr_cols and "elapsed_seconds" not in hr_cols:
             conn.execute(
                 "ALTER TABLE activity_hr_samples ADD COLUMN elapsed_seconds REAL")
+        # Same guard again: journal entries beyond the 60-entry hot cap are
+        # archived (flag flip), never deleted — pre-0.33.0 DBs get the column.
+        # Ordered BEFORE the FTS block so a failed FTS setup still leaves the
+        # archive feature whole.
+        jcols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(coach_journal)")}
+        if "archived" not in jcols:
+            conn.execute(
+                "ALTER TABLE coach_journal "
+                "ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+        # FTS5 recall index — guarded, best-effort (see FTS_SCHEMA comment).
+        try:
+            conn.executescript(FTS_SCHEMA)
+            # Backfill / self-heal: a fresh vtable on an upgraded DB indexes 0
+            # of the existing rows; a DB written by an FTS5-less build drifts.
+            # Count-mismatch → rebuild is idempotent and O(n) on a table that
+            # stays in the hundreds of rows. The indexed count MUST come from
+            # the _docsize shadow table (one row per indexed document):
+            # COUNT(*) on an external-content vtable reads through to the
+            # content table and would always "match".
+            n_rows = conn.execute(
+                "SELECT COUNT(*) FROM coach_journal").fetchone()[0]
+            n_fts = conn.execute(
+                "SELECT COUNT(*) FROM coach_journal_fts_docsize").fetchone()[0]
+            if n_fts != n_rows:
+                conn.execute(
+                    "INSERT INTO coach_journal_fts(coach_journal_fts) "
+                    "VALUES('rebuild')")
+        except sqlite3.OperationalError:
+            _LOG.warning(
+                "FTS5 unavailable in this SQLite build; coach-memory recall "
+                "degrades to substring search")
 
 
 def last_known_daily_date(

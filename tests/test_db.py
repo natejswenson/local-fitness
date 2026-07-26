@@ -31,6 +31,63 @@ def test_init_schema_idempotent(dbp):
     assert "source" in act_cols
 
 
+def test_init_schema_adds_archived_and_fts(dbp):
+    with db.connect(dbp) as conn:
+        jcols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(coach_journal)")}
+        master = {
+            (r["type"], r["name"])
+            for r in conn.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE name LIKE 'coach_journal_fts%'")
+        }
+    assert "archived" in jcols
+    assert ("table", "coach_journal_fts") in master
+    assert {("trigger", "coach_journal_fts_ai"),
+            ("trigger", "coach_journal_fts_ad"),
+            ("trigger", "coach_journal_fts_au")} <= master
+
+
+def test_init_schema_fts_idempotent_and_in_sync(dbp):
+    from local_fitness.agent import journal
+
+    journal.save_entry("a memory", source="chat", db_path=dbp)
+    db.init_schema(dbp)  # second init: no raise, no index churn
+    with db.connect(dbp) as conn:
+        n_rows = conn.execute("SELECT COUNT(*) FROM coach_journal").fetchone()[0]
+        # _docsize is the real indexed-document count; COUNT(*) on an
+        # external-content vtable reads through to the content table.
+        n_fts = conn.execute(
+            "SELECT COUNT(*) FROM coach_journal_fts_docsize").fetchone()[0]
+    assert (n_rows, n_fts) == (1, 1)
+
+
+def test_backfill_indexes_preexisting_rows(dbp):
+    # Simulate a pre-0.33.0 DB: rows written with no triggers and an empty
+    # (or missing) FTS index — the count-mismatch rebuild must pick them up.
+    with db.connect(dbp) as conn:
+        for trig in ("coach_journal_fts_ai", "coach_journal_fts_ad",
+                     "coach_journal_fts_au"):
+            conn.execute(f"DROP TRIGGER {trig}")
+        conn.execute("DROP TABLE coach_journal_fts")
+        for i, text in enumerate(
+                ["plantar fasciitis flared", "skipped the tempo again"], 1):
+            conn.execute(
+                "INSERT INTO coach_journal "
+                "(created_at, entry_date, source, seq, text) "
+                "VALUES ('2026-01-01T00:00:00', '2026-01-01', 'chat', ?, ?)",
+                (i, text))
+    db.init_schema(dbp)
+    from local_fitness.agent import journal
+
+    matches, mode = journal.search_entries("plantar", db_path=dbp)
+    assert mode == "fts"
+    assert [m["text"] for m in matches] == ["plantar fasciitis flared"]
+    with db.connect(dbp) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM coach_journal_fts_docsize").fetchone()[0] == 2
+
+
 def test_settings_roundtrip(dbp):
     assert db.get_setting("user_name", db_path=dbp) is None
     assert db.get_setting("user_name", default="nobody", db_path=dbp) == "nobody"
