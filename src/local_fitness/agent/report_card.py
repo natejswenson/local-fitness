@@ -967,7 +967,13 @@ def _delta_text(key: str, metric: dict) -> str:
         return "in range"
     if not expected:
         return "—"
-    return f"{(actual / expected - 1) * 100:+.0f}%"
+    pct = (actual / expected - 1) * 100
+    if round(pct) == 0:
+        # A sub-half-percent shortfall printed "-0%" on a live card (4.00 of
+        # 4.00 mi, off by meters) — negative zero reads like a typo beside an
+        # A+. Within rounding of zero IS on target; say so.
+        return "on target"
+    return f"{pct:+.0f}%"
 
 
 def reference_line(card: dict, *, markdown: bool = True) -> str:

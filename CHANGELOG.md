@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-07-26
+
+Live-session polish: two warts caught while grading a real run on the
+freshly shipped code.
+
+### Fixed
+- `goal_gap` rounds at the payload boundary (a live payload shipped
+  `gap_seconds: 186.44919632676692`) and carries a signed `gap_formatted`
+  duration (`"+3:06"`) for the coach voice.
+- The report card's distance delta no longer prints `-0%` for a
+  within-rounding-of-target distance (4.00-of-4.00 mi, short by meters) —
+  it says `on target`, matching pace's existing behavior.
+
 ## [0.38.0] - 2026-07-26
 
 Maintainability pass (batch 4 of 4 from the 2026-07-26 audit): the lint

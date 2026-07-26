@@ -1388,3 +1388,14 @@ def test_report_card_imports_without_workout_coach():
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True)
     assert proc.returncode == 0, proc.stderr.decode()
+
+
+def test_delta_text_never_prints_negative_zero_percent():
+    """A live card printed 'Distance ... -0%' for 4.00-of-4.00 miles (short
+    by meters): within rounding of zero IS on target — say so."""
+    just_under = {"actual": 6432.0, "expected": 6437.376, "grade": "A+"}
+    assert rc._delta_text("distance", just_under) == "on target"
+    just_over = {"actual": 6440.0, "expected": 6437.376, "grade": "A+"}
+    assert rc._delta_text("distance", just_over) == "on target"
+    real_gap = {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
+    assert rc._delta_text("distance", real_gap) == "+9%"
