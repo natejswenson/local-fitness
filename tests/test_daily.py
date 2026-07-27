@@ -19,7 +19,10 @@ per-pull 429).
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+import json
+import os
+import time as real_time
+from datetime import date, datetime, timedelta
 
 import pytest
 from garminconnect import GarminConnectAuthenticationError
@@ -266,6 +269,137 @@ def test_ingest_day_full_transform(seeded_db):
     # Sample arrays: the malformed entries are skipped by the length guard.
     assert bb_n == 2
     assert stress_n == 2
+
+
+def test_ingest_day_derives_bb_minmax_from_samples_when_no_explicit_keys(seeded_db):
+    """Realistic Garmin payload (confirmed live 2026-07-27): body_battery
+    entries carry charged/drained but NOT min/max keys — only the per-minute
+    bodyBatteryValuesArray levels. body_battery_min/max must be DERIVED from
+    those levels rather than staying NULL forever."""
+    d = date(2026, 6, 23)
+    realistic_bb = [
+        {
+            "charged": 68,
+            "drained": 72,
+            # No "min"/"max" keys — matches the real Garmin payload shape.
+            "bodyBatteryValuesArray": [
+                [1700000000000, 35],
+                [1700003600000, 96],
+                [1700007200000, 97],
+                [1700010800000, 25],
+                [1700014400000, 51],
+            ],
+        }
+    ]
+    fake = FakeGarmin(body_battery=realistic_bb)
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)
+
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT body_battery_min, body_battery_max, body_battery_charged, "
+            "body_battery_drained FROM daily_metrics WHERE date = ?",
+            (d.isoformat(),),
+        ).fetchone()
+
+    assert row["body_battery_min"] == 25  # min of the sampled levels
+    assert row["body_battery_max"] == 97  # max of the sampled levels
+    assert row["body_battery_charged"] == 68
+    assert row["body_battery_drained"] == 72
+
+
+def test_ingest_day_bb_minmax_empty_samples_is_none_not_zero(seeded_db):
+    """No usable samples -> body_battery_min/max stay None, never 0."""
+    d = date(2026, 6, 24)
+    fake = FakeGarmin(body_battery=[{"charged": 10, "drained": 5, "bodyBatteryValuesArray": []}])
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)
+
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT body_battery_min, body_battery_max FROM daily_metrics WHERE date = ?",
+            (d.isoformat(),),
+        ).fetchone()
+    assert row["body_battery_min"] is None
+    assert row["body_battery_max"] is None
+
+
+def test_ingest_day_bb_minmax_no_entries_at_all_is_none(seeded_db):
+    """get_body_battery returning an empty list entirely -> still None, not 0."""
+    d = date(2026, 6, 25)
+    fake = FakeGarmin(body_battery=[])
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)
+
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT body_battery_min, body_battery_max FROM daily_metrics WHERE date = ?",
+            (d.isoformat(),),
+        ).fetchone()
+    assert row["body_battery_min"] is None
+    assert row["body_battery_max"] is None
+
+
+def test_ingest_day_prefers_explicit_minmax_keys_over_derived(seeded_db):
+    """If a payload DOES carry explicit min/max keys (older/alt shape), those
+    win over the samples-derived values rather than being silently replaced."""
+    d = date(2026, 6, 26)
+    explicit_bb = [
+        {
+            "min": 15,
+            "max": 99,
+            "charged": 60,
+            "drained": 40,
+            "bodyBatteryValuesArray": [
+                [1700000000000, 50],  # would derive to min=50, max=50 alone
+            ],
+        }
+    ]
+    fake = FakeGarmin(body_battery=explicit_bb)
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)
+
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT body_battery_min, body_battery_max FROM daily_metrics WHERE date = ?",
+            (d.isoformat(),),
+        ).fetchone()
+    assert row["body_battery_min"] == 15
+    assert row["body_battery_max"] == 99
+
+
+# --------------------------------------------------------------------------- #
+# _bb_minmax_from_entries (pure helper)
+# --------------------------------------------------------------------------- #
+def test_bb_minmax_from_entries_derives_min_max():
+    bb = [{"bodyBatteryValuesArray": [[1, 35], [2, 96], [3, 25]]}]
+    assert daily._bb_minmax_from_entries(bb) == (25, 96)
+
+
+def test_bb_minmax_from_entries_multiple_entries_combined():
+    bb = [
+        {"bodyBatteryValuesArray": [[1, 40], [2, 80]]},
+        {"bodyBatteryValuesArray": [[3, 10], [4, 90]]},
+    ]
+    assert daily._bb_minmax_from_entries(bb) == (10, 90)
+
+
+def test_bb_minmax_from_entries_empty_list_returns_none_none():
+    assert daily._bb_minmax_from_entries([]) == (None, None)
+
+
+def test_bb_minmax_from_entries_not_a_list_returns_none_none():
+    assert daily._bb_minmax_from_entries(None) == (None, None)
+
+
+def test_bb_minmax_from_entries_skips_malformed_samples():
+    bb = [{"bodyBatteryValuesArray": [[1, 50], ["bad"], [2, "not-a-number"], [3, 60]]}]
+    assert daily._bb_minmax_from_entries(bb) == (50, 60)
+
+
+def test_bb_minmax_from_entries_skips_non_dict_entries():
+    bb = ["not-a-dict", {"bodyBatteryValuesArray": [[1, 42], [2, 88]]}]
+    assert daily._bb_minmax_from_entries(bb) == (42, 88)
 
 
 def test_ingest_day_all_core_endpoints_fail_raises_and_writes_no_row(seeded_db):
@@ -865,3 +999,362 @@ def test_failed_day_rollback_does_not_lose_earlier_committed_days(seeded_db, mon
     assert today.isoformat() in dates
     assert (today - timedelta(days=2)).isoformat() in dates
     assert poisoned not in dates
+
+
+# --------------------------------------------------------------------------- #
+# recompute_body_battery_minmax() — backfill for historical NULL rows
+# --------------------------------------------------------------------------- #
+def test_recompute_body_battery_minmax_fills_null_row_from_samples(seeded_db):
+    """A historical row with body_battery_min/max NULL (ingested before the
+    derivation fix existed) gets filled from its stored body_battery_samples,
+    pinned to the exact min/max values."""
+    d = "2026-06-01"
+    with db.connect(seeded_db) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics (date, rhr, body_battery_min, body_battery_max) "
+            "VALUES (?, 50, NULL, NULL)", (d,),
+        )
+        for ts, val in [("2026-06-01T06:00:00", 30), ("2026-06-01T12:00:00", 88),
+                        ("2026-06-01T18:00:00", 55)]:
+            conn.execute(
+                "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+                (d, ts, val),
+            )
+
+    n = daily.recompute_body_battery_minmax()
+
+    assert n == 1
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT rhr, body_battery_min, body_battery_max FROM daily_metrics WHERE date = ?",
+            (d,),
+        ).fetchone()
+    assert row["body_battery_min"] == 30
+    assert row["body_battery_max"] == 88
+    assert row["rhr"] == 50  # untouched column preserved
+
+
+def test_recompute_body_battery_minmax_never_overwrites_existing_non_null(seeded_db):
+    """A row that already has body_battery_min/max populated (correctly, by a
+    live ingest) must not be clobbered by a re-run of the backfill even if the
+    stored samples would compute a different value."""
+    d = "2026-06-02"
+    with db.connect(seeded_db) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics (date, body_battery_min, body_battery_max) "
+            "VALUES (?, 20, 95)", (d,),
+        )
+        # Samples that would derive to a DIFFERENT min/max if applied.
+        conn.execute(
+            "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+            (d, "2026-06-02T06:00:00", 1),
+        )
+        conn.execute(
+            "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+            (d, "2026-06-02T18:00:00", 100),
+        )
+
+    n = daily.recompute_body_battery_minmax()
+
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT body_battery_min, body_battery_max FROM daily_metrics WHERE date = ?",
+            (d,),
+        ).fetchone()
+    # Existing non-NULL values survive untouched; the row is not counted as
+    # updated since neither column needed filling.
+    assert n == 0
+    assert row["body_battery_min"] == 20
+    assert row["body_battery_max"] == 95
+
+
+def test_recompute_body_battery_minmax_is_idempotent(seeded_db):
+    """Running the backfill twice produces the same result — the second run
+    touches zero rows since the first already filled everything."""
+    d = "2026-06-03"
+    with db.connect(seeded_db) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics (date, body_battery_min, body_battery_max) "
+            "VALUES (?, NULL, NULL)", (d,),
+        )
+        conn.execute(
+            "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+            (d, "2026-06-03T06:00:00", 40),
+        )
+        conn.execute(
+            "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+            (d, "2026-06-03T18:00:00", 70),
+        )
+
+    n1 = daily.recompute_body_battery_minmax()
+    n2 = daily.recompute_body_battery_minmax()
+
+    assert n1 == 1
+    assert n2 == 0  # nothing left to fill
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT body_battery_min, body_battery_max FROM daily_metrics WHERE date = ?",
+            (d,),
+        ).fetchone()
+    assert row["body_battery_min"] == 40
+    assert row["body_battery_max"] == 70
+
+
+def test_recompute_body_battery_minmax_no_matching_daily_metrics_row(seeded_db):
+    """Samples exist for a date with no daily_metrics row at all (e.g. a day
+    that failed core-endpoint ingest but still recorded body battery samples
+    some other way) — the UPDATE matches nothing, and that's not an error."""
+    d = "2026-06-04"
+    with db.connect(seeded_db) as conn:
+        conn.execute(
+            "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+            (d, "2026-06-04T06:00:00", 40),
+        )
+
+    n = daily.recompute_body_battery_minmax()
+
+    assert n == 0
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT * FROM daily_metrics WHERE date = ?", (d,)
+        ).fetchone()
+    assert row is None
+
+
+def test_recompute_body_battery_minmax_respects_through_cutoff(seeded_db):
+    """`through` caps which dates are eligible — a later date's NULL row stays
+    NULL when it's after the cutoff."""
+    early, late = "2026-06-05", "2026-06-10"
+    with db.connect(seeded_db) as conn:
+        for d in (early, late):
+            conn.execute(
+                "INSERT INTO daily_metrics (date, body_battery_min, body_battery_max) "
+                "VALUES (?, NULL, NULL)", (d,),
+            )
+            conn.execute(
+                "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+                (d, f"{d}T06:00:00", 33),
+            )
+            conn.execute(
+                "INSERT INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
+                (d, f"{d}T18:00:00", 77),
+            )
+
+    n = daily.recompute_body_battery_minmax(through=date(2026, 6, 7))
+
+    assert n == 1
+    with db.connect(seeded_db) as conn:
+        rows = {r["date"]: dict(r) for r in conn.execute(
+            "SELECT date, body_battery_min, body_battery_max FROM daily_metrics"
+        ).fetchall()}
+    assert rows[early]["body_battery_min"] == 33
+    assert rows[early]["body_battery_max"] == 77
+    assert rows[late]["body_battery_min"] is None  # after the cutoff, untouched
+    assert rows[late]["body_battery_max"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Timezone-drift fix: sample timestamps must not depend on the host's TZ.
+#
+# Root cause (measured live, 2026-07-27): `datetime.fromtimestamp(ts / 1000)`
+# with no `tz=` silently applies the CALLING PROCESS's system timezone, so
+# the exact same Garmin payload landed a different stored wall-clock
+# depending on whether the pull ran on the host (America/Chicago) or in the
+# container (TZ=UTC) — a measured +5h split across ~2156 days, corrupting
+# 6,400 stress_samples and 11,605 body_battery_samples rows onto the wrong
+# calendar date. The fix uses each payload entry's own
+# startTimestampGMT/startTimestampLocal delta instead.
+# --------------------------------------------------------------------------- #
+
+# Real payload confirmed live 2026-07-27: a -5h (CDT) local/GMT delta, first
+# sample landing exactly at local midnight.
+_TZ_BB_ENTRY = {
+    "charged": 55, "drained": 64,
+    "startTimestampGMT": "2026-05-15T05:00:00.0",
+    "startTimestampLocal": "2026-05-15T00:00:00.0",
+    "bodyBatteryValuesArray": [[1778821200000, 35]],  # -> local 2026-05-15T00:00:00
+}
+_TZ_STRESS_ENTRY = {
+    "startTimestampGMT": "2026-05-15T05:00:00.0",
+    "startTimestampLocal": "2026-05-15T00:00:00.0",
+    "stressValuesArray": [[1778821200000, 25]],  # -> local 2026-05-15T00:00:00
+}
+
+
+def _set_host_tz(monkeypatch, tz: str) -> None:
+    monkeypatch.setenv("TZ", tz)
+    real_time.tzset()
+
+
+@pytest.fixture
+def restore_host_tz():
+    """`time.tzset()` mutates real, PROCESS-WIDE local-time state — anything
+    this fixture doesn't hand back exactly as found would leak into every
+    other test that runs after it in the same process."""
+    original = os.environ.get("TZ")
+    yield
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    real_time.tzset()
+
+
+def test_bb_sample_conversion_is_independent_of_host_timezone(
+    seeded_db, monkeypatch, restore_host_tz
+):
+    """THE CRUX: the exact same payload must store the exact same wall-clock
+    regardless of which timezone the ingesting PROCESS runs in. This is the
+    live bug — pre-fix, this assertion fails under TZ=UTC vs TZ=America/Chicago."""
+    d = date(2026, 5, 15)
+    fake = FakeGarmin(body_battery=[_TZ_BB_ENTRY])
+    stored = {}
+    for tz in ("UTC", "America/Chicago", "Pacific/Kiritimati"):  # UTC+14, extreme case too
+        _set_host_tz(monkeypatch, tz)
+        with db.connect(seeded_db) as conn:
+            daily._ingest_day(fake, conn, d)
+        with db.connect(seeded_db) as conn:
+            row = conn.execute(
+                "SELECT timestamp, date FROM body_battery_samples WHERE value = 35"
+            ).fetchone()
+        stored[tz] = (row["date"], row["timestamp"])
+
+    assert stored["UTC"] == ("2026-05-15", "2026-05-15T00:00:00")
+    assert stored["America/Chicago"] == stored["UTC"]
+    assert stored["Pacific/Kiritimati"] == stored["UTC"]
+
+
+def test_stress_sample_conversion_is_independent_of_host_timezone(
+    seeded_db, monkeypatch, restore_host_tz
+):
+    """Same crux, for stress_samples (the table with NO source raw_json
+    preserved before this fix — see test_ingest_day_raw_json_now_includes_stress)."""
+    d = date(2026, 5, 15)
+    fake = FakeGarmin(stress=_TZ_STRESS_ENTRY)
+    stored = {}
+    for tz in ("UTC", "America/Chicago"):
+        _set_host_tz(monkeypatch, tz)
+        with db.connect(seeded_db) as conn:
+            daily._ingest_day(fake, conn, d)
+        with db.connect(seeded_db) as conn:
+            row = conn.execute(
+                "SELECT timestamp, date FROM stress_samples WHERE value = 25"
+            ).fetchone()
+        stored[tz] = (row["date"], row["timestamp"])
+
+    assert stored["UTC"] == ("2026-05-15", "2026-05-15T00:00:00")
+    assert stored["America/Chicago"] == stored["UTC"]
+
+
+def test_bb_sample_past_local_midnight_is_rekeyed_to_its_own_date(seeded_db):
+    """A sample whose true local time falls on the day AFTER the day being
+    requested must be filed under ITS OWN date, never blindly forced under
+    `cdate` — this is the (b) requirement: a sample can never be filed under
+    a date it doesn't belong to."""
+    d = date(2026, 5, 15)
+    entry = {
+        "startTimestampGMT": "2026-05-15T05:00:00.0",
+        "startTimestampLocal": "2026-05-15T00:00:00.0",
+        "bodyBatteryValuesArray": [
+            [1778821200000, 35],   # local 2026-05-15T00:00:00 — belongs to cdate
+            [1778907660000, 40],   # local 2026-05-16T00:01:00 — belongs to NEXT day
+        ],
+    }
+    fake = FakeGarmin(body_battery=[entry])
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)
+
+    with db.connect(seeded_db) as conn:
+        rows = {r["value"]: (r["date"], r["timestamp"])
+                for r in conn.execute("SELECT date, timestamp, value FROM body_battery_samples").fetchall()}
+
+    assert rows[35] == ("2026-05-15", "2026-05-15T00:00:00")
+    assert rows[40] == ("2026-05-16", "2026-05-16T00:01:00")  # re-keyed, not filed under 05-15
+
+
+def test_bb_sample_garbled_delta_is_dropped_not_filed(seeded_db):
+    """A delta that would derive a date more than 1 day from the ingest day
+    signals a corrupted/garbled payload, not a legitimate boundary sample —
+    drop it rather than risk filing garbage."""
+    d = date(2026, 5, 15)
+    entry = {
+        # Local far removed from GMT — nothing like a real UTC offset.
+        "startTimestampGMT": "2026-05-15T05:00:00.0",
+        "startTimestampLocal": "2026-05-20T00:00:00.0",
+        "bodyBatteryValuesArray": [[1778821200000, 35]],
+    }
+    fake = FakeGarmin(body_battery=[entry])
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)  # must not raise
+
+    with db.connect(seeded_db) as conn:
+        n = conn.execute("SELECT COUNT(*) AS n FROM body_battery_samples").fetchone()["n"]
+    assert n == 0
+
+
+def test_bb_sample_without_gmt_local_keys_falls_back_to_host_tz_conversion(
+    seeded_db, monkeypatch, restore_host_tz
+):
+    """A payload shape lacking the GMT/local keys (never observed live, but
+    not something this fix can silently start dropping) degrades to the
+    EXACT pre-fix conversion rather than a new failure mode."""
+    _set_host_tz(monkeypatch, "UTC")
+    d = date(2026, 6, 20)
+    fake = FakeGarmin()  # module-level BODY_BATTERY fixture — no GMT/local keys
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)
+    with db.connect(seeded_db) as conn:
+        row = conn.execute(
+            "SELECT timestamp FROM body_battery_samples WHERE value = 50"
+        ).fetchone()
+    # With TZ=UTC, the old host-tz-dependent conversion equals the raw UTC
+    # reading of the epoch — pins the fallback path's exact, unchanged output.
+    assert row["timestamp"] == datetime.fromtimestamp(1700000000000 / 1000).isoformat()
+
+
+def test_ingest_day_raw_json_now_includes_stress_payload(seeded_db):
+    """Before this fix, `raw_json` carried summary/sleep/body_battery but NOT
+    stress — so a historical stress_samples row corrupted by the timezone
+    bug had no source data left to repair it from. Persist it going forward."""
+    d = date(2026, 6, 20)
+    fake = FakeGarmin()
+    with db.connect(seeded_db) as conn:
+        daily._ingest_day(fake, conn, d)
+    with db.connect(seeded_db) as conn:
+        raw = conn.execute(
+            "SELECT raw_json FROM daily_metrics WHERE date = ?", (d.isoformat(),)
+        ).fetchone()["raw_json"]
+    payload = json.loads(raw)
+    assert "stress" in payload
+    assert payload["stress"] == STRESS
+
+
+# --------------------------------------------------------------------------- #
+# _entry_local_delta / _local_iso_from_epoch_ms (pure helpers)
+# --------------------------------------------------------------------------- #
+def test_entry_local_delta_computes_negative_offset():
+    entry = {
+        "startTimestampGMT": "2026-05-15T05:00:00.0",
+        "startTimestampLocal": "2026-05-15T00:00:00.0",
+    }
+    assert daily._entry_local_delta(entry) == timedelta(hours=-5)
+
+
+def test_entry_local_delta_missing_keys_returns_none():
+    assert daily._entry_local_delta({}) is None
+    assert daily._entry_local_delta({"startTimestampGMT": "2026-05-15T05:00:00.0"}) is None
+
+
+def test_entry_local_delta_unparseable_returns_none():
+    entry = {"startTimestampGMT": "not-a-date", "startTimestampLocal": "2026-05-15T00:00:00.0"}
+    assert daily._entry_local_delta(entry) is None
+
+
+def test_local_iso_from_epoch_ms_applies_delta_to_utc_instant():
+    iso = daily._local_iso_from_epoch_ms(1778821200000, timedelta(hours=-5))
+    assert iso == "2026-05-15T00:00:00"
+
+
+def test_store_sample_rejects_unknown_table():
+    with pytest.raises(ValueError):
+        daily._store_sample(None, "not_a_real_table", date(2026, 5, 15), 1, 2, None)
