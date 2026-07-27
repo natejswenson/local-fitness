@@ -4,6 +4,7 @@ generator (Claude call + deterministic fallback).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -45,6 +46,40 @@ def test_build_prompt_includes_adherence_and_days_to_race():
     _, user = plan_coach.build_prompt(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
     assert "75%" in user
     assert "71 days to the 10k." in user
+
+
+def test_build_prompt_names_the_rest_day_free_adherence_when_given_one():
+    """Both numbers, on one line: 75% counts four rest days at full credit
+    while only half the prescribed running happened."""
+    _, user = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k",
+        sessions_adherence_pct=50)
+    assert ("Plan adherence over the last graded stretch: 75%. Excluding rest "
+            "days, 50% of prescribed sessions.") in user
+
+
+def test_build_prompt_adherence_line_is_unchanged_without_the_sessions_number():
+    """None (an un-wired caller, or a window with no prescribed session) must
+    reproduce the previous line byte for byte — the prompt hash is the disk
+    cache's key."""
+    _, user = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+    assert "Plan adherence over the last graded stretch: 75%.\n" in user
+    assert "Excluding rest days" not in user
+    baseline = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k",
+        sessions_adherence_pct=None)
+    assert baseline == plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+
+
+def test_build_prompt_sessions_adherence_of_zero_is_still_stated():
+    """0 is the number that most needs saying — a falsy-check here would drop
+    'you ran none of it' and leave only the flattering total."""
+    _, user = plan_coach.build_prompt(
+        _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 43, 71, "10k",
+        sessions_adherence_pct=0)
+    assert "Excluding rest days, 0% of prescribed sessions." in user
 
 
 def test_build_prompt_no_race_date_uses_goal_only_phrasing():
@@ -391,6 +426,33 @@ def test_ground_coaching_line_passes_faithful_citations_including_pace_string():
     assert flags == []
 
 
+def test_ground_coaching_line_accepts_a_faithful_sessions_adherence_citation():
+    # The sessions number joins the pool only when the plan section carries
+    # it — the same condition under which build_prompt puts it in the prompt.
+    section = {**_PLAN_SECTION, "sessions_adherence_pct": 50}
+    assert plan_coach.ground_coaching_line(
+        "75% overall, but 50% of the sessions you were actually given.",
+        section) == []
+
+
+def test_ground_coaching_line_flags_a_corrupted_sessions_adherence():
+    # 52% against a real 50%: past the EXACT band, inside NEARBY -> flagged,
+    # and attributed to the sessions number rather than to adherence_pct.
+    section = {**_PLAN_SECTION, "sessions_adherence_pct": 50}
+    flags = plan_coach.ground_coaching_line(
+        "Only 52% of your prescribed sessions got done.", section)
+    assert [(f.token, f.nearest_metric, f.delta) for f in flags] == [
+        ("52%", "sessions_adherence_pct", 2.0)]
+
+
+def test_ground_coaching_line_sessions_pool_entry_is_absent_when_unwired():
+    # Same prose, a section that never carried the number: 52 is now 30% off
+    # the nearest pool entry (75% adherence), which reads as an unrelated
+    # quantity and is ignored rather than misattributed.
+    assert plan_coach.ground_coaching_line(
+        "Only 52% of your prescribed sessions got done.", _PLAN_SECTION) == []
+
+
 def test_ground_coaching_line_empty_list_on_numberless_prose():
     text = "Keep showing up and trust the process."
     assert plan_coach.ground_coaching_line(text, _PLAN_SECTION) == []
@@ -502,7 +564,65 @@ def test_corrupt_cache_file_is_ignored_and_rewritten(monkeypatch, tmp_path):
     line = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
     assert line == "Clean line."
     assert calls["n"] == 1
-    # Cache healed: the entry now round-trips.
+    # Cache healed: the entry now round-trips, in the v2 multi-entry shape.
     import json as _json
-    entry = _json.loads(cache.read_text(encoding="utf-8"))
-    assert entry["line"] == "Clean line."
+    data = _json.loads(cache.read_text(encoding="utf-8"))
+    assert data["version"] == 2
+    assert [e["line"] for e in data["entries"].values()] == ["Clean line."]
+
+
+# --------------------------------------------------------------------------- #
+# 0.36.0 multi-entry cache (S5)
+# --------------------------------------------------------------------------- #
+def test_two_alternating_keys_both_stay_cached(monkeypatch, tmp_path):
+    """THE thrash case the v2 format exists for: rendering two brief dates
+    alternately must not evict each other (single-entry 'latest key wins'
+    made every alternation a live SDK call)."""
+    fake, calls = _fake_generator(["Line for easy.", "Line for long."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+    args_a = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+    today_long = {"type": "long", "distance_mi": 10.0,
+                  "pace_min_per_mi": "10:15", "description": ""}
+    args_b = (_PROFILE, today_long, _LAST_7_DAYS, 83, 12, "10k")
+
+    a1 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_a, cache_path=cache))
+    b1 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_b, cache_path=cache))
+    a2 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_a, cache_path=cache))
+    b2 = asyncio.run(plan_coach.generate_coaching_line_cached(*args_b, cache_path=cache))
+    assert (a1, b1) == (a2, b2) == ("Line for easy.", "Line for long.")
+    assert calls["n"] == 2  # exactly one generation per distinct key
+
+
+def test_v1_single_entry_file_reads_as_a_hit(monkeypatch, tmp_path):
+    """An upgrade must keep the v1 file's one hit — regenerating on the first
+    post-upgrade render would be a silent SDK call for a line we have."""
+    fake, calls = _fake_generator(["Should never generate."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+    import hashlib
+    system_prompt, user_prompt = plan_coach.build_prompt(*args)
+    key = hashlib.sha256(
+        "\x00".join([system_prompt, user_prompt, "default"]).encode("utf-8")
+    ).hexdigest()
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"key": key, "line": "V1 cached line."}))
+
+    line = asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert line == "V1 cached line."
+    assert calls["n"] == 0
+
+
+def test_cache_evicts_oldest_ts_at_the_cap(tmp_path):
+    entries = {
+        f"key{i}": {"line": f"line {i}", "ts": f"2026-07-{i + 1:02d}T00:00:00+00:00"}
+        for i in range(plan_coach.CACHE_MAX_ENTRIES)
+    }
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"version": 2, "entries": entries}))
+    plan_coach._write_cached_line(cache, "fresh", "the newest line")
+    kept = plan_coach._load_cache_entries(cache)
+    assert len(kept) == plan_coach.CACHE_MAX_ENTRIES
+    assert "fresh" in kept
+    assert "key0" not in kept  # oldest ts evicted
+    assert "key1" in kept

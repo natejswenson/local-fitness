@@ -6,6 +6,235 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-07-26
+
+Live-session polish: two warts caught while grading a real run on the
+freshly shipped code.
+
+### Fixed
+- `goal_gap` rounds at the payload boundary (a live payload shipped
+  `gap_seconds: 186.44919632676692`) and carries a signed `gap_formatted`
+  duration (`"+3:06"`) for the coach voice.
+- The report card's distance delta no longer prints `-0%` for a
+  within-rounding-of-target distance (4.00-of-4.00 mi, short by meters) —
+  it says `on target`, matching pace's existing behavior.
+
+## [0.38.0] - 2026-07-26
+
+Maintainability pass (batch 4 of 4 from the 2026-07-26 audit): the lint
+gate becomes real, the docs become tested surface, and the one structural
+inversion that forced seven lazy imports is undone. No behavior changes.
+
+### Changed
+- **`READ_SECTIONS` moved to `report_card`** — its true home (it is the
+  card's contract; `render_markdown`, `visuals` and `card_store` all
+  consume it). Housing it in `workout_coach` forced every `report_card`
+  reach in that module into a lazy import; the move deletes seven of them
+  plus four pure-indirection wrapper functions. `workout_coach` re-exports
+  the name, so importers are unaffected; a subprocess test pins that
+  `report_card` now imports without `workout_coach`.
+- **Ruff runs an explicit ruleset** (`E4,E7,E9,F,I,UP,B,A`) — the repo
+  carried `noqa: BLE001` comments for a rule that was never enabled (ruff
+  ran defaults-only, so the blind-except gate reviewers assumed existed
+  didn't). ~75 violations fixed: import sorting, pyupgrade modernization,
+  `zip(..., strict=True)` on same-length series (length drift now errors
+  instead of silently clipping a chart), a `raise ... from e`, a frozen
+  `GradingConfig` default singleton. `BLE`+`RUF100` deferred as a
+  documented pair (30 broad-except sites need per-site triage); `ARG`
+  deliberately never (MCP handlers take `_args` by contract).
+- **Docs are tested surface.** README claimed 37 tools; the truth was 45.
+  Eight missing pages written (the whole coach-memory, personality and
+  report-card-store surface — including `recall_coach_memories`, the tool
+  the coach is told to call before claiming it doesn't remember), and
+  `tests/test_docs_drift.py` now fails the build on a missing page, an
+  orphan page, or a stale count.
+- Six plan-validation tests upgraded from `assert err` truthiness to
+  pinned messages (two boundary checks could previously swap without a
+  test noticing); dead `plans._foot_duration` deleted; the mile constants
+  are `units.METERS_PER_MILE`/`KM_PER_MILE` (public, single source —
+  `interpret`'s private copy stays for its stdlib-only contract, pinned
+  equal by test); `plan_coach`'s one silent fail-open now logs like its
+  siblings; a stale `units.format_hm` docstring stopped claiming the
+  dependency points the wrong way.
+
+## [0.37.0] - 2026-07-26
+
+UX pass (batch 3 of 4 from the 2026-07-26 audit): forgiving inputs, honest
+truncation, actionable errors, staleness surfaced.
+
+### Changed
+- **`query_workouts` returns an envelope** — `{"workouts", "count",
+  "truncated"}` instead of a bare array (breaking for payload-shape
+  consumers). "Show me all my runs this year" no longer silently answers
+  from a clipped 50: the `limit+1` fetch sets `truncated`. `limit` is
+  validated 1–500 (`-1` used to reach SQLite as LIMIT -1 — an unbounded
+  table dump into context). `list_report_cards` and `list_coach_memories`
+  gained the same `truncated` flag.
+- **`update_plan_workout` pace accepts `"M:SS"`** (preferred) or decimal
+  minutes, with the trap documented in the schema: a model copying the
+  display string "9:39" as the float 9.39 silently prescribed 9:23/mi — a
+  16 s/mi error invisible in the echo. Implausible paces (outside
+  3:00–30:00/mi) are rejected.
+- **One real date validator.** `date.fromisoformat` replaces the shape
+  regex that accepted `2026-13-45`/`2026-02-30` (impossible dates matched
+  nothing in SQL — unreadable as "bad input" vs "empty window"), unifying
+  the two error-message idioms across every dated tool. `compare_periods`
+  additionally rejects reversed ranges; `find_anomalies` bounds
+  `sd_threshold` to 0.5–10 (an explicit 0 — every day an anomaly — now
+  errors instead of silently becoming the default).
+- **Errors say what the model can act on.** `run_sql` carries the SQLite
+  detail ("no such column: sleep_hours" — the model's own typo, the whole
+  correction signal; a deliberate reversal of the earlier don't-leak
+  stance, safe under the read-only URI gate). Pydantic failures compact to
+  `loc: msg` pairs instead of the multi-line repr with a docs URL. PDF
+  render failures return one stable line and put the raw traceback in the
+  server log where it belongs.
+- **`min_distance_mi`** on `query_workouts`/`recovery_pattern` — this is a
+  miles-display app, and "runs over 5 miles" sent as `min_distance_km: 5`
+  filtered at 5 km. The km param stays as a deprecated alias (mi wins).
+- **The `/coach` snapshot flags stale training load** — CTL/ATL/TSB now
+  render with `as of <date>` plus a warning line when the baselines row
+  lags (TSB decays daily, so a five-day-old row misstates freshness with
+  full confidence), and an all-empty day says "No Garmin data for … yet"
+  instead of a silent table of dashes.
+
+### Added
+- **`get_metric` attaches the baseline read** (`baseline_60day_mean`,
+  `current_vs_baseline_sd`, `vs_baseline`) for baselined metrics, mirroring
+  `get_metric_trend` — "is 52 high?" no longer costs a second call.
+- `units.from_miles`, `units.parse_pace_min_per_mi`,
+  `units.pace_sec_per_mi_to_sec_per_km`; `METERS_PER_MILE`/`KM_PER_MILE`
+  are public.
+- `training_load_status`'s TSB band description is generated from the
+  `interpret` constants (can't drift from the classifier).
+
+## [0.36.0] - 2026-07-26
+
+Speed pass (batch 2 of 4 from the 2026-07-26 audit): fewer connections,
+fewer queries, fewer sleeps, shared render caches. No behavior changes —
+every payload byte-identical except the two additions noted.
+
+### Changed
+- **The HTTP persona is memoized.** Stateless `/mcp/` mode resolved the full
+  coach persona (6 DB opens + a complete relationship-ledger compute, ~5× the
+  cost of the tool call it wrapped) on **every request**. Now memoized behind
+  a `(today, db_path, PRAGMA data_version, notes-file stat)` key on a
+  dedicated read-only monitor connection — any DB commit, notes edit, or day
+  rollover re-resolves; failures and the fresh-clone no-DB path are never
+  cached (fail-open preserved).
+- **Sync fast-path.** `daily.pull` no longer re-fetches HR zones/splits (or
+  pays their 0.3 s throttle) for past activities whose details are already
+  stored — the repeated-detail-call shape that trips Garmin's 429; today's
+  activities always re-fetch (still finalizing). The day loop shares one
+  connection with per-day commit/rollback, never sleeps after the final day,
+  and scans the historical gap once instead of twice.
+- **`baselines.recompute` is single-pass.** The per-day AVG scan + duplicate
+  SD scan (3 statements/day; a backdated manual workout could issue ~2,200)
+  became one fetch + one pure rolling-window walk + one `executemany` — 3
+  statements total, bit-identical output (pinned against the retired SQL
+  reference in tests). `log_manual_workout`/`delete_manual_workout` now run
+  it via `asyncio.to_thread` instead of blocking the event loop.
+- **`recovery_pattern` dropped its N+1** (~953 point queries on a year of
+  running → 3 range queries, identical thresholds and rounding).
+- **One read connection through the card/report/reflect pipelines.**
+  `workout_report_card` (was ~8 opens), `generate_brief_report`, `reflect`,
+  and `get_coach_personality` (4 opens + two COUNT scans → 1 open + one
+  aggregate) each share a single connection for their read phase; writes keep
+  their own (worker-thread same-thread rule).
+- **Query pruning + a new index.** `SELECT *` no longer drags `raw_json`
+  blobs (50 KB/activity row, 16.5 KB/daily row) through the report-card
+  activity pick (7.7 ms → ~0.2 ms before indexing), the status metric window,
+  or `get_workout_detail`; new `idx_activities_date_start` serves the
+  `date DESC, start_time DESC` sorts (applies automatically via
+  `init_schema`).
+- **Render caches.** `fit_one_page` shares one FontConfiguration + image
+  cache across density rungs (was: re-decode ~124 KB of chart base64 + re-parse
+  a 140 KB TTF per rung); `plan_coach`'s disk cache is multi-entry (v2 format,
+  32 entries — alternating two brief dates no longer thrashes a 30 s SDK call;
+  v1 files read as a hit); `coach.load_profile` is lru_cached;
+  `card_store.load_read` extracts the read via `json_extract` instead of
+  decoding the whole stored card; the V2 brief no longer computes-and-discards
+  the full memory render; `import tools` no longer pays garminconnect's 28 ms
+  (deferred into `sync_garmin_data`).
+
+### Added
+- `recovery_pattern.n_skipped_no_baseline` — workouts that matched the filter
+  but had no usable baseline row were silently dropped; now counted.
+
+## [0.35.0] - 2026-07-26
+
+Accuracy pass from the 2026-07-26 three-axis audit: wrong numbers stop
+reaching the coach's voice. First of four planned batches (accuracy →
+speed → UX → maintainability).
+
+### Fixed
+- **`sync_garmin_data` no longer reports a healthy sync as an error, and
+  recomputes baselines whenever new data lands.** `daily.pull` returns
+  `partial` whenever any gap remains back to 2020-09-01, so a single missing
+  historical day made every sync return `is_error: true` *and* skip the
+  CTL/ATL/TSB recompute — fresh workouts landed while training load silently
+  froze. Only hard failures (`auth_failure`, `not_configured`, `failure`,
+  `interrupted`) are errors now; the recompute triggers on
+  `days_pulled > 0 or activities_loaded > 0`. The payload gains a
+  deterministic one-line `sync_state` read and a countable `days_failed`
+  (also added to `daily.pull`'s return dict), and the error payload no longer
+  drops `deferred_count`/`gap_days_remaining`.
+- **Brief signals judge runs by measured pace, not Garmin's label.**
+  `days_since_last_run`, `runs_14d`, `runs_prior_14d` and `recent_te` now
+  gate on `interpret.is_running_effort` (on-foot checked first — pace alone
+  would promote a fast bike ride), falling back to the activity-type label
+  only for paceless rows. Walking-desk sessions file as `treadmill_running`,
+  so the planner previously saw a run every day and the brief could never
+  say "you haven't actually run in eight days."
+- **Report card's reference line can no longer contradict its own grades.**
+  A plan-graded card with thin comparable history printed "Not enough
+  comparable history to grade" directly under a real overall grade; the
+  disclaimer is now scoped to the metrics it actually applies to ("HR and
+  training load ungraded — only 2 comparable activities…").
+- **The card's "setting up for" block gets its numbers back.**
+  `workout_coach._describe_prescription` read display keys that upcoming
+  plan rows never carry, silently dropping every distance/pace/duration from
+  the prompt. It now converts the stored `target_*` columns. One-time read
+  regeneration per card on next render (prompt-hash cache bust).
+- **Double days grade the session the prescription was written for.** The
+  date-branch of `workout_report_card` picked the day's *last* session while
+  grading against the primary (lowest-seq) prescription — a PM shakeout got
+  graded against the AM long-run target. It now takes the day's first
+  session, and `other_activities_on_date` carries
+  `{activity_id, activity_type, distance_mi, start_time}` instead of bare
+  ids so the model can offer to grade the other one.
+- **Manual-lap interval sessions stop being graded at warmup pace.** The
+  quality-day splits exception filtered to "full" splits — defined relative
+  to the workout's own longest lap, which on a 2-mile-warmup-then-800s
+  session is the warmup. `fastest_rep_split` (formerly
+  `fastest_full_split_pace`) now selects by a 300 m distance floor
+  (`QUALITY_MIN_SPLIT_M`) so the fastest rep-sized split is graded; with no
+  qualifying split it returns n/a with a stated reason, never warmup pace.
+
+### Added
+- **`get_brief_context` gained continuity and freshness.** The handler now
+  passes the last seven saved briefs in, so `continuity` is populated over
+  MCP instead of permanently `[]`, and `BriefContext` carries
+  `data_frontier`, `baseline_stale_days`, `brief_stale_days` and `tsb_zone`
+  — surfacing the orphaned-sync state that was invisible from the tool
+  surface. All four fields are optional and ride the existing single DB
+  connection (the ==1-connect perf gate still holds).
+- **Riegel projection names its basis.** `predicted_finish_seconds` now
+  ships with `projection_basis` ({distance_mi, pace_min_per_mi, date,
+  extrapolation_ratio}) and `projection_confidence`
+  (`interpret.riegel_confidence`: high ≤1.5×, medium ≤3×, low beyond).
+  `best_recent_effort` is pace-gated (a mislabeled walking-pad session can
+  no longer be the "best effort") and prefers efforts ≥ goal/4, falling
+  back to the 2 km floor — labeled low-confidence — rather than dropping
+  the projection.
+- **Adherence splits out rest days.** `sessions_adherence_pct` (rest
+  excluded) and `rest_days_counted` join the untouched `adherence_pct` in
+  plan status/progress payloads, the brief-PDF plan strip, and the
+  plan-coach prompt — a week of 3 kept rest days + 4 skipped runs no longer
+  headlines as 43% without the 0% session number beside it.
+- **`last_graded` says which day.** `_slim_workout` now carries `date` and
+  `seq`, so "you missed your long run" can say when.
+
 ## [0.34.0] - 2026-07-26
 
 Past report cards become part of the coach's standing memory, without

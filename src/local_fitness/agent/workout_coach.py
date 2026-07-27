@@ -33,7 +33,7 @@ import re
 from pathlib import Path
 
 from .. import config
-from . import prompts
+from . import prompts, report_card, units
 from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
@@ -87,14 +87,12 @@ _METRIC_TRANSLATION_BLOCK = (
     "Pair every number with its plain-English meaning."
 )
 
-#: The four paragraphs, in card order. The key is what the model must label
-#: its output with; the label is what the reader sees above each paragraph.
-READ_SECTIONS: tuple[tuple[str, str], ...] = (
-    ("distance", "DISTANCE"),
-    ("pace", "PACE"),
-    ("hr", "HEART RATE"),
-    ("load", "TRAINING LOAD"),
-)
+#: The four paragraphs, in card order — re-exported from ``report_card``
+#: (its true home since 0.38.0: it is the CARD's contract, and housing it
+#: here forced report_card/visuals/card_store to import from this module,
+#: which is what made every ``report_card`` reach in this file a lazy
+#: import). Kept in ``__all__`` so existing importers keep working.
+READ_SECTIONS = report_card.READ_SECTIONS
 
 #: Deliberately states the rule without demonstrating it. The previous version
 #: spelled out the forbidden tokens ("Do not write \"A\", \"B-\", \"C+\"…"),
@@ -189,7 +187,7 @@ def build_prompt(
         "Per-metric verdicts (already computed — phrase them, never re-derive "
         "them, and never convert them back into a letter):",
     ]
-    for key, label in _metric_labels():
+    for key, label in report_card._METRIC_LABELS:
         m = (card.get("metrics") or {}).get(key) or {}
         if not m.get("grade"):
             # Prefer the metric's own reason. "not enough to grade" is true of a
@@ -199,11 +197,11 @@ def build_prompt(
             continue
         # actual_text, not the raw number: quality pace is graded on the fastest
         # split, and a bare "9:25/mi" would read as the whole run's average.
-        line = f"  {label}: {grade_severity(m['grade'])} — actual {_actual_text(key, m)}"
+        line = f"  {label}: {grade_severity(m['grade'])} — actual {report_card.actual_text(key, m)}"
         # expected_text, not the raw number: HR is held to a BAND, and handing
         # the model a bare midpoint is how it ends up explaining a heart-rate
         # verdict against a number the grade was never measured against.
-        expected = _expected_text(key, m)
+        expected = report_card.expected_text(key, m)
         if expected != "—":
             line += f" vs target {expected}"
         if m.get("in_band"):
@@ -254,13 +252,11 @@ _RECENT_LABEL = "trailing 14 days"
 
 
 def _describe_activity(row: dict) -> str:
-    from .report_card import _fmt_distance, _fmt_pace
-
     parts = [f"{row.get('date')}: {row.get('activity_type') or 'activity'}"]
     if row.get("distance_meters"):
-        parts.append(_fmt_distance(row["distance_meters"]))
+        parts.append(report_card._fmt_distance(row["distance_meters"]))
     if row.get("avg_pace_sec_per_km"):
-        parts.append(_fmt_pace(row["avg_pace_sec_per_km"]))
+        parts.append(report_card._fmt_pace(row["avg_pace_sec_per_km"]))
     if row.get("avg_hr"):
         parts.append(f"{round(row['avg_hr'])} bpm")
     if row.get("training_load"):
@@ -269,38 +265,33 @@ def _describe_activity(row: dict) -> str:
 
 
 def _describe_prescription(w: dict) -> str:
+    """One upcoming plan day, for the "setting up for" block.
+
+    These rows come from ``plans.get_active_plan()``, so they carry the stored
+    columns (``target_distance_m`` / ``target_pace_sec_per_km`` /
+    ``target_duration_sec``), not the mile-and-min/mi display fields. Reading
+    only the display keys meant every number silently dropped out and the model
+    was handed a bare date and workout type. The display keys are still read
+    first, since a caller may pass an already-converted row.
+    """
     parts = [f"{w.get('date')}: {w.get('type') or 'workout'}"]
-    if w.get("distance_mi") is not None:
-        parts.append(f"{w['distance_mi']} mi")
-    if w.get("pace_min_per_mi"):
-        parts.append(f"@ {w['pace_min_per_mi']}/mi")
+    miles = w.get("distance_mi")
+    if miles is None:
+        miles = units.to_miles(w.get("target_distance_m"))
+    if miles is not None:
+        parts.append(f"{miles} mi")
+    pace = w.get("pace_min_per_mi") or units.format_pace_min_per_mi(
+        w.get("target_pace_sec_per_km"))
+    if pace:
+        parts.append(f"@ {pace}/mi")
+    duration_sec = w.get("target_duration_sec")
+    if duration_sec:
+        # Minutes, not H:MM:SS — a prescription is written as "45 min", and the
+        # duration-formatted form reads like a finishing time.
+        parts.append(f"{round(duration_sec / 60)} min")
     if w.get("description"):
         parts.append(str(w["description"]))
     return " · ".join(parts)
-
-
-def _metric_labels():
-    from .report_card import _METRIC_LABELS
-
-    return _METRIC_LABELS
-
-
-def _fmt(key: str, value) -> str:
-    from .report_card import _FORMATTERS
-
-    return _FORMATTERS[key](value)
-
-
-def _expected_text(key: str, metric: dict) -> str:
-    from .report_card import expected_text
-
-    return expected_text(key, metric)
-
-
-def _actual_text(key: str, metric: dict) -> str:
-    from .report_card import actual_text
-
-    return actual_text(key, metric)
 
 
 def reference_summary(card: dict) -> str:
@@ -309,9 +300,7 @@ def reference_summary(card: dict) -> str:
     Reuses ``report_card.reference_line`` with markdown off so the model is
     never handed ``**`` it might echo into a plain-text paragraph.
     """
-    from .report_card import reference_line
-
-    return reference_line(card, markdown=False)
+    return report_card.reference_line(card, markdown=False)
 
 
 #: A letter grade named in the prose. ``_GRADE_TONE`` forbids this outright —
@@ -638,18 +627,16 @@ def fallback_read(card: dict) -> dict[str, str]:
     template pretending to be a personality reads worse than one that plainly
     states the result, and the table below carries the verdict regardless.
     """
-    from .report_card import _delta_text
-
     out: dict[str, str] = {}
-    for key, label in READ_SECTIONS:
+    for key, _label in READ_SECTIONS:
         m = ((card.get("metrics") or {}).get(key)) or {}
-        actual = _actual_text(key, m)
+        actual = report_card.actual_text(key, m)
         if not m.get("grade"):
             reason = m.get("note") or "not enough comparable history to grade this"
             out[key] = f"{actual}. {reason[0].upper()}{reason[1:]}."
             continue
-        target = _expected_text(key, m)
-        delta = _delta_text(key, m)
+        target = report_card.expected_text(key, m)
+        delta = report_card._delta_text(key, m)
         sentence = f"{actual} against {target}." if target != "—" else f"{actual}."
         if delta != "—":
             sentence += f" {delta.capitalize()}."

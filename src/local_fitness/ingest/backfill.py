@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .. import db
@@ -325,7 +325,7 @@ def _ingest_activities(raw: bytes) -> int:
             gmt_ms = act.get("beginTimestamp")
             if isinstance(local_ms, (int, float)) and local_ms > 1e11:
                 start_dt = datetime.fromtimestamp(
-                    local_ms / 1000, tz=timezone.utc
+                    local_ms / 1000, tz=UTC
                 ).replace(tzinfo=None)
                 start_iso = start_dt.isoformat()
                 cdate = start_dt.date().isoformat()

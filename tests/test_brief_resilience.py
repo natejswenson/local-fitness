@@ -14,7 +14,6 @@ import pytest
 
 from local_fitness.agent import briefing
 
-
 # --- _iter_with_idle_timeout ------------------------------------------------
 
 def test_idle_timeout_passthrough_when_stream_is_live():

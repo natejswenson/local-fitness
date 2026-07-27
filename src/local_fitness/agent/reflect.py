@@ -188,16 +188,23 @@ async def _reflect(source: str, source_key: str, entry_date: str | None,
     """The shared pipeline. Never raises past its own boundary."""
     if not memory.memory_enabled():
         return
-    if journal.has_event(source, source_key):
-        return
+    from .. import db
     from . import coach
 
-    profile = coach.resolve_coach_profile()
-    user_name = config.user_name()
-    today = date.today().isoformat()
-    led = ledger.compute_relationship_ledger(today=today)
-    ledger_text = ledger.render_ledger_block(led, user_name)
-    recent = journal.list_entries(limit=memory.FULL_ENTRIES)
+    # ONE connection for the whole read phase (0.36.0 — was ~6 opens: the
+    # has_event probe, the profile resolve x2, user_name, the ledger, the
+    # recent-entries load). The SDK call and the journal WRITES stay outside:
+    # writes must land on their own committed connections so a failed write
+    # can't hold this read transaction open.
+    with db.connect() as conn:
+        if journal.has_event(source, source_key, conn=conn):
+            return
+        profile = coach.resolve_coach_profile(conn=conn)
+        user_name = config.user_name(conn=conn)
+        today = date.today().isoformat()
+        led = ledger.compute_relationship_ledger(conn=conn, today=today)
+        ledger_text = ledger.render_ledger_block(led, user_name)
+        recent = journal.list_entries(limit=memory.FULL_ENTRIES, conn=conn)
 
     text = await generate_reflection(
         profile, event, ledger_text, recent, user_name=user_name)

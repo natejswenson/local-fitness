@@ -17,7 +17,24 @@ and `get_metric_trend` for drift within one window.
 |---|---|---|---|---|
 | `metric` | string | yes | — | Enum: `"rhr"` or `"sleep_seconds"` only. These are the two metrics with 60-day mean/SD columns in `baselines`; anything else is a hard error. |
 | `lookback_days` | integer | no | `90` | Trailing window, `date >= today - lookback_days`. Bounds-checked 1–3650. |
-| `sd_threshold` | number | no | `2.0` | Flags rows where `ABS(value - baseline_mean) > baseline_sd * threshold`. **Strictly greater than** — exactly 2.0 SD is not an anomaly. |
+| `sd_threshold` | number | no | `2.0` | Flags rows where `ABS(value - baseline_mean) > baseline_sd * threshold`. **Strictly greater than** — exactly 2.0 SD is not an anomaly. Bounded **0.5–10**, both ends inclusive. |
+
+`sd_threshold` is bounds-checked as of 0.37.0. Only an *omitted* value takes the
+2.0 default; an explicit `0`, a negative number, or anything above 10 is a hard
+error, and a non-numeric value returns a message instead of raising:
+
+```json
+{"error": "sd_threshold must be between 0.5 and 10"}
+```
+
+```json
+{"error": "sd_threshold must be a number between 0.5 and 10"}
+```
+
+The bounds exist because both ends fail as *data* rather than as input: at or
+below 0 every day in the window breaches, so the tool returns the entire history
+as "anomalies"; above 10 nothing can breach, so it returns an empty list that
+reads like a clean bill of health.
 
 ## Returns
 
@@ -114,13 +131,13 @@ One day, 3.3 SDs high — about 9 bpm above normal.
   can't produce an anomaly, so an empty result may mean "baselines not computed"
   rather than "nothing unusual". `sync_garmin_data` recomputes baselines when
   new data lands.
-- **`sd_threshold: 0` is silently replaced by 2.0.** The handler uses
-  `args.get("sd_threshold") or 2.0`, so a falsy 0 falls back to the default
-  rather than flagging every day. Same falsy-fallback applies to
-  `lookback_days: 0` → 90.
-- **`sd_threshold` is not bounds-checked** (only `float()`-coerced). A negative
-  threshold makes the `ABS(...) > sd * threshold` condition true for every row
-  and returns the whole window.
+- **`sd_threshold: 0` errors; it is no longer silently replaced by 2.0.** The
+  handler used to write `args.get("sd_threshold") or 2.0`, which defaulted an
+  *explicit* 0 the same way it defaulted an omitted value — so asking for
+  "everything off baseline at all" quietly returned the 2-SD answer. Only
+  `None` (omitted) takes the default now.
+- **`lookback_days: 0` still falls back to 90.** That falsy-fallback was left
+  alone; only `sd_threshold` changed.
 - **The baseline is *that day's* rolling window, not today's.** Each row is
   compared against the mean/SD as of its own date, so an anomaly is judged
   against what was normal at the time — the right behaviour, but it means

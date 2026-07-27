@@ -20,10 +20,10 @@ We exercise the pure transform/merge/dedup logic:
 from __future__ import annotations
 
 import json
-import zipfile
 import os
 import time
-from datetime import datetime, timezone
+import zipfile
+from datetime import UTC, datetime
 
 import pytest
 
@@ -350,7 +350,7 @@ def _sample_activity(**overrides):
     # wall-clock (07:30 on 2026-03-10) when decoded AS UTC. Encode it that way
     # (tz=utc) so the fixture is host-tz-independent and matches the real format;
     # > 1e11 so the code uses it as a local epoch.
-    ts = int(datetime(2026, 3, 10, 7, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    ts = int(datetime(2026, 3, 10, 7, 30, 0, tzinfo=UTC).timestamp() * 1000)
     act = {
         "activityId": 111,
         "startTimeLocal": ts,
@@ -498,7 +498,7 @@ def test_early_morning_activity_does_not_roll_back_a_day_under_western_tz(
     # the PREVIOUS day. Pin the host tz to America/Chicago (independent of the
     # machine's real tz) and assert a 05:30-local run stays on its own date.
     local_epoch_ms = int(
-        datetime(2026, 1, 15, 5, 30, 0, tzinfo=timezone.utc).timestamp() * 1000
+        datetime(2026, 1, 15, 5, 30, 0, tzinfo=UTC).timestamp() * 1000
     )
     act = _sample_activity(activityId=999, startTimeLocal=local_epoch_ms)
     original_tz = os.environ.get("TZ")

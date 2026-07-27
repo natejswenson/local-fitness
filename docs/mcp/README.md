@@ -16,13 +16,13 @@ worked examples, and gotchas.
 
 ## Connecting
 
-**Local, over stdio** — all 37 tools, no token:
+**Local, over stdio** — all 45 tools, no token:
 
 ```bash
 claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
 ```
 
-**Over the running server** — 35 tools, bearer-gated:
+**Over the running server** — 43 tools, bearer-gated:
 
 ```bash
 claude mcp add --transport http fitness \
@@ -39,7 +39,7 @@ unreachable over the networked `/mcp/` transport:
 
 | | stdio (`fitness mcp-stdio`) | HTTP (`/mcp/`) |
 |---|---|---|
-| Tool count | **37** | **35** |
+| Tool count | **45** | **43** |
 | [`generate_brief_report`](generate_brief_report.md) | ✅ | ❌ |
 | [`workout_report_card`](workout_report_card.md) | ✅ | ❌ |
 
@@ -74,11 +74,19 @@ Three tools overlap here; the distinction is on each page.
 
 | Tool | Use it for |
 |---|---|
-| [`query_workouts`](query_workouts.md) | List/filter sessions |
+| [`query_workouts`](query_workouts.md) | List/filter sessions — returns `{workouts, count, truncated}` |
 | [`get_workout_detail`](get_workout_detail.md) | One session in full, including splits where they exist |
 | [`workout_report_card`](workout_report_card.md) | 📄 **Graded** report card for one session — letters, not adjectives |
 | [`log_manual_workout`](log_manual_workout.md) | ✍️ Record a non-Garmin session (feeds CTL/ATL/TSB) |
 | [`delete_manual_workout`](delete_manual_workout.md) | ✍️ Remove one |
+| [`list_report_cards`](list_report_cards.md) | Graded history — every card ever rendered, newest run first |
+| [`get_report_card`](get_report_card.md) | One stored card in full, with the coach's read and preformatted markdown |
+
+Stored cards are **dated snapshots**, graded against the plan active at that
+render, and there is no backfill — history starts when cards start rendering.
+The two query tools are pure JSON so they work over both transports, but
+`workout_report_card`, which creates the rows, is stdio-only: a remote client
+can read the graded history it cannot extend.
 
 ### Analysis
 
@@ -141,6 +149,30 @@ Two different things — see each page.
 | [`list_observations`](list_observations.md) | Read them back |
 | [`delete_observation`](delete_observation.md) | ✍️ Remove one |
 
+### Coach memory
+
+The coach's own journal — the color a query can't produce, distinct from the
+user preferences above. The newest 60 entries ride every voice surface's
+prompt; older ones **archive rather than vanish** and stay searchable.
+
+| Tool | Use it for |
+|---|---|
+| [`save_coach_memory`](save_coach_memory.md) | ✍️ Write ONE dated line (≤240 chars) in the coach's voice |
+| [`list_coach_memories`](list_coach_memories.md) | Page the journal, newest first — the hot 60 by default |
+| [`recall_coach_memories`](recall_coach_memories.md) | **Search** the whole journal, archive included — call this before saying you don't remember |
+| [`delete_coach_memory`](delete_coach_memory.md) | ✍️ The ONLY path that really deletes an entry — no undo |
+
+### Coach personality
+
+Tuning the voice is conversational; there is no UI, and the agent owns the
+writes, same model as training plans. Precedence: **user notes > spec >
+profile file**.
+
+| Tool | Use it for |
+|---|---|
+| [`get_coach_personality`](get_coach_personality.md) | Active profile, effective spec, the five dials, journal size — read before editing |
+| [`update_coach_personality`](update_coach_personality.md) | ✍️ Patch the persona, the lists, per-topic intensity, or the dials |
+
 ### Data and escape hatches
 
 | Tool | Use it for |
@@ -182,8 +214,25 @@ payloads rather than leaving the model to apply a legend by hand. The rule is
 repo-wide: **the LLM phrases a judgment, it never derives one tested Python can
 compute.**
 
-**Display units are miles.** Distances and pace render as `mi` and `min/mi`
-alongside the raw SI values (`LOCAL_FITNESS_DISPLAY_UNITS`).
+**Display units are miles — on the way in as well as out.** Distances and pace
+render as `mi` and `min/mi` alongside the raw SI values
+(`LOCAL_FITNESS_DISPLAY_UNITS`), and distance *filters* take miles too:
+[`query_workouts`](query_workouts.md) and
+[`recovery_pattern`](recovery_pattern.md) grew `min_distance_mi` in 0.37.0, with
+`min_distance_km` kept as a deprecated alias (miles wins if both are given).
+
+**Lists say when they were clipped.** Every tool with a `limit` fetches one row
+past it and signals `truncated` when more matched —
+[`query_workouts`](query_workouts.md),
+[`list_observations`](list_observations.md),
+[`list_coach_memories`](list_coach_memories.md),
+[`list_report_cards`](list_report_cards.md), and [`run_sql`](run_sql.md) at its
+500-row cap. Never answer "that's all of them" without checking it. Note the two
+shapes: `query_workouts`, `list_coach_memories` and `list_report_cards` always
+carry the key (`true` or `false`), while `list_observations` and `run_sql` add
+it **only when clipped**, so its absence there is the complete-set signal.
+[`recall_coach_memories`](recall_coach_memories.md) carries no flag at all —
+there, `count == limit` is the hint to re-ask.
 
 **Charts render in the reply.** When a tool produces a chart, paste the full
 output into the message in a fenced code block. A chart left in a collapsed tool

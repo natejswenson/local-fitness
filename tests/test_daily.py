@@ -169,6 +169,8 @@ class FakeGarmin:
         self._auth_fail_sleep = set(auth_fail_sleep_dates or ())
         self.summary_calls: list[str] = []
         self.activity_range_calls: list[tuple[str, str]] = []
+        self.zone_calls: list[int] = []
+        self.split_calls: list[int] = []
 
     # wellness ---------------------------------------------------------------
     def get_user_summary(self, cdate):
@@ -197,9 +199,11 @@ class FakeGarmin:
         return self._activities
 
     def get_activity_hr_in_timezones(self, activity_id):
+        self.zone_calls.append(activity_id)
         return self._hr_zones
 
     def get_activity_splits(self, activity_id):
+        self.split_calls.append(activity_id)
         return self._splits
 
 
@@ -446,6 +450,7 @@ def test_pull_success_full_window(seeded_db, monkeypatch):
     assert res["days_pulled"] == 3  # today, -1, -2
     assert res["gap_days_remaining"] == 0
     assert res["deferred_count"] == 0
+    assert res["days_failed"] == 0
     assert res["last_date"] == today.isoformat()
     assert res["activities_loaded"] == 1
     # Activities pulled once across the bounding range.
@@ -492,6 +497,7 @@ def test_pull_partial_when_a_day_fails(seeded_db, monkeypatch):
 
     assert res["status"] == "partial"
     assert res["days_pulled"] == 2  # 3 targeted, 1 failed
+    assert res["days_failed"] == 1  # countable, not only prose in `error`
     assert bad_day in res["error"]
     assert "failed" in res["error"]
     run = _latest_run(seeded_db)
@@ -519,6 +525,7 @@ def test_pull_all_endpoints_fail_never_reports_success(seeded_db, monkeypatch):
     assert res["status"] != "success"
     assert res["status"] == "partial"
     assert res["days_pulled"] == 0  # nothing saved
+    assert res["days_failed"] == 3  # every targeted date failed
     assert res["gap_days_remaining"] == 3  # all three dates still missing
     assert "failed" in res["error"]
     # No rows written for any of the failed dates.
@@ -589,6 +596,7 @@ def test_pull_skipped_when_no_targets(seeded_db, monkeypatch):
     assert res["status"] == "skipped"
     assert res["days_pulled"] == 0
     assert res["gap_days_remaining"] == 0
+    assert res["days_failed"] == 0
     assert res["last_date"] == today.isoformat()
     # No ingest_runs row is created on the skipped path.
     with db.connect(seeded_db) as conn:
@@ -755,3 +763,105 @@ def test_client_passes_env_override_to_login(monkeypatch):
     daily._client()
 
     assert rec.login_calls == ["/custom/loc/garmin_tokens.json"]
+
+
+# --------------------------------------------------------------------------- #
+# 0.36.0 sync fast-path (S4)
+# --------------------------------------------------------------------------- #
+def test_second_pull_skips_details_for_stored_past_activities(seeded_db, monkeypatch):
+    """Zones/splits are immutable once a past day closes: the re-pull keeps
+    the summary INSERT OR REPLACE (freshness) but must not re-fetch details
+    it already stored — the repeated-detail-call shape is what trips 429."""
+    today = date(2026, 6, 25)
+    monkeypatch.setattr(daily, "EARLIEST_BACKFILL_DATE", today - timedelta(days=2))
+    fake = FakeGarmin()
+    monkeypatch.setattr(daily, "_client", lambda *a, **k: fake)
+
+    daily.pull(through=today)
+    assert fake.zone_calls == [111] and fake.split_calls == [111]
+
+    # Wipe the freshness window's daily rows so the second pull re-targets the
+    # same dates; the activity + its details are already stored.
+    with db.connect(seeded_db) as conn:
+        conn.execute("DELETE FROM daily_metrics")
+    res = daily.pull(through=today)
+    assert res["activities_loaded"] == 1  # summary still refreshed
+    assert fake.zone_calls == [111] and fake.split_calls == [111]  # no re-fetch
+
+
+def test_pull_refetches_details_for_today_dated_activities(seeded_db, monkeypatch):
+    """An activity dated wall-clock TODAY may still be finalizing — details
+    always re-fetch, stored or not."""
+    today = date.today()
+    monkeypatch.setattr(daily, "EARLIEST_BACKFILL_DATE", today - timedelta(days=1))
+    act = dict(ACTIVITY)
+    act["startTimeLocal"] = f"{today.isoformat()} 07:00:00"
+    fake = FakeGarmin(activities=[act])
+    monkeypatch.setattr(daily, "_client", lambda *a, **k: fake)
+
+    daily.pull(through=today)
+    with db.connect(seeded_db) as conn:
+        conn.execute("DELETE FROM daily_metrics")
+    daily.pull(through=today)
+    assert fake.zone_calls == [111, 111]  # fetched on BOTH pulls
+    assert fake.split_calls == [111, 111]
+
+
+def test_pull_never_sleeps_after_the_final_day(seeded_db, monkeypatch):
+    """The throttle exists BETWEEN Garmin day fetches; the old trailing sleep
+    added 0.5 s of nothing to every pull. 3 target days -> exactly 2 sleeps
+    (the detail 0.3 s sleeps don't fire: fresh activity, but details land on
+    the first and only pull -> 1 detail sleep)."""
+    today = date(2026, 6, 25)
+    monkeypatch.setattr(daily, "EARLIEST_BACKFILL_DATE", today - timedelta(days=2))
+    sleeps: list[float] = []
+    monkeypatch.setattr(daily.time, "sleep", sleeps.append)
+    fake = FakeGarmin()
+    monkeypatch.setattr(daily, "_client", lambda *a, **k: fake)
+
+    daily.pull(through=today)
+    assert sleeps.count(0.5) == 2  # between 3 days, never after the last
+    assert sleeps.count(0.3) == 1  # one activity's detail fetch
+
+
+def test_pull_scans_the_gap_once_after_the_run(seeded_db, monkeypatch):
+    """gap_after is reused for gap_days_remaining on the success path — the
+    old shape scanned all of history twice back to back."""
+    today = date(2026, 6, 25)
+    monkeypatch.setattr(daily, "EARLIEST_BACKFILL_DATE", today - timedelta(days=2))
+    fake = FakeGarmin()
+    monkeypatch.setattr(daily, "_client", lambda *a, **k: fake)
+    calls = []
+    real = db.missing_daily_dates
+
+    def counting(*a, **k):
+        calls.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(db, "missing_daily_dates", counting)
+    monkeypatch.setattr(daily.db, "missing_daily_dates", counting)
+    res = daily.pull(through=today)
+    assert res["status"] == "success"
+    # One pre-pull target scan + one post-pull gap scan. Was 3.
+    assert len(calls) == 2
+
+
+def test_failed_day_rollback_does_not_lose_earlier_committed_days(seeded_db, monkeypatch):
+    """The shared-connection rework keeps per-day durability: a poisoned day
+    rolls back ONLY its own partial writes; prior days stay committed."""
+    today = date(2026, 6, 25)
+    monkeypatch.setattr(daily, "EARLIEST_BACKFILL_DATE", today - timedelta(days=2))
+    poisoned = (today - timedelta(days=1)).isoformat()
+    fake = FakeGarmin(poison_bb_dates={poisoned})
+    monkeypatch.setattr(daily, "_client", lambda *a, **k: fake)
+
+    res = daily.pull(through=today)
+    assert res["status"] == "partial"
+    assert res["days_failed"] == 1
+    with db.connect(seeded_db) as conn:
+        dates = {r["date"] for r in conn.execute("SELECT date FROM daily_metrics")}
+    # Newest-first order: today committed BEFORE the poisoned day failed, and
+    # the oldest day committed after the rollback — both survive.
+    assert today.isoformat() in dates
+    assert (today - timedelta(days=2)).isoformat() in dates
+    assert poisoned not in dates

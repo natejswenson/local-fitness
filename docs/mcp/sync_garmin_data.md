@@ -10,10 +10,10 @@ surface that reaches outside the database. It calls
 logs into Garmin Connect (resuming a cached session token), fetches wellness +
 activity data for the target dates, and `INSERT OR REPLACE`s into
 `daily_metrics`, `body_battery_samples`, `stress_samples`, `activities`,
-`activity_hr_zones`, and `activity_splits`. If — and only if — the pull returns
-`status == "success"` with `days_pulled > 0`, it then runs
-`ingest.baselines.recompute(lookback_days=90)`, rewriting 90 days of rolling
-baselines and Banister CTL/ATL/TSB.
+`activity_hr_zones`, and `activity_splits`. Whenever the pull landed anything at
+all — `days_pulled > 0` **or** `activities_loaded > 0`, regardless of status — it
+then runs `ingest.baselines.recompute(lookback_days=90)`, rewriting 90 days of
+rolling baselines and Banister CTL/ATL/TSB.
 
 The pull is **gap-aware**: it targets the union of every missing date since
 `EARLIEST_BACKFILL_DATE` (2020-09-01, when Nate's Instinct Solar launched) and the
@@ -35,7 +35,7 @@ the CLI could pull. Every other tool reads what's already stored.
 
 ## Returns
 
-The `daily.pull()` summary dict, passed through verbatim:
+The `daily.pull()` summary dict, plus a `sync_state` line the tool adds:
 
 ```json
 {
@@ -45,7 +45,9 @@ The `daily.pull()` summary dict, passed through verbatim:
   "last_date": "2026-07-21",
   "error": null,
   "gap_days_remaining": 0,
-  "deferred_count": 0
+  "deferred_count": 0,
+  "days_failed": 0,
+  "sync_state": "success — synced 4 day(s), 2 activity row(s) through 2026-07-21; baselines recomputed"
 }
 ```
 
@@ -58,18 +60,24 @@ The `daily.pull()` summary dict, passed through verbatim:
 | `error` | Human-readable failure/partial reason, or `null` |
 | `gap_days_remaining` | Dates still missing between 2020-09-01 and today, **after** this run |
 | `deferred_count` | Target dates dropped by the `SYNC_MAX_DAYS` cap; they'll be picked up on subsequent runs |
+| `days_failed` | Targeted dates whose ingest raised this run (the countable form of what `error` spells out in prose) |
+| `sync_state` | One-line deterministic read of the run — status, what landed, what's still outstanding, and whether baselines were recomputed. Relay this rather than re-deriving a verdict from the raw counts. |
 
 `status: "skipped"` means there was nothing to do (`days_pulled: 0`) — it is not
-an error.
+an error. **Neither is `status: "partial"`**: `gap_days_remaining` is measured
+back to 2020-09-01, so a DB that has never been fully backfilled reports
+`partial` on every run even when today's sync landed perfectly.
 
-When `error` is non-null the tool returns an MCP error payload (`is_error: true`)
-carrying `error`, `status`, `days_pulled`, and `last_date`:
+Only a hard failure — `auth_failure`, `not_configured`, `failure`, or
+`interrupted` — returns an MCP error payload (`is_error: true`), carrying
+`error`, `status`, `days_pulled`, `days_failed`, and `last_date`:
 
 ```json
 {
   "error": "mfa_required: Garmin requested MFA but no interactive callback is available. Run `uv run fitness pull` in your terminal once to authenticate; subsequent pulls reuse the cached session.",
   "status": "auth_failure",
   "days_pulled": 0,
+  "days_failed": 0,
   "last_date": null
 }
 ```
@@ -92,12 +100,14 @@ Abridged output:
   "last_date": "2026-07-21",
   "error": null,
   "gap_days_remaining": 0,
-  "deferred_count": 0
+  "deferred_count": 0,
+  "days_failed": 0,
+  "sync_state": "success — synced 3 day(s), 1 activity row(s) through 2026-07-21; baselines recomputed"
 }
 ```
 
-Baselines were recomputed (success + `days_pulled > 0`), so a follow-up
-`daily_snapshot` / `training_load_status` call now reflects the new data.
+Baselines were recomputed (new data landed), so a follow-up `daily_snapshot` /
+`training_load_status` call now reflects it.
 
 ## Gotchas
 
@@ -132,13 +142,15 @@ Baselines were recomputed (success + `days_pulled > 0`), so a follow-up
   when both are set** (env wins — required in the container, which can't reach the
   host Keychain). Neither available ⇒ `status: "not_configured"` with "Garmin
   credentials not stored. Run `fitness setup` first."
-- **`partial` does not recompute baselines.** The recompute is gated on
-  `status == "success"`, so a run that landed real days but left a gap elsewhere
-  (or had one day fail) writes activity rows without refreshing CTL/ATL/TSB.
-  Symptom: new workouts visible in `query_workouts` but training load unchanged.
-  Call again until `status` is `success`, or run `fitness recompute-baselines`.
-  Note `gap_days_remaining` is measured back to 2020-09-01, so a DB that has never
-  been backfilled can report `partial` on every run.
+- **`partial` is the normal steady state, not a failure.** It used to be both
+  gated out of the recompute *and* returned as `is_error: true`, so a single
+  missing day back in 2023 meant every sync reported an error while new workouts
+  landed and CTL/ATL/TSB silently froze — `query_workouts` showed the run,
+  `training_load_status` didn't move. Now the recompute fires on any landed data
+  and only hard failures are errors. Use `sync_state` (and `days_failed` /
+  `gap_days_remaining`) to tell "today synced fine, old history is still
+  incomplete" from "this sync failed". A real backfill is still `fitness pull`,
+  not this tool.
 - **Never reached by the automated brief.** `sync_garmin_data` is in `ALL_TOOLS`
   but deliberately absent from `_READ_ONLY_TOOL_NAMES`, the brief loop's explicit
   allow-list, so a generated briefing can never trigger a network pull. The daily

@@ -841,7 +841,7 @@ def brief_v2_user_prompt(
     # The MCP path is the opposite contract: an external agent composes the JSON
     # and then calls the `save_brief` tool — so the closing instruction differs.
     if persist_via_tool:
-        intro = "Compose today's morning brief for {0} as STRUCTURED JSON".format(user_name)
+        intro = f"Compose today's morning brief for {user_name} as STRUCTURED JSON"
         outro = (
             "# Compose, then persist via the tool\n"
             "Build a JSON object with exactly one top-level key, `takeaways` (3-5\n"
@@ -850,7 +850,7 @@ def brief_v2_user_prompt(
             "complete. Saved notes shape TONE/EMPHASIS, never the structure."
         )
     else:
-        intro = "Build today's morning brief for {0} as STRUCTURED JSON".format(user_name)
+        intro = f"Build today's morning brief for {user_name} as STRUCTURED JSON"
         outro = (
             "# Output JSON only\n"
             "Return ONLY a JSON object with exactly one top-level key, `takeaways`\n"

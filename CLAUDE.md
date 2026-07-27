@@ -110,7 +110,18 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   ships to the container).
 - **What CI does and does NOT cover.** The `validate` job runs `pytest`
   (85% coverage gate), a separate perf-benchmark regression gate (see
-  below), and `ruff`, the prompt scorer. A separate `docker-build` job
+  below), and `ruff`, the prompt scorer. **Ruff's ruleset is explicit**
+  (0.38.0 — `[tool.ruff.lint] select` in `pyproject.toml`, currently
+  `E4,E7,E9,F,I,UP,B,A`; before that it silently ran defaults while the
+  code carried `noqa`s for rules that weren't on). The exclusions are
+  documented in the config itself: never enable `ARG` (MCP handlers take
+  `_args` by contract), and enable `BLE` + `RUF100` only TOGETHER after
+  triaging the ~30 broad-except sites (RUF100 alone flags the existing
+  BLE001 noqas as unused). **`tests/test_docs_drift.py` makes docs/mcp
+  tested surface**: every tool in `ALL_TOOLS`/`LOCAL_ONLY_TOOLS` must have
+  a page, no orphan pages, and the README tool counts must match
+  `len()` of the registries — adding a tool without its page fails the
+  build. A separate `docker-build` job
   compiles the full image (no push) so a base-image bump or `Dockerfile`
   change can't silently break `docker compose up --build` while CI stays
   green — but a green `docker-build` only proves the image *compiles*, not
@@ -134,7 +145,17 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   never locally on Nate's Mac (`Darwin-CPython-3.12-64bit` would never
   match, turning every subsequent `validate` run into a hard failure).
   Rebaseline only when intentionally resetting the comparison floor after
-  a further perf improvement, not routinely.
+  a further perf improvement, not routinely — with ONE more legitimate
+  trigger (first hit 2026-07-26): **runner-fleet drift**. GitHub's ubuntu
+  runners are a mix of CPU models, and a baseline captured on one
+  generation slowly stops describing the fleet — unchanged dev code was
+  reading +13.7% against the July-9 floor, so ANY PR was one slow runner
+  draw from a false failure. The tell that it's drift and not a real
+  regression: (1) a local before/after A/B of the touched path is at
+  parity, and (2) the last passing validate run on UNCHANGED code already
+  shows a double-digit margin. Confirm both, then recapture via the
+  workflow dispatched on `main` (pre-PR code = the honest floor) and
+  hand-promote the artifact to the committed `0001_*.json`.
 - **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
   manual prefix today, `/devlog` skill (auto from git commits) going
   forward.
@@ -342,7 +363,13 @@ These are settled — don't redesign without a reason.
   the label rather than vanishing from mileage. **`load_activities_by_date`
   MUST select `avg_pace_sec_per_km`**: without it every row falls back to the
   label and the whole gate is a silent no-op (it shipped that way for one
-  render before a live PDF caught it).
+  render before a live PDF caught it). Since 0.35.0 the brief planner's run
+  signals (`days_since_last_run`, `runs_14d`, `recent_te`) obey the same rule —
+  `brief_planner._running` checks on-foot FIRST, then pace, then label
+  fallback for paceless rows (on-foot-first is load-bearing: pace alone would
+  promote a fast bike ride to a run) — and so does `plans.best_recent_effort`,
+  which feeds the Riegel projection (there a paceless row is excluded rather
+  than label-fallbacked: an unverifiable pace can't be a "best effort").
 - **Analysis tools carry deterministic interpretation, not just raw numbers**
   (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
   SDK) housing every classifier the brief path already computed in tested
@@ -458,7 +485,30 @@ These are settled — don't redesign without a reason.
   non-interactive 06:30 job may hit a login/MFA and fail; the remedy is to
   re-seed with an interactive `uv run fitness pull`. `~/.garminconnect` is
   outside the repo; `Path.home()` resolves from `HOME`, so the launchd job and
-  the seeding shell must share the same `HOME`.
+  the seeding shell must share the same `HOME`. **Activity details are
+  fetched once, not per pull** (0.36.0): `_ingest_activity_range` pre-checks
+  stored `activity_hr_zones`/`activity_splits` ids and, for an activity dated
+  before wall-clock today with BOTH present, refreshes only the summary row
+  (INSERT OR REPLACE — the freshness feature) and skips the two detail calls
+  plus their 0.3 s throttle. Today's activities always re-fetch (laps may
+  still be finalizing — that guard is load-bearing). The day loop shares ONE
+  connection with per-day commit/rollback (a failed day rolls back only its
+  own writes), and only sleeps BETWEEN days.
+- **The HTTP persona is memoized behind a `data_version` key** (0.36.0). In
+  stateless mode every `/mcp/` request re-resolved the full persona (6
+  connects + a whole ledger compute — ~5× the tool call it wrapped).
+  `mcp_server._with_coach_persona` now memoizes on
+  `(today, db_path, PRAGMA data_version, notes-file (mtime_ns, size))` — a
+  dedicated read-only monitor connection reads `data_version`, which bumps on
+  ANY other connection's commit (settings UPSERTs and journal archived-flips
+  UPDATE in place, so rowid-style keys would miss them; that's why it's NOT
+  MAX(rowid)). The notes stat covers the file-backed notes data_version can't
+  see; the date covers the ledger's as-of-yesterday facts. No-DB/error →
+  key None → resolve live, never cache (fresh-clone fail-open preserved);
+  failures are never cached. Env-var changes still need a restart, as before
+  the memo. The monitor conn must NEVER write (data_version only reports
+  OTHER connections' commits) and re-opens if `db.get_db_path()` changes.
+  `_persona_cache_clear()` resets it (tests use an autouse fixture).
 - **Path defaults**: `db.py`, `notes.py`, `briefing.py` all resolve to
   `_PROJECT_ROOT / ...` when env vars are unset.
 - **MCP tool surface can trigger a Garmin sync, not just read.** `agent/tools.py`'s
@@ -466,6 +516,14 @@ These are settled — don't redesign without a reason.
   allow-list) wraps `ingest.daily.pull(max_days=SYNC_MAX_DAYS)` +
   `ingest.baselines.recompute()` — a bite-sized, gap-aware pull, capped so a
   long absence doesn't turn one tool call into a multi-minute Garmin backfill.
+  **`partial` is a normal outcome, not an error** (0.35.0): `pull` returns
+  `partial` whenever any gap remains back to 2020, so treating it as an error
+  made every sync for a user with one missing historical day return
+  `is_error: true` AND skip the recompute — training load froze while fresh
+  workouts landed. Now only hard failures (`auth_failure`/`not_configured`/
+  `failure`/`interrupted`) are errors, the recompute fires whenever
+  `days_pulled or activities_loaded` is nonzero, and the payload carries a
+  deterministic one-line `sync_state` plus countable `days_failed`.
   Any MCP client wired to `fitness mcp-stdio` (Claude Desktop, opencode, etc.)
   can call it directly; before this tool existed, MCP-only clients had read
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
@@ -594,10 +652,16 @@ These are settled — don't redesign without a reason.
     `avg_pace_sec_per_km` averages in the warmup, recovery jogs and cooldown,
     so that comparison returns F for every correctly-executed interval session
     (measured 2026-07-21: a 6:58/mi prescription averaged 10:42/mi → F, while
-    its 4th mile ran 9:25 at 164 bpm). `fastest_full_split_pace` is the only
-    number that can answer "did you hit the reps". With no splits the metric
-    returns n/a **with a stated reason** and its weight redistributes — it
-    never falls back to the average-vs-rep comparison.
+    its 4th mile ran 9:25 at 164 bpm). `fastest_rep_split` (0.35.0; formerly
+    `fastest_full_split_pace`) is the only number that can answer "did you hit
+    the reps" — and it selects by a distance floor (`QUALITY_MIN_SPLIT_M` =
+    300 m), NOT the `partial` flag: partial is relative to the workout's own
+    longest lap, so a manually-lapped session (2-mile warmup, then 800 m reps)
+    marked every rep partial and graded the reps at warmup pace — a guaranteed
+    F on exactly the workouts this exception exists to grade fairly. With no
+    qualifying split the metric returns n/a **with a stated reason** and its
+    weight redistributes — it never falls back to the average-vs-rep
+    comparison, and never grades against warmup pace.
   - **A grade must never contradict the prose beside it.** Two live cases fixed
     2026-07-21: `load_deviation` was one-sided-low and uncapped, so a day at 81
     load against a 22 expectation printed **A+** directly above its own

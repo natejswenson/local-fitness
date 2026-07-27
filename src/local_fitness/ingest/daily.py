@@ -10,9 +10,10 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from garminconnect import Garmin, GarminConnectAuthenticationError
 
@@ -218,6 +219,21 @@ def _ingest_activity_range(client: Garmin, conn, start: date, end: date) -> int:
     activities = _safe(client.get_activities_by_date, start.isoformat(), end.isoformat()) or []
     if not isinstance(activities, list):
         return 0
+    # Detail fast-path: zones + splits are immutable once a past day closes,
+    # but every pull re-fetched them (plus a 0.3 s throttle sleep) for EVERY
+    # activity the freshness window re-pulls — the exact repeated-detail-call
+    # shape that trips Garmin's 429. An activity dated before today whose
+    # details are already stored keeps its INSERT OR REPLACE summary refresh
+    # (that overwrite IS the freshness feature) but skips both detail calls.
+    # Today's activities always re-fetch: laps can still be finalizing.
+    # Deliberately unscoped (no date filter): the presence sets must cover
+    # whatever ids the API hands back, and Garmin's range endpoint is the
+    # authority on which those are. Both DISTINCTs are sub-ms index walks.
+    have_zones = {r["activity_id"] for r in conn.execute(
+        "SELECT DISTINCT activity_id FROM activity_hr_zones").fetchall()}
+    have_splits = {r["activity_id"] for r in conn.execute(
+        "SELECT DISTINCT activity_id FROM activity_splits").fetchall()}
+    today_str = date.today().isoformat()
     n = 0
     for act in activities:
         if not isinstance(act, dict):
@@ -261,6 +277,12 @@ def _ingest_activity_range(client: Garmin, conn, start: date, end: date) -> int:
             f"INSERT OR REPLACE INTO activities ({cols}) VALUES ({placeholders})",
             row,
         )
+
+        act_date = row["date"]
+        if (act_date and act_date < today_str
+                and activity_id in have_zones and activity_id in have_splits):
+            n += 1
+            continue
 
         zones = _safe(client.get_activity_hr_in_timezones, activity_id)
         if isinstance(zones, list):
@@ -362,6 +384,7 @@ def pull(
             "error": None,
             "gap_days_remaining": 0,
             "deferred_count": 0,
+            "days_failed": 0,
         }
 
     # Most-recent-first so freshness wins. Fill yesterday before backfilling
@@ -395,27 +418,37 @@ def pull(
     activities_loaded = 0
     status: str | None = None
 
+    gap_after: int | None = None
     try:
         client = _client(mfa_callback)
-        for d in target_dates:
-            try:
-                with db.connect() as conn:
-                    _ingest_day(client, conn, d)
-                days += 1
-                if last_ok is None or d > last_ok:
-                    last_ok = d
-            except GarminConnectAuthenticationError:
-                # Auth failures invalidate the rest of the run — bubble up.
-                raise
-            except Exception as e:
-                # One bad day shouldn't poison the whole run.
-                LOG.warning("Day %s ingest failed: %s", d, e)
-                days_failed.append(d.isoformat())
-            time.sleep(0.5)
-
-        # Activities: bounding range covers all touched days; INSERT OR REPLACE
-        # makes overlap with existing rows harmless.
+        # ONE connection for the whole run (a connect per day paid ~0.33 ms
+        # x 30 days for nothing), with the old per-day durability kept by
+        # hand: commit after each good day, rollback a failed day's partial
+        # writes so one bad day still can't poison the run OR the days
+        # already committed.
         with db.connect() as conn:
+            for i, d in enumerate(target_dates):
+                try:
+                    _ingest_day(client, conn, d)
+                    conn.commit()
+                    days += 1
+                    if last_ok is None or d > last_ok:
+                        last_ok = d
+                except GarminConnectAuthenticationError:
+                    # Auth failures invalidate the rest of the run — bubble up.
+                    raise
+                except Exception as e:
+                    # One bad day shouldn't poison the whole run.
+                    conn.rollback()
+                    LOG.warning("Day %s ingest failed: %s", d, e)
+                    days_failed.append(d.isoformat())
+                # Throttle BETWEEN Garmin days only — the trailing sleep after
+                # the final day bought 0.5 s of nothing on every single pull.
+                if i < len(target_dates) - 1:
+                    time.sleep(0.5)
+
+            # Activities: bounding range covers all touched days; INSERT OR
+            # REPLACE makes overlap with existing rows harmless.
             activities_loaded = _ingest_activity_range(client, conn, pull_min, pull_max)
 
         # Honest status: success only if no gap remains AND no day failed
@@ -488,7 +521,12 @@ def pull(
         except Exception:
             LOG.exception("Failed to close ingest_runs row %s", run_id)
 
-    gap_days_remaining = len(db.missing_daily_dates(EARLIEST_BACKFILL_DATE, today))
+    # Reuse the post-pull scan when the success path already ran it — nothing
+    # changes between there and here. Exception paths never computed it.
+    gap_days_remaining = (
+        gap_after if gap_after is not None
+        else len(db.missing_daily_dates(EARLIEST_BACKFILL_DATE, today))
+    )
 
     return {
         "days_pulled": days,
@@ -498,4 +536,7 @@ def pull(
         "error": error,
         "gap_days_remaining": gap_days_remaining,
         "deferred_count": deferred_count,
+        # Countable form of what the error string only spells out in prose, so
+        # callers can classify a run without parsing it.
+        "days_failed": len(days_failed),
     }

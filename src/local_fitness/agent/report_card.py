@@ -78,12 +78,14 @@ __all__ = [
     "overall_grade", "label_splits", "hr_drift_pct", "build_card",
     "render_markdown", "reference_line", "bin_hr_trace", "expected_text",
     "actual_text", "hr_band_bounds", "hr_expectation",
-    "is_running_effort", "fastest_full_split_pace",
+    "is_running_effort", "fastest_rep_split", "fastest_rep_split_pace",
+    "READ_SECTIONS",
     "load_report_card_inputs", "rolling_reference",
 ]
 
-# 1 international mile, exactly — matches units.py's constant.
-MILE_M = 1609.344
+# 1 international mile, exactly — units.py owns the constant (0.38.0);
+# the local name survives because the module uses it ~everywhere.
+MILE_M = units.METERS_PER_MILE
 # How close a lap must be to a mile before we call the column "Mile" rather
 # than "Lap". Garmin auto-lap lands within a few meters; a manual-lap workout
 # can be anything, and mislabeling laps as miles is a lie on the card.
@@ -91,6 +93,14 @@ MILE_TOLERANCE = 0.03
 # Below this many comparable activities in the window, the median is noise.
 # Grading against noise is worse than not grading — return n/a and say so.
 MIN_REFERENCE_ACTIVITIES = 5
+# The smallest split a quality-day pace grade will read. Deliberately NOT the
+# `partial` flag: that is relative to the workout's OWN longest lap, so a
+# manually-lapped interval session (2-mile warmup, then 800m reps) marks every
+# rep partial and leaves the warmup as the only "full" split — which graded the
+# reps at warmup pace and guaranteed an F on exactly the workouts the splits
+# exception exists to grade fairly. 300 m sits under a standard 400 m rep and
+# well over any trailing GPS fragment.
+QUALITY_MIN_SPLIT_M = 300.0
 REFERENCE_WINDOW_DAYS = 60
 # The run/walk boundary and its classifier moved to ``interpret.py`` (the pure
 # classifier module) on 2026-07-22, so ``plans.py`` can gate its mileage rollup
@@ -115,6 +125,28 @@ UPCOMING_WINDOW_DAYS = 7
 # window enumerated — a handful either side is enough to place the run, and
 # every extra row is prompt the model pays to read.
 MAX_CONTEXT_ACTIVITIES = 5
+
+# Every `activities` column EXCEPT `raw_json` — the whole-row read list, and the
+# single definition of it (`tools.get_workout_detail` imports this one rather
+# than keeping a second copy). `raw_json` is the preserved Garmin payload, ~50 KB
+# per row, and nothing downstream of a whole-row fetch reads it: both call sites
+# used to `SELECT *` and then pop the key back off, which is 50 KB decoded out of
+# SQLite and thrown away per activity. `source` is here because init_schema's
+# guarded ALTER guarantees it (see db.init_schema) — a DB that skipped
+# init_schema is out of contract for every other table too.
+# tests/test_report_card.py pins this against PRAGMA table_info, so a new column
+# in db.SCHEMA fails the build instead of silently going unread.
+_ACTIVITY_COLUMNS: tuple[str, ...] = (
+    "activity_id", "date", "start_time", "activity_type", "activity_name",
+    "duration_seconds", "moving_seconds", "distance_meters", "avg_hr",
+    "max_hr", "avg_pace_sec_per_km", "elevation_gain_meters",
+    "elevation_loss_meters", "calories", "aerobic_te", "anaerobic_te",
+    "training_load", "avg_cadence", "vo2_max_estimate", "weather_temp_c",
+    "weather_conditions", "source",
+)
+# Interpolated into SQL, never parameterized — these are frozen identifiers from
+# the constant above, not user input (the whitelist-not-f-string rule).
+_ACTIVITY_SELECT = ", ".join(_ACTIVITY_COLUMNS)
 
 # The one band table. `d` is a non-negative relative deviation; every metric
 # reduces to one, which is why there is exactly one grader.
@@ -510,20 +542,35 @@ def label_splits(splits: list[dict]) -> dict:
     }
 
 
-def fastest_full_split_pace(labelled: dict) -> float | None:
-    """The fastest full split's pace in sec/km, or ``None`` when there isn't one.
+def fastest_rep_split(labelled: dict) -> dict | None:
+    """The fastest rep-sized split, or ``None`` when there isn't one.
 
-    Partial splits are excluded for the same reason ``hr_drift_pct`` excludes
-    them: a 90-metre trailing fragment can post an absurdly fast pace and would
-    win this comparison every time.
+    Rep-sized is ``distance_meters >= QUALITY_MIN_SPLIT_M`` rather than "not
+    ``partial``". The partial flag is measured against the workout's own longest
+    lap, which on a manually-lapped session is the warmup — so every rep of a
+    2-mile-warmup-then-800s workout is partial and the warmup is the only
+    candidate left, which is how a correctly-run interval session got graded at
+    warmup pace.
+
+    The distance floor still solves what the partial filter was there for: a
+    90-metre trailing fragment can post an absurdly fast pace and would win
+    every time. Anything long enough to be a rep is a fair candidate, and a
+    slower warmup simply loses ``min()``.
 
     This is the one place a *grade* is allowed to read splits — see the quality
     branch of ``build_card`` for why, and the module docstring for the rule it
     is an exception to.
     """
-    paces = [r["avg_pace_sec_per_km"] for r in (labelled.get("rows") or [])
-             if not r.get("partial") and r.get("avg_pace_sec_per_km")]
-    return min(paces) if paces else None
+    candidates = [r for r in (labelled.get("rows") or [])
+                  if (r.get("distance_meters") or 0.0) >= QUALITY_MIN_SPLIT_M
+                  and r.get("avg_pace_sec_per_km")]
+    return min(candidates, key=lambda r: r["avg_pace_sec_per_km"]) if candidates else None
+
+
+def fastest_rep_split_pace(labelled: dict) -> float | None:
+    """:func:`fastest_rep_split`'s pace in sec/km, or ``None``."""
+    best = fastest_rep_split(labelled)
+    return best["avg_pace_sec_per_km"] if best else None
 
 
 def bin_hr_trace(
@@ -697,16 +744,19 @@ def build_card(
             # Measured 2026-07-21: a prescribed 6:58/mi interval day averaged
             # 10:42/mi and scored F, while its 4th mile ran 9:25 at 164 bpm.
             #
-            # The fastest full split is the only number available that can answer
-            # "did you hit the reps", so quality pace — and ONLY quality pace —
-            # reads splits. Everything else keeps the no-splits-in-grades rule.
-            graded_pace = fastest_full_split_pace(labelled_splits)
+            # The fastest rep-sized split is the only number available that can
+            # answer "did you hit the reps", so quality pace — and ONLY quality
+            # pace — reads splits. Everything else keeps the no-splits rule.
+            best_split = fastest_rep_split(labelled_splits)
+            graded_pace = best_split["avg_pace_sec_per_km"] if best_split else None
             if graded_pace is None:
                 # Backfilled activities carry no splits at all. Show the average
                 # so the number isn't lost, but refuse to grade it against a rep
                 # target — pace's weight redistributes instead.
                 pace_display = f"{_fmt_pace(avg_pace)} avg" if avg_pace else None
-                pace_note = ("interval day, no splits recorded — average pace "
+                reason = ("no splits recorded" if not labelled_splits["available"]
+                          else "no split long enough to be a rep")
+                pace_note = (f"interval day, {reason} — average pace "
                              "can't be graded against a rep target")
             else:
                 # No note in the success case: "9:25/mi best mile" against a
@@ -714,7 +764,11 @@ def build_card(
                 # the PDF's one-page budget is real — this bullet alone pushed a
                 # 6-split card onto a second page. A note earns its row only
                 # when the reader could not otherwise infer the reason.
-                unit = labelled_splits["unit"].lower()
+                # A rep shorter than the workout's full lap is not a "best
+                # mile", and calling it one on a manual-lap card is the kind of
+                # small lie the card is not allowed to tell.
+                unit = ("split" if best_split.get("partial")
+                        else labelled_splits["unit"].lower())
                 pace_display = f"{_fmt_pace(graded_pace)} best {unit}"
     elif plan_usable and plan_workout.get("target_distance_m"):
         # A prescribed distance with no pace is an explicit by-feel day. It
@@ -791,10 +845,38 @@ def build_card(
 
 # --- markdown rendering ----------------------------------------------------
 
+#: The four coach-read paragraphs, in card order. The key is what the model
+#: labels its output with; the label is what the reader sees above each
+#: paragraph. Lives HERE (0.38.0, formerly workout_coach.READ_SECTIONS)
+#: because it is the card's contract — render_markdown, visuals and
+#: card_store all consume it, and housing it in workout_coach forced each of
+#: them to import from the module that judges the card rather than the one
+#: that defines it. workout_coach re-exports it unchanged.
+READ_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("distance", "DISTANCE"),
+    ("pace", "PACE"),
+    ("hr", "HEART RATE"),
+    ("load", "TRAINING LOAD"),
+)
+
 _METRIC_LABELS = [
     ("distance", "Distance"), ("pace", "Pace"),
     ("hr", "Avg HR"), ("load", "Training Load"),
 ]
+
+# The same metrics named for prose rather than for a table column: "Avg HR"
+# reads wrong mid-sentence.
+_METRIC_PROSE = {"distance": "distance", "pace": "pace",
+                 "hr": "HR", "load": "training load"}
+
+
+def _prose_list(items: list[str]) -> str:
+    """``["HR", "training load"]`` → ``"HR and training load"``, sentence-cased
+    because the result opens a sentence."""
+    if not items:
+        return ""
+    joined = items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+    return joined[0].upper() + joined[1:]
 
 
 def _fmt_distance(m):
@@ -875,7 +957,7 @@ def _delta_text(key: str, metric: dict) -> str:
         # to refuse.
         return "—"
     if key == "pace":
-        diff = round((actual - expected) * 1.609344)
+        diff = round((actual - expected) * units.KM_PER_MILE)
         if abs(diff) < 1:
             return "on target"
         return f"{abs(diff)}s/mi {'slower' if diff > 0 else 'faster'}"
@@ -885,7 +967,13 @@ def _delta_text(key: str, metric: dict) -> str:
         return "in range"
     if not expected:
         return "—"
-    return f"{(actual / expected - 1) * 100:+.0f}%"
+    pct = (actual / expected - 1) * 100
+    if round(pct) == 0:
+        # A sub-half-percent shortfall printed "-0%" on a live card (4.00 of
+        # 4.00 mi, off by meters) — negative zero reads like a typo beside an
+        # A+. Within rounding of zero IS on target; say so.
+        return "on target"
+    return f"{pct:+.0f}%"
 
 
 def reference_line(card: dict, *, markdown: bool = True) -> str:
@@ -900,7 +988,9 @@ def reference_line(card: dict, *, markdown: bool = True) -> str:
     ref = card["reference"]
     mode = ref.get("mode")
     em = "**" if markdown else ""
-    if mode == "insufficient_data":
+    plan_graded = any((m.get("reference") or "").startswith("plan")
+                      for m in card["metrics"].values())
+    if mode == "insufficient_data" and not plan_graded:
         return (f"Not enough comparable history to grade — {ref.get('n', 0)} similar "
                 f"activities in the last {REFERENCE_WINDOW_DAYS} days "
                 f"(need {MIN_REFERENCE_ACTIVITIES}).")
@@ -919,9 +1009,24 @@ def reference_line(card: dict, *, markdown: bool = True) -> str:
                 f"Garmin labels them the same, the pace says otherwise."
                 if n_excluded else "")
     widened += excluded
-    if any((m.get("reference") or "").startswith("plan") for m in card["metrics"].values()):
-        return (f"Graded against your {em}training plan{em} for this date "
-                f"(intent: {card['intent']}, {intent_src}). HR and training load "
+    if plan_graded:
+        plan_sentence = (f"Graded against your {em}training plan{em} for this date "
+                         f"(intent: {card['intent']}, {intent_src}).")
+        if mode == "insufficient_data":
+            # The plan still graded what it has targets for, so the blanket
+            # "not enough history to grade" sentence would contradict the
+            # letters printed directly above it. Scope the disclaimer to the
+            # metrics it actually applies to.
+            n = ref.get("n", 0)
+            ungraded = _prose_list([
+                _METRIC_PROSE[k] for k, _ in _METRIC_LABELS
+                if not card["metrics"].get(k, {}).get("grade")])
+            if not ungraded:
+                return plan_sentence
+            return (f"{plan_sentence} {ungraded} ungraded — only {n} comparable "
+                    f"{'activity' if n == 1 else 'activities'} in the last "
+                    f"{REFERENCE_WINDOW_DAYS} days (need {MIN_REFERENCE_ACTIVITIES}).")
+        return (f"{plan_sentence} HR and training load "
                 f"have no plan target, so they use your 60-day median of "
                 f"{ref.get('n', 0)} {pool} activities.{widened}")
     return (f"Graded against your {em}60-day rolling median{em} of {ref.get('n', 0)} "
@@ -948,8 +1053,6 @@ def render_markdown(card: dict) -> str:
     # per metric, which is where a reader actually checks it.
     read = card.get("coach_read") or {}
     if read:
-        from .workout_coach import READ_SECTIONS
-
         for key, label in READ_SECTIONS:
             if read.get(key):
                 lines += [f"**{label.title()}** — {read[key]}", ""]
@@ -1150,19 +1253,29 @@ def _select_activity(
     grade. An explicit ``activity_id`` bypasses it — if you asked for that one,
     you get it, with n/a where metrics are missing. ``start_time`` is
     'YYYY-MM-DD HH:MM:SS' text, so lexicographic ordering is chronological.
+
+    The date branch takes the day's FIRST session, because the prescription it
+    will be graded against is the day's lowest ``seq`` — the primary/AM session
+    (see ``load_report_card_inputs``). Taking the last one instead paired an
+    evening shakeout with the morning's long-run target and graded the wrong
+    run. The no-argument branch is unaffected: "most recent" genuinely means
+    the latest session.
     """
     if activity_id is not None:
         return conn.execute(
-            "SELECT * FROM activities WHERE activity_id = ?", (activity_id,)
+            f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE activity_id = ?",
+            (activity_id,),
         ).fetchone()
     if target_date:
         return conn.execute(
-            "SELECT * FROM activities WHERE date = ? AND distance_meters > 0 "
-            "AND duration_seconds > 0 ORDER BY start_time DESC LIMIT 1",
+            f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE date = ? "
+            "AND distance_meters > 0 AND duration_seconds > 0 "
+            "ORDER BY start_time ASC LIMIT 1",
             (target_date,),
         ).fetchone()
     return conn.execute(
-        "SELECT * FROM activities WHERE distance_meters > 0 AND duration_seconds > 0 "
+        f"SELECT {_ACTIVITY_SELECT} FROM activities "
+        "WHERE distance_meters > 0 AND duration_seconds > 0 "
         "ORDER BY date DESC, start_time DESC LIMIT 1"
     ).fetchone()
 
@@ -1185,8 +1298,8 @@ def load_report_card_inputs(
     row = _select_activity(conn, activity_id, target_date)
     if row is None:
         return None
+    # No raw_json to strip — _select_activity never fetched it (_ACTIVITY_COLUMNS).
     activity = dict(row)
-    activity.pop("raw_json", None)
     aid = activity["activity_id"]
 
     splits = [dict(r) for r in conn.execute(
@@ -1244,9 +1357,19 @@ def load_report_card_inputs(
         "upcoming_workouts": upcoming_workouts,
         "reference": rolling_reference(conn, activity),
         "context": context,
+        # Enough of each other session to say WHICH one wasn't graded. A bare
+        # id told the reader a second session existed and nothing else, so
+        # "grade my run" on a double day gave no way to tell whether the card
+        # covered the one they meant.
         "other_activities_on_date": [
-            r["activity_id"] for r in conn.execute(
-                "SELECT activity_id FROM activities WHERE date = ? AND activity_id != ?",
+            {"activity_id": r["activity_id"],
+             "activity_type": r["activity_type"],
+             "distance_mi": units.to_miles(r["distance_meters"]),
+             "start_time": r["start_time"]}
+            for r in conn.execute(
+                "SELECT activity_id, activity_type, distance_meters, start_time "
+                "FROM activities WHERE date = ? AND activity_id != ? "
+                "ORDER BY start_time",
                 (activity["date"], aid),
             ).fetchall()
         ],

@@ -128,6 +128,7 @@ def test_coach_prompt_renders_each_note_once(seeded_status_db):
     assert not saved.get("is_error")
 
     from mcp import types
+
     from local_fitness.web import mcp_server
 
     server = mcp_server.build_server()
@@ -145,6 +146,7 @@ def test_coach_prompt_includes_output_formatting_contract(seeded_status_db):
     # The coach prompt must steer the model toward narrow/monospace-friendly
     # layouts so its reply renders cleanly in the MCP client.
     from mcp import types
+
     from local_fitness.web import mcp_server
 
     server = mcp_server.build_server()

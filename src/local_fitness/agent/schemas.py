@@ -146,3 +146,12 @@ class BriefContext(BaseModel):
     plan_today: dict | None = None
     step_goal: int | None = None
     days_to_race: int | None = None
+    # Freshness + interpretation. All optional and defaulted so stored eval
+    # fixtures (captured before these existed) still validate. `*_stale_days`
+    # expose the orphaned-sync failure — a data frontier or a baselines row
+    # that stopped advancing, or a brief that never saved — which is otherwise
+    # invisible to a generator reading only the numbers themselves.
+    data_frontier: str | None = None        # newest daily_metrics date on hand
+    baseline_stale_days: int | None = None  # today − the baselines row's date
+    brief_stale_days: int | None = None     # today − the newest saved brief
+    tsb_zone: str | None = None             # interpret.tsb_zone(tsb)

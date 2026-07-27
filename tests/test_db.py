@@ -31,6 +31,37 @@ def test_init_schema_idempotent(dbp):
     assert "source" in act_cols
 
 
+def test_init_schema_adds_the_activity_ordering_index_to_an_existing_db(dbp):
+    """`idx_activities_date_start` is a plain `CREATE INDEX IF NOT EXISTS` in
+    SCHEMA, which IS the whole migration: a DB written before it existed picks
+    it up on the next init_schema, with its rows intact. Drop it and re-init to
+    stand in for that older DB."""
+    with db.connect(dbp) as conn:
+        conn.execute("DROP INDEX idx_activities_date_start")
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time) "
+            "VALUES (7, '2026-01-02', '2026-01-02 06:00:00')"
+        )
+        names = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert "idx_activities_date_start" not in names
+
+    db.init_schema(dbp)
+
+    with db.connect(dbp) as conn:
+        names = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert "idx_activities_date_start" in names
+        # (date, start_time) in that order, compound. A single-column index
+        # can't serve the compound ORDER BY, which is the entire point of it.
+        assert [r["name"] for r in conn.execute(
+            "PRAGMA index_info(idx_activities_date_start)")] == ["date", "start_time"]
+        # The pre-existing row survives — this is an add, not a rebuild.
+        assert conn.execute(
+            "SELECT date FROM activities WHERE activity_id = 7").fetchone()["date"] \
+            == "2026-01-02"
+
+
 def test_init_schema_adds_archived_and_fts(dbp):
     with db.connect(dbp) as conn:
         jcols = {r["name"] for r in conn.execute(

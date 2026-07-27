@@ -27,7 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .. import config
@@ -114,6 +114,7 @@ def build_prompt(
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,
+    sessions_adherence_pct: int | None = None,
 ) -> tuple[str, str]:
     """Assemble the ``(system_prompt, user_prompt)`` pair for the coaching
     line. Pure string assembly — no I/O, no randomness, fully unit-testable.
@@ -131,6 +132,13 @@ def build_prompt(
     (``memory.render_memory_for_prompt()`` output) — passed in, not resolved,
     because this prompt's hash is ``generate_coaching_line_cached``'s cache
     key and a builder that did I/O would break caching.
+
+    ``sessions_adherence_pct`` (``plans._sessions_adherence_pct``) is appended
+    to the adherence line when supplied, so the coach reads the number that
+    excludes rest days alongside the one that counts them — a plan with three
+    rest days a week can show 80%+ overall while half the running went
+    undone. Optional and ``None`` by default: omitting it reproduces the
+    previous prompt byte for byte, so an un-wired caller keeps its cache.
     """
     system_prompt = (
         f"You are {user_name}'s running coach, writing ONE short paragraph (2-4 "
@@ -151,7 +159,12 @@ def build_prompt(
     if today_workout.get("description"):
         lines.append(f"Prescription notes: {today_workout['description']}")
 
-    lines.append(f"Plan adherence over the last graded stretch: {adherence_pct}%.")
+    adherence_line = f"Plan adherence over the last graded stretch: {adherence_pct}%."
+    if sessions_adherence_pct is not None:
+        adherence_line += (
+            f" Excluding rest days, {sessions_adherence_pct}% of prescribed sessions."
+        )
+    lines.append(adherence_line)
     if days_to_race is not None:
         lines.append(f"{days_to_race} days to the {goal_type}.")
     else:
@@ -183,6 +196,7 @@ async def generate_coaching_line(
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,
+    sessions_adherence_pct: int | None = None,
 ) -> str:
     """Claude-generated coaching line prepping the athlete for today's run.
 
@@ -208,6 +222,7 @@ async def generate_coaching_line(
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
         notes_text=notes_text, user_name=user_name, memory_text=memory_text,
+        sessions_adherence_pct=sessions_adherence_pct,
     )
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -240,27 +255,58 @@ def _cache_path() -> Path:
     return db.DEFAULT_DB_PATH.parent / "plan_coach_cache.json"
 
 
-def _read_cached_line(path: Path, key: str) -> str | None:
-    """The cached line if ``path`` holds an entry for exactly ``key``; else
-    None. Tolerates a missing/corrupt cache file — never raises."""
+#: Multi-entry cache cap (0.36.0). The old single-entry "latest key wins"
+#: shape thrashed the moment two different brief dates alternated — every
+#: render of A evicted B and vice versa, each miss a live SDK call on a 30 s
+#: budget. 32 entries is a month of dates with room for plan edits.
+CACHE_MAX_ENTRIES = 32
+
+
+def _load_cache_entries(path: Path) -> dict[str, dict]:
+    """The cache file's entries, tolerating every historical shape: the v2
+    ``{"version": 2, "entries": {...}}`` dict, the retired v1 single-entry
+    ``{"key": ..., "line": ...}`` (read as one entry so an upgrade keeps its
+    hit), and missing/corrupt files (empty). Never raises."""
     try:
-        entry = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(entry, dict) and entry.get("key") == key:
-            line = entry.get("line")
-            if isinstance(line, str) and line:
-                return line
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        pass
-    return None
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("version") == 2 and isinstance(data.get("entries"), dict):
+        return {
+            k: v for k, v in data["entries"].items()
+            if isinstance(v, dict) and isinstance(v.get("line"), str) and v["line"]
+        }
+    if isinstance(data.get("key"), str) and isinstance(data.get("line"), str):
+        return {data["key"]: {"line": data["line"], "ts": ""}}
+    return {}
+
+
+def _read_cached_line(path: Path, key: str) -> str | None:
+    """The cached line for exactly ``key``, else None. Never raises."""
+    entry = _load_cache_entries(path).get(key)
+    return entry["line"] if entry else None
 
 
 def _write_cached_line(path: Path, key: str, line: str) -> None:
-    """Best-effort single-entry cache write (latest key wins). A cache write
+    """Best-effort v2 multi-entry cache write, capped at
+    ``CACHE_MAX_ENTRIES`` by evicting the oldest ``ts``. A cache write
     failure must never fail the PDF render — swallow and log."""
     try:
+        entries = _load_cache_entries(path)
+        entries[key] = {
+            "line": line,
+            "ts": datetime.now(UTC).isoformat(),
+        }
+        while len(entries) > CACHE_MAX_ENTRIES:
+            # Missing ts (a migrated v1 entry) sorts oldest — first out.
+            oldest = min(entries, key=lambda k: entries[k].get("ts") or "")
+            del entries[oldest]
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"key": key, "line": line}), encoding="utf-8")
+        tmp.write_text(
+            json.dumps({"version": 2, "entries": entries}), encoding="utf-8")
         tmp.replace(path)
     except OSError:
         _LOG.warning("plan_coach cache write failed (ignored)", exc_info=True)
@@ -279,6 +325,7 @@ async def generate_coaching_line_cached(
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,
+    sessions_adherence_pct: int | None = None,
     cache_path: Path | None = None,
 ) -> str:
     """``generate_coaching_line`` behind a single-entry disk cache.
@@ -295,7 +342,7 @@ async def generate_coaching_line_cached(
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, notes_text=notes_text, user_name=user_name,
-        memory_text=memory_text,
+        memory_text=memory_text, sessions_adherence_pct=sessions_adherence_pct,
     )
     key = hashlib.sha256(
         "\x00".join([system_prompt, user_prompt, model or "default"]).encode("utf-8")
@@ -309,6 +356,7 @@ async def generate_coaching_line_cached(
         profile, today_workout, last_7_days, adherence_pct, days_to_race,
         goal_type, model=model, timeout=timeout, notes_text=notes_text,
         user_name=user_name, memory_text=memory_text,
+        sessions_adherence_pct=sessions_adherence_pct,
     )
     _write_cached_line(path, key, line)
     return line
@@ -376,6 +424,13 @@ def _plan_section_pool(plan_section: dict) -> list[tuple[float, str]]:
     adherence_pct = plan_section.get("adherence_pct")
     if adherence_pct is not None:
         pool.append((abs(float(adherence_pct)), "adherence_pct"))
+
+    # Cited only when the caller wired it (build_prompt appends it to the
+    # adherence line under the same condition) — a number the line can't have
+    # seen must not become a licence to invent one.
+    sessions_adherence_pct = plan_section.get("sessions_adherence_pct")
+    if sessions_adherence_pct is not None:
+        pool.append((abs(float(sessions_adherence_pct)), "sessions_adherence_pct"))
 
     days_to_race = plan_section.get("days_to_race")
     if days_to_race is not None:
@@ -450,4 +505,9 @@ def ground_coaching_line(text: str, plan_section: dict) -> list[GroundingFlag]:
                     nearest_metric=near_name, delta=round(x - near_val, 2)))
         return flags
     except Exception:
+        # Advisory-only signal, so degrading to "no flags" is right — but
+        # silently, it was the one fail-open in the module without a log
+        # line (every sibling warns with exc_info).
+        _LOG.warning("coaching-line grounding check failed (ignored)",
+                     exc_info=True)
         return []

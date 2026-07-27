@@ -34,14 +34,9 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from local_fitness import db
-from local_fitness import notes
-from local_fitness.agent import briefing
-from local_fitness.agent import briefs
-from local_fitness.agent import coach
-from local_fitness.agent import prompts
+from local_fitness import db, notes
+from local_fitness.agent import briefing, briefs, coach, prompts
 from local_fitness.agent.schemas import Brief, BriefContext
-
 
 # --- _iter_partial_takeaways: the streaming partial-JSON parser ------------
 #
@@ -814,7 +809,7 @@ def test_local_model_gemma4_gets_tightened_schema_and_higher_temperature(stream_
     calls: list[dict] = []
     monkeypatch.setattr(
         briefing.local_model, "generate_local_completion",
-        lambda sp, up, *, format=None, temperature=None, **kw: (  # noqa: A002
+        lambda sp, up, *, format=None, temperature=None, **kw: (  # noqa: A002, A006 — mirrors the SDK kwarg
             calls.append({"format": format, "temperature": temperature})
             or _brief_json([_takeaway()])))
 
@@ -1186,3 +1181,39 @@ def test_local_model_gemma4_skips_plan_facts_when_no_active_plan(stream_env, mon
     assert "CITE THESE VERBATIM" not in calls[0]
     done = [e for e in events if e["type"] == "done"]
     assert "Training plan status" not in done[0]["brief"]["takeaways"][0]["details"]
+
+
+# --------------------------------------------------------------------------- #
+# 0.36.0: memory resolved once per generation (S6)
+# --------------------------------------------------------------------------- #
+def _install_memory_recorder(monkeypatch):
+    calls: list[dict] = []
+    real = briefing.memory.render_memory_for_prompt
+
+    def recording(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(briefing.memory, "render_memory_for_prompt", recording)
+    return calls
+
+
+def test_v2_default_resolves_memory_once_and_only_compact(stream_env, monkeypatch):
+    """V2 (the production default) uses only the compact variant; the old
+    shape ALSO computed the full ledger render per brief and threw it away."""
+    calls = _install_memory_recorder(monkeypatch)
+    _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
+    _drain()
+    assert len(calls) == 1
+    assert calls[0].get("compact") is True
+
+
+def test_v1_rollback_resolves_the_full_variant(stream_env, monkeypatch):
+    """LOCAL_FITNESS_BRIEF_V2=0 still gets the full memory block — laziness
+    must defer the second resolve, never delete it."""
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
+    calls = _install_memory_recorder(monkeypatch)
+    _install_query(monkeypatch, [_text_event(_brief_json([_takeaway()]))])
+    _drain()
+    full_calls = [c for c in calls if not c.get("compact")]
+    assert len(full_calls) == 1

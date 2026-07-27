@@ -294,6 +294,25 @@ def test_render_plan_section_html_stat_tile_exact_values():
     assert '<div class="value">11.1 mi / 17.0 mi</div>' in html_out
     assert '<div class="value">2</div>' in html_out
     assert '<div class="label">Slips</div>' in html_out
+    # No sessions number in this section -> the label is bare, exactly as before.
+    assert '<div class="label">Adherence</div>' in html_out
+
+
+def test_render_plan_section_html_sessions_adherence_rides_the_label():
+    """The compound value goes on the tiny dim label, never in the 1.25em/900
+    numeral slot that collided with its neighbour once already."""
+    section = dict(_PLAN_SECTION, sessions_adherence_pct=62, rest_days_counted=2)
+    html_out = visuals._render_plan_section_html(section)
+    assert '<div class="value">75%</div>' in html_out          # numeral untouched
+    assert '<div class="label">Adherence · 62% sessions</div>' in html_out
+
+
+def test_render_plan_section_html_zero_sessions_adherence_is_still_printed():
+    """`is not None`, not truthy — 0% is the number that most needs to sit
+    beside a flattering total."""
+    section = dict(_PLAN_SECTION, sessions_adherence_pct=0)
+    assert ('<div class="label">Adherence · 0% sessions</div>'
+            in visuals._render_plan_section_html(section))
 
 
 def test_render_plan_section_html_no_race_date_shows_goal_tile():
@@ -678,6 +697,21 @@ def test_brief_fits_one_page_at_realistic_takeaway_counts(n_takeaways, with_plan
         assert len(doc.pages) == 1
 
 
+@pytest.mark.parametrize("n_takeaways", [1, 2, 3])
+def test_brief_fits_one_page_with_the_sessions_adherence_sublabel(n_takeaways):
+    """The longer adherence label wraps to a second line inside its tile.
+    Measured, not assumed: that extra height must still land on one page."""
+    png = _chart_png()
+    pdf, pages = visuals.render_brief_pdf(
+        _brief(_realistic_takeaways(n_takeaways)),
+        {str(i): png for i in range(n_takeaways)},
+        dict(_PLAN_SECTION, sessions_adherence_pct=62, rest_days_counted=2),
+    )
+    assert pages == 1
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        assert len(doc.pages) == 1
+
+
 @pytest.mark.parametrize("n_takeaways", [4, 5])
 def test_render_reports_overflow_rather_than_silently_spilling(n_takeaways):
     """At the schema's upper end the ladder can be exhausted. The contract is
@@ -857,3 +891,39 @@ def test_chart_is_a_band_not_a_square():
     """The height cap only buys page room if the figure is wide and short."""
     w, h = visuals.CHART_FIGSIZE
     assert w / h > 2.5
+
+
+def test_fit_one_page_decodes_each_asset_once_across_rungs(monkeypatch):
+    """0.36.0 (S10): the shared image cache must stop per-rung re-decodes —
+    a 3-rung fit used to re-fetch/re-decode every data: chart and the
+    @font-face TTF at each rung. The fetcher is only consulted on a cache
+    miss, so a multi-rung walk fetching the same data: URL once IS the
+    behavior under test."""
+    fetches: list[str] = []
+    real_factory = visuals._report_url_fetcher
+
+    def counting_factory():
+        real = real_factory()
+
+        def fetcher(url):
+            fetches.append(url[:40])
+            return real(url)
+
+        return fetcher
+
+    monkeypatch.setattr(visuals, "_report_url_fetcher", counting_factory)
+    # A real 1x1 PNG as a data: URI, embedded at every rung; tall body so the
+    # ladder walks all three rungs.
+    png_b64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+               "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+
+    def build(preset):
+        rows = "".join("<p>line</p>" for _ in range(120))
+        return (f"<html><head><style>@page {{ size: A4; margin: 1.5cm; }}"
+                f"body {{ font-size: {preset['body_pt']}pt; }}"
+                f"p {{ margin: 0; }}</style></head><body>"
+                f'<img src="data:image/png;base64,{png_b64}">{rows}</body></html>')
+
+    _pdf, pages, index = visuals.fit_one_page(build)
+    assert index == 2  # the ladder genuinely walked all three rungs
+    assert len(fetches) == 1  # ...but the image was fetched/decoded ONCE

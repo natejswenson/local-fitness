@@ -444,6 +444,50 @@ def test_reference_line_names_the_yardstick():
     assert "rolling median" in rc.reference_line(rolling_card)
 
 
+def test_reference_line_does_not_disclaim_what_the_plan_graded():
+    """A thin rolling pool used to print "not enough history to grade" directly
+    under two letters the plan had just graded. The disclaimer is now scoped to
+    the metrics it actually applies to."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        plan={"type": "easy", "target_distance_m": 10000,
+              "target_pace_sec_per_km": 310, "seq": 1},
+        reference={"mode": "insufficient_data", "n": 2, "pool": "running"},
+    )
+    assert card["metrics"]["distance"]["grade"] == "A+"     # graded off the plan
+    assert card["metrics"]["hr"]["grade"] is None           # no rolling median
+    line = rc.reference_line(card)
+    assert line == (
+        "Graded against your **training plan** for this date (intent: easy, "
+        "prescribed by your plan). HR and training load ungraded — only 2 "
+        "comparable activities in the last 60 days (need 5).")
+
+
+def test_scoped_caveat_counts_one_activity_in_the_singular():
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        plan={"type": "easy", "target_distance_m": 10000, "seq": 1},
+        reference={"mode": "insufficient_data", "n": 1, "pool": "running"},
+    )
+    # A by-feel prescription grades distance only, so pace joins the caveat.
+    assert rc.reference_line(card, markdown=False).endswith(
+        "Pace, HR and training load ungraded — only 1 comparable activity in "
+        "the last 60 days (need 5).")
+
+
+def test_reference_line_still_disclaims_when_the_plan_graded_nothing():
+    """The no-plan case is untouched: with nothing graded at all, the blanket
+    sentence is the honest one."""
+    card = card_for({"date": "2026-07-19", "distance_meters": 10000,
+                     "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+                    reference={"mode": "insufficient_data", "n": 3})
+    assert rc.reference_line(card) == (
+        "Not enough comparable history to grade — 3 similar activities in the "
+        "last 60 days (need 5).")
+
+
 def test_reference_line_drops_markdown_for_the_pdf():
     """The PDF escapes its HTML rather than rendering markdown, so leaving the
     asterisks in printed a literal `**training plan**` on the page."""
@@ -576,6 +620,99 @@ def test_rolling_reference_handles_a_malformed_date():
     assert rc.rolling_reference(_Conn(), {"date": "nope"})["mode"] == "insufficient_data"
 
 
+class TracingConn:
+    """Records the SQL each `execute` issues AND the column names SQLite
+    actually returned for it, then delegates everything else to the real
+    connection. The description is the honest answer to "did raw_json leave
+    SQLite" — a `not in` check on the caller's dict can't tell a column that
+    was never fetched from one that was fetched and popped."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def execute(self, sql, params=()):
+        cur = self._conn.execute(sql, params)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        self.calls.append((sql, cols))
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def sql_for(self, table: str) -> str:
+        """The one SELECT issued against `table`. Fails loudly on 0 or 2+, so
+        a refactor that splits or drops the query can't quietly pass."""
+        hits = [sql for sql, _ in self.calls
+                if f"FROM {table}" in sql and sql.lstrip().upper().startswith("SELECT")]
+        assert len(hits) == 1, f"expected one SELECT on {table}, got {len(hits)}"
+        return hits[0]
+
+    def columns_for(self, table: str) -> list[str]:
+        return next(cols for sql, cols in self.calls if f"FROM {table}" in sql)
+
+
+def test_activity_columns_is_every_activities_column_except_raw_json(rc_db):
+    """The frozen list must stay exhaustive. A column added to db.SCHEMA (or by
+    an init_schema ALTER, like `source`) and not added here would be silently
+    unreadable everywhere the whole-row fetch is used — this fails the build
+    instead. raw_json is the one deliberate omission."""
+    with db.connect(rc_db) as conn:
+        actual = [r["name"] for r in conn.execute("PRAGMA table_info(activities)")]
+    assert list(rc._ACTIVITY_COLUMNS) == [c for c in actual if c != "raw_json"]
+    assert "raw_json" in actual                     # ...and it really is a column
+    assert "source" in rc._ACTIVITY_COLUMNS         # the ALTER-added one
+
+
+def test_select_activity_never_fetches_raw_json_on_any_branch(rc_db):
+    """raw_json is ~50 KB of preserved Garmin payload per row. All three
+    resolution branches used to `SELECT *` and hand it back for the caller to
+    pop — decoded out of SQLite only to be discarded."""
+    today = date.today().isoformat()
+    for kwargs in ({"activity_id": 1}, {"target_date": today}, {}):
+        with db.connect(rc_db) as conn:
+            tracer = TracingConn(conn)
+            row = rc._select_activity(
+                tracer, kwargs.get("activity_id"), kwargs.get("target_date"))
+        sql, cols = tracer.calls[0]
+        assert "SELECT *" not in sql, kwargs
+        assert "raw_json" not in cols, kwargs
+        assert cols == list(rc._ACTIVITY_COLUMNS), kwargs
+        assert row["activity_id"] == 1              # branch still resolves
+
+
+def test_load_report_card_inputs_hands_back_no_raw_json_and_never_popped_one(rc_db):
+    """The pop in load_report_card_inputs is gone, so this is now a claim about
+    the query rather than about cleanup after it: the key is absent because it
+    was never selected."""
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "UPDATE activities SET raw_json = ? WHERE activity_id = 1",
+            ('{"big": "' + "x" * 5000 + '"}',),
+        )
+        tracer = TracingConn(conn)
+        inputs = rc.load_report_card_inputs(tracer)
+    assert "raw_json" not in inputs["activity"]
+    assert "raw_json" not in tracer.columns_for("activities")
+    # The rest of the row is intact — pruning dropped exactly one column.
+    assert inputs["activity"]["activity_name"] == "Morning Run"
+    assert inputs["activity"]["training_load"] == 100
+
+
+def test_default_activity_lookup_is_served_by_the_ordering_index(rc_db):
+    """`ORDER BY date DESC, start_time DESC` against the single-column
+    idx_activities_date forced a USE TEMP B-TREE — SQLite materializing and
+    sorting the whole activities table to return one row. Explain the SQL the
+    code actually issued, not a copy of it."""
+    with db.connect(rc_db) as conn:
+        tracer = TracingConn(conn)
+        rc._select_activity(tracer, None, None)
+        sql = tracer.sql_for("activities")
+        plan = " ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql))
+    assert "idx_activities_date_start" in plan
+    assert "TEMP B-TREE" not in plan
+
+
 def test_load_inputs_defaults_to_the_most_recent_activity(rc_db):
     with db.connect(rc_db) as conn:
         inputs = rc.load_report_card_inputs(conn)
@@ -618,15 +755,54 @@ def test_load_inputs_by_date_and_miss(rc_db):
 
 
 def test_load_inputs_reports_other_activities_on_the_date(rc_db):
-    """A double-day must not silently hide its second session."""
+    """A double-day must not silently hide its second session — and a bare id
+    doesn't tell the reader which session went ungraded."""
+    today = date.today().isoformat()
     with db.connect(rc_db) as conn:
         conn.execute(
             "INSERT INTO activities (activity_id, date, start_time, activity_type, "
             "duration_seconds, distance_meters) VALUES (555, ?, ?, 'running', 1200, 5000)",
-            (date.today().isoformat(), date.today().isoformat() + " 05:00:00"),
+            (today, today + " 05:00:00"),
         )
         inputs = rc.load_report_card_inputs(conn)
-    assert 555 in inputs["other_activities_on_date"]
+    assert inputs["other_activities_on_date"] == [
+        {"activity_id": 555, "activity_type": "running", "distance_mi": 3.11,
+         "start_time": today + " 05:00:00"},
+    ]
+
+
+def test_date_branch_grades_the_first_session_of_a_double_day(rc_db):
+    """The prescription a date-selected card is graded against is the day's
+    lowest seq — the morning session — so taking the day's LAST activity paired
+    an evening shakeout with the morning's target and graded the wrong run."""
+    today = date.today().isoformat()
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "activity_name, duration_seconds, distance_meters, avg_hr, "
+            "avg_pace_sec_per_km, training_load) VALUES "
+            "(777, ?, ?, 'running', 'Evening Shakeout', 1200, 3200, 140, 380, 30)",
+            (today, today + " 18:30:00"),
+        )
+        inputs = rc.load_report_card_inputs(conn, target_date=today)
+    assert inputs["activity"]["activity_id"] == 1          # 07:00, not 18:30
+    assert inputs["other_activities_on_date"] == [
+        {"activity_id": 777, "activity_type": "running", "distance_mi": 1.99,
+         "start_time": today + " 18:30:00"},
+    ]
+
+
+def test_explicit_id_still_beats_the_first_session_rule(rc_db):
+    """Asking for one activity by id gets that activity, morning or not."""
+    today = date.today().isoformat()
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "duration_seconds, distance_meters) VALUES (777, ?, ?, 'running', 1200, 3200)",
+            (today, today + " 18:30:00"),
+        )
+        inputs = rc.load_report_card_inputs(conn, activity_id=777)
+    assert inputs["activity"]["activity_id"] == 777
 
 
 def test_load_inputs_picks_the_planned_workout_for_that_date(rc_db):
@@ -935,14 +1111,49 @@ def _mile_splits(*paces_sec_per_km):
     return rows
 
 
-def test_fastest_full_split_ignores_the_trailing_fragment():
+def test_fastest_rep_split_ignores_the_trailing_fragment():
     """A 90-metre fragment can post an absurd pace and would win every time."""
     labelled = rc.label_splits(_mile_splits(360.0, 300.0, 330.0))
-    assert rc.fastest_full_split_pace(labelled) == pytest.approx(300.0)
+    assert rc.fastest_rep_split_pace(labelled) == pytest.approx(300.0)
 
 
-def test_fastest_full_split_is_none_without_splits():
-    assert rc.fastest_full_split_pace(rc.label_splits([])) is None
+def test_fastest_rep_split_is_none_without_splits():
+    assert rc.fastest_rep_split_pace(rc.label_splits([])) is None
+
+
+def _manual_lap_splits():
+    """A manually-lapped interval session: one warmup lap, then 800m reps with
+    200m recovery jogs between them. The warmup is the LONGEST lap, so
+    label_splits flags every rep partial — which is exactly the shape that used
+    to hand the warmup's pace to the rep grade."""
+    rows = [{"split_index": 0, "distance_meters": 1600.0, "duration_seconds": 624,
+             "avg_hr": 130, "avg_pace_sec_per_km": 390.0}]
+    for i in range(4):
+        rows.append({"split_index": 1 + i * 2, "distance_meters": 800.0,
+                     "duration_seconds": 208, "avg_hr": 168,
+                     "avg_pace_sec_per_km": 260.0})
+        rows.append({"split_index": 2 + i * 2, "distance_meters": 200.0,
+                     "duration_seconds": 120, "avg_hr": 140,
+                     "avg_pace_sec_per_km": 600.0})
+    return rows
+
+
+def test_fastest_rep_split_takes_the_rep_not_the_warmup_lap():
+    """The manual-lap failure: every rep is "partial" against a 1600m warmup, so
+    the old full-splits-only rule left the 6:30/km warmup as the only
+    candidate."""
+    labelled = rc.label_splits(_manual_lap_splits())
+    assert all(r["partial"] for r in labelled["rows"][1:])   # reps and recoveries
+    assert rc.fastest_rep_split_pace(labelled) == pytest.approx(260.0)
+
+
+def test_fastest_rep_split_ignores_recovery_jogs_below_the_floor():
+    """The 200m recovery jogs are under QUALITY_MIN_SPLIT_M, so they can't win
+    the comparison even though they are the shortest rows present."""
+    short = [{"split_index": i, "distance_meters": 200.0, "duration_seconds": 60,
+              "avg_hr": 150, "avg_pace_sec_per_km": 300.0 - i} for i in range(4)]
+    assert rc.QUALITY_MIN_SPLIT_M == 300.0
+    assert rc.fastest_rep_split_pace(rc.label_splits(short)) is None
 
 
 def test_interval_pace_is_graded_on_the_fastest_split():
@@ -1001,6 +1212,47 @@ def test_interval_pace_is_na_without_splits_not_a_fabricated_f():
     assert pace["actual_display"] == "10:42/mi avg"
     assert "no splits recorded" in pace["note"]
     # ...and the weight redistributes rather than scoring pace as zero.
+    assert card["overall"]["graded_metrics"] == 3
+
+
+def test_manual_lap_interval_is_graded_on_the_rep_not_the_warmup():
+    """The manual-lap failure end to end: a 2-mile-warmup-then-800s session had
+    every rep flagged partial, so the rep grade read the 6:30/km warmup against
+    a 4:20/km target — a guaranteed F on a session that hit every rep."""
+    card = card_for(
+        {"date": "2026-07-21", "distance_meters": 5600, "duration_seconds": 2000,
+         "avg_pace_sec_per_km": 357.1, "avg_hr": 155, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 5600,
+              "target_pace_sec_per_km": 260.0, "seq": 1},
+        splits=_manual_lap_splits(),
+    )
+    pace = card["metrics"]["pace"]
+    assert pace["actual"] == pytest.approx(260.0)      # the 800m rep, not 390
+    assert pace["deviation"] == pytest.approx(0.0)
+    assert pace["grade"] == "A+"
+    # The 1600m warmup is mile-sized, so the split table's unit is "Mile" — but
+    # the graded rep is not a mile and the card must not say it was.
+    assert card["splits"]["unit"] == "Mile"
+    assert pace["actual_display"] == "6:58/mi best split"
+
+
+def test_interval_pace_is_na_when_no_split_is_rep_sized():
+    """Splits exist but none clears the floor — still n/a, and the note says
+    why rather than repeating the no-splits wording."""
+    tiny = [{"split_index": i, "distance_meters": 200.0, "duration_seconds": 60,
+             "avg_hr": 150, "avg_pace_sec_per_km": 300.0} for i in range(6)]
+    card = card_for(
+        {"date": "2026-07-21", "distance_meters": 9575, "duration_seconds": 3822,
+         "avg_pace_sec_per_km": 399.2, "avg_hr": 150, "training_load": 100},
+        plan={"type": "interval", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 300.0, "seq": 1},
+        splits=tiny,
+    )
+    pace = card["metrics"]["pace"]
+    assert pace["grade"] is None
+    assert pace["note"] == ("interval day, no split long enough to be a rep — "
+                            "average pace can't be graded against a rep target")
+    assert pace["actual_display"] == "10:42/mi avg"
     assert card["overall"]["graded_metrics"] == 3
 
 
@@ -1120,3 +1372,30 @@ def test_exclusion_count_covers_only_mislabelled_rows(bimodal_db):
     # not counted as mislabelled.
     assert ref["excluded_other_mode"] == 12
     assert ref["n"] == 8
+
+
+def test_report_card_imports_without_workout_coach():
+    """0.38.0 (M1): READ_SECTIONS lives here now — report_card must be fully
+    importable without workout_coach ever entering sys.modules (the old
+    direction forced lazy imports in three consumers)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; from local_fitness.agent import report_card; "
+        "assert report_card.READ_SECTIONS[0] == ('distance', 'DISTANCE'); "
+        "sys.exit(1 if 'local_fitness.agent.workout_coach' in sys.modules else 0)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True)
+    assert proc.returncode == 0, proc.stderr.decode()
+
+
+def test_delta_text_never_prints_negative_zero_percent():
+    """A live card printed 'Distance ... -0%' for 4.00-of-4.00 miles (short
+    by meters): within rounding of zero IS on target — say so."""
+    just_under = {"actual": 6432.0, "expected": 6437.376, "grade": "A+"}
+    assert rc._delta_text("distance", just_under) == "on target"
+    just_over = {"actual": 6440.0, "expected": 6437.376, "grade": "A+"}
+    assert rc._delta_text("distance", just_over) == "on target"
+    real_gap = {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
+    assert rc._delta_text("distance", real_gap) == "+9%"

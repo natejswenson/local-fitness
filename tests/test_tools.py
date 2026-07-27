@@ -27,7 +27,15 @@ import pytest
 
 from local_fitness import db, plans
 from local_fitness.agent import (
-    branding, interpret, journal, report_card, tools, units, visuals)
+    branding,
+    interpret,
+    journal,
+    report_card,
+    tools,
+    units,
+    visuals,
+)
+from local_fitness.ingest import daily as daily_ingest_mod
 
 
 def test_text_emits_compact_json():
@@ -332,19 +340,23 @@ def test_chart_excluded_from_brief_toolset(seeded):
 
 
 def test_query_workouts_filters(seeded):
+    # 0.37.0 envelope: {workouts, count, truncated}, and the native filter
+    # unit is MILES (min_distance_mi) — the km alias stays accepted below.
     payload, err = call(
         tools.query_workouts,
-        {"activity_type": "run", "days": 30, "min_distance_km": 5, "min_duration_min": 10, "limit": 10},
+        {"activity_type": "run", "days": 30, "min_distance_mi": 3.1, "min_duration_min": 10, "limit": 10},
     )
     assert not err
-    assert len(payload) == 1
-    assert payload[0]["activity_id"] == 1
+    assert payload["count"] == 1
+    assert payload["truncated"] is False
+    assert payload["workouts"][0]["activity_id"] == 1
 
 
 def test_query_workouts_no_filters(seeded):
     payload, err = call(tools.query_workouts, {})
     assert not err
-    assert len(payload) >= 1
+    assert payload["count"] >= 1
+    assert len(payload["workouts"]) == payload["count"]
 
 
 def test_get_workout_detail_found(seeded):
@@ -401,7 +413,7 @@ def test_compare_periods_unknown(seeded):
 
 
 def test_find_anomalies(seeded):
-    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.1})
+    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.5})
     assert not err
     assert payload["metric"] == "rhr"
     assert isinstance(payload["anomalies"], list)
@@ -600,7 +612,7 @@ def test_correlate_pearson_r_none_when_zero_variance_skips_rounding(tmp_path, mo
 
 
 def test_find_anomalies_sd_distance_and_direction(seeded):
-    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.1})
+    payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.5})
     assert not err
     assert payload["anomalies"]
     for row in payload["anomalies"]:
@@ -1157,7 +1169,7 @@ def test_log_observation_malformed_date(seeded):
         {"obs_type": "weight", "value": 165, "date": "not-a-date"},
     )
     assert err
-    assert "invalid date" in _payload["error"]
+    assert "must be a valid YYYY-MM-DD" in _payload["error"]
     assert not _obs_rows(seeded)  # nothing inserted
 
 
@@ -1526,73 +1538,149 @@ def test_sync_garmin_data_success_recomputes_baselines(monkeypatch):
         calls["lookback_days"] = lookback_days
         return 90
 
-    monkeypatch.setattr(tools.daily_ingest, "pull", fake_pull)
+    monkeypatch.setattr(daily_ingest_mod, "pull", fake_pull)
     monkeypatch.setattr(tools.baselines_mod, "recompute", fake_recompute)
 
     payload, err = call(tools.sync_garmin_data, {})
     assert not err
     assert payload["status"] == "success"
     assert payload["days_pulled"] == 2
-    # Bite-sized cap wired through, and baselines only recomputed because new
-    # days actually landed.
+    # Bite-sized cap wired through, and baselines recomputed because new data
+    # actually landed.
     assert calls["max_days"] == tools.SYNC_MAX_DAYS
     assert calls["lookback_days"] == 90
+    assert payload["sync_state"] == (
+        "success — synced 2 day(s), 1 activity row(s) through 2026-07-06; "
+        "baselines recomputed"
+    )
 
 
 def test_sync_garmin_data_skipped_does_not_recompute(monkeypatch):
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
             "status": "skipped", "days_pulled": 0, "activities_loaded": 0,
             "last_date": "2026-07-06", "error": None,
+            "gap_days_remaining": 0, "deferred_count": 0, "days_failed": 0,
         },
     )
     monkeypatch.setattr(
         tools.baselines_mod, "recompute",
-        lambda **_: pytest.fail("recompute should not run when no new days pulled"),
+        lambda **_: pytest.fail("recompute should not run when nothing landed"),
     )
     payload, err = call(tools.sync_garmin_data, {})
     assert not err
     assert payload["status"] == "skipped"
     assert payload["days_pulled"] == 0
+    assert payload["sync_state"] == "skipped — already up to date; baselines unchanged"
 
 
-def test_sync_garmin_data_partial_success_skips_recompute(monkeypatch):
-    # Mirrors _run_sync in web/server.py: only a clean "success" status
-    # triggers a baseline recompute, not "partial".
+def test_sync_garmin_data_partial_is_not_an_error_and_recomputes(monkeypatch):
+    """A pull that landed real days is a success for the caller's purposes.
+
+    daily.pull reports `partial` whenever ANY gap remains back to
+    EARLIEST_BACKFILL_DATE, so one missing historical day used to make every
+    sync return is_error AND skip the recompute — fresh workouts in the DB,
+    CTL/ATL/TSB frozen, downstream tools claiming currency.
+    """
+    calls = {}
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
-            "status": "partial", "days_pulled": 1, "activities_loaded": 0,
-            "last_date": "2026-07-05", "error": "1 day(s) still missing",
+            "status": "partial", "days_pulled": 3, "activities_loaded": 0,
+            "last_date": "2026-07-25",
+            "error": "5 day(s) still missing; 2 day(s) failed: 2024-01-02,2024-01-03",
+            "gap_days_remaining": 5, "deferred_count": 3, "days_failed": 2,
         },
     )
     monkeypatch.setattr(
         tools.baselines_mod, "recompute",
-        lambda **_: pytest.fail("recompute should not run on a partial pull"),
+        lambda **kw: calls.setdefault("recompute", []).append(kw["lookback_days"]),
     )
+
     payload, err = call(tools.sync_garmin_data, {})
-    assert err
+
+    assert not err
     assert payload["status"] == "partial"
-    assert "still missing" in payload["error"]
+    assert payload["days_failed"] == 2
+    assert payload["deferred_count"] == 3
+    assert payload["gap_days_remaining"] == 5
+    assert calls["recompute"] == [90]  # exactly once
+    assert payload["sync_state"] == (
+        "partial — synced 3 day(s) through 2026-07-25; "
+        "3 day(s) deferred, 2 day(s) failed, 5 day(s) still missing; "
+        "baselines recomputed"
+    )
 
 
-def test_sync_garmin_data_auth_failure_is_error(monkeypatch):
+def test_sync_garmin_data_recomputes_when_only_activities_landed(monkeypatch):
+    # A ride/run can be written by _ingest_activity_range without any new
+    # wellness day, so days_pulled alone is the wrong recompute trigger.
+    calls = {}
     monkeypatch.setattr(
-        tools.daily_ingest, "pull",
+        daily_ingest_mod, "pull",
         lambda **_: {
-            "status": "auth_failure", "days_pulled": 0, "activities_loaded": 0,
-            "last_date": None, "error": "mfa_required: verification needed",
+            "status": "partial", "days_pulled": 0, "activities_loaded": 2,
+            "last_date": None, "error": "1 day(s) still missing",
+            "gap_days_remaining": 1, "deferred_count": 0, "days_failed": 0,
         },
     )
     monkeypatch.setattr(
         tools.baselines_mod, "recompute",
-        lambda **_: pytest.fail("recompute should not run on auth failure"),
+        lambda **kw: calls.setdefault("recompute", []).append(kw["lookback_days"]),
+    )
+
+    payload, err = call(tools.sync_garmin_data, {})
+
+    assert not err
+    assert calls["recompute"] == [90]
+    assert payload["sync_state"] == (
+        "partial — synced 2 activity row(s); 1 day(s) still missing; "
+        "baselines recomputed"
+    )
+
+
+@pytest.mark.parametrize("status", ["auth_failure", "not_configured", "failure", "interrupted"])
+def test_sync_garmin_data_hard_failures_are_errors(monkeypatch, status):
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **_: {
+            "status": status, "days_pulled": 0, "activities_loaded": 0,
+            "last_date": None, "error": f"mfa_required: {status} detail",
+            "gap_days_remaining": 4, "deferred_count": 0, "days_failed": 0,
+        },
+    )
+    monkeypatch.setattr(
+        tools.baselines_mod, "recompute",
+        lambda **_: pytest.fail("recompute should not run when nothing landed"),
     )
     payload, err = call(tools.sync_garmin_data, {})
     assert err
-    assert payload["status"] == "auth_failure"
-    assert "mfa_required" in payload["error"]
+    assert payload["status"] == status
+    assert payload["error"] == f"mfa_required: {status} detail"
+    assert payload["days_failed"] == 0
+    assert payload["days_pulled"] == 0
+    assert "sync_state" not in payload
+
+
+def test_sync_garmin_data_hard_failure_without_error_string_still_errors(monkeypatch):
+    # `interrupted` can close a run with error=None; the tool must not fall
+    # through to a success payload just because the string is empty.
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **_: {
+            "status": "interrupted", "days_pulled": 0, "activities_loaded": 0,
+            "last_date": None, "error": None,
+            "gap_days_remaining": 2, "deferred_count": 0, "days_failed": 0,
+        },
+    )
+    monkeypatch.setattr(
+        tools.baselines_mod, "recompute",
+        lambda **_: pytest.fail("recompute should not run when nothing landed"),
+    )
+    payload, err = call(tools.sync_garmin_data, {})
+    assert err
+    assert payload["error"] == "Garmin sync failed (interrupted)"
 
 
 def test_sync_garmin_data_is_in_full_tool_set():
@@ -1917,7 +2005,7 @@ def test_generate_brief_report_malformed_date_no_file_io(monkeypatch):
     for bad in ("2026/07/08", "../../../etc/passwd", "20260708", "2026-7-8", ""):
         payload, err = call(tools.generate_brief_report, {"date": bad})
         assert err
-        assert "malformed date" in payload["error"]
+        assert "must be a valid YYYY-MM-DD" in payload["error"]
     assert not tools.subprocess.run.called
 
 
@@ -2542,6 +2630,11 @@ def test_build_plan_section_active_plan_full_values(plan_seeded):
     section = tools._build_plan_section(today.isoformat())
     assert section is not None
     assert section["adherence_pct"] == 75  # 4.5/6 non-pending graded workouts
+    # Same window, rest days out of both halves of the fraction: 2.5/4 graded
+    # SESSIONS (long missed, easy done, tempo done, easy partial) = 62%. The
+    # 13-point gap is the two compliant rest days.
+    assert section["sessions_adherence_pct"] == 62
+    assert section["rest_days_counted"] == 2
     assert section["goal_type"] == "10k"
     assert section["days_to_race"] == 71
     assert section["week_planned_mi"] == 13.7
@@ -2606,9 +2699,11 @@ def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
 
     async def fake_generate(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
-        *, model=None, timeout=30.0, notes_text=None, **_kw,
+        *, model=None, timeout=30.0, notes_text=None, sessions_adherence_pct=None,
+        **_kw,
     ):
-        calls.append((today_workout, adherence_pct, days_to_race, goal_type, notes_text))
+        calls.append((today_workout, adherence_pct, days_to_race, goal_type,
+                      notes_text, sessions_adherence_pct))
         return "Go hit today's easy 4 clean."
 
     monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
@@ -2624,6 +2719,9 @@ def test_generate_brief_report_wires_plan_section_and_calls_coaching_line(
     assert calls[0][1] == 75  # adherence_pct threaded through correctly
     assert calls[0][2] == 71  # days_to_race
     assert calls[0][3] == "10k"
+    # The rest-day-free companion reaches the coach too, or the prompt would
+    # quote 75% while the strip beside it prints 62%.
+    assert calls[0][5] == 62
 
 
 def test_generate_brief_report_coaching_line_failure_falls_back(
@@ -2806,7 +2904,10 @@ def test_run_sql_invalid_query_points_at_schema_resource(seeded, monkeypatch):
     monkeypatch.setattr(tools, "_run_sql_blocking", boom)
     payload, err = call(tools.run_sql, {"query": "SELECT 1"})
     assert err
-    assert "query failed: invalid query" in payload["error"]
+    # 0.37.0: the sqlite message rides along (it names only the model's own
+    # SQL identifiers — the read-only gate keeps anything else out), because
+    # "invalid query" alone produced blind same-shape retries.
+    assert "query failed: boom" in payload["error"]
     assert "fitness://schema" in payload["error"]
 
 
@@ -2862,6 +2963,43 @@ def test_get_brief_context_description_names_get_metric_trend():
     tool = next(t for t in tools.ALL_TOOLS if t.name == "get_brief_context")
     assert "get_metric" in tool.description
     assert "get_metric_trend" in tool.description
+
+
+def test_get_brief_context_populates_continuity_from_saved_briefs(tmp_path, monkeypatch):
+    """The handler has to pass `recent_briefs` in — assemble_brief_context never
+    reads the briefings dir itself, so `continuity` used to be permanently []
+    over MCP while the in-process composer got the real headlines."""
+    from local_fitness.agent import briefs as briefs_mod
+
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        conn.execute("INSERT INTO daily_metrics (date, rhr, steps) VALUES (?, 54, 9100)",
+                     (today.isoformat(),))
+
+    out = tmp_path / "briefings"
+    out.mkdir()
+    for offset, headline in ((1, "Yesterday: you skipped the tempo"),
+                             (3, "Three days back: RHR climbing")):
+        d = (today - timedelta(days=offset)).isoformat()
+        (out / f"{d}.json").write_text(
+            json.dumps({"date": d, "user_name": "t",
+                        "takeaways": [{"headline": headline, "summary": "s",
+                                       "tone": "caution"}]}),
+            encoding="utf-8")
+    monkeypatch.setattr(briefs_mod, "DEFAULT_BRIEFINGS_DIR", out)
+
+    payload, err = call(tools.get_brief_context, {})
+    assert not err
+    assert payload["continuity"] == ["Yesterday: you skipped the tempo",
+                                     "Three days back: RHR climbing"]
+    # Same call now also carries the freshness fields: newest brief is 1 day
+    # old, and the only daily row is today's, so the frontier is today.
+    assert payload["brief_stale_days"] == 1
+    assert payload["data_frontier"] == today.isoformat()
 
 
 # --- long-window bar/combo weekly bucketing (round-2 facet review) -----------
@@ -2985,7 +3123,7 @@ def test_report_card_malformed_date_never_touches_the_db(rc_seeded, monkeypatch)
     monkeypatch.setattr(tools.db, "connect", boom)
     payload, err = call(tools.workout_report_card, {"date": "07-19-2026"})
     assert err
-    assert "malformed date" in payload["error"]
+    assert "must be a valid YYYY-MM-DD" in payload["error"]
 
 
 def test_report_card_bad_format_is_an_error(rc_seeded, monkeypatch):
@@ -3112,7 +3250,13 @@ def test_report_card_reports_a_double_day(rc_seeded, reports_tmp):
         )
     payload, err = call(tools.workout_report_card, {"format": "table"})
     assert not err
-    assert 555 in payload["other_activities_on_date"]
+    # Enriched shape (A5): enough of the other session to say WHICH one the
+    # card did not grade, not just that one exists.
+    others = payload["other_activities_on_date"]
+    assert [o["activity_id"] for o in others] == [555]
+    assert others[0]["activity_type"] == "running"
+    assert others[0]["distance_mi"] == 3.11
+    assert others[0]["start_time"].endswith("05:00:00")
 
 
 def test_report_card_pdf_render_failure_is_an_error(rc_seeded, reports_tmp, monkeypatch):
@@ -3736,9 +3880,9 @@ def test_report_card_save_failure_never_fails_the_render(
 def test_list_report_cards_empty_and_bad_args(seeded):
     payload, err = call(tools.list_report_cards, {})
     assert not err
-    assert payload == {"cards": [], "count": 0}
+    assert payload == {"cards": [], "count": 0, "truncated": False}
     payload, err = call(tools.list_report_cards, {"start_date": "07-01-2026"})
-    assert err and "malformed start_date" in payload["error"]
+    assert err and "start_date must be a valid YYYY-MM-DD" in payload["error"]
     payload, err = call(tools.list_report_cards, {"intent_class": "tempo"})
     assert err
     assert payload["allowed"] == ["easy", "long", "quality", "steady"]
@@ -3795,3 +3939,250 @@ def test_card_query_tools_are_shared_not_local_only():
     local_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
     assert {"list_report_cards", "get_report_card"} <= all_names
     assert not {"list_report_cards", "get_report_card"} & local_names
+
+
+def test_importing_tools_does_not_import_garminconnect():
+    """S7 (0.36.0): the garminconnect -> requests chain (~28 ms measured) must
+    stay out of `import tools` — every stdio session start pays it otherwise.
+    sync_garmin_data is its only consumer and imports it in its body."""
+    import sys
+
+    code = (
+        "import sys; import local_fitness.agent.tools; "
+        "sys.exit(1 if 'garminconnect' in sys.modules else 0)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True)
+    assert proc.returncode == 0, proc.stderr.decode()
+
+
+# --------------------------------------------------------------------------- #
+# 0.36.0 speed pass: recovery_pattern range queries + connect counts
+# --------------------------------------------------------------------------- #
+def _count_connects(monkeypatch):
+    counts = {"n": 0}
+    orig = db.connect
+
+    def counting(*a, **k):
+        counts["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(db, "connect", counting)
+    return counts
+
+
+def test_recovery_pattern_counts_workouts_skipped_for_missing_baseline(
+    tmp_path, monkeypatch
+):
+    """A matched workout whose date has no baselines row was silently dropped
+    — '3 matched' printed identically for 3-of-3 and 3-of-40."""
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        for i, has_baseline in ((10, True), (20, False), (30, True)):
+            d = (today - timedelta(days=i)).isoformat()
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, activity_type, "
+                "duration_seconds, distance_meters, training_load) "
+                "VALUES (?, ?, 'running', 3600, 10000, 80)",
+                (i, d),
+            )
+            if has_baseline:
+                conn.execute(
+                    "INSERT INTO baselines (date, body_battery_max_60day_mean, "
+                    "rhr_60day_mean) VALUES (?, 88.0, 52.0)",
+                    (d,),
+                )
+                conn.execute(
+                    "INSERT INTO daily_metrics (date, body_battery_max, rhr) "
+                    "VALUES (?, 90, 50)",
+                    ((today - timedelta(days=i - 1)).isoformat(),),
+                )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running"})
+    assert not err
+    assert payload["n_workouts_matched"] == 2
+    assert payload["n_skipped_no_baseline"] == 1
+    # The two survivors both recovered on day +1 (bb 90 >= 0.95*88).
+    assert payload["avg_recovery_days_body_battery"] == 1.0
+
+
+def test_recovery_pattern_issues_range_queries_not_per_workout_probes(
+    seeded, monkeypatch
+):
+    """The N+1 rewrite: 1 workouts query + 2 range loads, total — the old
+    shape issued 1 baselines + up to 7 daily_metrics probes PER workout
+    (~953 statements on a year of running)."""
+    executed: list[str] = []
+    orig = db.connect
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def traced(*a, **k):
+        with orig(*a, **k) as conn:
+            class _T:
+                def execute(self, sql, *ar, **kw):
+                    executed.append(sql.strip().split()[0].upper() + " " + sql[:60])
+                    return conn.execute(sql, *ar, **kw)
+
+                def __getattr__(self, name):
+                    return getattr(conn, name)
+
+            yield _T()
+
+    monkeypatch.setattr(db, "connect", traced)
+    payload, err = call(tools.recovery_pattern, {"activity_type": "run"})
+    assert not err
+    selects = [s for s in executed if s.startswith("SELECT")]
+    assert len(selects) == 3  # workouts + baselines range + metrics range
+
+
+def test_workout_report_card_read_phase_opens_at_most_three_connections(
+    rc_seeded, reports_tmp, monkeypatch
+):
+    """S8: the read pipeline (inputs, profile, user_name, memory, stored
+    read, has_event) shares ONE connection; only save_card (worker thread —
+    sqlite3 same-thread check) and reflect's read block open their own.
+    Was ~8."""
+    counts = _count_connects(monkeypatch)
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert counts["n"] <= 3
+
+
+def test_get_coach_personality_opens_one_connection(seeded, monkeypatch):
+    counts = _count_connects(monkeypatch)
+    payload, err = call(tools.get_coach_personality, {})
+    assert not err
+    assert counts["n"] == 1
+    # The single-aggregate rewrite still reports both journal counts.
+    assert payload["journal_entries"] == 0
+    assert payload["journal_archived"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 0.37.0 UX pass: input validation, envelopes, error detail, interpretation
+# --------------------------------------------------------------------------- #
+def test_compare_periods_rejects_reversed_and_impossible_dates(seeded):
+    """Reversed/malformed ranges used to return {"n": 0} — unreadable as
+    'bad input' vs 'genuinely empty window'."""
+    base = {"metric": "rhr", "period_a_start": "2026-07-10", "period_a_end": "2026-07-01",
+            "period_b_start": "2026-06-01", "period_b_end": "2026-06-10"}
+    payload, err = call(tools.compare_periods, base)
+    assert err
+    assert "period_a_start must be on or before period_a_end" in payload["error"]
+
+    bad = dict(base, period_a_start="2026-13-45", period_a_end="2026-07-10")
+    payload, err = call(tools.compare_periods, bad)
+    assert err
+    assert "period_a_start must be a valid YYYY-MM-DD" in payload["error"]
+
+
+def test_find_anomalies_sd_threshold_bounds(seeded):
+    for bad in (0, -1, 0.4, 11, "two"):
+        payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": bad})
+        assert err, bad
+        assert "sd_threshold must be" in payload["error"]
+    _payload, err = call(tools.find_anomalies, {"metric": "rhr", "sd_threshold": 0.5})
+    assert not err
+
+
+def test_query_workouts_min_distance_mi_and_km_alias(seeded):
+    # 10 km activity: 6.22 mi excludes it, 6.0 mi... 10000m = 6.21mi so 6.3 excludes.
+    payload, err = call(tools.query_workouts, {"min_distance_mi": 6.3})
+    assert not err and payload["count"] == 0
+    payload, err = call(tools.query_workouts, {"min_distance_mi": 6.0})
+    assert not err and payload["count"] == 1
+    # km alias still accepted; mi wins when both are given.
+    payload, err = call(tools.query_workouts, {"min_distance_km": 9.5})
+    assert not err and payload["count"] == 1
+    payload, err = call(tools.query_workouts,
+                        {"min_distance_mi": 6.3, "min_distance_km": 1.0})
+    assert not err and payload["count"] == 0  # mi (excluding) won
+    payload, err = call(tools.query_workouts, {"min_distance_mi": "fast"})
+    assert err and "min_distance_mi must be a number" in payload["error"]
+
+
+def test_query_workouts_limit_validation_and_truncation(seeded):
+    payload, err = call(tools.query_workouts, {"limit": -1})
+    assert err and "limit must be" in payload["error"]
+    payload, err = call(tools.query_workouts, {"limit": "ten"})
+    assert err and "limit must be" in payload["error"]
+    # Add a second activity, then limit=1 → truncated.
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "duration_seconds, distance_meters) VALUES (2, ?, 'running', 1200, 3000)",
+            ((date.today() - timedelta(days=1)).isoformat(),))
+    payload, err = call(tools.query_workouts, {"limit": 1})
+    assert not err
+    assert payload["count"] == 1 and payload["truncated"] is True
+
+
+def test_list_coach_memories_truncated_flag(seeded):
+    for i in range(3):
+        journal.save_entry(f"memory number {i}", source="chat")
+    payload, err = call(tools.list_coach_memories, {"limit": 2})
+    assert not err
+    assert payload["count"] == 2 and payload["truncated"] is True
+    payload, err = call(tools.list_coach_memories, {"limit": 10})
+    assert not err
+    assert payload["count"] == 3 and payload["truncated"] is False
+
+
+def test_run_sql_error_carries_the_sqlite_detail(seeded):
+    payload, err = call(tools.run_sql, {"query": "SELECT sleep_hours FROM daily_metrics"})
+    assert err
+    assert "no such column: sleep_hours" in payload["error"]
+    assert "fitness://schema" in payload["error"]
+
+
+def test_save_brief_validation_error_is_compact_loc_msg_pairs(seeded):
+    payload, err = call(tools.save_brief, {"brief": {
+        "takeaways": [{"headline": "x", "summary": "y", "tone": "smug",
+                       "details": "z"}]}})
+    assert err
+    msg = payload["error"]
+    assert "takeaways.0.tone" in msg
+    assert "https://errors.pydantic.dev" not in msg  # the noise is gone
+
+
+def test_report_card_pdf_failure_returns_stable_reason_and_logs(rc_seeded, reports_tmp, monkeypatch, caplog):
+    from local_fitness.agent import visuals
+
+    def boom(*_a, **_k):
+        raise RuntimeError("cairo exploded with a 40-line traceback")
+
+    monkeypatch.setattr(visuals, "render_report_card_pdf", boom)
+    with caplog.at_level(logging.WARNING, logger="local_fitness.agent.tools"):
+        payload, err = call(tools.workout_report_card, {})
+    assert err
+    assert payload["error"] == "PDF render failed — see the server log for the traceback"
+    assert "cairo exploded" not in payload["error"]
+    assert any(r.exc_info for r in caplog.records)  # the traceback IS in the log
+
+
+def test_get_metric_attaches_vs_baseline_for_baselined_metrics(seeded):
+    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 14})
+    assert not err
+    # seeded: baseline mean 52.0 sd 2.0; newest value 50 → exactly -1.0 SD.
+    assert payload["baseline_60day_mean"] == 52.0
+    assert payload["current_vs_baseline_sd"] == -1.0
+    assert payload["vs_baseline"] == "normal"
+
+
+def test_get_metric_vs_baseline_no_data_for_non_baselined(seeded):
+    payload, err = call(tools.get_metric, {"metric": "steps", "days": 14})
+    assert not err
+    assert "current_vs_baseline_sd" not in payload
+    assert payload["vs_baseline"] == "no data"
+
+
+def test_training_load_status_description_renders_interpret_constants():
+    # The registered description must carry the rendered band numbers from
+    # interpret — built, not hand-written, so they can't drift from the
+    # classifier attached to the payload.
+    text = tools.training_load_status.description
+    assert f"TSB > {interpret.TSB_FRESH:g} fresh" in text
+    assert f"< {interpret.TSB_VERY_FATIGUED:g} very fatigued" in text

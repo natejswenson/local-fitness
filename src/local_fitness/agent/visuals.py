@@ -23,8 +23,9 @@ import asyncio
 import base64
 import html
 import io
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Sequence
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .schemas import Brief
@@ -97,18 +98,32 @@ def fit_one_page(
     from the winning `Document` rather than re-rendering it — `render()` then
     `write_pdf()` on the same object is the whole reason this doesn't call
     `HTML.write_pdf()` directly.
+
+    One ``FontConfiguration`` + one image ``cache`` dict are shared across
+    the rungs (0.36.0): with neither, every rung got a fresh empty cache and
+    a fresh font config, so a 3-rung fit re-decoded ~124 KB of base64 chart
+    PNGs and re-parsed/re-registered a ~140 KB @font-face TTF twice for
+    nothing — density changes scalars in the stylesheet, never the assets.
+    Both are PER CALL, not module-global, deliberately: WeasyPrint writes a
+    temp font file per registered face, and a process-lifetime
+    FontConfiguration on a long-running server would accumulate them without
+    bound; per-call keeps the growth bounded at rungs-per-render and lets GC
+    reclaim the temp files with the config.
     """
     import weasyprint
+    from weasyprint.text.fonts import FontConfiguration
 
     if not presets:
         raise ValueError("presets must not be empty")
 
+    font_config = FontConfiguration()
+    image_cache: dict = {}
     doc = None
     index = 0
-    for index, preset in enumerate(presets):
+    for index, preset in enumerate(presets):  # noqa: B007 — index is read AFTER the loop (returned rung)
         doc = weasyprint.HTML(
             string=build_html(preset), url_fetcher=_report_url_fetcher()
-        ).render()
+        ).render(font_config=font_config, cache=image_cache)
         if len(doc.pages) == 1:
             break
     return doc.write_pdf(), len(doc.pages), index
@@ -627,6 +642,17 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
     walk_mi = plan_section.get("week_walk_mi") or 0
     walk_suffix = f" · +{walk_mi:.1f} walked" if walk_mi else ""
 
+    # Rest-day-free adherence rides the tiny dim LABEL, never the numeral —
+    # the same move as walk_suffix above, for the same reason: the 1.25em/900
+    # .value slot in a ~third-rail tile is exactly where a compound value
+    # collided with its neighbour once already. A label this long wraps to a
+    # second line inside its own tile (there is a space to break at), costing
+    # height the density ladder absorbs rather than width that would spill.
+    # `is not None`, not truthy: 0% of sessions is the number that most needs
+    # printing next to a flattering total.
+    sessions_pct = plan_section.get("sessions_adherence_pct")
+    adherence_suffix = f" · {sessions_pct}% sessions" if sessions_pct is not None else ""
+
     # 3-up + 1 wide, not 2x2: the three short values fit a third of the rail
     # each, while "This Week" is a compound value that overflowed its half-rail
     # tile and collided with the tile beside it (see the stat-strip CSS note).
@@ -635,7 +661,7 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
       <tr>
         <td class="stat-tile">
           <div class="value">{plan_section["adherence_pct"]}%</div>
-          <div class="label">Adherence</div>
+          <div class="label">Adherence{adherence_suffix}</div>
         </td>
         <td class="stat-tile">
           <div class="value">{tile2_value}</div>
@@ -715,7 +741,7 @@ def _render_plan_section_html(plan_section: dict | None) -> str:
 
 
 def _build_html(
-    brief: "Brief",
+    brief: Brief,
     charts: dict[str, bytes],
     plan_section: dict | None,
     density: dict | None = None,
@@ -797,7 +823,7 @@ def _build_html(
 
 
 def render_brief_pdf(
-    brief: "Brief",
+    brief: Brief,
     charts: dict[str, bytes],
     plan_section: dict | None = None,
     omitted: int = 0,
@@ -1345,7 +1371,7 @@ def _build_report_card_html(
     # directly under the GPA/distance/pace line. The masthead title names the
     # run and carries nothing else. Omitted entirely when absent rather than
     # left as an empty block.
-    from .workout_coach import READ_SECTIONS
+    from .report_card import READ_SECTIONS
 
     read = card.get("coach_read") or {}
     coach_html = "".join(

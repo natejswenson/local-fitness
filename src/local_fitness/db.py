@@ -10,11 +10,11 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date as date_cls, datetime, timedelta
+from datetime import date as date_cls
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator
-
 
 _LOG = logging.getLogger(__name__)
 
@@ -103,6 +103,17 @@ CREATE TABLE IF NOT EXISTS activities (
 );
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
 CREATE INDEX IF NOT EXISTS idx_activities_type ON activities(activity_type);
+-- "Most recent activity first" is the shape of nearly every activities read
+-- (query_workouts, status._recent_workouts, report_card._select_activity's
+-- default branch). Against the single-column date index each of those paid a
+-- USE TEMP B-TREE to break the intra-day tie on start_time; this one serves
+-- the whole ORDER BY from the index. Declared DESC to match the query
+-- direction, and it also covers the date-equality branch
+-- (`WHERE date = ? ORDER BY start_time`) that idx_activities_date served
+-- only halfway. `IF NOT EXISTS` + executescript means init_schema adds it to
+-- an existing DB with no migration step.
+CREATE INDEX IF NOT EXISTS idx_activities_date_start
+    ON activities(date DESC, start_time DESC);
 
 CREATE TABLE IF NOT EXISTS activity_hr_zones (
     activity_id      INTEGER NOT NULL,

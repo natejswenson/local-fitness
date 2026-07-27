@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
+import threading
 from datetime import date
 from typing import Any
 
@@ -25,11 +27,11 @@ from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .. import config, db
+from .. import config, db, notes
 from ..agent import brief_planner, briefs, coach, memory, prompts
 from ..agent import tools as agent_tools
-from ..agent.render import render_table
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
+from ..agent.render import render_table
 from ..agent.schemas import Brief
 from ..agent.status import assemble_status
 
@@ -95,15 +97,38 @@ def _render_status(status: dict[str, Any]) -> str:
             read = ""
         rows.append([name, value_str, read])
     lines.append(render_table(["Metric", "Value", "Read"], rows))
+    # A table of nothing but dashes is what "no daily_metrics row for today
+    # yet" looks like from here — indistinguishable, without a line saying so,
+    # from a genuinely flat day. assemble_status always emits one row per
+    # DAILY_NUMERIC_METRICS, so all-None values IS the missing-row case.
+    if metrics and all(m.get("value") is None for m in metrics):
+        lines.append("")
+        lines.append(
+            f"No Garmin data for {status.get('date', '')} yet — run "
+            "sync_garmin_data to refresh."
+        )
     lines.append("")
 
-    # Training-load read.
+    # Training-load read. The as_of date rides along because CTL/ATL/TSB come
+    # from the latest baselines row on/before today, which may be days old —
+    # and TSB decays daily even with zero workouts, so an undated read of a
+    # stale row states the wrong freshness with full confidence.
     tl = status.get("training_load") or {}
     lines.append("## Training load")
+    as_of = tl.get("as_of")
+    as_of_str = f" (as of {as_of})" if as_of else ""
     lines.append(
         f"CTL (fitness): {tl.get('ctl')} · ATL (fatigue): {tl.get('atl')} · "
-        f"TSB (freshness): {tl.get('tsb')} — {tl.get('interpretation', '')}"
+        f"TSB (freshness): {tl.get('tsb')}{as_of_str} — "
+        f"{tl.get('interpretation', '')}"
     )
+    baseline_stale = tl.get("baseline_stale_days")
+    if isinstance(baseline_stale, int) and baseline_stale > 0:
+        lines.append(
+            f"⚠ Training load is {baseline_stale} day(s) stale (newest "
+            f"baselines: {as_of}) — TSB decays daily, so the freshness read "
+            "above is out of date. Run sync_garmin_data to refresh."
+        )
     lines.append("")
 
     # Recent workouts (miles / formatted convenience fields from status.py).
@@ -378,6 +403,101 @@ def _register_prompts_and_resources(instance: Server) -> None:
         return [ReadResourceContents(content=text, mime_type="text/markdown")]
 
 
+# --- persona memo (0.36.0) --------------------------------------------------
+# In stateless HTTP mode ``create_initialization_options`` runs PER REQUEST,
+# and resolving the persona live cost 6 db.connect() opens plus a full
+# relationship-ledger compute per request — ~5x the tool call it wrapped. The
+# memo key covers every input the persona can change through:
+#
+#   * DB state (settings, journal, plans, observations, report cards, synced
+#     metrics) → ``PRAGMA data_version`` on a dedicated read-only monitor
+#     connection. data_version — NOT a MAX(rowid)-style key — because settings
+#     UPSERTs and journal archived-flips UPDATE in place and never move a
+#     rowid; data_version increments on ANY other connection's commit.
+#     The monitor connection must NEVER write: data_version only reports
+#     changes made by OTHER connections.
+#   * The notes FILE (invisible to data_version) → (st_mtime_ns, st_size).
+#   * The ledger's as-of-yesterday facts → today's ISO date in the key.
+#
+# Known non-invalidators, by convention process-stable: env-var changes
+# (LOCAL_FITNESS_COACH_*, _COACH_MEMORY, _NOTES_PATH) need a restart, exactly
+# as before this cache existed for everything env-driven.
+_PERSONA_CACHE: dict[str, Any] = {"key": None, "instructions": None}
+_PERSONA_LOCK = threading.Lock()
+_MONITOR_CONN: sqlite3.Connection | None = None
+_MONITOR_PATH: str | None = None
+
+
+def _persona_cache_clear() -> None:
+    """Reset memo + monitor connection (tests, and safe to call anytime)."""
+    global _MONITOR_CONN, _MONITOR_PATH
+    with _PERSONA_LOCK:
+        _PERSONA_CACHE["key"] = None
+        _PERSONA_CACHE["instructions"] = None
+        if _MONITOR_CONN is not None:
+            try:
+                _MONITOR_CONN.close()
+            except Exception:
+                pass
+        _MONITOR_CONN = None
+        _MONITOR_PATH = None
+
+
+def _data_version() -> int | None:
+    """The DB-change component of the memo key; ``None`` → do not cache.
+
+    ``None`` covers the fresh-clone path (no DB file yet — ``build_server``
+    runs before ``db.init_schema()``) and any monitor-connection failure; the
+    caller then resolves live every time, which is exactly the pre-memo
+    behavior. The monitor re-opens when ``db.get_db_path()`` changes — the
+    path is resolvable at runtime (env, tests), and a monitor pinned to the
+    first-seen file would silently watch the wrong database. Includes the
+    path in the returned key material via the reopen, so two DBs can't alias
+    each other's data_version counters across a swap."""
+    global _MONITOR_CONN, _MONITOR_PATH
+    try:
+        path = str(db.get_db_path())
+        if _MONITOR_CONN is not None and _MONITOR_PATH != path:
+            try:
+                _MONITOR_CONN.close()
+            except Exception:
+                pass
+            _MONITOR_CONN = None
+        if _MONITOR_CONN is None:
+            if not db.get_db_path().exists():
+                return None
+            _MONITOR_CONN = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            _MONITOR_PATH = path
+        return _MONITOR_CONN.execute("PRAGMA data_version").fetchone()[0]
+    except Exception:
+        try:
+            if _MONITOR_CONN is not None:
+                _MONITOR_CONN.close()
+        except Exception:
+            pass
+        _MONITOR_CONN = None
+        _MONITOR_PATH = None
+        return None
+
+
+def _notes_stat() -> tuple:
+    try:
+        st = notes._default_notes_path().stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ("missing",)
+
+
+def _persona_cache_key() -> tuple | None:
+    dv = _data_version()
+    if dv is None:
+        return None
+    # The DB path rides in the key directly: data_version is a per-connection
+    # counter with no cross-file meaning, so without the path two databases
+    # could alias each other's counters across a runtime path swap.
+    return (date.today().isoformat(), str(db.get_db_path()), dv, _notes_stat())
+
+
 def _install_coach_persona(instance: Server) -> None:
     """Advertise the resolved coach persona as the server's MCP ``instructions``,
     resolved LIVE at each client connect — so tool-driven Claude Code fitness chat
@@ -404,10 +524,30 @@ def _install_coach_persona(instance: Server) -> None:
 
     def _with_coach_persona(*args, **kwargs):
         try:
-            instance.instructions = prompts.system_prompt(
-                _user_name(), coach.resolve_coach_profile(),
-                memory.render_memory_for_prompt(user_name=_user_name()),
-            )
+            # Memoized (see _PERSONA_CACHE above). Key is computed BEFORE the
+            # resolve: a write landing between the two caches FRESH data under
+            # a pre-write key, so the next request misses and re-resolves —
+            # self-correcting in the safe direction, never serving stale.
+            key = _persona_cache_key()
+            with _PERSONA_LOCK:
+                hit = key is not None and _PERSONA_CACHE["key"] == key
+                if hit:
+                    instance.instructions = _PERSONA_CACHE["instructions"]
+            if not hit:
+                # ONE connection for the whole resolve (was 6 opens, with
+                # _user_name() computed twice).
+                with db.connect() as conn:
+                    user_name = config.user_name(conn=conn)
+                    instructions = prompts.system_prompt(
+                        user_name, coach.resolve_coach_profile(conn=conn),
+                        memory.render_memory_for_prompt(
+                            conn=conn, user_name=user_name),
+                    )
+                instance.instructions = instructions
+                if key is not None:
+                    with _PERSONA_LOCK:
+                        _PERSONA_CACHE["key"] = key
+                        _PERSONA_CACHE["instructions"] = instructions
         except Exception:
             # Fail-open: never break the handshake. But a persistent failure
             # (corrupt user_notes, a settings-table problem) silently strips

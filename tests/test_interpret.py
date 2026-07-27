@@ -11,7 +11,6 @@ import pytest
 
 from local_fitness.agent import interpret
 
-
 # === tsb_zone ================================================================
 
 @pytest.mark.parametrize("tsb,expected", [
@@ -262,6 +261,30 @@ def test_sd_position_zero_delta_is_above():
     assert result == {"sd_distance": 0.0, "direction": "above"}
 
 
+# === riegel_confidence =========================================================
+
+@pytest.mark.parametrize("ratio,expected", [
+    (1.0, "high"),          # a 5k effort onto a 5k goal — no reach at all
+    (1.5, "high"),          # boundary: inclusive upper bound, still high
+    (1.5001, "medium"),
+    (2.0, "medium"),        # 5k measured, 10k goal
+    (3.0, "medium"),        # boundary: inclusive upper bound, still medium
+    (3.0001, "low"),
+    (10.5, "low"),          # 2 km effort onto a half marathon
+    (21.1, "low"),          # 2 km effort onto a marathon
+])
+def test_riegel_confidence_bands(ratio, expected):
+    assert interpret.riegel_confidence(ratio) == expected
+
+
+@pytest.mark.parametrize("ratio", [None, 0.0, -1.0])
+def test_riegel_confidence_degenerate_inputs_are_no_data(ratio):
+    # A zero/negative reach is degenerate, not confident. Unreachable from
+    # build_plan_detail (which needs both distances truthy first), pinned
+    # anyway per the module's never-raise contract.
+    assert interpret.riegel_confidence(ratio) == "no data"
+
+
 # === module hygiene =============================================================
 
 def test_interpret_imports_nothing_outside_stdlib():
@@ -272,3 +295,12 @@ def test_interpret_imports_nothing_outside_stdlib():
     for banned in ("import sqlite3", "from .. import", "from . import",
                    "claude_agent_sdk", "from .schemas"):
         assert banned not in src, banned
+
+
+def test_km_per_mile_pinned_to_the_units_constant():
+    """interpret stays deliberately stdlib-only (its documented contract), so
+    it keeps a private copy of the mile factor rather than importing units —
+    this pin is what stops the two from drifting."""
+    from local_fitness.agent import units
+
+    assert interpret._KM_PER_MILE == units.KM_PER_MILE

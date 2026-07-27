@@ -48,6 +48,17 @@ _TREND_METRICS: tuple[str, ...] = ("steps", "sleep_score", "max_stress")
 # How many recent days feed the trend-slope computation.
 _TREND_WINDOW_DAYS = 7
 
+# The only columns _metric_rows reads off a daily_metrics row: every metric it
+# reports, plus the `date` it slices today's row out of the window with. Derived
+# from DAILY_NUMERIC_METRICS rather than hand-listed so the two cannot drift —
+# a metric added to that set is fetched here automatically. `SELECT *` used to
+# drag each row's raw_json (the preserved ~16 KB Garmin payload) through an
+# 8-day window for fields nothing below reads. Sorted for a stable SQL string.
+# Interpolated, never parameterized — frozen identifiers from a module constant,
+# not user input.
+_METRIC_WINDOW_COLUMNS: tuple[str, ...] = ("date",) + tuple(sorted(DAILY_NUMERIC_METRICS))
+_METRIC_WINDOW_SELECT = ", ".join(_METRIC_WINDOW_COLUMNS)
+
 
 def _arrow(delta: float) -> str:
     """Direction glyph for a signed delta. Pure direction — no good/bad."""
@@ -104,7 +115,8 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
     cutoff = (date.fromisoformat(today) - timedelta(days=_TREND_WINDOW_DAYS)).isoformat()
     window_rows = [
         dict(r) for r in conn.execute(
-            "SELECT * FROM daily_metrics WHERE date >= ? AND date <= ? ORDER BY date",
+            f"SELECT {_METRIC_WINDOW_SELECT} FROM daily_metrics "
+            "WHERE date >= ? AND date <= ? ORDER BY date",
             (cutoff, today),
         ).fetchall()
     ]

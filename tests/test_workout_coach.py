@@ -377,6 +377,30 @@ def test_prompt_carries_past_runs_and_upcoming_prescriptions():
     assert "2026-07-22" in user and "interval" in user and "6x800" in user
 
 
+def test_upcoming_prescriptions_carry_the_numbers_from_raw_plan_rows():
+    """`upcoming_workouts` come straight from plans.get_active_plan(), which
+    carries target_distance_m / target_pace_sec_per_km / target_duration_sec.
+    Reading only the display keys dropped every number out of this block and
+    left the model a bare date and workout type."""
+    card = a_card(upcoming_workouts=[{
+        "date": "2026-07-22", "type": "tempo", "seq": 1,
+        "target_distance_m": 9656.06, "target_pace_sec_per_km": 359.86,
+        "target_duration_sec": 2700, "description": "3 mi @ tempo"}])
+    _, user = workout_coach.build_prompt(PROFILE, card)
+    assert ("2026-07-22: tempo · 6.0 mi · @ 9:39/mi · 45 min · 3 mi @ tempo"
+            in user)
+
+
+def test_upcoming_prescription_prefers_already_converted_fields():
+    """A caller that hands over an augmented row is not re-converted."""
+    card = a_card(upcoming_workouts=[{
+        "date": "2026-07-22", "type": "interval", "distance_mi": 5.0,
+        "pace_min_per_mi": "7:30", "target_distance_m": 1.0,
+        "target_pace_sec_per_km": 999.0}])
+    _, user = workout_coach.build_prompt(PROFILE, card)
+    assert "2026-07-22: interval · 5.0 mi · @ 7:30/mi" in user
+
+
 def test_prompt_omits_the_history_blocks_when_there_is_none():
     _, user = workout_coach.build_prompt(PROFILE, a_card())
     assert "What led into this run" not in user

@@ -10,6 +10,7 @@ real transformed values (tones, fired triggers, ordering), not stand-ins.
 """
 from __future__ import annotations
 
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -17,10 +18,10 @@ import pytest
 
 from local_fitness import db
 from local_fitness.agent import brief_planner as bp
+from local_fitness.agent import briefs
 from local_fitness.agent.coach import CoachProfile
 from local_fitness.agent.schemas import BriefContext, GroundedValue
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from eval_fixtures import build_fixture_db  # noqa: E402
 
@@ -389,3 +390,216 @@ def test_hm_keeps_its_own_empty_string_on_none_contract():
 
     assert bp._hm(None) == ""
     assert units.format_hm(None) is None
+
+
+# === 4. run classification is pace-gated, not label-gated ==================
+# Garmin files walking-desk sessions as `treadmill_running`. Before this gate
+# every walk reset days_since_last_run and inflated runs_14d, so the brief
+# could never say "you haven't actually run in a week".
+# 560 sec/km = 15:01/mi (a walk); 350 sec/km = 9:23/mi (a run); the ceiling is
+# a 13:00 mile (interpret.RUN_PACE_CEILING_SEC_PER_MI).
+_WALK_PACE = 560.0
+_RUN_PACE = 350.0
+
+
+@pytest.mark.parametrize("typ,pace,is_run", [
+    ("treadmill_running", _WALK_PACE, False),  # THE bug: walking-pad session
+    ("treadmill_running", _RUN_PACE, True),
+    ("running", _WALK_PACE, False),            # label loses to measurement
+    ("running", None, True),                   # paceless -> label fallback
+    ("running", 0.0, True),                    # 0 is "no usable pace", not fast
+    ("walking", _RUN_PACE, True),              # mislabelled the other way
+    ("walking", None, False),                  # paceless walk stays a walk
+    ("cycling", 120.0, False),                 # 3:13/mi, but not on foot
+    ("indoor_cycling", None, False),
+    (None, _RUN_PACE, False),
+])
+def test_running_gates_on_measured_pace_then_falls_back_to_the_label(typ, pace, is_run):
+    assert bp._running({"activity_type": typ, "avg_pace_sec_per_km": pace}) is is_run
+
+
+def _activity_db(tmp_path, rows, *, today=_FIXED, name="acts.db"):
+    """A DB carrying only activities — the run-classifier's whole input.
+
+    ``rows`` are ``(days_ago, activity_type, avg_pace_sec_per_km)``.
+    """
+    p = tmp_path / name
+    db.init_schema(p)
+    with db.connect(p) as conn:
+        for i, (days_ago, typ, pace) in enumerate(rows, start=1):
+            adate = (today - timedelta(days=days_ago)).isoformat()
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+                "activity_name, duration_seconds, distance_meters, avg_pace_sec_per_km, "
+                "aerobic_te) VALUES (?, ?, ?, ?, 'Session', 2800, 8000, ?, 2.5)",
+                (i, adate, adate + "T07:00:00", typ, pace),
+            )
+    return p
+
+
+def _signals(tmp_path, rows, *, today=_FIXED, name="acts.db"):
+    p = _activity_db(tmp_path, rows, today=today, name=name)
+    with db.connect(p) as conn:
+        return bp._compute_signals(conn, today.isoformat(), None, 10000, None, None)
+
+
+def test_walking_pad_sessions_do_not_count_as_runs_or_reset_the_gap(tmp_path):
+    # Six walking-pad sessions labelled `treadmill_running` (one a day for the
+    # last six days) and one real run eight days back. Label-only classifying
+    # read this as "ran yesterday, 7 runs in 14 days"; it is one run, eight
+    # days ago — which is exactly what fires long_run_absence.
+    sig = _signals(tmp_path, [(d, "treadmill_running", _WALK_PACE) for d in range(1, 7)]
+                   + [(8, "running", _RUN_PACE)])
+    assert sig.days_since_last_run == 8
+    assert sig.runs_14d == 1
+    assert sig.runs_prior_14d == 0
+    assert bp.long_run_absence(sig.days_since_last_run) is True
+
+
+def test_walking_pad_sessions_are_kept_out_of_recent_te(tmp_path):
+    # recent_te reads the last 5 RUNS. With walks admitted it was the walks' TE
+    # (2.5 each) and te_collapsing could never fire; with them excluded the one
+    # real run's TE is the only entry.
+    sig = _signals(tmp_path, [(d, "treadmill_running", _WALK_PACE) for d in range(1, 6)]
+                   + [(7, "running", _RUN_PACE)])
+    assert sig.recent_te == (2.5,)
+
+
+def test_paceless_rows_fall_back_to_the_label_and_still_count(tmp_path):
+    # A manual entry / bad sync has no pace. It must not vanish from the run
+    # history — the label is all we have, so it is what decides.
+    sig = _signals(tmp_path, [(2, "running", None), (4, "walking", None)])
+    assert sig.days_since_last_run == 2
+    assert sig.runs_14d == 1
+
+
+def test_a_fast_session_mislabelled_walking_counts_as_a_run(tmp_path):
+    sig = _signals(tmp_path, [(3, "walking", _RUN_PACE)])
+    assert sig.days_since_last_run == 3
+    assert sig.runs_14d == 1
+
+
+def test_a_bike_ride_is_never_a_run_however_fast(tmp_path):
+    # 120 sec/km is a 3:13 mile — well inside the run ceiling. The pace gate
+    # answers run-vs-walk, not foot-vs-wheel, so on-foot has to be checked
+    # first or a 30 km ride reads as the week's fastest run.
+    sig = _signals(tmp_path, [(1, "cycling", 120.0)])
+    assert sig.days_since_last_run is None
+    assert sig.runs_14d == 0
+
+
+def test_signals_query_selects_pace_so_the_gate_is_not_a_silent_no_op(tmp_path):
+    # Regression net for the failure mode that shipped once in plans.py: drop
+    # avg_pace_sec_per_km from the SELECT and every row falls back to the label,
+    # leaving the gate green but inert. Asserted end-to-end through the public
+    # entry point, so the column has to survive the real query.
+    p = _activity_db(tmp_path, [(1, "treadmill_running", _WALK_PACE),
+                                (9, "running", _RUN_PACE)], name="e2e.db")
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    workout = next(c for c in ctx.candidates if c.category == "workout")
+    days_since = next(g for g in workout.metrics if g.name == "days_since_last_run")
+    assert days_since.value == 9.0 and days_since.display == "9"
+    conditioning = next(c for c in ctx.candidates if c.category == "conditioning")
+    assert "long_run_absence" in conditioning.fired_triggers
+
+
+# === 5. freshness + continuity fields ======================================
+
+def _stale_db(tmp_path, *, frontier_days_ago: int, tsb: float | None):
+    """A DB whose data frontier and baselines row both stopped ``n`` days ago."""
+    p = tmp_path / "stale.db"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    db.init_schema(p)
+    frontier = (_FIXED - timedelta(days=frontier_days_ago)).isoformat()
+    with db.connect(p) as conn:
+        conn.execute("INSERT INTO daily_metrics (date, rhr, steps) VALUES (?, 54, 9000)",
+                     (frontier,))
+        conn.execute(
+            "INSERT INTO baselines (date, rhr_60day_mean, ctl, atl, tsb) "
+            "VALUES (?, 52.0, 40.0, 55.0, ?)", (frontier, tsb))
+    return p
+
+
+def test_context_carries_data_frontier_baseline_staleness_and_tsb_zone(tmp_path):
+    p = _stale_db(tmp_path, frontier_days_ago=3, tsb=-25.0)
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    assert ctx.data_frontier == "2026-06-23"          # _FIXED (06-26) minus 3
+    assert ctx.baseline_stale_days == 3
+    assert ctx.tsb_zone == "very fatigued"            # tsb -25 < TSB_VERY_FATIGUED
+
+
+def test_tsb_zone_reads_the_zone_not_the_none_sentence(tmp_path):
+    # interpret.tsb_zone(None) returns the sentence "no training-load data yet".
+    # That is prose, not a zone label, so an absent TSB leaves the field None
+    # and exclude_none keeps it out of the generator's prompt entirely.
+    p = _stale_db(tmp_path, frontier_days_ago=0, tsb=None)
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    assert ctx.tsb_zone is None
+    assert ctx.baseline_stale_days == 0
+
+    fresh = _stale_db(tmp_path / "b", frontier_days_ago=0, tsb=8.0)
+    assert bp.assemble_brief_context(db_path=fresh,
+                                     today=_FIXED.isoformat()).tsb_zone == "fresh"
+
+
+def test_empty_db_leaves_every_freshness_field_none(tmp_path, monkeypatch):
+    p = tmp_path / "empty.db"
+    db.init_schema(p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "notes.md"))
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", tmp_path / "no-briefings")
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    assert ctx.data_frontier is None
+    assert ctx.baseline_stale_days is None
+    assert ctx.tsb_zone is None
+    assert ctx.brief_stale_days is None
+
+
+def test_brief_stale_days_counts_days_since_the_newest_saved_brief(tmp_path, monkeypatch):
+    # The orphaned-sync signal: the pull advanced but no brief saved. A brief
+    # dated two days before `today` reads 2, not 0 and not None.
+    out = tmp_path / "briefings"
+    out.mkdir()
+    for offset in (2, 5):
+        d = (_FIXED - timedelta(days=offset)).isoformat()
+        (out / f"{d}.json").write_text('{"takeaways": []}', encoding="utf-8")
+    monkeypatch.setattr(briefs, "DEFAULT_BRIEFINGS_DIR", out)
+    p = _stale_db(tmp_path, frontier_days_ago=0, tsb=-2.0)
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    assert ctx.brief_stale_days == 2
+
+
+def test_assemble_brief_context_still_opens_exactly_one_connection(tmp_path, monkeypatch):
+    """The freshness fields must ride the connection already open. Duplicated
+    from tests/test_perf_benchmarks.py deliberately: that file's copy runs on
+    the synthetic perf fixture, this one guards the fields added here."""
+    p = _build("fatigued_recovery", tmp_path)
+    opens = {"n": 0}
+    real_connect = db.connect
+
+    def counting_connect(*a, **k):
+        opens["n"] += 1
+        return real_connect(*a, **k)
+
+    monkeypatch.setattr(db, "connect", counting_connect)
+    ctx = bp.assemble_brief_context(db_path=p, today=_FIXED.isoformat())
+    assert opens["n"] == 1
+    assert ctx.data_frontier is not None   # the added read actually ran
+
+
+def test_new_context_fields_round_trip_and_default_to_none():
+    """Stored eval fixtures predate these fields; the defaults are what keeps
+    baseline.json validating, and exclude_none is what keeps them out of the
+    V2 prompt until they are populated."""
+    bare = BriefContext(date="2026-06-26", user_name="Nate", candidates=[])
+    assert (bare.data_frontier, bare.baseline_stale_days,
+            bare.brief_stale_days, bare.tsb_zone) == (None, None, None, None)
+    assert "tsb_zone" not in bare.model_dump_json(exclude_none=True)
+
+    full = BriefContext(date="2026-06-26", user_name="Nate", candidates=[],
+                        data_frontier="2026-06-24", baseline_stale_days=2,
+                        brief_stale_days=1, tsb_zone="fatigued")
+    again = BriefContext.model_validate_json(full.model_dump_json())
+    assert again.data_frontier == "2026-06-24"
+    assert again.baseline_stale_days == 2
+    assert again.brief_stale_days == 1
+    assert again.tsb_zone == "fatigued"
