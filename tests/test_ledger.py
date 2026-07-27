@@ -11,9 +11,11 @@ TODAY = "2026-07-23"
 
 
 def _w(day: str, verdict: str, wtype: str = "easy", seq: int = 1,
-       target_m: float | None = None, actual_m: float | None = None) -> dict:
+       target_m: float | None = None, actual_m: float | None = None,
+       run_m: float | None = None, walk_m: float | None = None) -> dict:
     return {"date": day, "verdict": verdict, "type": wtype, "seq": seq,
-            "target_distance_m": target_m, "actual_distance_m": actual_m}
+            "target_distance_m": target_m, "actual_distance_m": actual_m,
+            "actual_run_distance_m": run_m, "actual_walk_distance_m": walk_m}
 
 
 # --- plan_adherence_facts ---------------------------------------------------
@@ -187,6 +189,102 @@ def test_notables_quality_done_and_overachieve_boundary():
     notables = ledger.notable_results(graded, TODAY)
     assert notables == [
         {"date": "2026-07-21", "type": "interval", "kind": "quality_done"},
+        {"date": "2026-07-20", "type": "easy", "kind": "overachieved"},
+    ]
+
+
+# --- notable_results: suppressing a false "done as prescribed" receipt ------
+# A quality day's plan verdict is distance-based ("done" = target distance
+# hit), but a graded report card can still say the execution was a D/F (pace,
+# HR, load blown). Promoting that "done" as a receipt hands the coach a false
+# callback that contradicts its own report-card memory (0.38.2 fix).
+
+
+def test_notables_suppresses_quality_done_when_same_date_card_grades_d():
+    graded = [_w("2026-07-21", "done", "interval")]
+    cards = [_card("2026-07-21", 1.05, "D")]
+    assert ledger.notable_results(graded, TODAY, cards=cards) == []
+
+
+def test_notables_suppresses_quality_done_for_an_f_card_too():
+    graded = [_w("2026-07-21", "done", "tempo")]
+    cards = [_card("2026-07-21", 0.7, "F")]
+    assert ledger.notable_results(graded, TODAY, cards=cards) == []
+
+
+def test_notables_keeps_quality_done_when_same_date_card_grades_a():
+    graded = [_w("2026-07-21", "done", "interval")]
+    cards = [_card("2026-07-21", 4.0, "A")]
+    assert ledger.notable_results(graded, TODAY, cards=cards) == [
+        {"date": "2026-07-21", "type": "interval", "kind": "quality_done"},
+    ]
+
+
+def test_notables_keeps_quality_done_when_no_card_for_that_date():
+    graded = [_w("2026-07-21", "done", "interval")]
+    # A card exists, but for a different date — must not suppress.
+    cards = [_card("2026-07-20", 1.0, "D")]
+    assert ledger.notable_results(graded, TODAY, cards=cards) == [
+        {"date": "2026-07-21", "type": "interval", "kind": "quality_done"},
+    ]
+    # No cards at all — today's behavior, unaffected.
+    assert ledger.notable_results(graded, TODAY) == [
+        {"date": "2026-07-21", "type": "interval", "kind": "quality_done"},
+    ]
+
+
+# --- notable_results: overachievement is gated on RUN distance, not the ---
+# --- on-foot total (Fix 4b) -------------------------------------------------
+# Plan adherence's ``actual_distance_m`` is the on-foot total (run + walk).
+# Grading "overachieved" from it lets a large WALK on an easy day (or a
+# separate walking session that day) manufacture a false "run past its
+# target" receipt on a day the run matched its target exactly, or on a day
+# with no running at all.
+
+
+def test_notables_no_overachieve_when_run_matches_target_but_walk_is_large():
+    """Real evidence, 2026-07-26: a 6436.3m run @ 8:56/mi matched its
+    6437.376m target to within ~1m, plus a separate 4069.9m walk that day.
+    actual_distance_m (foot total) = 10506.2m -> 1.63x target, which used to
+    fire 'run past its target'. The run itself did not overachieve."""
+    graded = [_w("2026-07-26", "done", "easy", target_m=6437.376,
+                  actual_m=10506.2, run_m=6436.3, walk_m=4069.9)]
+    assert ledger.notable_results(graded, "2026-07-27") == []
+
+
+def test_notables_overachieve_still_fires_on_real_run_overachievement():
+    graded = [_w("2026-07-26", "done", "easy", target_m=6437.376,
+                  actual_m=10506.2, run_m=7100.0, walk_m=3406.2)]  # run alone >= 1.10x
+    assert ledger.notable_results(graded, "2026-07-27") == [
+        {"date": "2026-07-26", "type": "easy", "kind": "overachieved"},
+    ]
+
+
+def test_notables_no_overachieve_on_a_pure_walk_day():
+    """2026-07-11 evidence: a single 4798.9m walk (zero running) against a
+    4023.36m easy target = 1.19x on the foot total. A day with no running at
+    all must never earn 'run past its target'."""
+    graded = [_w("2026-07-26", "done", "easy", target_m=4023.36,
+                  actual_m=4798.9, run_m=0.0, walk_m=4798.9)]
+    assert ledger.notable_results(graded, "2026-07-27") == []
+
+
+def test_notables_overachieve_falls_back_to_actual_distance_without_the_split():
+    """Rows with no run/walk split (older/synthetic data, no
+    actual_run_distance_m key set) fall back to actual_distance_m, same as
+    tools.weekly_rollup's established fallback — unaffected regression."""
+    graded = [_w("2026-07-20", "done", "easy", target_m=5000, actual_m=5500)]
+    assert ledger.notable_results(graded, TODAY) == [
+        {"date": "2026-07-20", "type": "easy", "kind": "overachieved"},
+    ]
+
+
+def test_notables_suppression_is_scoped_to_quality_done_not_overachieved():
+    """An overachieved easy day isn't the receipt this suppresses — it isn't
+    claiming 'done as prescribed' the way a quality day's callback does."""
+    graded = [_w("2026-07-20", "done", "easy", target_m=5000, actual_m=5500)]
+    cards = [_card("2026-07-20", 1.0, "D")]
+    assert ledger.notable_results(graded, TODAY, cards=cards) == [
         {"date": "2026-07-20", "type": "easy", "kind": "overachieved"},
     ]
 
@@ -386,6 +484,38 @@ def test_compute_relationship_ledger_reads_report_cards_table(tmp_path, monkeypa
     led = ledger.compute_relationship_ledger(db_path=p)
     assert led["cards"]["count"] == 3
     assert "Report cards: 3 workouts graded" in ledger.render_ledger_block(led, "Alex")
+
+
+def test_compute_relationship_ledger_wires_cards_into_notables(tmp_path, monkeypatch):
+    """Integration: the divider passes the already-loaded report_cards rows
+    into notable_results (no second DB round trip), so a same-date D card
+    suppresses the false 'done as prescribed' receipt end-to-end."""
+    from local_fitness import plans as plans_mod
+
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    workout_date = (date.today() - timedelta(days=1)).isoformat()
+
+    monkeypatch.setattr(plans_mod, "get_active_plan", lambda conn=None: {"workouts": []})
+    monkeypatch.setattr(
+        plans_mod, "load_activities_by_date",
+        lambda start, end, conn=None: {})
+    monkeypatch.setattr(plans_mod, "resolve_grading_config", lambda conn=None: None)
+    monkeypatch.setattr(
+        plans_mod, "build_plan_detail",
+        lambda active, frontier, activities, cfg=None: {
+            "workouts": [_w(workout_date, "done", "interval")]})
+
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO report_cards (activity_id, activity_date, graded_at, "
+            "overall_grade, gpa, card_json) VALUES (?, ?, ?, ?, ?, '{}')",
+            (5001, workout_date, "2026-07-01T00:00:00", "D", 1.1),
+        )
+
+    led = ledger.compute_relationship_ledger(db_path=p)
+    assert led["notables"] == []
 
 
 def test_ledger_survives_missing_report_cards_table(tmp_path, monkeypatch):

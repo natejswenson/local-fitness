@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import date
 
 from .. import config
-from . import journal, ledger, memory, prompts
+from . import journal, ledger, memory, prompts, workout_coach
 from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
@@ -51,18 +52,85 @@ _TASK = (
     "injury signal, a pattern crossing a line, a breakthrough performance. "
     "Most days are NOT worth an entry — routine execution is the job, not a "
     "memory.\n\n"
+    "Capture COLOR, not a stat recap: what {user_name} SAID or committed to "
+    "(an excuse, a promise, a stated feeling or fact), not a number the "
+    "computed facts already state and a future report card will state again. "
+    "If the only candidate is a bare restatement of a metric with nothing "
+    "said around it, stay silent instead.\n\n"
     "Rules:\n"
     "- 0, 1 or at most 2 lines. Each under 200 characters.\n"
     "- Only facts present in the event or the computed facts — never invent "
     "a count, a date, or a quote.\n"
     "- Never repeat something your recent journal already says — escalate it "
     "('second time this month') or stay silent.\n"
+    "- Never begin the line with a date — every entry is already shown with "
+    "its own date attached when it's read back to you; start straight with "
+    "the content.\n"
     "- No letter grades, no CTL/ATL/TSB numbers.\n\n"
     "# Output format — follow exactly\n"
     "Either the single word NONE, or one line per memory:\n"
     "MEMORY: <the line>\n"
     "Nothing else — no preamble, no markdown, no explanation."
 )
+
+#: Journal entries must never carry a letter grade or a raw CTL/ATL/TSB
+#: number — ``_TASK`` already asks the model not to, and it complies most of
+#: the time, but a live sample (2026-07-26) measured 6+ of 13 hot entries
+#: leaking one anyway: "hit distance/pace/HR (A/A+/A+) but load graded C-",
+#: "graded D overall", "distance D- (2.05/2.50mi", "after CTL peaked at
+#: 58.4". Same division of labor as workout_coach's ``_GRADE_LEAK``: the
+#: prompt asks, the code enforces. A leaking entry is REJECTED whole rather
+#: than scrubbed in place — cutting the offending token out of a coach-voice
+#: sentence usually leaves broken grammar, and the model reliably has
+#: another way to phrase the same fact without a grade.
+_GRADED_WORD_RE = re.compile(r"\bgraded\s+[A-DF][+-]?\b", re.IGNORECASE)
+_TRAINING_LOAD_RE = re.compile(r"\bCTL\b|\bATL\b|\bTSB\b", re.IGNORECASE)
+#: A run of 2+ slash-separated grade-like tokens, e.g. "A/A+/A+" or "B-/C".
+#: workout_coach's ``_GRADE_LEAK`` requires a preceding space/paren/start,
+#: which a "/" never satisfies, so it misses this shape entirely. Narrowed
+#: to runs of 3+ tokens OR any signed token (len 2, e.g. "A+") to avoid
+#: flagging a common two-letter idiom like "A/B testing".
+_GRADE_RUN_RE = re.compile(r"\b[A-DF][+-]?(?:/[A-DF][+-]?){1,}\b")
+
+#: A model-written leading date the render will prefix again
+#: (``journal.render_journal_block`` already emits "Jul 18: <text>"), e.g. a
+#: live entry read "Jul 26: Jul 26 easy run hot..." — the model repeating the
+#: date journal.py was always going to add.
+_LEADING_DATE_RE = re.compile(
+    r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}"
+    r"(?:st|nd|rd|th)?\s*[:,-]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_date(entry: str) -> str:
+    """Drop a model-written leading date so it doesn't double up with the
+    render's own date prefix. Pure; may return ``""`` if the entry was
+    nothing but a date. Recapitalizes only when a date was actually
+    stripped — an entry with no leading date (the common case) must come
+    back byte-identical, never re-cased."""
+    stripped = _LEADING_DATE_RE.sub("", entry, count=1)
+    if stripped == entry:
+        return entry
+    stripped = stripped.strip()
+    if stripped and stripped[0].islower():
+        stripped = stripped[0].upper() + stripped[1:]
+    return stripped
+
+
+def _has_grade_leak(text: str) -> bool:
+    """Narrow, deterministic scrub for the two failure modes measured live: a
+    letter grade (reusing workout_coach's proven pattern, extended with a
+    slash-run and a "graded X" case) and a bare CTL/ATL/TSB mention."""
+    if workout_coach.find_grade_leak({"entry": text}) is not None:
+        return True
+    if _GRADED_WORD_RE.search(text) or _TRAINING_LOAD_RE.search(text):
+        return True
+    for m in _GRADE_RUN_RE.finditer(text):
+        tokens = m.group(0).split("/")
+        if len(tokens) >= 3 or any(len(t) == 2 for t in tokens):
+            return True
+    return False
 
 
 def build_prompt(
@@ -94,7 +162,14 @@ def parse_reflection(text: str, existing: tuple[str, ...] = ()) -> list[str]:
     """``MEMORY:`` lines from a generation — deduped against ``existing``
     (case-insensitive), capped at :data:`MAX_ENTRIES`, each truncated at a
     word boundary to :data:`journal.ENTRY_MAX_CHARS`. ``NONE``, garbage, or
-    an empty generation → ``[]``. Pure, never raises."""
+    an empty generation → ``[]``. Pure, never raises.
+
+    Two more rejections happen here, deterministically, rather than trusting
+    the prompt: a leading date the model wrote itself is stripped (the render
+    already dates every line), and an entry naming a letter grade or a
+    CTL/ATL/TSB number is dropped outright (see ``_has_grade_leak``) — the
+    same "the prompt asks, the code enforces" split as workout_coach.
+    """
     if not text:
         return []
     seen = {e.strip().lower() for e in existing}
@@ -105,6 +180,11 @@ def parse_reflection(text: str, existing: tuple[str, ...] = ()) -> list[str]:
             continue
         entry = line[len("memory:"):].strip()
         if not entry:
+            continue
+        entry = _strip_leading_date(entry)
+        if not entry:
+            continue
+        if _has_grade_leak(entry):
             continue
         if len(entry) > journal.ENTRY_MAX_CHARS:
             cut = entry[: journal.ENTRY_MAX_CHARS]

@@ -119,6 +119,15 @@ def list_entries(
         params.append(f"-{int(days)} days")
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
+    # entry_date DESC first: a report_card reflection can be graded on-demand
+    # long after the activity happened (normal usage — Nate grades older
+    # cards after the fact), so entry_id (write order) runs INVERSE to
+    # entry_date for a large share of real rows. Sorting by entry_id alone
+    # was tried (0.38.2) and reverted: it silently dropped the newest EVENTS
+    # whenever they were graded/written out of order, which is the common
+    # case, not the exception. entry_id DESC is only the tiebreak, for two
+    # entries that share one entry_date — there it correctly puts the one
+    # WRITTEN later (e.g. a same-day correction) above the one it corrects.
     sql += " ORDER BY entry_date DESC, entry_id DESC LIMIT ?"
     params.append(int(limit))
 

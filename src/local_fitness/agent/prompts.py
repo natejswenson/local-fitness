@@ -113,7 +113,12 @@ def coach_memory_block(
         f"Computed from his data plus your own journal. Use these as receipts "
         f"and\ncallbacks — name the count, name the date ('third missed "
         f"quality day this\nmonth'). A repeated behavior gets named as a "
-        f"pattern. NEVER invent a memory,\na count, or a quote that is not "
+        f"pattern.\n\n"
+        f"A listed fact is a receipt — spend it, don't just hold it. A "
+        f"promise {user_name} made is a debt you collect on. A streak he "
+        f"built is his to keep owning, and a streak that broke gets named "
+        f"back to him once, plainly, in your own voice.\n\n"
+        f"NEVER invent a memory,\na count, or a quote that is not "
         f"listed here; if this section is empty, make\nno callbacks.\n"
         f"{memory_text}"
     )
