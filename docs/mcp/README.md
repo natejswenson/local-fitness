@@ -16,13 +16,13 @@ worked examples, and gotchas.
 
 ## Connecting
 
-**Local, over stdio** — all 45 tools, no token:
+**Local, over stdio** — all 46 tools, no token:
 
 ```bash
 claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
 ```
 
-**Over the running server** — 43 tools, bearer-gated:
+**Over the running server** — 44 tools, bearer-gated:
 
 ```bash
 claude mcp add --transport http fitness \
@@ -39,7 +39,7 @@ unreachable over the networked `/mcp/` transport:
 
 | | stdio (`fitness mcp-stdio`) | HTTP (`/mcp/`) |
 |---|---|---|
-| Tool count | **45** | **43** |
+| Tool count | **46** | **44** |
 | [`generate_brief_report`](generate_brief_report.md) | ✅ | ❌ |
 | [`workout_report_card`](workout_report_card.md) | ✅ | ❌ |
 
@@ -102,7 +102,7 @@ The first three attach **deterministic interpretation** — see
 
 ### Training plans
 
-The full lifecycle. These eight are a state machine — every page carries the
+The full lifecycle. These nine are a state machine — every page carries the
 diagram.
 
 ```
@@ -117,6 +117,7 @@ propose_training_plan ──> DRAFT ──> commit_training_plan ──> ACTIVE
 |---|---|
 | [`propose_training_plan`](propose_training_plan.md) | ✍️ Draft a new plan toward a goal |
 | [`revise_training_plan`](revise_training_plan.md) | ✍️ Restructure the draft |
+| [`get_training_plan_draft`](get_training_plan_draft.md) | The only way to see a pending draft — read it before committing or discarding |
 | [`commit_training_plan`](commit_training_plan.md) | ✍️ Activate the draft |
 | [`discard_training_plan_draft`](discard_training_plan_draft.md) | ✍️ Throw the draft away |
 | [`update_plan_workout`](update_plan_workout.md) | ✍️ Re-prescribe **one day** on the active plan |

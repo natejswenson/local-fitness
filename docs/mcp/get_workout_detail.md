@@ -23,9 +23,14 @@ An object with three top-level keys.
 
 | Key | Meaning |
 |---|---|
-| `activity` | The full `activities` row (`SELECT *`) with `raw_json` stripped, plus the same `distance_mi` / `pace_min_per_mi` / `duration_formatted` convenience fields `query_workouts` adds. |
+| `activity` | The full `activities` row (`SELECT *`) with `raw_json` stripped, plus the same `distance_mi` / `pace_min_per_mi` / `duration_formatted` / `effort` convenience fields `query_workouts` adds. |
 | `hr_zones` | Rows from `activity_hr_zones` — `{zone, seconds_in_zone}` — ordered by `zone`. Empty list when none were ingested. |
-| `splits` | Rows from `activity_splits` ordered by `split_index`, each augmented the same way as `activity` (so a split gets its own `distance_mi` / `pace_min_per_mi` / `duration_formatted`). Empty list when none were ingested. |
+| `splits` | Rows from `activity_splits` ordered by `split_index`, each augmented the same way as `activity` (so a split gets its own `distance_mi` / `pace_min_per_mi` / `duration_formatted` / `effort`). Empty list when none were ingested. |
+
+`effort` (`"run"` / `"walk"` / `null`) is MEASURED from pace
+(`interpret.is_running_effort`), never from `activity_type` — Garmin's own
+label can misreport a walk as a run (walking-desk sessions log as
+`treadmill_running`).
 
 `activity` carries the full column set: `activity_id`, `date`, `start_time`,
 `activity_type`, `activity_name`, `duration_seconds`, `moving_seconds`,

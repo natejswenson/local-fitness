@@ -792,3 +792,65 @@ def test_persona_failure_is_not_cached(monkeypatch):
     state["boom"] = False
     recovered = server.create_initialization_options().instructions
     assert recovered is not None and "running coach" in recovered
+
+
+# --- Fix 11: matplotlib pre-warm on mcp-stdio start -------------------------
+
+def test_prewarm_matplotlib_swallows_import_failure(monkeypatch, caplog):
+    """A broken/missing matplotlib install must never take the process down
+    — visuals.py's own lazy `import matplotlib` is the real fallback path,
+    so a pre-warm failure here has to be silent-and-logged, not raised."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def boom_import(name, *args, **kwargs):
+        if name == "matplotlib":
+            raise ImportError("simulated broken install")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", boom_import)
+    with caplog.at_level(logging.DEBUG, logger=mcp_server.__name__):
+        mcp_server._prewarm_matplotlib()  # must not raise
+    assert any("pre-warm failed" in r.message for r in caplog.records)
+
+
+def test_run_stdio_prewarms_matplotlib_in_a_background_daemon_thread(monkeypatch):
+    """run_stdio() must pay matplotlib's 157-210ms import cost off the
+    request path — in a background thread, not inline before the handshake
+    — and that thread must be a daemon so it can never block process exit."""
+    import contextlib
+    import threading as threading_mod
+
+    import mcp.server.stdio as stdio_mod
+
+    spawned = []
+    real_thread = threading_mod.Thread
+
+    def capturing_thread(*args, **kwargs):
+        t = real_thread(*args, **kwargs)
+        spawned.append(kwargs)
+        return t
+
+    monkeypatch.setattr(mcp_server.threading, "Thread", capturing_thread)
+
+    @contextlib.asynccontextmanager
+    async def fake_stdio_server():
+        yield (object(), object())
+
+    monkeypatch.setattr(stdio_mod, "stdio_server", fake_stdio_server)
+
+    class _FakeServer:
+        def create_initialization_options(self):
+            return object()
+
+        async def run(self, read, write, opts):
+            return None
+
+    monkeypatch.setattr(mcp_server, "build_server", lambda **kwargs: _FakeServer())
+
+    asyncio.run(mcp_server.run_stdio())
+
+    assert len(spawned) == 1
+    assert spawned[0].get("target") is mcp_server._prewarm_matplotlib
+    assert spawned[0].get("daemon") is True

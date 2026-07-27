@@ -193,6 +193,77 @@ def test_get_metric_trend_no_data(seeded):
     assert err  # vo2_max never seeded → no rows in window
 
 
+# --------------------------------------------------------------------------- #
+# Fix 8: get_metric / get_metric_trend anchor PARTIAL_DAY_METRICS windows on
+# yesterday, not today — a same-day running tally (avg_stress, steps, ...) is
+# partial all day, so a "trend" computed against it is misleading. Measured
+# live: get_metric_trend("avg_stress", 7) returned current=17, slope_direction
+# "flat" off a 50-sample overnight-only reading, when the honest read on 7
+# COMPLETE days was rising (every complete day that week ran 24-32).
+# --------------------------------------------------------------------------- #
+def test_get_metric_trend_reads_rising_not_flat_when_today_is_a_partial_low_read(
+    tmp_path, monkeypatch
+):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # Today: partial overnight-only stress read (17). Prior 7 days: a
+        # clean, real rising trend (24 -> 32... well within TREND_FLAT_SD).
+        conn.execute(
+            "INSERT INTO daily_metrics (date, avg_stress) VALUES (?, ?)",
+            (today.isoformat(), 17),
+        )
+        for i, stress in enumerate((18, 20, 22, 24, 27, 30, 32)):
+            d = (today - timedelta(days=7 - i)).isoformat()
+            conn.execute("INSERT INTO daily_metrics (date, avg_stress) VALUES (?, ?)", (d, stress))
+    payload, err = call(tools.get_metric_trend, {"metric": "avg_stress", "days": 7})
+    assert not err
+    assert payload["current"] == 32  # yesterday's real value, not today's partial 17
+    assert payload["slope_direction"] == "rising"  # not "flat"
+    assert payload["partial_today_excluded"] is True
+    assert payload["n_samples"] == 7  # 7 COMPLETE days, today never counted
+
+
+def test_get_metric_trend_non_partial_metric_unaffected(seeded):
+    # rhr is not in PARTIAL_DAY_METRICS — no flag, today's row still counts.
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert "partial_today_excluded" not in payload
+
+
+def test_get_metric_excludes_todays_partial_reading_for_steps(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # A tiny partial today's-steps reading that would otherwise drag the
+        # "recent values" list and its baseline comparison down.
+        conn.execute(
+            "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)", (today.isoformat(), 400)
+        )
+        conn.execute(
+            "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)",
+            ((today - timedelta(days=1)).isoformat(), 11000),
+        )
+    payload, err = call(tools.get_metric, {"metric": "steps", "days": 5})
+    assert not err
+    assert payload["partial_today_excluded"] is True
+    dates = [v["date"] for v in payload["values"]]
+    assert today.isoformat() not in dates  # today's partial 400 never listed
+    assert payload["values"][-1]["value"] == 11000
+
+
+def test_get_metric_non_partial_metric_unaffected(seeded):
+    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 5})
+    assert not err
+    assert "partial_today_excluded" not in payload
+
+
 def test_chart_default_is_compact_calendar(seeded):
     # No style -> calendar (the default). It must be the week-stacked grid (its
     # "Mon→Sun" legend is the signature) and COMPACT: a 30-day window is a handful
@@ -372,6 +443,85 @@ def test_get_workout_detail_missing(seeded):
     assert err
 
 
+# --------------------------------------------------------------------------- #
+# Fix 3: measured `effort` (run/walk/null) on workout payloads.
+#
+# Garmin's activity_type label lies — walking-desk sessions log as
+# treadmill_running (documented in CLAUDE.md) — so `effort` is derived from
+# pace via interpret.is_running_effort, never from the label. Pinned against
+# live-shaped values: 1090 sec/km ≈ 29:15/mi is a real walking-desk row.
+# --------------------------------------------------------------------------- #
+def test_augment_workout_effort_walk_for_slow_pace():
+    w = tools._augment_workout({"avg_pace_sec_per_km": 1090.0})
+    assert w["effort"] == "walk"
+
+
+def test_augment_workout_effort_run_for_fast_pace():
+    w = tools._augment_workout({"avg_pace_sec_per_km": 333.0})
+    assert w["effort"] == "run"
+
+
+def test_augment_workout_effort_null_when_paceless():
+    w = tools._augment_workout({"avg_pace_sec_per_km": None})
+    assert w["effort"] is None
+
+
+def _insert_effort_activities(conn, today):
+    """Three activities all labelled 'treadmill_running' — mislabeled per
+    CLAUDE.md's documented Garmin quirk — distinguished only by measured
+    pace: a real walk (1090 sec/km), a real run (333 sec/km), and a paceless
+    row (pace column NULL)."""
+    rows = [
+        (1, (today - timedelta(days=1)).isoformat(), 1090.0),  # walk
+        (2, (today - timedelta(days=2)).isoformat(), 333.0),   # run
+        (3, (today - timedelta(days=3)).isoformat(), None),    # paceless
+    ]
+    for aid, d, pace in rows:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "distance_meters, avg_pace_sec_per_km, duration_seconds) "
+            "VALUES (?, ?, ?, 'treadmill_running', 5000, ?, 1800)",
+            (aid, d, d + "T07:00:00", pace),
+        )
+
+
+def test_query_workouts_effort_field_pins_walk_run_null(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        _insert_effort_activities(conn, today)
+
+    payload, err = call(tools.query_workouts, {})
+    assert not err
+    by_id = {w["activity_id"]: w for w in payload["workouts"]}
+    assert by_id[1]["effort"] == "walk"
+    assert by_id[2]["effort"] == "run"
+    assert by_id[3]["effort"] is None
+    # Additive, never filtered: all three (including the walk) still present.
+    assert by_id[1]["activity_type"] == "treadmill_running"
+
+
+def test_get_workout_detail_effort_field_pins_walk_and_run(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        _insert_effort_activities(conn, today)
+
+    walk_payload, err1 = call(tools.get_workout_detail, {"activity_id": 1})
+    run_payload, err2 = call(tools.get_workout_detail, {"activity_id": 2})
+    paceless_payload, err3 = call(tools.get_workout_detail, {"activity_id": 3})
+    assert not err1 and not err2 and not err3
+    assert walk_payload["activity"]["effort"] == "walk"
+    assert run_payload["activity"]["effort"] == "run"
+    assert paceless_payload["activity"]["effort"] is None
+
+
 def test_compare_periods_daily(seeded):
     today = date.today()
     a0 = (today - timedelta(days=10)).isoformat()
@@ -436,6 +586,94 @@ def test_training_load_status_empty(tmp_path, monkeypatch):
     db.init_schema(p)
     _payload, err = call(tools.training_load_status, {})
     assert err
+
+
+# --------------------------------------------------------------------------- #
+# Fix 9: "current" TSB/CTL/ATL is the last COMPLETE day, never today's own
+# same-day projection. baselines.recompute walks the EWMA forward assuming
+# today's training_load is 0 until something posts, so reporting today's row
+# as "current form" pre-credits a zero-load rest day that hasn't happened.
+# Regression test per spec: insert a synthetic activity dated "today" — the
+# reported CURRENT tsb must NOT change (this failed before the fix: logging
+# an activity recomputes today's baselines row and the OLD code read it
+# straight through as "current").
+# --------------------------------------------------------------------------- #
+def test_training_load_status_current_unaffected_by_logging_todays_activity(
+    tmp_path, monkeypatch
+):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    with db.connect(p) as conn:
+        # Yesterday's row is "current form" — stable, complete-day CTL/ATL/TSB.
+        conn.execute(
+            "INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, 59.53, 72.27, -12.74)",
+            (yesterday,),
+        )
+        # Today's row assumes ZERO load so far (typical morning-read shape) —
+        # a materially different, lower TSB (more fatigued-looking).
+        conn.execute(
+            "INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, 59.10, 81.90, -22.80)",
+            (today,),
+        )
+    before, err1 = call(tools.training_load_status, {})
+    assert not err1
+    assert before["current"]["tsb"] == -12.74  # yesterday's, not today's -22.80
+
+    with db.connect(p) as conn:
+        # Now "log" today's activity by recomputing today's row with real load
+        # (what sync_garmin_data + baselines.recompute would do).
+        conn.execute(
+            "UPDATE baselines SET ctl = 59.80, atl = 76.40, tsb = -16.60 WHERE date = ?",
+            (today,),
+        )
+    after, err2 = call(tools.training_load_status, {})
+    assert not err2
+    # The reported CURRENT tsb is unchanged — still yesterday's stable read,
+    # completely unaffected by today's activity being logged or not.
+    assert after["current"]["tsb"] == before["current"]["tsb"] == -12.74
+    assert after["current"]["ctl"] == before["current"]["ctl"] == 59.53
+
+
+def test_training_load_status_exposes_projected_end_of_day(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, 59.53, 72.27, -12.74)",
+            (yesterday,),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, 59.10, 81.90, -22.80)",
+            (today,),
+        )
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    assert payload["current"]["tsb"] == -12.74
+    assert payload["projected_end_of_day"]["tsb"] == -22.8
+    assert payload["projected_end_of_day"]["ctl"] == 59.1
+    assert payload["projected_end_of_day"]["interpretation"] == "very fatigued"
+
+
+def test_training_load_status_no_projection_when_today_has_no_row(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, 40.0, 45.0, -5.0)",
+            (yesterday,),
+        )
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    assert payload["current"]["tsb"] == -5.0
+    assert payload["projected_end_of_day"] is None  # no baselines row for today
 
 
 def test_correlate(seeded):
@@ -694,7 +932,10 @@ def test_training_load_status_ctl_pct_change_matches_brief_on_gappy_baselines(tm
 
     with db.connect(p) as conn:
         baseline = bp.status_mod._baseline_row(conn, today.isoformat())
-        sig = bp._compute_signals(conn, today.isoformat(), baseline, 10000, None, None)
+        # Fix 9: "now" is current_form (last COMPLETE day), matching what
+        # training_load_status's own "current" now anchors on.
+        current_form = bp.status_mod._baseline_row_before(conn, today.isoformat())
+        sig = bp._compute_signals(conn, today.isoformat(), baseline, current_form, 10000, None, None)
     assert payload["ctl_pct_change_14d"] == sig.ctl_pct_change_14d
 
 
@@ -4005,6 +4246,155 @@ def test_recovery_pattern_counts_workouts_skipped_for_missing_baseline(
     assert payload["n_skipped_no_baseline"] == 1
     # The two survivors both recovered on day +1 (bb 90 >= 0.95*88).
     assert payload["avg_recovery_days_body_battery"] == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Fix 2: recovery_pattern gates recovery PER METRIC, not on bb baseline alone.
+#
+# body_battery_max_60day_mean derived from the dead body_battery_max column
+# (NULL on every daily_metrics row since ingest never populated it — see the
+# daily.py fix) and only exists through 2026-01-27 on real data, while
+# rhr_60day_mean is alive through today. The old whole-workout gate
+# (`if not baseline or baseline["bb"] is None: skip`) meant a 90-day
+# recovery_pattern call always returned 0 matched, even though rhr recovery
+# was fully computable the entire time.
+# --------------------------------------------------------------------------- #
+def test_recovery_pattern_matches_workout_with_rhr_baseline_but_no_bb_baseline(
+    tmp_path, monkeypatch
+):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "duration_seconds, distance_meters, training_load) "
+            "VALUES (1, ?, 'running', 3600, 10000, 80)",
+            (wdate.isoformat(),),
+        )
+        # rhr baseline present, bb baseline column left NULL — the real-data shape.
+        conn.execute(
+            "INSERT INTO baselines (date, rhr_60day_mean) VALUES (?, 52.0)",
+            (wdate.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO daily_metrics (date, rhr) VALUES (?, 50)",
+            ((wdate + timedelta(days=2)).isoformat(),),
+        )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    assert payload["n_workouts_matched"] == 1  # matched despite no bb baseline
+    assert payload["n_skipped_no_baseline"] == 0
+    assert payload["n_skipped_no_bb_baseline"] == 1
+    assert payload["n_skipped_no_rhr_baseline"] == 0
+    w = payload["recent_workouts"][0]
+    assert w["recovery_days_to_rhr_baseline"] == 2  # 50 <= 52*1.03 on day +2
+    assert w["recovery_days_to_bb_baseline"] is None
+    assert w["bb_baseline_note"] == "no body-battery baseline for this date"
+    assert w["rhr_baseline_note"] is None
+    assert payload["avg_recovery_days_rhr"] == 2.0
+    assert payload["avg_recovery_days_body_battery"] is None
+
+
+def test_recovery_pattern_matches_workout_with_bb_baseline_but_no_rhr_baseline(
+    tmp_path, monkeypatch
+):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "duration_seconds, distance_meters, training_load) "
+            "VALUES (1, ?, 'running', 3600, 10000, 80)",
+            (wdate.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, body_battery_max_60day_mean) VALUES (?, 80.0)",
+            (wdate.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO daily_metrics (date, body_battery_max) VALUES (?, 90)",
+            ((wdate + timedelta(days=3)).isoformat(),),
+        )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    assert payload["n_workouts_matched"] == 1
+    assert payload["n_skipped_no_bb_baseline"] == 0
+    assert payload["n_skipped_no_rhr_baseline"] == 1
+    w = payload["recent_workouts"][0]
+    assert w["recovery_days_to_bb_baseline"] == 3  # 90 >= 80*0.95 on day +3
+    assert w["recovery_days_to_rhr_baseline"] is None
+    assert w["rhr_baseline_note"] == "no RHR baseline for this date"
+    assert w["bb_baseline_note"] is None
+    assert payload["avg_recovery_days_body_battery"] == 3.0
+    assert payload["avg_recovery_days_rhr"] is None
+
+
+def test_recovery_pattern_both_baselines_present_computes_both(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "duration_seconds, distance_meters, training_load) "
+            "VALUES (1, ?, 'running', 3600, 10000, 80)",
+            (wdate.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, body_battery_max_60day_mean, rhr_60day_mean) "
+            "VALUES (?, 80.0, 52.0)",
+            (wdate.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO daily_metrics (date, body_battery_max, rhr) VALUES (?, 90, 50)",
+            ((wdate + timedelta(days=1)).isoformat(),),
+        )
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    assert payload["n_workouts_matched"] == 1
+    assert payload["n_skipped_no_baseline"] == 0
+    assert payload["n_skipped_no_bb_baseline"] == 0
+    assert payload["n_skipped_no_rhr_baseline"] == 0
+    w = payload["recent_workouts"][0]
+    assert w["recovery_days_to_bb_baseline"] == 1
+    assert w["recovery_days_to_rhr_baseline"] == 1
+    assert w["bb_baseline_note"] is None
+    assert w["rhr_baseline_note"] is None
+
+
+def test_recovery_pattern_neither_baseline_present_skips_and_counts(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    wdate = today - timedelta(days=10)
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "duration_seconds, distance_meters, training_load) "
+            "VALUES (1, ?, 'running', 3600, 10000, 80)",
+            (wdate.isoformat(),),
+        )
+        # No baselines row at all for wdate.
+    payload, err = call(tools.recovery_pattern, {"activity_type": "running", "lookback_days": 30})
+    assert not err
+    assert payload["n_workouts_matched"] == 0
+    assert payload["n_skipped_no_baseline"] == 1
+    assert payload["n_skipped_no_bb_baseline"] == 0
+    assert payload["n_skipped_no_rhr_baseline"] == 0
+    assert payload["recent_workouts"] == []
 
 
 def test_recovery_pattern_issues_range_queries_not_per_workout_probes(

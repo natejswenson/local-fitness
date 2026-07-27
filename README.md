@@ -217,7 +217,7 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **45 tools over stdio** (43 over HTTP — two are
+Once connected you get **46 tools over stdio** (44 over HTTP — two are
 local-only, see below), **2 prompts**, and **2 resources**.
 
 📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool
@@ -250,8 +250,10 @@ is a map; that directory is the documentation.
   UI: `propose_training_plan` / `revise_training_plan` (draft),
   `commit_training_plan` / `discard_training_plan_draft` (activate or drop),
   `update_plan_workout` (re-prescribe one day on the active plan),
-  `abandon_active_plan` (**no undo**), and `get_training_plan_status` /
-  `get_training_plan_progress`.
+  `abandon_active_plan` (**no undo**), `get_training_plan_status` /
+  `get_training_plan_progress` (the active plan), and
+  `get_training_plan_draft` (the one way to see a pending draft so it can
+  actually be committed or discarded).
 - **Preferences & subjective data** — `save_user_note` / `list_user_notes` /
   `update_user_note` / `delete_user_note` (durable coaching preferences,
   injected into the system prompt) and `log_observation` / `list_observations` /
