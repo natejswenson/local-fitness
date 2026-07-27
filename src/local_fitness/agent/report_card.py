@@ -110,6 +110,17 @@ REFERENCE_WINDOW_DAYS = 60
 # the measured bimodal distribution that sets the 13:00 ceiling.
 RUN_PACE_CEILING_SEC_PER_MI = interpret.RUN_PACE_CEILING_SEC_PER_MI
 is_running_effort = interpret.is_running_effort
+# The same boundary, converted once to sec/km — the unit `pace_deviation` and
+# the plan-reference gate below actually compare against. Mirrors the
+# conversion `plans.py`'s `best_recent_effort` already does at its own call
+# site (`interpret.RUN_PACE_CEILING_SEC_PER_MI / interpret._KM_PER_MILE`), so
+# the two can't drift apart.
+_RUN_PACE_CEILING_SEC_PER_KM = interpret.RUN_PACE_CEILING_SEC_PER_MI / interpret._KM_PER_MILE
+# plan_workouts.type values that assert the workout IS a run. Used to decide
+# when a walk-effort activity must refuse its plan reference (see build_card):
+# "cross" is explicitly non-running cross-training and "rest" has no
+# reference to refuse at all (see plan_usable), so neither belongs here.
+_RUNNING_PLAN_TYPES = frozenset({"easy", "long", "tempo", "interval", "race"})
 # Advisory only: a 2x-median load day is a fact worth printing, not an F.
 LOAD_SPIKE_FACTOR = 2.0
 # Bucket width for the per-sample HR trace chart. A tenth of a mile is fine
@@ -352,18 +363,43 @@ def pace_deviation(
 
     - easy / long: penalized only for running too FAST. Slower than the easy
       expectation is the entire point of an easy run and scores an A. This is
-      the rule that stops recovery runs from failing.
+      the rule that stops recovery runs from failing. BUT there is a slow-side
+      floor anchored on ``RUN_PACE_CEILING_SEC_PER_MI``, the measured run/walk
+      boundary: past it the activity is a walk, not a slow run, and a 0.0
+      deviation there is what let a walking-desk session (83:49/mi, one
+      measured case) read a perfect A+ pace against an "easy" expectation.
+      The floor is anchored on the boundary itself, not on the (often much
+      faster) plan/rolling expectation, so it fires only once the actual pace
+      genuinely crosses into walk territory — a legitimate slow-but-real easy
+      run (anything up to a 13:00 mile) is untouched, which is what keeps this
+      from over-correcting the headline recovery-run case above.
     - quality (tempo/interval/race): penalized only for being too SLOW.
-      Beating the target is an A, uncapped.
+      Beating the target is an A, uncapped — but the SAME slow-side floor
+      applies. A walked "tempo"/"interval" day that refuses its plan pace
+      reference (see ``build_card``) falls to the rolling reference, which
+      for a walk is itself a *walking*-pool median — and quality's
+      slow-only gate scores 0.0 whenever the walk happens to be brisker than
+      that (often very slow) walking median. Measured: a 15:20/mi walk on a
+      prescribed tempo day scored A+ pace this way even after the plan-gate
+      fix, because nothing here checked whether "not slow" also meant "not a
+      walk". The floor closes that gap the same way it does for easy/long.
     - steady / unknown: two-sided, with bands widened by ``STEADY_WIDEN`` at
-      the grading step.
+      the grading step. Not floored — the two-sided formula already
+      penalizes a walk-paced steady day relative to its own expectation, so a
+      walk cannot quietly clear it.
     """
     if not actual_sec_per_km or not expected_sec_per_km or expected_sec_per_km <= 0:
         return None
+    walked = max(
+        0.0,
+        (actual_sec_per_km - _RUN_PACE_CEILING_SEC_PER_KM) / _RUN_PACE_CEILING_SEC_PER_KM,
+    )
     if cls in ("easy", "long"):
-        return max(0.0, (expected_sec_per_km - actual_sec_per_km) / expected_sec_per_km)
+        fast = max(0.0, (expected_sec_per_km - actual_sec_per_km) / expected_sec_per_km)
+        return max(fast, walked)
     if cls == "quality":
-        return max(0.0, (actual_sec_per_km - expected_sec_per_km) / expected_sec_per_km)
+        slow = max(0.0, (actual_sec_per_km - expected_sec_per_km) / expected_sec_per_km)
+        return max(slow, walked)
     return abs(actual_sec_per_km / expected_sec_per_km - 1.0)
 
 
@@ -710,8 +746,33 @@ def build_card(
     # only, so distance/pace fall through to the rolling reference.
     plan_usable = bool(plan_workout) and (plan_workout or {}).get("type") != "rest"
 
+    # Locomotion mode of the activity actually being graded, resolved ONCE —
+    # measured via pace (`interpret.is_running_effort`), never `activity_type`
+    # (Garmin's label lies; see the module docstring). `None` means the row
+    # has no usable pace and its mode is genuinely unknown, so it keeps
+    # today's behavior rather than being forced to one side.
+    mode = is_running_effort(activity.get("avg_pace_sec_per_km"))
+    # A walk against a RUNNING plan type must not be graded against that
+    # plan's target: a 4-miler walked at 14:09/mi against a 9:39/mi easy
+    # prescription is not "over 4x too fast" (the plan target math would say
+    # so), it's a different activity than the one prescribed. Scoped to
+    # running plan types only — "cross" is deliberately non-running and
+    # "rest" has no reference to refuse (`plan_usable` already excludes it).
+    plan_walk_mismatch = (
+        mode is False and plan_usable
+        and (plan_workout or {}).get("type") in _RUNNING_PLAN_TYPES
+    )
+    plan_ref_ok = plan_usable and not plan_walk_mismatch
+    walk_note = None
+    if plan_walk_mismatch:
+        walk_note = (
+            f"measured pace says this was walked, not run — a prescribed "
+            f"'{plan_workout['type']}' target doesn't apply to a walk effort; "
+            "graded against your rolling reference instead"
+        )
+
     # -- distance
-    if plan_usable and plan_workout.get("target_distance_m"):
+    if plan_ref_ok and plan_workout.get("target_distance_m"):
         target = plan_workout["target_distance_m"]
         d = distance_deviation(activity.get("distance_meters"), target, two_sided=True)
         distance = _metric(
@@ -722,17 +783,18 @@ def build_card(
         d = distance_deviation(activity.get("distance_meters"), expected, two_sided=False)
         distance = _metric(
             grade_from_deviation(d), activity.get("distance_meters"), expected or None,
-            d, "rolling_60d")
+            d, "rolling_60d", note=walk_note)
     else:
         distance = _metric(
-            None, activity.get("distance_meters"), None, None, reference.get("mode"))
+            None, activity.get("distance_meters"), None, None, reference.get("mode"),
+            note=walk_note)
 
     # -- pace
     avg_pace = activity.get("avg_pace_sec_per_km")
     # What gets graded. Normally the run average; on a quality day with a
     # prescribed rep pace it is the fastest split instead (see below).
     graded_pace, pace_note, pace_display = avg_pace, None, None
-    if plan_usable and plan_workout.get("target_pace_sec_per_km"):
+    if plan_ref_ok and plan_workout.get("target_pace_sec_per_km"):
         expected_pace = plan_workout["target_pace_sec_per_km"]
         pace_ref, widen = "plan", PLAN_TIGHTEN
         if cls == "quality":
@@ -770,7 +832,7 @@ def build_card(
                 unit = ("split" if best_split.get("partial")
                         else labelled_splits["unit"].lower())
                 pace_display = f"{_fmt_pace(graded_pace)} best {unit}"
-    elif plan_usable and plan_workout.get("target_distance_m"):
+    elif plan_ref_ok and plan_workout.get("target_distance_m"):
         # A prescribed distance with no pace is an explicit by-feel day. It
         # earns no pace grade at all, and its 30% weight redistributes.
         expected_pace, pace_ref, widen = None, "plan (by feel)", 1.0
@@ -782,6 +844,8 @@ def build_card(
         expected_pace, pace_ref, widen = None, reference.get("mode"), 1.0
     if pace_ref == "plan (by feel)":
         pace_note = "by-feel day — no pace target"
+    elif plan_walk_mismatch:
+        pace_note = walk_note
     d = pace_deviation(graded_pace, expected_pace, cls)
     pace = _metric(
         grade_from_deviation(d, widen),
@@ -1254,12 +1318,20 @@ def _select_activity(
     you get it, with n/a where metrics are missing. ``start_time`` is
     'YYYY-MM-DD HH:MM:SS' text, so lexicographic ordering is chronological.
 
-    The date branch takes the day's FIRST session, because the prescription it
-    will be graded against is the day's lowest ``seq`` — the primary/AM session
-    (see ``load_report_card_inputs``). Taking the last one instead paired an
-    evening shakeout with the morning's long-run target and graded the wrong
-    run. The no-argument branch is unaffected: "most recent" genuinely means
-    the latest session.
+    The date branch prefers the day's LONGEST running-effort session (pace-
+    gated via ``is_running_effort``, never the ``activity_type`` label),
+    falling back to the earliest session when NONE of the day's activities
+    measure as running — a genuine walk day must still be gradeable.
+
+    This replaced a bare "first by start_time" rule, whose own justification
+    (an evening shakeout paired with a morning long run) was measured to have
+    the OPPOSITE shape 26 times in the real corpus's 52 multi-activity days:
+    the FIRST session is a walk and the real run comes later. Live cases:
+    2026-07-21 selected a 3.23 mi @ 29:15/mi walk over a 5.95 mi @ 10:42/mi
+    interval run; 2026-07-26 selected a 2.53 mi @ 17:06/mi walk over a 4.00 mi
+    @ 8:56/mi run. Longest (not fastest) among running-effort candidates, so a
+    brief brisk shakeout can't outrank the day's real workout. The no-argument
+    branch is unaffected: "most recent" genuinely means the latest session.
     """
     if activity_id is not None:
         return conn.execute(
@@ -1267,12 +1339,19 @@ def _select_activity(
             (activity_id,),
         ).fetchone()
     if target_date:
-        return conn.execute(
+        rows = conn.execute(
             f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE date = ? "
             "AND distance_meters > 0 AND duration_seconds > 0 "
-            "ORDER BY start_time ASC LIMIT 1",
+            "ORDER BY start_time ASC",
             (target_date,),
-        ).fetchone()
+        ).fetchall()
+        if not rows:
+            return None
+        running = [r for r in rows
+                   if is_running_effort(r["avg_pace_sec_per_km"]) is True]
+        if running:
+            return max(running, key=lambda r: r["distance_meters"])
+        return rows[0]
     return conn.execute(
         f"SELECT {_ACTIVITY_SELECT} FROM activities "
         "WHERE distance_meters > 0 AND duration_seconds > 0 "

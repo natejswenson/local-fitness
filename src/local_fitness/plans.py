@@ -216,18 +216,31 @@ def _foot_distance(activities: list[dict]) -> float:
     )
 
 
-def _normalize_activity_types(activities: list[dict]) -> list[str]:
+def _normalize_activity_types(
+    activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
+) -> list[str]:
     """Normalized, deduped, sorted activity classes for a day: running | walking
-    | other. Surfaced so the plan view/agent can say 'walked' vs 'ran'."""
+    | other. Surfaced so the plan view/agent can say 'walked' vs 'ran'.
+
+    Classified via ``_ran`` (pace-gated), not the raw label. This used to
+    check ``_is_running``/``_is_walking`` directly — Garmin's label, which
+    lies (a walking-desk session logs as ``treadmill_running``) — so the
+    reported class could disagree with the run/walk split fields computed
+    right alongside it. Measured on live data: 4 of 21 graded days on the
+    active plan showed ``actual_activity_types: ["running"]`` sitting beside
+    ``actual_run_distance_m == 0.0`` (100% walking by the pace gate), because
+    this was the one classifier in the module still gated on the label.
+    On-foot activities with no usable pace fall back to the label, same as
+    ``_ran`` itself.
+    """
     classes: set[str] = set()
     for a in activities:
         at = a.get("activity_type")
-        if _is_running(at):
-            classes.add("running")
-        elif _is_walking(at):
-            classes.add("walking")
-        elif at:
-            classes.add("other")
+        if not _is_on_foot(at):
+            if at:
+                classes.add("other")
+            continue
+        classes.add("running" if _ran(a, cfg) else "walking")
     return sorted(classes)
 
 
@@ -1056,7 +1069,7 @@ def _workout_actuals(
         else:
             walk += d
     pace = (dur / (foot / 1000.0)) if foot > 0 else None
-    return foot, run, walk, pace, _normalize_activity_types(day_activities)
+    return foot, run, walk, pace, _normalize_activity_types(day_activities, cfg)
 
 
 def build_plan_detail(

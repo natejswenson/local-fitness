@@ -560,11 +560,50 @@ def test_workout_actuals_returns_foot_run_and_walk_in_one_pass():
     assert walk == pytest.approx(5202.75)
     assert run + walk == pytest.approx(foot)
     assert pace is not None
-    assert types == ["other", "running"]
+    # _MISLABELLED_WALK's own class must reconcile with the run/walk split
+    # above: it contributed 0 to `run` and all of its distance to `walk`, so
+    # it has to report as "walking" here too. Before the pace-gating fix this
+    # read ["other", "running"] — `_normalize_activity_types` classified it by
+    # the "treadmill_running" LABEL alone, disagreeing with the pace-gated
+    # split sitting right next to it in the same tuple.
+    assert types == ["other", "running", "walking"]
 
 
 def test_workout_actuals_pace_is_none_without_foot_distance():
     assert plans._workout_actuals([])[3] is None
+
+
+def test_normalize_activity_types_classifies_by_pace_not_label():
+    """Direct unit test of the classifier itself: a `treadmill_running`-typed
+    row must not report as "running" when its own pace says it was walked."""
+    assert plans._normalize_activity_types([_MISLABELLED_WALK]) == ["walking"]
+    assert plans._normalize_activity_types([_REAL_RUN]) == ["running"]
+
+
+def test_normalize_activity_types_a_100pct_walk_day_reports_walking_only():
+    """The live symptom this fix closes: a day graded 100% walking by the pace
+    gate (`actual_run_distance_m == 0.0`) must not simultaneously report
+    `actual_activity_types: ["running"]` — the two fields have to agree."""
+    day = [_MISLABELLED_WALK]
+    foot, run, walk, _pace, types = plans._workout_actuals(day)
+    assert run == 0.0
+    assert walk == pytest.approx(foot)
+    assert types == ["walking"]
+
+
+def test_normalize_activity_types_a_paceless_row_falls_back_to_the_label():
+    """Mirrors `_ran`'s own fallback: an unknowable mode defers to the label
+    rather than vanishing from either class."""
+    manual = {"activity_type": "running", "distance_meters": 5000.0,
+              "avg_pace_sec_per_km": None}
+    assert plans._normalize_activity_types([manual]) == ["running"]
+
+
+def test_normalize_activity_types_pace_gate_can_be_turned_off():
+    """`cfg.pace_gated_locomotion=False` reverts to the pre-2026-07-22 label
+    classification, same as `_ran` itself."""
+    cfg = plans.GradingConfig(pace_gated_locomotion=False)
+    assert plans._normalize_activity_types([_MISLABELLED_WALK], cfg) == ["running"]
 
 
 # --- A7: the Riegel basis is a measured RUN, and it names itself -------------
