@@ -205,3 +205,133 @@ def test_faithful_percent_citation_is_not_flagged():
     ctx = _ctx(snapshot=[GroundedValue(
         name="sleep_score", value=82, unit="pct", display="82%")])
     assert g.flag(_brief("sleep quality held at 82% overnight"), ctx) == []
+
+
+# --- Sign blindness fix (2026-07-27 facet review) ----------------------------
+# Measured: `flag()` matched on `ax = abs(x)`, so a sign-inverted prose value
+# (TSB "+22.4" cited when the real value is -22.4) read as an EXACT faithful
+# citation — abs(+22.4) == abs(-22.4) — even though a positive vs. negative
+# TSB is the difference between "you're rested, go hard" and "very fatigued,
+# back off". These four cases are the exact evidence from that review,
+# against a real tsb=-22.4.
+
+def _tsb_ctx() -> BriefContext:
+    # Isolated on purpose (no snapshot/steps/sleep noise) — matches how the
+    # evidence was measured: a context where tsb is the only citable number,
+    # so a "wildly wrong" +40.0 doesn't get compared against some OTHER
+    # closer-by-coincidence metric (e.g. rhr=58) instead of tsb itself.
+    return BriefContext(
+        date="2026-06-26", user_name="Nate", candidates=[],
+        training_load=[GroundedValue(name="tsb", value=-22.4, unit="none", display="-22.4")],
+    )
+
+
+def test_correctly_signed_tsb_citation_is_faithful():
+    assert g.flag(_brief("Freshness is -22.4 today"), _tsb_ctx()) == []
+
+
+def test_sign_inverted_exact_magnitude_is_flagged_as_sign_mismatch():
+    # abs(+22.4) == abs(-22.4) — the exact case magnitude-only matching missed.
+    flags = g.flag(_brief("Freshness is +22.4 today"), _tsb_ctx())
+    assert len(flags) == 1
+    assert flags[0].kind == "sign"
+    assert flags[0].nearest_metric == "tsb"
+    assert flags[0].delta == 44.8       # 22.4 - (-22.4), signed
+
+
+def test_sign_inverted_and_wildly_off_magnitude_still_flags_as_sign_mismatch():
+    # rel = (40 - 22.4) / 40 = 0.44 — past the NEARBY_REL magnitude band, but
+    # a sign flip is qualitatively wrong regardless of magnitude drift.
+    flags = g.flag(_brief("Freshness is +40.0 today"), _tsb_ctx())
+    assert len(flags) == 1
+    assert flags[0].kind == "sign"
+    assert flags[0].nearest_metric == "tsb"
+    assert flags[0].delta == 62.4       # 40.0 - (-22.4)
+
+
+def test_same_sign_magnitude_miss_reports_the_real_signed_gap():
+    # A 7% mis-state (real -22.4, cited -24.0): the OLD bug computed
+    # delta = prose - abs(nearest) = -24.0 - 22.4 = -46.4 for a 1.6-unit gap.
+    flags = g.flag(_brief("Freshness is -24.0 today"), _tsb_ctx())
+    assert len(flags) == 1
+    assert flags[0].kind == "value"
+    assert flags[0].nearest_metric == "tsb"
+    assert flags[0].delta == -1.6       # -24.0 - (-22.4), the REAL gap
+
+
+def test_sign_mismatch_band_excludes_a_genuinely_unrelated_number():
+    # rel = (21 - 10) / 21 = 0.524 — past the WIDENED sign-mismatch band too,
+    # so this is just an unrelated number, not a flip of anything.
+    ctx = _ctx(training_load=[GroundedValue(name="tsb", value=-10.0, unit="none", display="-10.0")])
+    assert g.flag(_brief("21 minutes easy today"), ctx) == []
+
+
+def test_duration_composite_does_not_inject_its_two_halves_as_bare_numbers():
+    # "7h 28m" is `_hm()`'s own render for a sleep_seconds display — real
+    # coach prose says this constantly. Before this fix, `_display_numbers`
+    # scraped the rendered STRING and injected bare 7 and 28 into the pool;
+    # now the pool holds the raw seconds value (26,880) instead, and the
+    # tokenizer additionally skips both halves of "7h 28m" in PROSE outright.
+    ctx = _ctx(snapshot=[
+        GroundedValue(name="sleep_baseline", value=26880, unit="sec", display="7h 28m"),
+        GroundedValue(name="intensity_minutes_vigorous", value=52, unit="min", display="52"),
+    ], training_load=[GroundedValue(name="rhr_baseline", value=52, unit="bpm", display="52 bpm")])
+    assert g.flag(_brief("you slept 7h 28m last night"), ctx) == []
+
+
+def test_exact_duplicate_value_across_units_is_still_faithful_not_flagged():
+    # The measured collision: intensity_minutes_vigorous=52 (min) and
+    # rhr_baseline=52 (bpm) are the SAME number in different units. Citing
+    # either exactly must read as faithful — an exact match always wins over
+    # any near-but-unequal match in a different unit.
+    ctx = _ctx(snapshot=[GroundedValue(name="intensity_minutes_vigorous", value=52, unit="min", display="52")],
+               training_load=[GroundedValue(name="rhr_baseline", value=52, unit="bpm", display="52 bpm")])
+    assert g.flag(_brief("52 vigorous minutes logged today"), ctx) == []
+
+
+# --- _union() additions: workouts_14d / plan_today / anomalies --------------
+
+def test_workouts_14d_citation_is_grounded_not_flagged():
+    ctx = _ctx(workouts_14d=[
+        {"date": "2026-06-19", "type": "long_run", "distance_mi": 8.0, "avg_hr": 132},
+    ])
+    assert g.flag(_brief("yesterday's 8mi at HR 132 was solid"), ctx) == []
+
+
+def test_workouts_14d_off_value_is_flagged_against_the_workout():
+    ctx = _ctx(workouts_14d=[
+        {"date": "2026-06-19", "type": "long_run", "distance_mi": 8.0, "avg_hr": 132},
+    ])
+    flags = g.flag(_brief("that was an 8.9mi effort"), ctx)
+    assert len(flags) == 1
+    assert flags[0].nearest_metric == "workouts_14d.distance_mi"
+
+
+def test_plan_today_target_distance_is_grounded():
+    ctx = _ctx(plan_today={
+        "active": True, "adherence_pct": 88,
+        "today": {"date": "2026-06-26", "target_distance_m": 9656.064, "type": "long_run"},
+    })
+    # 9656.06 m == 6.00 mi — the generator would cite the converted figure.
+    assert g.flag(_brief("today's plan calls for 6.0 miles"), ctx) == []
+
+
+def test_plan_today_inactive_contributes_nothing_to_the_pool():
+    ctx = _ctx(plan_today={"active": False})
+    assert g._plan_today_pool_entries(ctx.plan_today) == []
+
+
+def test_anomalies_citation_is_grounded():
+    ctx = _ctx(anomalies=[
+        {"date": "2026-06-24", "metric": "rhr", "value": 61, "baseline": 53, "sd_distance": 1.76},
+    ])
+    assert g.flag(_brief("RHR spiked to 61, about 1.76 SD above your baseline"), ctx) == []
+
+
+def test_anomalies_off_value_is_flagged():
+    ctx = _ctx(anomalies=[
+        {"date": "2026-06-24", "metric": "rhr", "value": 61, "baseline": 53, "sd_distance": 1.76},
+    ])
+    flags = g.flag(_brief("RHR spiked to 65 this morning"), ctx)
+    assert len(flags) == 1
+    assert flags[0].nearest_metric == "anomalies.rhr"
