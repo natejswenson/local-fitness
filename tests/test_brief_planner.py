@@ -347,11 +347,15 @@ def test_ctl_at_or_before_returns_latest_row_on_or_before_anchor(tmp_path):
 def test_ctl_pct_change_computed_from_baseline_history(tmp_path):
     p = tmp_path / "db.db"
     db.init_schema(p)
-    today, ago = _FIXED.isoformat(), (_FIXED - timedelta(days=14)).isoformat()
+    today = _FIXED.isoformat()
+    # Fix 9: "now" is current_form (the last COMPLETE day = yesterday), never
+    # today's own row, so the "now" ctl lives at yesterday, not `today`.
+    yesterday = (_FIXED - timedelta(days=1)).isoformat()
+    ago = (_FIXED - timedelta(days=14)).isoformat()
     with db.connect(p) as conn:
         conn.execute("INSERT INTO settings (key, value) VALUES ('daily_step_goal', '10000')")
         conn.execute("INSERT INTO daily_metrics (date, rhr) VALUES (?, 55)", (today,))
-        conn.execute("INSERT INTO baselines (date, ctl) VALUES (?, 12.0)", (today,))
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES (?, 12.0)", (yesterday,))
         conn.execute("INSERT INTO baselines (date, ctl) VALUES (?, 10.0)", (ago,))
     ctx = bp.assemble_brief_context(db_path=p, today=today)
     workout = next(c for c in ctx.candidates if c.category == "workout")
@@ -440,7 +444,7 @@ def _activity_db(tmp_path, rows, *, today=_FIXED, name="acts.db"):
 def _signals(tmp_path, rows, *, today=_FIXED, name="acts.db"):
     p = _activity_db(tmp_path, rows, today=today, name=name)
     with db.connect(p) as conn:
-        return bp._compute_signals(conn, today.isoformat(), None, 10000, None, None)
+        return bp._compute_signals(conn, today.isoformat(), None, None, 10000, None, None)
 
 
 def test_walking_pad_sessions_do_not_count_as_runs_or_reset_the_gap(tmp_path):
@@ -503,6 +507,72 @@ def test_signals_query_selects_pace_so_the_gate_is_not_a_silent_no_op(tmp_path):
     assert "long_run_absence" in conditioning.fired_triggers
 
 
+# === 4b. Fix 8 — partial-day metrics excluded from _recent's rolling window =
+def _daily_metrics_db(tmp_path, rows, *, today=_FIXED, name="daily.db"):
+    """A DB carrying only daily_metrics rows. ``rows`` are (days_ago, avg_stress, steps)."""
+    p = tmp_path / name
+    db.init_schema(p)
+    with db.connect(p) as conn:
+        for days_ago, stress, steps in rows:
+            d = (today - timedelta(days=days_ago)).isoformat()
+            conn.execute(
+                "INSERT INTO daily_metrics (date, avg_stress, steps) VALUES (?, ?, ?)",
+                (d, stress, steps),
+            )
+    with db.connect(p) as conn:
+        return bp._compute_signals(conn, today.isoformat(), None, None, 10000, None, None)
+
+
+def test_recent_excludes_today_for_partial_day_metrics():
+    # avg_stress and steps are both in tools.PARTIAL_DAY_METRICS.
+    assert "avg_stress" in bp.PARTIAL_DAY_METRICS
+    assert "steps" in bp.PARTIAL_DAY_METRICS
+
+
+def test_stress_7d_avg_excludes_todays_partial_reading(tmp_path):
+    # Today's stress is a partial overnight-only read (17); every complete day
+    # this week ran 24-32. The old behavior averaged all 7 including today's
+    # 17, biasing the recovery trigger optimistically. Fixed: the average is
+    # computed over the 7 COMPLETE days (yesterday..7 days ago), today's 17
+    # never enters it.
+    rows = [(0, 17, None)] + [(d, 28, None) for d in range(1, 8)]
+    sig = _daily_metrics_db(tmp_path, rows)
+    assert sig.stress_7d_avg == 28.0  # today's 17 excluded entirely
+
+
+def test_steps_7d_avg_excludes_todays_null_reading(tmp_path):
+    # Today's steps row often doesn't exist yet at 06:30 (sync hasn't run) —
+    # _recent must still average over 7 COMPLETE prior days, not silently
+    # produce a 6-day average mislabeled as 7.
+    rows = [(d, None, 12000) for d in range(1, 8)]
+    sig = _daily_metrics_db(tmp_path, rows)
+    assert sig.steps_7d_avg == 12000.0
+
+
+def test_bb_low_nights_still_counts_today_body_battery_is_not_partial(tmp_path):
+    # body_battery_max is deliberately EXCLUDED from PARTIAL_DAY_METRICS (Fix
+    # 1's scope, not reopened here) — bb_low_nights must still include today.
+    p = tmp_path / "bb.db"
+    db.init_schema(p)
+    with db.connect(p) as conn:
+        for d in range(3):  # today, -1, -2: all under the bb_low_max=50 gate
+            conn.execute(
+                "INSERT INTO daily_metrics (date, body_battery_max) VALUES (?, ?)",
+                ((_FIXED - timedelta(days=d)).isoformat(), 40),
+            )
+        sig = bp._compute_signals(conn, _FIXED.isoformat(), None, None, 10000, None, None)
+    assert sig.bb_low_nights == 3  # today counted — body_battery_max is not partial
+
+
+def test_stress_trigger_fires_on_the_honest_complete_day_average(tmp_path):
+    # End-to-end: a partial today (17) diluting a genuinely elevated week
+    # (every complete day > 40) must not mask the bb_or_stress_low trigger.
+    rows = [(0, 17, None)] + [(d, 45, None) for d in range(1, 8)]
+    sig = _daily_metrics_db(tmp_path, rows)
+    assert sig.stress_7d_avg == 45.0
+    assert bp.bb_or_stress_low(sig.bb_low_nights, sig.stress_7d_avg) is True
+
+
 # === 5. freshness + continuity fields ======================================
 
 def _stale_db(tmp_path, *, frontier_days_ago: int, tsb: float | None):
@@ -537,7 +607,12 @@ def test_tsb_zone_reads_the_zone_not_the_none_sentence(tmp_path):
     assert ctx.tsb_zone is None
     assert ctx.baseline_stale_days == 0
 
-    fresh = _stale_db(tmp_path / "b", frontier_days_ago=0, tsb=8.0)
+    # Fix 9: "current form" is the last COMPLETE day, so a "fresh" read needs
+    # its baselines row dated BEFORE `today` (frontier_days_ago=0 puts the row
+    # ON today, where current_form can never resolve — that's the "no data"
+    # case just asserted above, not a "fresh" one).
+
+    fresh = _stale_db(tmp_path / "b", frontier_days_ago=1, tsb=8.0)
     assert bp.assemble_brief_context(db_path=fresh,
                                      today=_FIXED.isoformat()).tsb_zone == "fresh"
 

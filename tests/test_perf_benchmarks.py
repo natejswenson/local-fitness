@@ -183,7 +183,7 @@ def test_days_since_last_run_none_when_run_predates_bound(tmp_path):
             (today.isoformat(),),
         )
         sig = brief_planner._compute_signals(
-            conn, today.isoformat(), baseline=None, step_goal=10000,
+            conn, today.isoformat(), baseline=None, current_form=None, step_goal=10000,
             plan_today=None, days_to_race=None,
         )
     assert sig.days_since_last_run is None
