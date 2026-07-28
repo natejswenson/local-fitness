@@ -509,6 +509,27 @@ These are settled — don't redesign without a reason.
   the memo. The monitor conn must NEVER write (data_version only reports
   OTHER connections' commits) and re-opens if `db.get_db_path()` changes.
   `_persona_cache_clear()` resets it (tests use an autouse fixture).
+- **The container MUST set `TZ`; UTC is not harmless** (0.39.0). A container
+  with `TZ` unset runs UTC while the host CLI uses the machine's real zone,
+  so from ~19:00 America/Chicago until midnight the container's
+  `date.today()` is already TOMORROW — and this app is date-anchored
+  everywhere ("today", "the last complete day", `ledger`'s as-of-yesterday
+  streaks, every trailing trend window). Measured 2026-07-27 19:59 CDT
+  (container: 2026-07-28 00:59 UTC), same image and same bind-mounted DB:
+  host read `avg_stress` 28 (−12.5%) / TSB −22.41 "very fatigued" /
+  `body_battery_max` 55, container read 17 (−46.9%) / −12.74 "fatigued" /
+  `None`. The container was reproducing the exact false-recovery reading
+  0.39.0 had just fixed. **Nothing errors** — you get a confident answer
+  computed against the wrong day. Two reasons it hid for so long: the 06:30
+  launchd brief is unaffected (UTC and Central share a calendar date at
+  that hour), so the flagship surface looked fine while evening chat, report
+  cards and PDF renders drifted; and 0.39.0 raised the stakes by anchoring
+  the partial-day and current-form fixes explicitly to "the last COMPLETE
+  day". Wired as `TZ=${LOCAL_FITNESS_TZ:-America/Chicago}` in the traefik
+  repo's compose `environment:` block, documented in `docs/deployment.md`
+  and `.env.example`. Verify with `docker exec <container> date` against
+  the host's `date` — they must match. The host CLI needs nothing; it
+  inherits the OS zone.
 - **Path defaults**: `db.py`, `notes.py`, `briefing.py` all resolve to
   `_PROJECT_ROOT / ...` when env vars are unset.
 - **MCP tool surface can trigger a Garmin sync, not just read.** `agent/tools.py`'s
