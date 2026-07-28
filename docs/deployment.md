@@ -30,6 +30,11 @@ services:
     build:
       context: ./../local-fitness
     environment:
+      # Local timezone — REQUIRED, not cosmetic. A container with TZ
+      # unset runs UTC, so from ~19:00 local until midnight (for a
+      # US-Central deployer) its date.today() is already TOMORROW and
+      # every date-anchored read shifts a day. Set it to YOUR zone.
+      - TZ=${LOCAL_FITNESS_TZ:-America/Chicago}
       # Garmin Connect (when the container does its own pulls — the
       # host CLI's macOS Keychain isn't reachable from a Linux container)
       - GARMIN_EMAIL=${LOCAL_FITNESS_GARMIN_EMAIL}
@@ -124,3 +129,37 @@ neither `LOCAL_FITNESS_API_TOKEN` nor an MCP allowed-host, because the
 composer reaches the tools in-process rather than over the `/mcp/` endpoint.
 For the container, `CLAUDE_CODE_OAUTH_TOKEN` is already wired into the compose
 `environment:` block above; for the host CLI it goes in this repo's `.env`.
+
+## Set `TZ` on the container — it is load-bearing
+
+A Docker container with `TZ` unset runs **UTC**. The host CLI picks up the
+machine's real zone, so the two disagree for part of every day, and the app
+is full of date-anchored reads: "today", "the last complete day", streaks
+computed as-of-yesterday, and the trailing windows behind every trend.
+
+Measured on the reference deployment (America/Chicago) at 2026-07-27
+19:59 local, where the container believed it was 2026-07-28 00:59 — same
+image, same code, same bind-mounted database:
+
+| | host (correct local date) | container (UTC) |
+|---|---|---|
+| Avg stress vs baseline | 28, −12.5% | 17, −46.9% |
+| Body Battery max | 55 | `None` |
+| Current form (TSB) | −22.41, "very fatigued" | −12.74, "fatigued" |
+
+Those aren't rounding differences — they are opposite coaching calls, and
+the UTC column is the exact false-recovery reading 0.39.0 was written to
+eliminate.
+
+Two reasons this is easy to miss. First, a 06:30 brief is unaffected for
+any zone west of UTC that still shares the calendar date at that hour, so
+the flagship surface looks correct while evening chat, report cards and
+PDF renders drift. Second, nothing errors — you get a confident answer
+computed against the wrong day.
+
+Set `TZ` to your own zone (the compose snippet above defaults to
+`America/Chicago` and reads `LOCAL_FITNESS_TZ` if you set it). Verify with:
+
+```bash
+docker exec <container> date        # must match `date` on the host
+```
