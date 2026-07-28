@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +118,146 @@ def _to_real(v: Any) -> float | None:
         return None
 
 
+def _bb_minmax_from_entries(bb: Any) -> tuple[int | None, int | None]:
+    """Derive the day's body-battery min/max from the per-minute level samples.
+
+    Confirmed against a live stored payload (2026-07-27): Garmin's
+    ``get_body_battery`` response does NOT expose ``min``/``max`` keys — only
+    ``charged``/``drained`` — which is why those two columns have been NULL on
+    every row ever ingested. The per-minute levels ARE present, under each
+    entry's ``bodyBatteryValuesArray`` (``[timestamp, level]`` pairs) — the
+    same array ``_ingest_day`` already walks to populate
+    ``body_battery_samples`` — so the rollup is derived from there instead of
+    adding a second Garmin API call. Returns ``(None, None)`` when there are no
+    usable samples, never ``(0, 0)``.
+    """
+    levels: list[float] = []
+    if isinstance(bb, list):
+        for entry in bb:
+            if not isinstance(entry, dict):
+                continue
+            for sample in entry.get("bodyBatteryValuesArray") or []:
+                if (
+                    isinstance(sample, (list, tuple))
+                    and len(sample) >= 2
+                    and isinstance(sample[1], (int, float))
+                ):
+                    levels.append(sample[1])
+    if not levels:
+        return None, None
+    return int(min(levels)), int(max(levels))
+
+
+# Body-battery/stress sample rows this module writes to. Table names are
+# never attacker/user-controlled here — both call sites below pass a literal
+# — but every DB-write helper in this codebase whitelists its table/column
+# names against a frozen set on principle (see agent/tools.py), so this one
+# does too rather than being the one exception.
+_SAMPLE_TABLES = frozenset({"body_battery_samples", "stress_samples"})
+
+
+def _entry_local_delta(entry: dict) -> timedelta | None:
+    """The (local − GMT) wall-clock delta a Garmin wellness-service entry's
+    own timestamps carry.
+
+    Body-battery AND stress payloads (both under
+    ``/wellness-service/wellness/...``) carry a ``startTimestampGMT`` /
+    ``startTimestampLocal`` pair for the exact same instant — confirmed
+    directly against a live stored body-battery payload (2026-07-27):
+    ``startTimestampGMT="2026-05-15T05:00:00.0"`` /
+    ``startTimestampLocal="2026-05-15T00:00:00.0"``, a -5h (CDT) delta. Their
+    difference IS that day's true local UTC offset (DST-correct), so a
+    sample's wall-clock time never has to guess at the INGESTING PROCESS's
+    timezone the way ``datetime.fromtimestamp(ts / 1000)`` (no ``tz=``) did —
+    that call silently applies whatever timezone the calling process
+    happens to run in, which is why the exact same Garmin payload landed a
+    different stored wall-clock depending on whether the pull ran on the
+    host (America/Chicago) or in the container (``TZ=UTC``): a measured
+    +5h split across ~2156 days, corrupting 6,400 stress_samples rows and
+    11,605 body_battery_samples rows onto the wrong calendar date.
+
+    Stress's raw payload was never persisted to ``raw_json`` before this
+    fix (see ``_ingest_day``), so unlike body_battery this exact key
+    presence could not be directly verified against this account's stored
+    data — it is inferred from the shared wellness-service DTO family. If a
+    stress payload shape ever lacks these keys, this returns None and the
+    caller degrades to the pre-fix conversion for that shape only (never a
+    regression from today's behavior; see ``_store_sample``).
+
+    Returns None when either key is missing or unparseable.
+    """
+    gmt_s = entry.get("startTimestampGMT")
+    local_s = entry.get("startTimestampLocal")
+    if not isinstance(gmt_s, str) or not isinstance(local_s, str):
+        return None
+    try:
+        return datetime.fromisoformat(local_s) - datetime.fromisoformat(gmt_s)
+    except ValueError:
+        return None
+
+
+def _local_iso_from_epoch_ms(ts_ms: float, delta: timedelta) -> str:
+    """Epoch-ms (Garmin's per-sample timestamps are true UTC) → local
+    wall-clock ISO string.
+
+    Uses an EXPLICIT UTC-aware conversion (``tz=timezone.utc``) plus the
+    payload's own ``delta`` (see ``_entry_local_delta``), then drops tzinfo
+    to store a naive local wall-clock — never the bare
+    ``datetime.fromtimestamp(ts / 1000)`` the old code used, which silently
+    keys off the calling process's system timezone instead of the data's
+    own local offset.
+    """
+    utc_dt = datetime.fromtimestamp(ts_ms / 1000, tz=UTC).replace(tzinfo=None)
+    return (utc_dt + delta).isoformat()
+
+
+def _store_sample(
+    conn, table: str, cdate: date, ts: Any, val: Any, delta: timedelta | None
+) -> None:
+    """INSERT OR REPLACE one (date, timestamp, value) sample row.
+
+    When ``delta`` is available (the payload carried its own GMT/local
+    timestamps — the normal case), the sample is filed under ITS OWN
+    derived local date, never blindly forced under ``cdate`` (the day being
+    requested) — so a sample can never be filed under a date it doesn't
+    belong to. A derived date more than one day away from ``cdate`` signals
+    a garbled delta rather than a legitimate boundary sample (Garmin's own
+    per-entry window is exactly midnight-to-midnight local, so a
+    well-formed sample is never more than one day off even at the
+    boundary); that row is dropped (logged) rather than risk filing
+    corrupted data.
+
+    When no delta is available (the payload lacks the GMT/local keys — not
+    observed on a real payload but kept as a safety net for an
+    unanticipated shape), the sample falls back to the pre-fix host-tz
+    conversion under ``cdate`` so behavior for that shape is unchanged from
+    today (never a NEW regression; it just doesn't get the fix either).
+    """
+    if table not in _SAMPLE_TABLES:
+        raise ValueError(f"unexpected sample table: {table!r}")
+    if delta is not None:
+        local_iso = _local_iso_from_epoch_ms(ts, delta)
+        sample_date_str = local_iso[:10]
+        try:
+            derived = date.fromisoformat(sample_date_str)
+        except ValueError:
+            derived = None
+        if derived is None or abs((derived - cdate).days) > 1:
+            LOG.warning(
+                "%s sample for %s derived date %s (>1 day away) — dropping "
+                "rather than risk filing it under a corrupted delta",
+                table, cdate.isoformat(), sample_date_str,
+            )
+            return
+    else:
+        sample_date_str = cdate.isoformat()
+        local_iso = datetime.fromtimestamp(ts / 1000).isoformat()
+    conn.execute(
+        f"INSERT OR REPLACE INTO {table} (date, timestamp, value) VALUES (?, ?, ?)",
+        (sample_date_str, local_iso, val),
+    )
+
+
 def _ingest_day(client: Garmin, conn, cdate: date) -> None:
     cdate_str = cdate.isoformat()
 
@@ -136,12 +276,33 @@ def _ingest_day(client: Garmin, conn, cdate: date) -> None:
 
     bb = _safe(client.get_body_battery, cdate_str, cdate_str)
     bb_first = bb[0] if isinstance(bb, list) and bb else {}
+    # Prefer explicit min/max keys in case a future/older payload shape ever
+    # carries them directly; the live payload doesn't (see
+    # _bb_minmax_from_entries), so this falls through to the derived values
+    # on every real pull today.
+    bb_explicit_min = _to_int(bb_first.get("min")) if isinstance(bb_first, dict) else None
+    bb_explicit_max = _to_int(bb_first.get("max")) if isinstance(bb_first, dict) else None
+    bb_derived_min, bb_derived_max = _bb_minmax_from_entries(bb)
 
     max_metrics = _safe(client.get_max_metrics, cdate_str)
     vo2 = None
     if isinstance(max_metrics, list) and max_metrics:
         generic = (max_metrics[0] or {}).get("generic") or {}
         vo2 = generic.get("vo2MaxValue")
+
+    # Fetched here (before raw_json is built) rather than after the daily_metrics
+    # INSERT, so the raw stress payload can be preserved in raw_json alongside
+    # summary/sleep/body_battery. It never was before 0.39.0, and that omission
+    # is why the ~6,400 stress_samples rows already misfiled by the timezone bug
+    # (see _entry_local_delta) are UNREPAIRABLE: their original epochs are gone.
+    # Storing the payload from here on is what makes a future repair possible at
+    # all. No such repair exists yet — one was written for 0.39.0 and withdrawn
+    # because rebuilding a day's samples from raw_json destroyed 699 of 13,603
+    # body-battery rows: raw_json holds only the LAST pull's payload for a day,
+    # while the samples table accumulates the union across every pull of it
+    # (6 stored against 16 in the table, measured on 2026-07-26). Any repair
+    # must correct timestamps in place, never rebuild a day from the payload.
+    stress = _safe(client.get_stress_data, cdate_str)
 
     daily = {
         "date": cdate_str,
@@ -155,8 +316,8 @@ def _ingest_day(client: Garmin, conn, cdate: date) -> None:
         "rhr": _to_int(summary.get("restingHeartRate")),
         "avg_stress": _to_int(summary.get("averageStressLevel")),
         "max_stress": _to_int(summary.get("maxStressLevel")),
-        "body_battery_min": _to_int(bb_first.get("min") if isinstance(bb_first, dict) else None),
-        "body_battery_max": _to_int(bb_first.get("max") if isinstance(bb_first, dict) else None),
+        "body_battery_min": bb_explicit_min if bb_explicit_min is not None else bb_derived_min,
+        "body_battery_max": bb_explicit_max if bb_explicit_max is not None else bb_derived_max,
         "body_battery_charged": _to_int(bb_first.get("charged") if isinstance(bb_first, dict) else None),
         "body_battery_drained": _to_int(bb_first.get("drained") if isinstance(bb_first, dict) else None),
         "steps": _to_int(summary.get("totalSteps")),
@@ -169,7 +330,9 @@ def _ingest_day(client: Garmin, conn, cdate: date) -> None:
         "fitness_age": None,
         "intensity_minutes_moderate": _to_int(summary.get("moderateIntensityMinutes")),
         "intensity_minutes_vigorous": _to_int(summary.get("vigorousIntensityMinutes")),
-        "raw_json": json.dumps({"summary": summary, "sleep": sleep, "body_battery": bb}),
+        "raw_json": json.dumps(
+            {"summary": summary, "sleep": sleep, "body_battery": bb, "stress": stress}
+        ),
     }
 
     cols = ", ".join(daily.keys())
@@ -194,25 +357,20 @@ def _ingest_day(client: Garmin, conn, cdate: date) -> None:
         for entry in bb:
             if not isinstance(entry, dict):
                 continue
+            delta = _entry_local_delta(entry)
             for sample in entry.get("bodyBatteryValuesArray") or []:
                 if not (isinstance(sample, (list, tuple)) and len(sample) >= 2):
                     continue
                 ts, val = sample[0], sample[1]
-                conn.execute(
-                    "INSERT OR REPLACE INTO body_battery_samples (date, timestamp, value) VALUES (?, ?, ?)",
-                    (cdate_str, datetime.fromtimestamp(ts / 1000).isoformat(), val),
-                )
+                _store_sample(conn, "body_battery_samples", cdate, ts, val, delta)
 
-    stress = _safe(client.get_stress_data, cdate_str)
     if isinstance(stress, dict):
+        delta = _entry_local_delta(stress)
         for sample in stress.get("stressValuesArray") or []:
             if not (isinstance(sample, (list, tuple)) and len(sample) >= 2):
                 continue
             ts, val = sample[0], sample[1]
-            conn.execute(
-                "INSERT OR REPLACE INTO stress_samples (date, timestamp, value) VALUES (?, ?, ?)",
-                (cdate_str, datetime.fromtimestamp(ts / 1000).isoformat(), val),
-            )
+            _store_sample(conn, "stress_samples", cdate, ts, val, delta)
 
 
 def _ingest_activity_range(client: Garmin, conn, start: date, end: date) -> int:
@@ -319,6 +477,54 @@ def _ingest_activity_range(client: Garmin, conn, start: date, end: date) -> int:
         n += 1
         time.sleep(0.3)
     return n
+
+
+def recompute_body_battery_minmax(through: date | None = None) -> int:
+    """Backfill ``daily_metrics.body_battery_min/max`` from stored samples.
+
+    ``_ingest_day`` only started deriving these two columns correctly once
+    ``_bb_minmax_from_entries`` existed (they were NULL on every historical
+    row before that). This recomputes them for existing rows from the
+    per-minute ``body_battery_samples`` the daily pull already wrote, mirroring
+    ``ingest.baselines.recompute()``'s pattern: explicit, idempotent, invoked
+    deliberately — it does NOT run automatically as part of ``pull()``, same
+    as baselines' recompute isn't auto-triggered by every ingest.
+
+    Only fills the two body-battery columns and only where at least one is
+    currently NULL (the ``WHERE`` clause below); ``COALESCE(col, ?)`` keeps
+    the existing value when it's already non-NULL, so a re-run never
+    overwrites a good value and a second call is a no-op (idempotent).
+
+    Args:
+        through: only backfill dates on/before this date (default: no cap —
+            every date with samples). Matches ``pull(through=...)``'s shape.
+
+    Returns the number of ``daily_metrics`` rows touched.
+    """
+    with db.connect() as conn:
+        query = (
+            "SELECT date, MIN(value) AS min_v, MAX(value) AS max_v "
+            "FROM body_battery_samples WHERE value IS NOT NULL"
+        )
+        params: tuple = ()
+        if through is not None:
+            query += " AND date <= ?"
+            params = (through.isoformat(),)
+        query += " GROUP BY date"
+        rollups = conn.execute(query, params).fetchall()
+
+        updated = 0
+        for r in rollups:
+            cur = conn.execute(
+                "UPDATE daily_metrics SET "
+                "body_battery_min = COALESCE(body_battery_min, ?), "
+                "body_battery_max = COALESCE(body_battery_max, ?) "
+                "WHERE date = ? AND (body_battery_min IS NULL OR body_battery_max IS NULL)",
+                (r["min_v"], r["max_v"], r["date"]),
+            )
+            updated += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    LOG.info("Backfilled body_battery_min/max for %d date(s)", updated)
+    return updated
 
 
 FRESHNESS_WINDOW_DAYS = 3

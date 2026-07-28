@@ -28,7 +28,7 @@ from typing import Any
 
 from .. import db, notes
 from . import briefs, interpret, units
-from .tools import DAILY_NUMERIC_METRICS
+from .tools import DAILY_NUMERIC_METRICS, PARTIAL_DAY_METRICS
 
 # Explicit metric → (baseline mean column, baseline sd column | None). Do NOT
 # derive these from the metric name: avg_stress → stress_60day_mean breaks the
@@ -92,6 +92,32 @@ def _baseline_row(conn, today: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def _baseline_row_before(conn, today: str) -> dict[str, Any] | None:
+    """Latest baselines row STRICTLY BEFORE `today` — the last COMPLETE day's
+    training-load state (Fix 9, 2026-07-27).
+
+    ``_baseline_row`` (on/before today) is right for the 60-day MEAN reference
+    columns (rhr_60day_mean etc.) — those windows already exclude the target
+    day from their own average (``build_baseline_rows`` admits rows with
+    ``date < d``), so a mean "as of today" is a legitimate same-day reference.
+    CTL/ATL/TSB are different: ``baselines.recompute`` walks forward day by
+    day feeding each day's OWN ``training_load`` into the EWMA, so TODAY's row
+    assumes today's training_load is whatever has posted so far — 0 on a
+    typical morning read, before any activity syncs. Reporting that row as
+    "current form" pre-credits a zero-load rest day that hasn't happened:
+    measured live, TSB read -12.74 today vs -22.41 yesterday, a swing large
+    enough to cross the very-fatigued/fatigued zone boundary, purely because
+    no run had posted yet. "Current form" is therefore always the latest row
+    with date < today (the standard Banister/TrainingPeaks convention —
+    stable across the day, immune to same-day sync order).
+    """
+    row = conn.execute(
+        "SELECT * FROM baselines WHERE date < ? ORDER BY date DESC LIMIT 1",
+        (today,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def _tsb_interpretation(tsb: float | None) -> str:
     """Plain-English read of training stress balance.
 
@@ -109,7 +135,20 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
     ``today``, its last day) up front; today's row and each trend metric's
     series are then sliced out of that single result set in Python, with
     per-column null-filtering standing in for the old per-metric ``WHERE
-    <metric> IS NOT NULL`` clause."""
+    <metric> IS NOT NULL`` clause.
+
+    Fix 8 (2026-07-27): for a same-day running-tally metric
+    (``tools.PARTIAL_DAY_METRICS`` — steps, avg_stress, max_stress,
+    active_calories, intensity minutes, body_battery_charged/drained),
+    today's value is a PARTIAL number all day (Garmin accumulates it through
+    the day), so any DERIVED comparison — a baseline_delta % or a trend_arrow
+    slope — anchors on YESTERDAY instead. Measured live: avg_stress read 17
+    off 50 overnight samples (00:00-02:27) against a 32 baseline, narrated as
+    "-47%, recovery holding" in a 06:30 brief, when every complete day that
+    week ran 24-32. Raw-treatment metrics (no comparison to get wrong) keep
+    today's live number — a mid-day "how are my steps so far" answer must not
+    silently become yesterday's — but carry ``partial_today: true`` so a
+    caller knows it's still accumulating."""
     # Window is relative to the passed `today`, NOT wall-clock — so an
     # injected `today` (fixtures / brief_planner) is reproducible.
     cutoff = (date.fromisoformat(today) - timedelta(days=_TREND_WINDOW_DAYS)).isoformat()
@@ -121,69 +160,120 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
         ).fetchall()
     ]
     today_row = next((r for r in window_rows if r["date"] == today), {})
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    yesterday_row = next((r for r in window_rows if r["date"] == yesterday), {})
 
     rows: list[dict[str, Any]] = []
     for metric in sorted(DAILY_NUMERIC_METRICS):
+        is_partial = metric in PARTIAL_DAY_METRICS
         value = today_row.get(metric)
 
         if metric in _BASELINE_DELTA_MAP:
             mean_col, _sd_col = _BASELINE_DELTA_MAP[metric]
             base_val = baseline.get(mean_col) if baseline else None
+            cmp_value = yesterday_row.get(metric) if is_partial else value
             delta_pct: float | None = None
             arrow: str | None = None
-            if value is not None and base_val:
-                delta_pct = round((value - base_val) / base_val * 100, 1)
-                arrow = _arrow(value - base_val)
+            if cmp_value is not None and base_val:
+                delta_pct = round((cmp_value - base_val) / base_val * 100, 1)
+                arrow = _arrow(cmp_value - base_val)
             row = {
                 "metric": metric,
-                "value": value,
+                "value": cmp_value,
                 "treatment": "baseline_delta",
                 "baseline": base_val,
                 "delta_pct": delta_pct,
                 "arrow": arrow,
             }
+            if is_partial:
+                row["partial_today_excluded"] = True
             if metric == "sleep_seconds":
                 # Sleep renders as "7h 33m", not raw seconds or format_duration's
                 # "7:33:00" run-duration shape — units.format_hm is the single
                 # source (brief_planner._hm delegates to it), so the brief's
                 # grounding pool and this snapshot row agree by construction.
-                row["value_formatted"] = units.format_hm(value)
+                row["value_formatted"] = units.format_hm(cmp_value)
                 row["baseline_formatted"] = units.format_hm(base_val)
             rows.append(row)
             continue
 
         if metric in _TREND_METRICS:
-            series = [r[metric] for r in window_rows if r.get(metric) is not None]
-            rows.append({
+            cmp_value = yesterday_row.get(metric) if is_partial else value
+            series = [
+                r[metric] for r in window_rows
+                if r.get(metric) is not None and (not is_partial or r["date"] != today)
+            ]
+            row = {
                 "metric": metric,
-                "value": value,
+                "value": cmp_value,
                 "treatment": "trend_arrow",
                 "arrow": _slope_arrow(series),
-            })
+            }
+            if is_partial:
+                row["partial_today_excluded"] = True
+            rows.append(row)
             continue
 
-        rows.append({"metric": metric, "value": value, "treatment": "raw"})
+        row = {"metric": metric, "value": value, "treatment": "raw"}
+        if is_partial and value is not None:
+            row["partial_today"] = True
+        rows.append(row)
 
     return rows
 
 
-def _training_load(baseline: dict[str, Any] | None, today: str) -> dict[str, Any]:
-    """CTL/ATL/TSB from the latest baselines row + a plain-English read.
+def _projected_end_of_day(today_row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Today's OWN baselines row, if one exists, labelled as what it is: a
+    same-day PROJECTION that assumes no further training_load posts today —
+    never the "current form" read (see ``_training_load``)."""
+    if not today_row:
+        return None
+    tsb = today_row.get("tsb")
+    return {
+        "ctl": today_row.get("ctl"),
+        "atl": today_row.get("atl"),
+        "tsb": tsb,
+        "interpretation": _tsb_interpretation(tsb),
+    }
 
-    Carries the row's own ``as_of`` date and ``baseline_stale_days`` (days
-    between ``today`` and that row, floored at 0) so a downstream surface can
-    say "as of Monday" and flag a frozen data frontier. TSB decays daily even
-    with zero workouts (ATL's 7-day EWMA fades faster than CTL's 42-day one),
-    so a stale baselines row served as *current* reports the wrong freshness
-    and zone — the same orphaned-data failure the brief-side
-    ``latest_brief_date``/``brief_stale_days`` fields exist to expose.
+
+def _training_load(
+    baseline: dict[str, Any] | None, today: str,
+    current_form: dict[str, Any] | None = None, today_row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """CTL/ATL/TSB "current form" + a plain-English read, plus today's own
+    row exposed separately as an explicit projection.
+
+    Fix 9 (2026-07-27): ``baselines.recompute`` walks forward day by day
+    feeding each day's OWN ``training_load`` into the CTL/ATL EWMA, so
+    TODAY's baselines row assumes today's training_load is whatever has
+    posted so far — 0 on a typical morning read, before any activity syncs.
+    Reporting that row as "current form" pre-credits a zero-load rest day
+    that hasn't happened: measured live, TSB read -12.74 today vs -22.41
+    yesterday, crossing the very-fatigued/fatigued zone boundary purely
+    because no run had posted yet, a swing that reverses the moment the
+    day's session logs. So ``ctl``/``atl``/``tsb`` here are ALWAYS the last
+    COMPLETE day's values (``current_form`` — see ``_baseline_row_before``,
+    the standard Banister/TrainingPeaks convention, stable across the day);
+    today's own row, if any, rides along under ``projected_end_of_day``
+    rather than being silently dropped.
+
+    ``as_of``/``baseline_stale_days`` are DELIBERATELY UNCHANGED — they still
+    measure the true data-pipeline frontier from ``baseline`` (latest row
+    on/before today), not the current-form date, so a caller can still tell
+    "the pipeline hasn't run in 3 days" (a real alarm) apart from "current
+    form is, by design, always at least one day behind" (never an alarm).
+    Conflating the two would either kill the frozen-data-frontier warning
+    (if anchored to current_form, which is never `today`) or bolt today's
+    projected TSB onto an as_of date it doesn't belong to.
     """
-    if not baseline:
-        return {"ctl": None, "atl": None, "tsb": None,
-                "as_of": None, "baseline_stale_days": None,
-                "interpretation": "no training-load data yet"}
-    tsb = baseline.get("tsb")
-    as_of = baseline.get("date")
+    projected = _projected_end_of_day(today_row)
+    # as_of/baseline_stale_days are computed from `baseline` UNCONDITIONALLY —
+    # this is the true pipeline-freshness signal and must not disappear just
+    # because current_form (a DIFFERENT row, always < today) is unavailable.
+    # A single-day-old DB (baseline present, no prior day yet) is "no
+    # training-load data yet" for current form but is NOT a stale pipeline.
+    as_of = baseline.get("date") if baseline else None
     stale_days: int | None = None
     if as_of:
         try:
@@ -191,20 +281,32 @@ def _training_load(baseline: dict[str, Any] | None, today: str) -> dict[str, Any
                 0, (date.fromisoformat(today) - date.fromisoformat(as_of)).days)
         except ValueError:
             stale_days = None
+    if not current_form:
+        return {"ctl": None, "atl": None, "tsb": None,
+                "as_of": as_of, "baseline_stale_days": stale_days,
+                "interpretation": "no training-load data yet",
+                "current_form_date": None,
+                "projected_end_of_day": projected}
+    tsb = current_form.get("tsb")
     return {
-        "ctl": baseline.get("ctl"),
-        "atl": baseline.get("atl"),
+        "ctl": current_form.get("ctl"),
+        "atl": current_form.get("atl"),
         "tsb": tsb,
         "as_of": as_of,
         "baseline_stale_days": stale_days,
         "interpretation": _tsb_interpretation(tsb),
+        "current_form_date": current_form.get("date"),
+        "projected_end_of_day": projected,
     }
 
 
 def _recent_workouts(conn, limit: int = 5) -> list[dict[str, Any]]:
     """Last ~5 workouts with raw fields plus mile/formatted convenience fields
     from units.py. Omits a formatted field when units.py returns None (null or
-    zero distance / pace)."""
+    zero distance / pace). Mirrors tools._augment_workout's exact field set
+    (including the measured ``effort`` read below) — this module duplicates
+    the augmentation inline rather than importing it, to avoid a status <->
+    tools import cycle."""
     rows = conn.execute(
         """SELECT activity_id, date, activity_type, activity_name, duration_seconds,
                   distance_meters, avg_hr, max_hr, avg_pace_sec_per_km,
@@ -227,6 +329,11 @@ def _recent_workouts(conn, limit: int = 5) -> list[dict[str, Any]]:
         duration = units.format_duration(w.get("duration_seconds"))
         if duration is not None:
             w["duration_formatted"] = duration
+        # Measured run-vs-walk (interpret.is_running_effort, pace only) — NOT
+        # activity_type, which Garmin mislabels (walking-desk sessions log as
+        # treadmill_running). Additive only; never filters/excludes a workout.
+        mode = interpret.is_running_effort(w.get("avg_pace_sec_per_km"))
+        w["effort"] = {True: "run", False: "walk", None: None}[mode]
         out.append(w)
     return out
 
@@ -273,16 +380,23 @@ def assemble_status(today: str | None = None) -> dict[str, Any]:
     nightly generation has been failing).
 
     ``training_load`` additionally carries ``as_of`` (the date of the baselines
-    row the CTL/ATL/TSB came from) and ``baseline_stale_days`` (days between
+    row the pipeline last wrote — pipeline-freshness signal, NOT the date of
+    the reported ctl/atl/tsb) and ``baseline_stale_days`` (days between
     ``today`` and that row; 0 = current, ``None`` = no baselines yet). A frozen
     data frontier makes the served TSB/zone drift from reality, so this is the
-    baselines-side mirror of the brief-staleness fields above.
+    baselines-side mirror of the brief-staleness fields above. ``ctl``/
+    ``atl``/``tsb`` themselves are the last COMPLETE day's values (Fix 9,
+    2026-07-27 — see ``_training_load``), dated by ``current_form_date``;
+    today's own (same-day-projection) row, if any, rides along under
+    ``projected_end_of_day`` rather than being reported as current.
     """
     today = today or date.today().isoformat()
     with db.connect() as conn:
         baseline = _baseline_row(conn, today)
+        current_form = _baseline_row_before(conn, today)
+        today_row = baseline if (baseline and baseline.get("date") == today) else None
         metrics = _metric_rows(conn, today, baseline)
-        training_load = _training_load(baseline, today)
+        training_load = _training_load(baseline, today, current_form, today_row)
         recent_workouts = _recent_workouts(conn)
 
     user_notes = [n.text for n in notes.read_notes() if n.text]

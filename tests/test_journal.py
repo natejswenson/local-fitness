@@ -62,6 +62,40 @@ def test_61st_write_archives_not_deletes(jdb):
             "SELECT COUNT(*) FROM coach_journal").fetchone()[0] == 61
 
 
+def test_render_order_is_by_entry_date_not_write_order(jdb):
+    """entry_date DESC is the PRIMARY sort key, deliberately, not entry_id: a
+    report_card reflection stamps entry_date to the ACTIVITY's own date, and
+    Nate routinely grades older report cards on demand long after the fact —
+    normal usage, not an anomaly. entry_id (write order) runs INVERSE to
+    entry_date for a large share of real rows, so sorting by entry_id alone
+    (tried in 0.38.2, reverted) silently dropped the newest EVENTS whenever
+    they were written out of order — the common case. The newer EVENT
+    (Jul 22) must render above the older one (Jul 21) regardless of which
+    was written first."""
+    # Written FIRST but the older event (Jul 21) — e.g. an on-demand report
+    # card graded well after the run happened.
+    journal.save_entry(
+        "Jul 21 interval graded D.", source="report_card",
+        source_key="987", entry_date="2026-07-21")
+    # Written SECOND but the newer event (Jul 22).
+    journal.save_entry(
+        "Jul 22 easy run, shortfall again.", source="brief",
+        source_key="2026-07-22", entry_date="2026-07-22")
+    entries = journal.list_entries(db_path=jdb)
+    assert entries[0]["text"] == "Jul 22 easy run, shortfall again."
+    assert entries[1]["text"] == "Jul 21 interval graded D."
+
+
+def test_render_order_write_recency_within_the_same_entry_date(jdb):
+    """Within one entry_date, entry_id is the tiebreak: the entry WRITTEN
+    later (higher entry_id) — e.g. a same-day correction — still renders
+    first, above the thing it corrects."""
+    journal.save_entry("first written", source="chat", entry_date="2026-07-21")
+    journal.save_entry("second written", source="chat", entry_date="2026-07-21")
+    entries = journal.list_entries(db_path=jdb)
+    assert [e["text"] for e in entries] == ["second written", "first written"]
+
+
 def test_search_finds_archived_entry_by_keyword(jdb):
     journal.save_entry(
         "left achilles flared on the hill repeats", source="chat",

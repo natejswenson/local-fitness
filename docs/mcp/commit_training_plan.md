@@ -92,14 +92,15 @@ The previously active plan (if any) is now `archived`, and `get_training_plan_st
   wall of `missed`.
 - **`committed_at` is the local wall clock** (`datetime.now().isoformat(timespec="seconds")`), not
   the data frontier and not UTC.
-- **You need the `plan_id`, and only propose/revise hand it to you.** No structured tool lists
-  drafts. If you have lost it mid-session, `run_sql` can recover it:
-  `SELECT plan_id, title, race_date, created_at FROM training_plans WHERE status='draft'`.
+- **You need the `plan_id`.** `propose_training_plan`/`revise_training_plan` hand it to you at
+  creation time; if you lost it mid-session (a new chat, a compacted context),
+  `get_training_plan_draft` reads it back — no need to fall back to `run_sql`.
 
 ## See also
 
 - [`propose_training_plan`](./propose_training_plan.md) — create the draft
 - [`revise_training_plan`](./revise_training_plan.md) — edit it before committing
+- [`get_training_plan_draft`](./get_training_plan_draft.md) — read the draft back if you lost its `plan_id`
 - [`discard_training_plan_draft`](./discard_training_plan_draft.md) — the other draft exit
 - [`abandon_active_plan`](./abandon_active_plan.md) — stop following a plan with nothing to replace it
 - [`get_training_plan_status`](./get_training_plan_status.md) — confirm the new plan is live

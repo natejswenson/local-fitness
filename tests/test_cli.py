@@ -251,6 +251,31 @@ def test_recompute_baselines_custom_lookback(runner, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# recompute-body-battery — wiring for the Fix 1 backfill command
+# --------------------------------------------------------------------------
+
+def test_recompute_body_battery_wires_to_daily_ingest_and_reports_count(runner, monkeypatch):
+    captured = {"called": False}
+
+    def fake_recompute():
+        captured["called"] = True
+        return 7
+
+    monkeypatch.setattr(cli.daily_ingest, "recompute_body_battery_minmax", fake_recompute)
+    result = runner.invoke(cli.main, ["recompute-body-battery"])
+    assert result.exit_code == 0
+    assert captured["called"] is True
+    assert "Backfilled body_battery_min/max for 7 date(s)." in result.output
+
+
+def test_recompute_body_battery_zero_dates(runner, monkeypatch):
+    monkeypatch.setattr(cli.daily_ingest, "recompute_body_battery_minmax", lambda: 0)
+    result = runner.invoke(cli.main, ["recompute-body-battery"])
+    assert result.exit_code == 0
+    assert "Backfilled body_battery_min/max for 0 date(s)." in result.output
+
+
+# --------------------------------------------------------------------------
 # brief — pull/no-pull wiring, model selection, notify suppression
 # --------------------------------------------------------------------------
 

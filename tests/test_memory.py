@@ -170,6 +170,61 @@ def test_prior_day_card_flips_memory_once_then_converges(mdb):
     assert m3 == m2
 
 
+def _fake_ledger_with_many_notables(n: int) -> dict:
+    """A ledger whose rendered block alone exceeds COMPACT_MAX_CHARS, so the
+    compact capping logic actually has to make a choice."""
+    notables = [
+        {"date": f"2026-07-{(i % 28) + 1:02d}", "type": "interval",
+         "kind": "quality_done"} for i in range(n)
+    ]
+    return {"as_of": "2026-07-23", "plan": {}, "steps": {}, "patterns": [],
+            "notables": notables, "cards": None}
+
+
+def test_compact_never_ends_with_bare_header(mdb, monkeypatch):
+    """0.38.2 bug: a long ledger could pop every journal line via one
+    whole-text cap, leaving the 'Your journal' header standing with nothing
+    under it — the V2 brief (the highest-frequency surface) shipped an empty
+    banner that invited invention instead of no callback at all."""
+    monkeypatch.setattr(
+        ledger, "compute_relationship_ledger",
+        lambda **kw: _fake_ledger_with_many_notables(14))
+    journal.save_entry("kept the promise this week", source="chat",
+                       entry_date="2026-07-22")
+    text = memory.render_memory_for_prompt(compact=True, user_name="Alex")
+    assert len(text) <= memory.COMPACT_MAX_CHARS
+    if "Your journal" in text:
+        after_header = text.split("Your journal (what you wrote down):\n", 1)[1]
+        assert after_header.strip() != ""
+
+
+def test_compact_keeps_a_journal_line_when_present(mdb, monkeypatch):
+    """Same heavy-ledger scenario: the journal's newest line must survive
+    the cap even though the ledger alone would exceed the whole budget."""
+    monkeypatch.setattr(
+        ledger, "compute_relationship_ledger",
+        lambda **kw: _fake_ledger_with_many_notables(14))
+    journal.save_entry("kept the promise this week", source="chat",
+                       entry_date="2026-07-22")
+    text = memory.render_memory_for_prompt(compact=True, user_name="Alex")
+    assert "kept the promise this week" in text
+    assert len(text) <= memory.COMPACT_MAX_CHARS
+
+
+def test_compact_with_no_journal_uses_the_full_budget_on_ledger(mdb, monkeypatch):
+    """No journal entries: the whole COMPACT_MAX_CHARS budget goes to the
+    ledger, same as before this fix — no journal reserve is carved out for
+    nothing. Uses a bigger ledger than the other tests so the difference
+    between a 400ish-char and a 600-char cap is actually visible."""
+    monkeypatch.setattr(
+        ledger, "compute_relationship_ledger",
+        lambda **kw: _fake_ledger_with_many_notables(20))
+    text = memory.render_memory_for_prompt(compact=True, user_name="Alex")
+    assert "Your journal" not in text
+    assert len(text) <= memory.COMPACT_MAX_CHARS
+    assert len(text) > memory.COMPACT_MAX_CHARS - memory._JOURNAL_RESERVE_CHARS
+
+
 def test_resolver_never_raises(mdb, monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("db exploded")

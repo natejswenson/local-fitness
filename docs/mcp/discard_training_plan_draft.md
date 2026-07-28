@@ -87,4 +87,5 @@ The previously active plan (if there was one) is untouched and still active.
 - [`commit_training_plan`](./commit_training_plan.md) — the other draft exit (activate instead)
 - [`propose_training_plan`](./propose_training_plan.md) — creates drafts (and archives prior ones)
 - [`revise_training_plan`](./revise_training_plan.md) — fix the draft instead of dropping it
+- [`get_training_plan_draft`](./get_training_plan_draft.md) — read the draft back if you lost its `plan_id`
 - [`abandon_active_plan`](./abandon_active_plan.md) — the ACTIVE-plan equivalent, with no undo

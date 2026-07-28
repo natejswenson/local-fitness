@@ -51,7 +51,9 @@ def test_tool_schemas_well_formed():
     # shared surface: pure JSON, no filesystem path)
     # +recall_coach_memories (0.33.0 FTS5 search over the whole journal,
     # archive included — pure JSON, shared surface)
-    assert len(agent_tools.ALL_TOOLS) == 43
+    # +get_training_plan_draft (Fix 12: the draft-plan read path — a draft was
+    # otherwise reachable only via run_sql, with no way back to its plan_id)
+    assert len(agent_tools.ALL_TOOLS) == 44
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

@@ -1097,6 +1097,175 @@ def test_reference_line_says_nothing_when_nothing_was_excluded():
     assert "excluded" not in rc.reference_line(card)
 
 
+# === plan-reference walk gate ==============================================
+# Batch 4a fix: the plan branch was the one place in the module that never
+# checked measured locomotion at all, so a walk-effort activity could be
+# graded straight against a RUNNING plan target.
+
+# 9:39/mi and 14:09/mi, converted to sec/km exactly as `is_running_effort`
+# does (`* units.KM_PER_MILE` inverted) — the live 2026-07-20 case.
+_EASY_TARGET_PACE = (9 * 60 + 39) / rc.units.KM_PER_MILE      # 359.76 s/km
+_WALKED_PACE = (14 * 60 + 9) / rc.units.KM_PER_MILE           # 527.50 s/km
+
+
+def test_pace_deviation_easy_long_has_a_slow_side_floor():
+    """`pace_deviation`'s own contract, isolated from `build_card`: a pace past
+    the run/walk boundary can never read as a perfectly-graded easy pace,
+    regardless of how much slower the expectation itself is."""
+    d = rc.pace_deviation(_WALKED_PACE, _EASY_TARGET_PACE, "easy")
+    assert d > 0.0
+    assert rc.base_letter(rc.grade_from_deviation(d)) != "A"
+
+
+def test_pace_deviation_floor_does_not_fire_on_a_genuine_slow_run():
+    """The over-correction guard: an honest easy run up to a 13:00 mile is
+    still ungated — only crossing the walk boundary trips the floor."""
+    just_inside = rc.RUN_PACE_CEILING_SEC_PER_MI / rc.units.KM_PER_MILE - 1
+    d = rc.pace_deviation(just_inside, _EASY_TARGET_PACE, "easy")
+    assert d == pytest.approx(0.0)
+
+
+def test_walk_against_a_running_plan_type_refuses_the_plan_reference():
+    """Live case, 2026-07-20: 4.00 mi at 14:09/mi (measured walking effort)
+    against a 9:39/mi easy prescription. Before this fix the plan branch
+    never checked locomotion and graded distance A+, pace A+."""
+    activity = {"date": "2026-07-20", "distance_meters": 6437.0,
+                "duration_seconds": 6789, "avg_pace_sec_per_km": _WALKED_PACE,
+                "avg_hr": 112, "training_load": 40}
+    plan = {"type": "easy", "target_distance_m": 6437.0,
+            "target_pace_sec_per_km": _EASY_TARGET_PACE, "seq": 1}
+    card = card_for(activity, plan=plan)
+    distance, pace = card["metrics"]["distance"], card["metrics"]["pace"]
+    assert distance["reference"] != "plan"
+    assert pace["reference"] != "plan"
+    assert distance["note"] and "walk" in distance["note"]
+    assert pace["note"] and "walk" in pace["note"]
+    assert rc.base_letter(pace["grade"]) != "A"
+
+
+def test_walk_against_a_running_plan_type_falls_to_rolling_reference():
+    """The refusal doesn't just blank the metric — it falls through to the
+    rolling reference (a walk pool, since `rolling_reference` gates the SAME
+    way on the graded activity's own mode) exactly like a plan-free day."""
+    activity = {"date": "2026-07-20", "distance_meters": 6437.0,
+                "duration_seconds": 6789, "avg_pace_sec_per_km": _WALKED_PACE,
+                "avg_hr": 112, "training_load": 40}
+    plan = {"type": "easy", "target_distance_m": 6437.0,
+            "target_pace_sec_per_km": _EASY_TARGET_PACE, "seq": 1}
+    card = card_for(activity, plan=plan)
+    assert card["metrics"]["distance"]["reference"] == "rolling_60d"
+    assert card["metrics"]["pace"]["reference"] == "rolling_60d"
+
+
+def test_cross_day_walk_does_not_trigger_the_plan_walk_gate():
+    """"cross" is deliberately non-running cross-training — a walk on a cross
+    day is the point, not a mismatch, so its plan reference (when it has one)
+    must not be refused."""
+    activity = {"date": "2026-07-20", "distance_meters": 6437.0,
+                "avg_pace_sec_per_km": _WALKED_PACE, "avg_hr": 112,
+                "training_load": 40}
+    plan = {"type": "cross", "target_distance_m": 6437.0, "seq": 1}
+    card = card_for(activity, plan=plan)
+    assert card["metrics"]["distance"]["reference"] == "plan"
+
+
+def test_a_slow_but_real_easy_run_still_uses_the_plan_reference():
+    """Neither the mismatch gate nor the pace floor may fire on an ordinary,
+    honestly-run easy day that is merely slower than prescribed — the
+    headline "don't over-correct" case from the same fix."""
+    activity = {"date": "2026-07-20", "distance_meters": 6437.0,
+                "duration_seconds": 3000, "avg_pace_sec_per_km": 466.0,  # ~12:30/mi
+                "avg_hr": 130, "training_load": 45}
+    plan = {"type": "easy", "target_distance_m": 6437.0,
+            "target_pace_sec_per_km": _EASY_TARGET_PACE, "seq": 1}
+    card = card_for(activity, plan=plan)
+    assert card["metrics"]["distance"]["reference"] == "plan"
+    assert card["metrics"]["pace"]["reference"] == "plan"
+    assert rc.base_letter(card["metrics"]["pace"]["grade"]) == "A"
+
+
+def test_quality_pace_floor_closes_the_walked_tempo_gap():
+    """Residual found while re-sweeping the fix: a walk on a prescribed
+    'tempo' day refuses its plan pace reference (mismatch gate) and falls to
+    the rolling reference — but that reference is itself a WALKING-pool
+    median for a walked activity, and quality's slow-only gate scored 0.0
+    whenever the walk was brisker than that (often very slow) median. Live
+    case, 2026-07-14: a 15.20 min/mi walk on a tempo day still graded A+
+    pace even after the plan-gate + easy/long floor fix."""
+    d = rc.pace_deviation(3125.3, 800.0, "quality")  # 83:49/mi vs a slow walk median
+    assert d > 0.0
+    assert rc.base_letter(rc.grade_from_deviation(d)) != "A"
+
+
+def test_quality_pace_floor_does_not_touch_a_genuine_fast_tempo():
+    """A real tempo run beating its target is still an A, uncapped — the
+    floor only fires once actual pace crosses the walk boundary, which a
+    legitimate tempo effort never does."""
+    assert rc.pace_deviation(240.0, 300.0, "quality") == 0.0
+
+
+def test_walking_desk_session_pace_floor_applies_even_without_a_plan():
+    """Case 2 from the evidence: 2.42 mi at 83:49/mi, inferred 'easy' off its
+    own low HR (no plan involved at all). Without the floor this scored a
+    deviation of 0.0 — a perfect A+ pace grade for an 83-minute mile."""
+    activity = {"date": "2026-05-22", "distance_meters": 3897.0,
+                "duration_seconds": 12180, "avg_pace_sec_per_km": 3125.3,
+                "avg_hr": 90, "training_load": 8}
+    card = card_for(activity)
+    assert card["intent_class"] == "easy"
+    assert rc.base_letter(card["metrics"]["pace"]["grade"]) == "F"
+
+
+# --- _select_activity: prefer the real run over a leading walk -------------
+
+def test_date_branch_prefers_a_later_run_over_a_leading_walk(rc_db):
+    """The corpus's real shape 26 times over: the FIRST session of the day is
+    a walk and the real run comes later. Live case, 2026-07-21: a 3.23 mi @
+    29:15/mi walk was selected over a 5.95 mi @ 10:42/mi interval run."""
+    today = date.today().isoformat()
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "UPDATE activities SET activity_type='walking', distance_meters=5200, "
+            "avg_pace_sec_per_km=1100, avg_hr=95 WHERE activity_id=1")
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "activity_name, duration_seconds, distance_meters, avg_hr, "
+            "avg_pace_sec_per_km, training_load) VALUES "
+            "(888, ?, ?, 'running', 'Intervals', 3576, 9577, 164, 400, 90)",
+            (today, today + " 17:30:00"),
+        )
+        row = rc._select_activity(conn, None, today)
+    assert row["activity_id"] == 888
+
+
+def test_date_branch_falls_back_to_first_when_the_day_is_all_walking(rc_db):
+    """A genuine walk day (no running-effort session at all) must still be
+    gradeable — falls back to the earliest session, same as before."""
+    today = date.today().isoformat()
+    with db.connect(rc_db) as conn:
+        conn.execute(
+            "UPDATE activities SET activity_type='walking', distance_meters=5200, "
+            "avg_pace_sec_per_km=1100, avg_hr=95 WHERE activity_id=1")
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, start_time, activity_type, "
+            "duration_seconds, distance_meters, avg_pace_sec_per_km) VALUES "
+            "(889, ?, ?, 'walking', 2000, 4000, 1200)",
+            (today, today + " 18:00:00"),
+        )
+        row = rc._select_activity(conn, None, today)
+    assert row["activity_id"] == 1
+
+
+def test_date_branch_a_paceless_activity_still_resolves(rc_db):
+    """An unknowable-mode row keeps today's default behavior rather than
+    being forced into the running or the walking bucket."""
+    today = date.today().isoformat()
+    with db.connect(rc_db) as conn:
+        conn.execute("UPDATE activities SET avg_pace_sec_per_km=NULL WHERE activity_id=1")
+        row = rc._select_activity(conn, None, today)
+    assert row["activity_id"] == 1
+
+
 # === quality-day pace ======================================================
 # The one documented exception to "no grade reads activity_splits".
 

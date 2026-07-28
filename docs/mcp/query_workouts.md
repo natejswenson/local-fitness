@@ -65,6 +65,7 @@ when it has a real value:
 | `distance_mi` | `distance_meters` in miles, 2 dp. Suppressed entirely when `LOCAL_FITNESS_DISPLAY_UNITS` isn't `miles`. |
 | `pace_min_per_mi` | `avg_pace_sec_per_km` rendered `"M:SS"` per mile. Omitted when pace is null or 0. |
 | `duration_formatted` | `"M:SS"` under an hour, `"H:MM:SS"` at or over. |
+| `effort` | `"run"` / `"walk"` / `null` — MEASURED from pace (`interpret.is_running_effort`), never from `activity_type`. Garmin's own label can misreport a walk as a run (e.g. a walking-desk session logging as `treadmill_running`) — always present, `null` only when pace is unusable. |
 
 ```json
 {

@@ -32,6 +32,7 @@ from .schemas import (
     TakeawayMetric,
     Tone,
 )
+from .tools import PARTIAL_DAY_METRICS
 
 # --- one named threshold block (the prompt's tuning knobs, now testable) ---
 # Each maps to a line in the mandate sections of ``prompts.briefing_prompt()``
@@ -87,6 +88,11 @@ _ACTIVITY_LOOKBACK_DAYS = 35
 class Signals:
     """Computed, deterministic read of the DB the predicates operate on. All
     fields default so unit tests construct only what a predicate needs."""
+    # Fix 9 (2026-07-27): tsb/ctl/atl are the last COMPLETE day's values
+    # ("current form" — status._baseline_row_before), never today's own
+    # baselines row, which assumes today's training_load is 0 until logged
+    # and would pre-credit a zero-load rest day into the workout/conditioning
+    # tone triggers below.
     tsb: float | None = None
     ctl: float | None = None
     atl: float | None = None
@@ -531,8 +537,9 @@ def ctl_at_or_before(conn, anchor_date: str) -> float | None:
     return row["ctl"] if row else None
 
 
-def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | None,
-                     plan_today: dict | None, days_to_race: int | None) -> Signals:
+def _compute_signals(conn, today: str, baseline: dict | None, current_form: dict | None,
+                     step_goal: int | None, plan_today: dict | None,
+                     days_to_race: int | None) -> Signals:
     today_d = date.fromisoformat(today)
     rows = {
         r["date"]: dict(r) for r in conn.execute(
@@ -544,8 +551,18 @@ def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | N
     yest_row = rows.get((today_d - timedelta(days=1)).isoformat(), {})
 
     def _recent(field: str, days: int) -> list[float]:
+        # Fix 8: a same-day running-tally field (tools.PARTIAL_DAY_METRICS —
+        # avg_stress, steps, etc.) is partial all day, so its window starts
+        # at yesterday (d=1), never today (d=0) — `days` COMPLETE days, not
+        # `days` calendar days that quietly include a half-finished one.
+        # Measured live: stress_7d_avg included today's 17 (50 overnight
+        # samples only) alongside 6 complete days, biasing the
+        # bb_or_stress_low recovery trigger. body_battery_max (used by
+        # bb_low_nights) is deliberately NOT in PARTIAL_DAY_METRICS — Fix 1's
+        # scope, not reopened here — so it still starts at d=0.
+        start = 1 if field in PARTIAL_DAY_METRICS else 0
         out = []
-        for d in range(days):
+        for d in range(start, days + start):
             row = rows.get((today_d - timedelta(days=d)).isoformat())
             if row and row.get(field) is not None:
                 out.append(row[field])
@@ -573,8 +590,11 @@ def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | N
     # single-sourced (ctl_at_or_before) so tools.training_load_status agrees
     # by construction; the arithmetic delegates to interpret.pct_change,
     # keeping only the rounding here (interpret returns unrounded).
+    # Fix 9: "now" is current_form's ctl (the last COMPLETE day), not
+    # baseline's (which can be today's same-day zero-load projection) — the
+    # same anchor training_load_status's "current" now uses.
     ctl_then = ctl_at_or_before(conn, (today_d - timedelta(days=_LOOKBACK_DAYS)).isoformat())
-    ctl_now = baseline.get("ctl") if baseline else None
+    ctl_now = current_form.get("ctl") if current_form else None
     ctl_pct = interpret.pct_change(ctl_now, ctl_then)
     if ctl_pct is not None:
         ctl_pct = round(ctl_pct, 1)
@@ -602,9 +622,9 @@ def _compute_signals(conn, today: str, baseline: dict | None, step_goal: int | N
     anomalies = _rhr_anomalies(rows, today_d, baseline)
 
     return Signals(
-        tsb=baseline.get("tsb") if baseline else None,
+        tsb=current_form.get("tsb") if current_form else None,
         ctl=ctl_now,
-        atl=baseline.get("atl") if baseline else None,
+        atl=current_form.get("atl") if current_form else None,
         ctl_pct_change_14d=ctl_pct,
         rhr_today=today_row.get("rhr"),
         rhr_baseline_mean=rhr_mean,
@@ -758,9 +778,16 @@ def assemble_brief_context(db_path: Path | None = None, *, today: str | None = N
         days_to_race = plan.get("days_to_race") if plan_today else None
 
         baseline = status_mod._baseline_row(conn, today)
+        # Fix 9: CTL/ATL/TSB "current form" is always the last COMPLETE day
+        # (never today's same-day projection) — see status._baseline_row_before
+        # and status._training_load's docstring. Shares the open `conn`, so
+        # this doesn't cost a second connection (see the perf-benchmark note
+        # below).
+        current_form = status_mod._baseline_row_before(conn, today)
+        today_baseline_row = baseline if (baseline and baseline.get("date") == today) else None
         metric_rows = status_mod._metric_rows(conn, today, baseline)
-        training_load = status_mod._training_load(baseline, today)
-        sig = _compute_signals(conn, today, baseline, step_goal,
+        training_load = status_mod._training_load(baseline, today, current_form, today_baseline_row)
+        sig = _compute_signals(conn, today, baseline, current_form, step_goal,
                                plan_today.get("today") if plan_today else None, days_to_race)
         workouts_14d = _workouts_payload(conn, today)
         # Shares the open connection — this function is held to exactly ONE
