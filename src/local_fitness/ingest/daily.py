@@ -292,9 +292,16 @@ def _ingest_day(client: Garmin, conn, cdate: date) -> None:
 
     # Fetched here (before raw_json is built) rather than after the daily_metrics
     # INSERT, so the raw stress payload can be preserved in raw_json alongside
-    # summary/sleep/body_battery — it never was before this fix, which meant a
-    # historical stress_samples row corrupted by the timezone bug below had no
-    # source data left to repair it from (see recompute_sample_timestamps).
+    # summary/sleep/body_battery. It never was before 0.39.0, and that omission
+    # is why the ~6,400 stress_samples rows already misfiled by the timezone bug
+    # (see _entry_local_delta) are UNREPAIRABLE: their original epochs are gone.
+    # Storing the payload from here on is what makes a future repair possible at
+    # all. No such repair exists yet — one was written for 0.39.0 and withdrawn
+    # because rebuilding a day's samples from raw_json destroyed 699 of 13,603
+    # body-battery rows: raw_json holds only the LAST pull's payload for a day,
+    # while the samples table accumulates the union across every pull of it
+    # (6 stored against 16 in the table, measured on 2026-07-26). Any repair
+    # must correct timestamps in place, never rebuild a day from the payload.
     stress = _safe(client.get_stress_data, cdate_str)
 
     daily = {
