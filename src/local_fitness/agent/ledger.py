@@ -255,13 +255,40 @@ def observation_patterns(observations: list[dict], today: str) -> list[dict]:
     return sorted(out, key=lambda e: (-e["count"], e["pattern"]))
 
 
-def notable_results(graded_workouts: list[dict], today: str) -> list[dict]:
+def notable_results(graded_workouts: list[dict], today: str,
+                   *, cards: list[dict] | None = None) -> list[dict]:
     """Recent results worth remembering FOR the athlete: quality sessions done
     as prescribed, and any day run at/over ``OVERACHIEVE_FRACTION`` of target.
-    Last 14 days, newest first."""
+    Last 14 days, newest first.
+
+    ``cards`` (the same ``report_cards`` rows ``report_card_facts`` reads —
+    ``activity_date``/``overall_grade``) lets a quality "done" verdict be
+    checked against how the session actually graded. Plan adherence is
+    distance-based, so a quality day can legitimately verdict "done" (target
+    distance hit) while the graded card says D or F (pace/HR/load blown) —
+    promoting that as a receipt hands the coach a false "done as prescribed"
+    callback that directly contradicts its own report-card memory. A date
+    with no card is unaffected (today's behavior): the notable stands.
+
+    "Overachieved" is gated on ``actual_run_distance_m`` (measured RUN
+    distance, pace-gated per the repo-wide run-vs-walk rule — see
+    ``interpret.is_running_effort``), never ``actual_distance_m`` (the
+    on-foot total, walks included). A day's easy target can be hit by the
+    run alone while a separate walking session that day pads the foot total
+    well past it, which is not a run that went past its target — and a
+    pure-walk day (no running at all) must never earn "run past its target"
+    just because the walking distance was long. Rows without the run/walk
+    split (older or synthetic data) fall back to ``actual_distance_m``, same
+    as ``tools.weekly_rollup``'s established fallback for this field.
+    """
     t = _parse(today)
     if t is None:
         return []
+    bad_grade_dates = {
+        c["activity_date"] for c in (cards or [])
+        if c.get("activity_date") and c.get("overall_grade")
+        and c["overall_grade"][0] in ("D", "F")
+    }
     out = []
     for w in graded_workouts:
         d = _parse(w.get("date") or "")
@@ -271,10 +298,17 @@ def notable_results(graded_workouts: list[dict], today: str) -> list[dict]:
             continue
         wtype = w.get("type")
         target = w.get("target_distance_m")
-        actual = w.get("actual_distance_m")
+        run_m = w.get("actual_run_distance_m")
+        if run_m is None:
+            run_m = w.get("actual_distance_m")
         overachieved = bool(
-            target and actual and actual >= OVERACHIEVE_FRACTION * target)
+            target and run_m and run_m >= OVERACHIEVE_FRACTION * target)
         if wtype in QUALITY_TYPES:
+            if w["date"] in bad_grade_dates:
+                # The plan verdict is "done" but the graded card says the
+                # execution was a D/F — do not let the coach quote this as a
+                # receipt for what "done as prescribed" should look like.
+                continue
             out.append({"date": w["date"], "type": wtype,
                         "kind": "quality_done"})
         elif overachieved:
@@ -527,7 +561,8 @@ def compute_relationship_ledger(
         step_facts = step_streak_facts(
             inputs["daily_steps"], inputs["step_goal"], today)
         patterns = observation_patterns(inputs["observations"], today)
-        notables = notable_results(inputs["graded_workouts"], today)
+        notables = notable_results(
+            inputs["graded_workouts"], today, cards=inputs["report_cards"])
         card_facts = report_card_facts(inputs["report_cards"], today)
         return compute_ledger(plan_facts, step_facts, patterns, notables,
                               today, card_facts=card_facts)

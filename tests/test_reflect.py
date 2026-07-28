@@ -89,6 +89,65 @@ def test_parse_truncates_overlong_entries_at_a_word_boundary():
     assert out[0] == out[0].strip()
 
 
+# --- the grade/CTL-leak guard (0.38.2) --------------------------------------
+# These two lists ARE the specification, same pattern as
+# tests/test_workout_coach.py's _REAL_LEAKS/_LOOKALIKES: the real live
+# offenders (measured 2026-07-26) must reject, and clean coach-voice entries
+# — including lookalikes an over-eager pattern would catch — must pass.
+
+_REAL_LEAKS = [
+    "Hit distance/pace/HR (A/A+/A+) but load graded C- on the tempo.",
+    "Graded D overall after ignoring the taper plan again.",
+    "Distance D- (2.05/2.50mi) vs the prescribed long run.",
+    "Blamed a work call after CTL peaked at 58.4 last week.",
+]
+
+_CLEAN_ENTRIES = [
+    "Blamed the heat again — second time this month.",
+    "Promised to hit intervals Thursday after skipping Tuesday.",
+    "Right knee flag on the tempo, says it's been off for a week.",
+    "A tough week — three sessions moved to rest.",
+    "Said the grading feels harsh lately and asked for more warmth.",
+    "Debated the A/B testing of the new commute route.",
+    "Kept the promise this week after last week's excuse.",
+]
+
+
+@pytest.mark.parametrize("text", _REAL_LEAKS)
+def test_grade_leak_entries_are_rejected(text):
+    assert reflect.parse_reflection(f"MEMORY: {text}") == []
+
+
+@pytest.mark.parametrize("text", _CLEAN_ENTRIES)
+def test_clean_entries_are_not_rejected(text):
+    assert reflect.parse_reflection(f"MEMORY: {text}") == [text]
+
+
+def test_has_grade_leak_flat_function_matches_the_two_lists():
+    for text in _REAL_LEAKS:
+        assert reflect._has_grade_leak(text) is True
+    for text in _CLEAN_ENTRIES:
+        assert reflect._has_grade_leak(text) is False
+
+
+def test_leading_date_is_stripped_and_capitalized():
+    """A live entry read 'Jul 26: Jul 26 easy run hot...' — the render
+    already prefixes the date, so a model-written leading date must be
+    dropped, not doubled."""
+    out = reflect.parse_reflection(
+        "MEMORY: Jul 26: easy run hot, blamed the heat again")
+    assert out == ["Easy run hot, blamed the heat again"]
+
+
+def test_leading_date_stripped_leaves_capitalization_alone_when_already_upper():
+    out = reflect.parse_reflection("MEMORY: Jul 26 Ran the tempo clean")
+    assert out == ["Ran the tempo clean"]
+
+
+def test_a_bare_date_with_nothing_else_is_dropped():
+    assert reflect.parse_reflection("MEMORY: Jul 26") == []
+
+
 # --- build_prompt -----------------------------------------------------------
 
 

@@ -141,11 +141,13 @@ Answer with the prescription and one line of coach read — don't narrate the lo
   "missed" that could be yesterday or three weeks ago, and the two are coached very differently.
 - **No `predicted_finish` / `goal_gap` / `this_week` here** — those live only on
   `get_training_plan_progress`.
-- **Drafts are invisible.** `{"active": false}` while a draft is sitting unopened is expected.
+- **Drafts are invisible here.** `{"active": false}` while a draft is sitting unopened is
+  expected — use `get_training_plan_draft` to see it.
 
 ## See also
 
 - [`get_training_plan_progress`](./get_training_plan_progress.md) — day-by-day, rollups, projection
+- [`get_training_plan_draft`](./get_training_plan_draft.md) — the draft this tool never shows
 - [`update_plan_workout`](./update_plan_workout.md) — change today's prescription
 - [`commit_training_plan`](./commit_training_plan.md) — what made this plan active
 - [`abandon_active_plan`](./abandon_active_plan.md) — what makes this return `{"active": false}`

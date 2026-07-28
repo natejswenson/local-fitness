@@ -113,6 +113,7 @@ Back:
 ## See also
 
 - [`propose_training_plan`](./propose_training_plan.md) — create the draft this edits
+- [`get_training_plan_draft`](./get_training_plan_draft.md) — read the draft back before/after revising
 - [`commit_training_plan`](./commit_training_plan.md) — activate the draft
 - [`discard_training_plan_draft`](./discard_training_plan_draft.md) — drop the draft instead
 - [`update_plan_workout`](./update_plan_workout.md) — the ACTIVE-plan counterpart, one day at a time

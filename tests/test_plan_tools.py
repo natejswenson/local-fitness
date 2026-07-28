@@ -216,6 +216,73 @@ def test_progress_kept_out_of_brief_allowlist():
     assert "mcp__fitness__get_training_plan_progress" not in tools.read_only_tool_names()
 
 
+# --- get_training_plan_draft (Fix 12: the stranded-draft read path) ---------
+
+def test_draft_no_draft_returns_clean_false(seeded):
+    """No draft, no active plan either — must not error, must not look like
+    the active-plan tools' {"active": false} shape."""
+    body, err = call(tools.get_training_plan_draft, {})
+    assert not err
+    assert body == {"draft": False}
+
+
+def test_draft_returns_plan_id_and_shape(seeded):
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    body, err = call(tools.get_training_plan_draft, {})
+    assert not err
+    assert body["draft"] is True
+    assert body["plan_id"] == pid
+    assert body["goal_type"] == "10k"
+    assert body["days_to_race"] == 90  # race_date is today + 90, same as propose/progress
+    assert body["workout_count"] == 1
+    assert len(body["workouts"]) == 1
+    w = body["workouts"][0]
+    # A draft has never been graded — no verdict, no actual_* fields at all
+    # (unlike the active-plan tools, where verdict is always one of the five).
+    assert w["verdict"] is None
+    assert "actual_distance_m" not in w
+    assert w["description"] == "6km easy"
+    # _augment_plan_workout's mile/pace fields are layered on top of the slim shape.
+    assert w["target_distance_mi"] == 3.73  # 6000m -> mi, units.to_miles rounds to 2dp
+
+
+def test_draft_description_truncated_at_120_chars(seeded):
+    """Same anti-injection cap plans._slim_workout applies to the active
+    plan's today/last_graded — a draft's prose is untrusted the same way."""
+    long_desc = "x" * 200
+    args = _args(workouts=[dict(
+        date=(date.today() + timedelta(days=1)).isoformat(), week_index=1,
+        type="easy", target_distance_m=6000.0, description=long_desc,
+    )])
+    call(tools.propose_training_plan, args)
+    body, err = call(tools.get_training_plan_draft, {})
+    assert not err
+    assert len(body["workouts"][0]["description"]) == 120
+    assert body["workouts"][0]["description"] == long_desc[:120]
+
+
+def test_draft_invisible_once_committed(seeded):
+    """Committing turns the draft into the active plan — get_training_plan_draft
+    must go back to reporting no draft, even though a plan clearly exists."""
+    pid = call(tools.propose_training_plan, _args())[0]["plan_id"]
+    plans.commit_plan(pid, now="t", db_path=seeded)
+    body, err = call(tools.get_training_plan_draft, {})
+    assert not err
+    assert body == {"draft": False}
+    # sanity: the plan really is active now, just invisible to this tool
+    active, _ = call(tools.get_training_plan_status, {})
+    assert active["active"] is True
+
+
+def test_draft_tool_registered():
+    assert "get_training_plan_draft" in {t.name for t in tools.ALL_TOOLS}
+
+
+def test_draft_kept_out_of_brief_allowlist():
+    # A draft is a chat-time decision surface, not a deterministic brief input.
+    assert "mcp__fitness__get_training_plan_draft" not in tools.read_only_tool_names()
+
+
 def test_progress_absent_race_date_yields_none_not_crash(seeded, monkeypatch):
     # The wrapper reads race_date via .get(...) — a plan dict with NO race_date
     # key must yield days_to_race=None, not a KeyError (the bare-subscript bug).

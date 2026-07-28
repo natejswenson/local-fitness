@@ -293,15 +293,29 @@ def build_fixture_db(scenario: str, dest: Path, *, today: date | None = None) ->
             _insert_daily(conn, day, curve(d))
 
         bl = _BASELINES[scenario]
-        conn.execute(
+        baselines_sql = (
             "INSERT INTO baselines (date, rhr_60day_mean, rhr_60day_sd, "
             "body_battery_max_60day_mean, body_battery_min_60day_mean, "
             "sleep_seconds_60day_mean, sleep_seconds_60day_sd, stress_60day_mean, "
             "ctl, atl, tsb) VALUES (:date, :rhr_60day_mean, :rhr_60day_sd, "
             ":body_battery_max_60day_mean, :body_battery_min_60day_mean, "
             ":sleep_seconds_60day_mean, :sleep_seconds_60day_sd, :stress_60day_mean, "
-            ":ctl, :atl, :tsb)",
-            {"date": today.isoformat(), **bl},
+            ":ctl, :atl, :tsb)"
+        )
+        conn.execute(baselines_sql, {"date": today.isoformat(), **bl})
+        # Fix 9 (2026-07-27): status._training_load now reads "current form"
+        # (ctl/atl/tsb) from the last COMPLETE day — the latest baselines row
+        # STRICTLY BEFORE `today` — never today's own row (a same-day
+        # zero-load-until-logged projection). A single today-only baselines
+        # row (the old shape here) would make current_form resolve to None
+        # for every scenario, silently reading "no training-load data yet"
+        # everywhere training-load-driven tone/candidates are eval'd. This
+        # duplicate yesterday row is numerically IDENTICAL to today's — it
+        # exists only so current_form resolves, and it keeps every existing
+        # eval fixture / captured baseline.json numerically unchanged (the
+        # generator sees the exact same ctl/atl/tsb it always did).
+        conn.execute(
+            baselines_sql, {"date": (today - timedelta(days=1)).isoformat(), **bl}
         )
 
         for i, (days_ago, typ, te, dist, load) in enumerate(_ACTIVITIES[scenario], start=1):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -31,12 +31,22 @@ def empty_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def seeded_status_db(tmp_path, monkeypatch):
-    """Seeded with today's daily_metrics + a baselines row + one workout."""
+    """Seeded with today's daily_metrics + a baselines row + one workout.
+
+    Carries TWO baselines rows (yesterday + today) so Fix 9's "current form
+    is the last COMPLETE day" has a real yesterday row to resolve to — a
+    single today-only baselines row (the old fixture shape) can never
+    represent "current form" under that rule. Today's row is deliberately
+    a DIFFERENT tsb/ctl/atl from yesterday's so a test asserting on
+    `training_load` values (current form) can't accidentally pass by reading
+    the projection instead.
+    """
     p = tmp_path / "fitness.db"
     monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
     monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
     db.init_schema(p)
     today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
     with db.connect(p) as conn:
         conn.execute(
             "INSERT INTO daily_metrics (date, rhr, sleep_seconds, sleep_score, "
@@ -44,11 +54,19 @@ def seeded_status_db(tmp_path, monkeypatch):
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (today, 55, 27000, 80, 30, 20, 90, 9000),
         )
-        # Baseline rhr_mean = 50 → today's 55 is +10% with an up arrow.
+        # Yesterday: the last COMPLETE day — this is "current form" under Fix 9.
         conn.execute(
             "INSERT INTO baselines (date, rhr_60day_mean, rhr_60day_sd, "
             "body_battery_max_60day_mean, ctl, atl, tsb) "
             "VALUES (?, 50.0, 2.0, 88.0, 40.0, 45.0, -5.0)",
+            (yesterday,),
+        )
+        # Today: a same-day projection, deliberately different so it can't be
+        # confused with current form in an assertion.
+        conn.execute(
+            "INSERT INTO baselines (date, rhr_60day_mean, rhr_60day_sd, "
+            "body_battery_max_60day_mean, ctl, atl, tsb) "
+            "VALUES (?, 50.0, 2.0, 88.0, 40.2, 48.0, -7.8)",
             (today,),
         )
         conn.execute(
@@ -88,16 +106,20 @@ def test_assemble_status_honors_injected_today(empty_db):
     from datetime import date, timedelta
 
     target = (date.today() - timedelta(days=400)).isoformat()
-    # A steps row only on the injected `today`; the 7-day trend window must
-    # therefore see exactly one point relative to `target`, not wall-clock.
+    # steps is a PARTIAL_DAY_METRICS trend_arrow metric (Fix 8) — its "value"
+    # anchors on the day BEFORE the injected `today`, never `today` itself, so
+    # the row is seeded on target-1 to prove the window is relative to the
+    # injected `today`, not wall-clock.
+    yesterday = (date.fromisoformat(target) - timedelta(days=1)).isoformat()
     with db.connect(empty_db) as conn:
         conn.execute(
-            "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)", (target, 8200)
+            "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)", (yesterday, 8200)
         )
     status = assemble_status(today=target)
     assert status["date"] == target
     steps_row = next(m for m in status["metrics"] if m["metric"] == "steps")
-    assert steps_row["value"] == 8200  # the row on `target` was found in-window
+    assert steps_row["value"] == 8200  # the row on target-1 was found in-window
+    assert steps_row["partial_today_excluded"] is True
 
 
 def test_assemble_status_defaults_to_today(empty_db):
@@ -120,6 +142,42 @@ def test_assemble_status_baseline_delta_and_workout(seeded_status_db):
     w = status["recent_workouts"][0]
     # 10000 m → 6.21 mi (units display = miles)
     assert w["distance_mi"] == pytest.approx(6.21, abs=0.01)
+
+
+# --------------------------------------------------------------------------- #
+# Fix 3: status._recent_workouts mirrors tools._augment_workout's measured
+# `effort` field (run/walk/null) — Garmin's activity_type label lies (a
+# walking-desk session logs as treadmill_running), so this must be derived
+# from pace, never the label, on this path too.
+# --------------------------------------------------------------------------- #
+def test_recent_workouts_effort_field_pins_walk_run_null(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    from datetime import timedelta
+    rows = [
+        (1, (today - timedelta(days=1)).isoformat(), 1090.0),  # walk
+        (2, (today - timedelta(days=2)).isoformat(), 333.0),   # run
+        (3, (today - timedelta(days=3)).isoformat(), None),    # paceless
+    ]
+    with db.connect(p) as conn:
+        for aid, d, pace in rows:
+            conn.execute(
+                "INSERT INTO activities (activity_id, date, start_time, "
+                "activity_type, distance_meters, avg_pace_sec_per_km, "
+                "duration_seconds) VALUES (?, ?, ?, 'treadmill_running', 5000, ?, 1800)",
+                (aid, d, d + "T07:00:00", pace),
+            )
+
+    status = assemble_status()
+    by_id = {w["activity_id"]: w for w in status["recent_workouts"]}
+    assert by_id[1]["effort"] == "walk"
+    assert by_id[2]["effort"] == "run"
+    assert by_id[3]["effort"] is None
+    # Additive — the mislabeled walk's activity_type is untouched.
+    assert by_id[1]["activity_type"] == "treadmill_running"
 
 
 def test_coach_prompt_renders_each_note_once(seeded_status_db):
@@ -248,10 +306,16 @@ def test_assemble_status_trend_slope_and_pace(trend_status_db):
 
 
 def test_assemble_status_seeded_tsb_interpretation(seeded_status_db):
-    # The seeded baseline carries tsb=-5.0 → "neutral" via _training_load.
+    # Current form comes from YESTERDAY's row (tsb=-5.0 -> "neutral"), not
+    # today's projection (tsb=-7.8) — Fix 9.
     status = assemble_status()
-    assert status["training_load"]["tsb"] == -5.0
-    assert status["training_load"]["interpretation"] == "neutral"
+    tl = status["training_load"]
+    assert tl["tsb"] == -5.0
+    assert tl["interpretation"] == "neutral"
+    assert tl["current_form_date"] == (date.today() - timedelta(days=1)).isoformat()
+    # Today's own row rides along separately, clearly labelled as a projection.
+    assert tl["projected_end_of_day"]["tsb"] == -7.8
+    assert tl["projected_end_of_day"]["ctl"] == 40.2
 
 
 def test_training_load_current_baseline_is_not_stale(seeded_status_db):
@@ -277,13 +341,68 @@ def test_training_load_flags_a_frozen_data_frontier(seeded_status_db):
     assert tl["as_of"] == row_date.isoformat()
     assert tl["baseline_stale_days"] == 4
     # The CTL/ATL/TSB numbers are still served (the disclosure rides alongside).
-    assert tl["tsb"] == -5.0
+    # From 4 days out both fixture rows are "complete" — current form is the
+    # MOST RECENT of the two (today's row, tsb=-7.8), not the older one.
+    assert tl["current_form_date"] == row_date.isoformat()
+    assert tl["tsb"] == -7.8
 
 
 def test_training_load_empty_db_carries_null_staleness(empty_db):
     tl = assemble_status()["training_load"]
     assert tl["as_of"] is None
     assert tl["baseline_stale_days"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Fix 9: _baseline_row_before + _training_load's current-form/projection split
+# --------------------------------------------------------------------------- #
+def test_baseline_row_before_excludes_todays_own_row(empty_db):
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    with db.connect(empty_db) as conn:
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES (?, 12.0)", (yesterday,))
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES (?, 99.0)", (today,))
+        row = status_mod._baseline_row_before(conn, today)
+    assert row["date"] == yesterday
+    assert row["ctl"] == 12.0  # never today's 99.0
+
+
+def test_baseline_row_before_falls_back_across_a_gap(empty_db):
+    # No row exactly at yesterday — falls back to the latest one still < today.
+    today = date.today().isoformat()
+    three_ago = (date.today() - timedelta(days=3)).isoformat()
+    with db.connect(empty_db) as conn:
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES (?, 33.0)", (three_ago,))
+        row = status_mod._baseline_row_before(conn, today)
+    assert row["date"] == three_ago
+    assert row["ctl"] == 33.0
+
+
+def test_baseline_row_before_none_when_only_todays_row_exists(empty_db):
+    today = date.today().isoformat()
+    with db.connect(empty_db) as conn:
+        conn.execute("INSERT INTO baselines (date, ctl) VALUES (?, 50.0)", (today,))
+        row = status_mod._baseline_row_before(conn, today)
+    assert row is None
+
+
+def test_training_load_reports_no_data_but_keeps_as_of_when_only_today_exists(
+    empty_db,
+):
+    # A single-day-old DB: baseline exists (pipeline is NOT stale) but there is
+    # no complete day yet, so current form is genuinely unavailable — the two
+    # facts must not be conflated (a stale pipeline is a real alarm; "current
+    # form always lags by a day" never is).
+    today = date.today().isoformat()
+    with db.connect(empty_db) as conn:
+        conn.execute("INSERT INTO baselines (date, ctl, atl, tsb) VALUES (?, 40.0, 45.0, -5.0)", (today,))
+    status = assemble_status()
+    tl = status["training_load"]
+    assert tl["tsb"] is None
+    assert tl["interpretation"] == "no training-load data yet"
+    assert tl["as_of"] == today          # pipeline freshness signal survives
+    assert tl["baseline_stale_days"] == 0
+    assert tl["projected_end_of_day"]["tsb"] == -5.0  # today's row still surfaced
 
 
 # --- 3c: sleep_seconds row value_formatted/baseline_formatted --------------
@@ -381,3 +500,104 @@ def test_brief_freshness_ignores_non_date_junk_files(empty_db, tmp_path, monkeyp
     # The junk filename is skipped, not a poison pill — the real brief wins.
     assert s["latest_brief_date"] == "2026-07-15"
     assert s["brief_stale_days"] == 4
+
+
+# --------------------------------------------------------------------------- #
+# Fix 8: partial-day metrics anchor derived comparisons on YESTERDAY, not
+# today. Measured live 2026-07-27: avg_stress read 17 off 50 overnight-only
+# samples (00:00-02:27), narrated in the brief as "-47%, recovery holding"
+# against a 32 baseline, when every complete day that week ran 24-32.
+# --------------------------------------------------------------------------- #
+def test_avg_stress_baseline_delta_anchors_on_yesterday_not_todays_partial_read(
+    tmp_path, monkeypatch
+):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    with db.connect(p) as conn:
+        # Today: a partial overnight-only read. Yesterday: a real complete day.
+        conn.execute("INSERT INTO daily_metrics (date, avg_stress) VALUES (?, ?)", (today, 17))
+        conn.execute("INSERT INTO daily_metrics (date, avg_stress) VALUES (?, ?)", (yesterday, 30))
+        conn.execute(
+            "INSERT INTO baselines (date, stress_60day_mean) VALUES (?, 32.0)", (today,)
+        )
+    status = assemble_status()
+    row = next(m for m in status["metrics"] if m["metric"] == "avg_stress")
+    assert row["value"] == 30  # yesterday's complete reading, NOT today's partial 17
+    # (30 - 32) / 32 * 100 = -6.25 -> rounds to -6.2 (banker's rounding), a
+    # world away from the false -47% today's 17 would have produced.
+    assert row["delta_pct"] == -6.2
+    assert row["partial_today_excluded"] is True
+
+
+def test_steps_trend_arrow_reads_rising_not_flat_when_today_is_null(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today()
+    with db.connect(p) as conn:
+        # A clear rising trend over the last 7 COMPLETE days; today has no row
+        # yet (sync hasn't run). Including a phantom "today" gap must not
+        # flatten the read.
+        for i, steps in enumerate((8000, 9000, 10000, 11000, 12000, 13000, 14000)):
+            d = (today - timedelta(days=7 - i)).isoformat()
+            conn.execute("INSERT INTO daily_metrics (date, steps) VALUES (?, ?)", (d, steps))
+    status = assemble_status()
+    row = next(m for m in status["metrics"] if m["metric"] == "steps")
+    assert row["value"] == 14000  # yesterday's value, not an absent today
+    assert row["arrow"] == "↑"
+    assert row["partial_today_excluded"] is True
+
+
+def test_raw_treatment_cumulative_metric_keeps_todays_live_value_but_flags_it(
+    tmp_path, monkeypatch
+):
+    # active_calories is in PARTIAL_DAY_METRICS but gets "raw" treatment (no
+    # baseline/trend judgment exists to corrupt) — a live "how are my calories
+    # today" answer must show TODAY's actual so-far number, not silently swap
+    # to yesterday's, but should still say it's partial.
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today().isoformat()
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics (date, active_calories) VALUES (?, ?)", (today, 120)
+        )
+    status = assemble_status()
+    row = next(m for m in status["metrics"] if m["metric"] == "active_calories")
+    assert row["treatment"] == "raw"
+    assert row["value"] == 120  # today's live partial number, NOT excluded
+    assert row["partial_today"] is True
+
+
+def test_non_partial_metrics_unaffected_rhr_and_sleep(tmp_path, monkeypatch):
+    # rhr and sleep_seconds are NOT in PARTIAL_DAY_METRICS — same-morning
+    # readings are legitimately complete (sleep_score/rhr land at wake time),
+    # and this fix must not touch them.
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
+    db.init_schema(p)
+    today = date.today().isoformat()
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO daily_metrics (date, rhr, sleep_seconds) VALUES (?, ?, ?)",
+            (today, 55, 27000),
+        )
+        conn.execute(
+            "INSERT INTO baselines (date, rhr_60day_mean, sleep_seconds_60day_mean) "
+            "VALUES (?, 50.0, 26000.0)", (today,),
+        )
+    status = assemble_status()
+    rhr_row = next(m for m in status["metrics"] if m["metric"] == "rhr")
+    sleep_row = next(m for m in status["metrics"] if m["metric"] == "sleep_seconds")
+    assert rhr_row["value"] == 55  # today's own reading, unchanged
+    assert "partial_today_excluded" not in rhr_row
+    assert sleep_row["value"] == 27000
+    assert "partial_today_excluded" not in sleep_row

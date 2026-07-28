@@ -135,6 +135,7 @@ Then present the schedule to the athlete, revise if they push back, and only cal
 ## See also
 
 - [`revise_training_plan`](./revise_training_plan.md) — iterate on the draft before committing
+- [`get_training_plan_draft`](./get_training_plan_draft.md) — read the draft back (its `plan_id`, its full workout list)
 - [`commit_training_plan`](./commit_training_plan.md) — activate the draft
 - [`discard_training_plan_draft`](./discard_training_plan_draft.md) — drop the draft
 - [`update_plan_workout`](./update_plan_workout.md) — edit ONE day once the plan is active

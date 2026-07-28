@@ -30,8 +30,10 @@ the last year.
 
 | Key | Meaning |
 |---|---|
-| `n_workouts_matched` | Count of workouts that matched the filters **and** had a usable baseline row on their own date (see gotchas — this is not the raw filter count). |
-| `n_skipped_no_baseline` | (0.36.0) Workouts that cleared the filters but were dropped for want of a usable baseline row — so "3 matched" is readable: 3 of 3 and 3 of 40 no longer print identically. |
+| `n_workouts_matched` | Count of workouts that matched the filters **and** had a usable baseline for AT LEAST ONE channel (body battery OR rhr) on their own date — see gotchas. A workout with only one channel's baseline still matches; the other channel reads `null` with a note (below). |
+| `n_skipped_no_baseline` | (0.36.0) Workouts that cleared the filters but were dropped because NEITHER channel had a usable baseline row — so "3 matched" is readable: 3 of 3 and 3 of 40 no longer print identically. |
+| `n_skipped_no_bb_baseline` | Of the matched workouts, how many had no usable body-battery baseline (that workout's `recovery_days_to_bb_baseline` is `null` with `bb_baseline_note` set). Real-data note: `body_battery_max_60day_mean` derives from a column that was NULL on every row until the ingest fix, so this can be nonzero for a long historical stretch even on a healthy DB. |
+| `n_skipped_no_rhr_baseline` | Same, for the RHR channel. |
 | `avg_recovery_days_body_battery` | Mean days to body-battery recovery across matched workouts that recovered inside 7 days, 2 dp. `null` when none did. |
 | `avg_recovery_days_rhr` | Same for RHR, 2 dp. `null` when none did. |
 | `recent_workouts` | The **10 most recent** matched workouts, ordered **oldest → newest** (the tail of a date-ascending list). |
@@ -39,12 +41,14 @@ the last year.
 Each entry in `recent_workouts` carries `activity_id`, `date`, `activity_type`,
 `distance_meters`, `training_load`, `aerobic_te`, `avg_pace_sec_per_km`,
 `duration_seconds`, the usual augmentation fields (`distance_mi`,
-`pace_min_per_mi`, `duration_formatted`), plus:
+`pace_min_per_mi`, `duration_formatted`, `effort`), plus:
 
 | Field | Meaning |
 |---|---|
-| `recovery_days_to_bb_baseline` | Days after the workout until `body_battery_max >= baseline * 0.95`. `null` = never got there within 7 days (or no data on those days). |
-| `recovery_days_to_rhr_baseline` | Days after the workout until `rhr <= baseline * 1.03`. `null` = same. |
+| `recovery_days_to_bb_baseline` | Days after the workout until `body_battery_max >= baseline * 0.95`. `null` = never got there within 7 days, no data on those days, **or** no bb baseline existed for this date at all (see `bb_baseline_note`). |
+| `recovery_days_to_rhr_baseline` | Days after the workout until `rhr <= baseline * 1.03`. `null` = same, with `rhr_baseline_note`. |
+| `bb_baseline_note` | `null` when a bb baseline existed for this date; otherwise a short string explaining why `recovery_days_to_bb_baseline` is n/a — so "n/a" is never mistaken for "recovered instantly". |
+| `rhr_baseline_note` | Same, for the RHR channel. |
 
 ```json
 {
@@ -92,15 +96,21 @@ for them.
 ## Gotchas
 
 - **`n_workouts_matched` is not the number of workouts your filter matched.**
-  Any workout whose own date has no `baselines` row — or whose
-  `body_battery_max_60day_mean` is NULL — is skipped entirely before it's
-  counted. Early history and baseline gaps therefore vanish silently. If the
-  number looks low against [`query_workouts`](query_workouts.md) with the same
-  filters, that's why.
-- **`null` recovery is ambiguous and the averages exclude it.** A `null` means
-  "did not reach the threshold within 7 days" *or* "no `daily_metrics` row on
-  those days". Both are dropped from `avg_recovery_days_*` (the averages filter
-  on truthiness), which biases the means **optimistically** — the workouts you
+  Any workout whose own date has NEITHER a body-battery NOR an RHR baseline is
+  skipped entirely before it's counted (`n_skipped_no_baseline`). A workout
+  with only one channel's baseline still matches — the other channel comes
+  back `null` with its `*_baseline_note` set, counted in
+  `n_skipped_no_bb_baseline`/`n_skipped_no_rhr_baseline`. If the number looks
+  low against [`query_workouts`](query_workouts.md) with the same filters,
+  check those two counts before assuming a data gap.
+- **`null` recovery is ambiguous and the averages exclude it — check the note
+  before reading it as "recovered instantly".** A `null` on
+  `recovery_days_to_bb_baseline`/`recovery_days_to_rhr_baseline` means either
+  "did not reach the threshold within 7 days", "no `daily_metrics` row on
+  those days", **or** "no baseline existed for that channel on this date" (the
+  paired `bb_baseline_note`/`rhr_baseline_note` distinguishes the last case).
+  All three are dropped from `avg_recovery_days_*` (the averages filter on
+  truthiness), which biases the means **optimistically** — the workouts you
   never recovered from don't drag the average up. Always report the averages
   alongside `n_workouts_matched` and the count of `null`s you can see.
 - **The 7-day search window is hard-coded** (`range(1, 8)`), as are the 0.95×

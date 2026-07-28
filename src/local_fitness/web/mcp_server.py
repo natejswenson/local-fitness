@@ -619,6 +619,28 @@ def build_session_manager(
     return server, manager
 
 
+def _prewarm_matplotlib() -> None:
+    """Best-effort background warm-up (Fix 11): matplotlib's own import costs
+    157-210ms, paid today on whichever of generate_chart/PDF-rendering tools
+    a stdio session calls first (the lazy `import matplotlib` in
+    visuals.py) — a warm process renders in 42-60ms. Importing it here, off
+    the request path, absorbs that cost while the client is still doing its
+    initialize handshake so the first real tool call already sees it warm.
+    Runs in a daemon thread so it can never block process shutdown, and any
+    failure (missing/broken install) is swallowed rather than raised — a
+    failed pre-warm just means visuals.py's own lazy import pays the cost
+    later, exactly like before this fix existed."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+    except Exception:
+        _LOG.debug(
+            "matplotlib pre-warm failed; falling back to on-demand import",
+            exc_info=True,
+        )
+
+
 async def run_stdio() -> None:
     """Serve the same tools over stdio (local, auth-free), PLUS
     ``agent_tools.LOCAL_ONLY_TOOLS`` — the PDF-writing tools
@@ -627,6 +649,8 @@ async def run_stdio() -> None:
     extra_tools note and the design doc). No HTTP, so the Host/Origin and
     trailing-slash gotchas of the HTTP path do not apply."""
     from mcp.server.stdio import stdio_server
+
+    threading.Thread(target=_prewarm_matplotlib, daemon=True).start()
 
     server = build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
     async with stdio_server() as (read, write):

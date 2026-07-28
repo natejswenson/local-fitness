@@ -137,16 +137,69 @@ DAILY_NUMERIC_METRICS = {
 }
 
 
+# Fix 10 (2026-07-27): fields whose raw float64 carries real sub-hundredth
+# precision that's borderline lossy at the default 2dp — pace (seconds/km,
+# summed over a whole run so 2dp's ~0.01 sec/km could compound visibly across
+# a long distance) and training-effect scores (already a 1dp Garmin scale, but
+# derived arithmetic on it — e.g. te_collapsing's `< 1.0` comparisons — reads
+# the raw value, not the rounded serialized one, so 4dp here just gives a
+# generous margin at negligible size cost). Every other float gets 2dp — the
+# measured win (10.2%/10.1%/6.8%/3.4% smaller payloads across query_workouts/
+# daily_snapshot/plan progress) comes from the ~15-digit tail float64 division
+# leaves behind (e.g. "avg_pace_sec_per_km": 333.2222672948015), and 2dp
+# already strips all of that for values callers only ever read to whole or
+# tenths precision.
+_TEXT_HIGH_PRECISION_KEYS = frozenset({
+    "avg_pace_sec_per_km", "target_pace_sec_per_km", "actual_pace_sec_per_km",
+    "aerobic_te", "anaerobic_te",
+})
+_TEXT_DEFAULT_DP = 2
+_TEXT_HIGH_DP = 4
+
+
+def _round_floats(obj: Any, key: str | None = None) -> Any:
+    """Recursively round float64 noise before JSON serialization.
+
+    The ONE choke point every tool payload flows through (``_text``/``_err``),
+    so every one of the 55+ tools gets this for free rather than each caller
+    rounding its own fields by hand (which is how the noise shipped in the
+    first place — most call sites DO round, a few don't, and json.dumps
+    serializes whatever float64 division left behind: 15+ digits for a value
+    nobody reads past the first 1-2).
+
+    ``bool`` is checked before ``float``/``int`` because ``bool`` is an
+    ``int`` subclass in Python (``isinstance(True, int) is True``) — without
+    the explicit check a boolean payload field would round-trip as an int.
+    ``key`` threads the enclosing dict key down so ``_TEXT_HIGH_PRECISION_KEYS``
+    (pace, aerobic/anaerobic TE) get 4dp instead of the default 2; every other
+    float, at any nesting depth, gets 2dp. Ints/strs/None pass through
+    untouched — this never corrupts a non-float type.
+    """
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        dp = _TEXT_HIGH_DP if key in _TEXT_HIGH_PRECISION_KEYS else _TEXT_DEFAULT_DP
+        return round(obj, dp)
+    if isinstance(obj, dict):
+        return {k: _round_floats(v, k) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_round_floats(v, key) for v in obj]
+    return obj
+
+
 def _text(payload: Any) -> dict:
     # Compact JSON (no indent) — fewer whitespace tokens across the multi-turn
     # agent loop; the model parses either format.
     if not isinstance(payload, str):
-        payload = json.dumps(payload, default=str)
+        payload = json.dumps(_round_floats(payload), default=str)
     return {"content": [{"type": "text", "text": payload}]}
 
 
 def _err(msg: str, **extra) -> dict:
-    return {"content": [{"type": "text", "text": json.dumps({"error": msg, **extra})}], "is_error": True}
+    return {
+        "content": [{"type": "text", "text": json.dumps(_round_floats({"error": msg, **extra}))}],
+        "is_error": True,
+    }
 
 
 def _validate_days(value: Any, name: str = "days", *, lo: int = 1, hi: int = 3650) -> str | None:
@@ -214,6 +267,13 @@ def _augment_workout(w: dict) -> dict:
     never dropped — correlate / run_sql depend on them. A convenience field is
     only added when units.py returns non-None (null / zero → omitted). The
     ``distance_mi`` field is suppressed entirely when display units aren't miles.
+
+    ``effort`` is the MEASURED run-vs-walk read (interpret.is_running_effort,
+    pace only) — "run" / "walk" / null when pace is unusable. Garmin's
+    activity_type label lies (walking-desk sessions log as
+    treadmill_running — see CLAUDE.md's run-vs-walk rule), so this is
+    additive, never a replacement for activity_type, and never used to filter
+    or exclude anything here.
     """
     if units.display_units() == "miles":
         distance_mi = units.to_miles(w.get("distance_meters"))
@@ -225,6 +285,8 @@ def _augment_workout(w: dict) -> dict:
     duration = units.format_duration(w.get("duration_seconds"))
     if duration is not None:
         w["duration_formatted"] = duration
+    mode = interpret.is_running_effort(w.get("avg_pace_sec_per_km"))
+    w["effort"] = {True: "run", False: "walk", None: None}[mode]
     return w
 
 
@@ -234,8 +296,10 @@ def _augment_workout(w: dict) -> dict:
 _DAILY_SNAPSHOT_DESCRIPTION = (
     "The full daily snapshot — today's metrics with baseline deltas / trend "
     "arrows, current CTL/ATL/TSB, recent workouts (with mile + formatted "
-    "fields), and saved user notes. The same payload the brief and coach "
-    "prompt share. Pure read. No plan/anomalies/candidates in this payload — "
+    "fields, plus a measured `effort` \"run\"/\"walk\"/null since Garmin's own "
+    "activity_type label can misreport a walk as a run), and saved user "
+    "notes. The same payload the brief and coach prompt share. Pure read. "
+    "No plan/anomalies/candidates in this payload — "
     "use get_brief_context for the full read or anything plan-/trend-related."
 )
 
@@ -259,7 +323,12 @@ async def get_today_status(_args: dict) -> dict:
     "get_metric",
     "Get raw daily values for one metric over the last N days, oldest-first. "
     "Skips days with no reading (NULL) and reports days_with_data vs the window. "
-    "*_seconds metrics carry a value_formatted (e.g. '7h 33m') alongside the raw value.",
+    "*_seconds metrics carry a value_formatted (e.g. '7h 33m') alongside the raw value. "
+    "For same-day running-tally metrics (steps, avg_stress, max_stress, "
+    "active_calories, intensity minutes, body_battery_charged/drained) the "
+    "window anchors on YESTERDAY, not today — today's tally is partial all "
+    "day, so `partial_today_excluded: true` is attached and 'the last N days' "
+    "means N complete days ending yesterday, not today.",
     {"metric": str, "days": int},
 )
 async def get_metric(args: dict) -> dict:
@@ -270,7 +339,9 @@ async def get_metric(args: dict) -> dict:
     if err:
         return _err(err)
     days = args["days"]
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    today = date.today()
+    anchor = _partial_day_anchor(metric, today)
+    cutoff = (anchor - timedelta(days=days)).isoformat()
     # Skip NULL readings: for sparse columns (vo2_max updates only on run days)
     # a long window is otherwise mostly {"value": null} rows — pure token cost.
     # get_metric_trend already filters the same way; this aligns the two on what
@@ -279,8 +350,8 @@ async def get_metric(args: dict) -> dict:
     with db.connect() as conn:
         rows = conn.execute(
             f"SELECT date, {metric} AS value FROM daily_metrics "
-            f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date",
-            (cutoff,),
+            f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date",
+            (cutoff, anchor.isoformat()),
         ).fetchall()
         # Same latest-baseline fetch as get_metric_trend (mirrored exactly):
         # without it, "is 52 high?" on a raw-values payload needed a second
@@ -311,6 +382,8 @@ async def get_metric(args: dict) -> dict:
         "days_with_data": len(values),
         "values": values,
     }
+    if anchor != today:
+        payload["partial_today_excluded"] = True
     current_vs_baseline_sd = None
     if values and baseline and baseline["m"] is not None:
         payload["baseline_60day_mean"] = baseline["m"]
@@ -327,7 +400,14 @@ async def get_metric(args: dict) -> dict:
 
 @tool(
     "get_metric_trend",
-    "Trend stats (mean, slope, current vs baseline) for a metric over N days.",
+    "Trend stats (mean, slope, current vs baseline) for a metric over N days. "
+    "For same-day running-tally metrics (steps, avg_stress, max_stress, "
+    "active_calories, intensity minutes, body_battery_charged/drained) the "
+    "window anchors on YESTERDAY — today's tally is partial all day and a "
+    "trend/mean computed against it is misleading (a 06:30 read of 50 "
+    "overnight stress samples is not the day's average). `current` is "
+    "therefore yesterday's value for those metrics, and "
+    "`partial_today_excluded: true` is attached.",
     {"metric": str, "days": int},
 )
 async def get_metric_trend(args: dict) -> dict:
@@ -339,12 +419,14 @@ async def get_metric_trend(args: dict) -> dict:
     if err:
         return _err(err)
     days = args["days"]
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    today = date.today()
+    anchor = _partial_day_anchor(metric, today)
+    cutoff = (anchor - timedelta(days=days)).isoformat()
     with db.connect() as conn:
         rows = conn.execute(
             f"SELECT date, {metric} AS v FROM daily_metrics "
-            f"WHERE date >= ? AND {metric} IS NOT NULL ORDER BY date",
-            (cutoff,),
+            f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date",
+            (cutoff, anchor.isoformat()),
         ).fetchall()
         baseline = None
         if metric in BASELINE_METRICS:
@@ -390,6 +472,8 @@ async def get_metric_trend(args: dict) -> dict:
         "slope_per_day": slope,
         "slope_direction": interpret.trend_direction(slope, flat_threshold=flat_threshold),
     }
+    if anchor != today:
+        payload["partial_today_excluded"] = True
     if baseline and baseline["m"] is not None:
         payload["baseline_60day_mean"] = baseline["m"]
         payload["baseline_60day_sd"] = baseline["sd"]
@@ -428,6 +512,32 @@ _CHART_CUMULATIVE_METRICS = frozenset({
     "intensity_minutes_moderate", "intensity_minutes_vigorous",
     "intensity_minutes_weighted", "body_battery_charged", "body_battery_drained",
 })
+
+# Fix 8 (2026-07-27): metrics that are a same-day RUNNING TALLY — Garmin
+# computes them incrementally through the day, so "today"'s reading is
+# necessarily partial no matter what time it's read, not just before some
+# cutoff we could detect from date-only data. Reuses _CHART_CUMULATIVE_METRICS
+# (same underlying fact: these accumulate over the day) plus avg_stress/
+# max_stress, which that set omits only because they don't get SUMMED in the
+# chart tool's weekly calendar column — they're still a running computation
+# over the day's samples-so-far. Measured live: a 06:30 brief read avg_stress
+# off 50 overnight samples (00:00-02:27) as "17", narrated 3x as recovery
+# evidence against a 32 baseline, when every complete day that week ran
+# 24-32. body_battery_max/min are deliberately EXCLUDED — Fix 1 (0.39.0)
+# already made those a per-day MIN/MAX rollup over the full day's samples;
+# that fix's scope stops there and this one doesn't reopen it.
+PARTIAL_DAY_METRICS = _CHART_CUMULATIVE_METRICS | frozenset({"avg_stress", "max_stress"})
+
+
+def _partial_day_anchor(metric: str, today: date) -> date:
+    """The latest date safe to treat as a COMPLETE reading for `metric`.
+
+    For PARTIAL_DAY_METRICS this is always yesterday, full stop — mirroring
+    ledger.py's as-of-yesterday step-streak discipline (today's tally is
+    partial ALL DAY, not just before some time-of-day cutoff nothing here can
+    observe). Every other metric anchors on `today`, unchanged.
+    """
+    return today - timedelta(days=1) if metric in PARTIAL_DAY_METRICS else today
 
 _CHART_SCHEMA = {
     "type": "object",
@@ -783,7 +893,10 @@ def _validate_limit(args: dict, *, default: int = 50, hi: int = 500) -> int | st
     "List workouts with optional filters (activity_type substring, days "
     "lookback, min distance in miles, min duration). Returns "
     "{workouts, count, truncated} — most recent first; truncated=true means "
-    "more rows matched than the limit returned.",
+    "more rows matched than the limit returned. Each workout also carries "
+    "a measured `effort` (\"run\"/\"walk\"/null) — activity_type is Garmin's "
+    "own label and can misreport a walk as a run (e.g. treadmill_running), "
+    "so prefer `effort` for run-vs-walk questions.",
     _QUERY_WORKOUTS_SCHEMA,
 )
 async def query_workouts(args: dict) -> dict:
@@ -833,7 +946,9 @@ async def query_workouts(args: dict) -> dict:
 
 @tool(
     "get_workout_detail",
-    "Full detail for one workout — splits and HR zones included.",
+    "Full detail for one workout — splits and HR zones included. Carries a "
+    "measured `effort` (\"run\"/\"walk\"/null) on the activity and each split — "
+    "activity_type is Garmin's own label and can misreport a walk as a run.",
     {"activity_id": int},
 )
 async def get_workout_detail(args: dict) -> dict:
@@ -1175,7 +1290,10 @@ async def sync_garmin_data(_args: dict) -> dict:
     # identical duplication was already removed from correlate's legend once).
     f"Current CTL/ATL/TSB plus 30-day history. TSB > {interpret.TSB_FRESH:g} fresh, "
     f"{interpret.TSB_FATIGUED:g}..{interpret.TSB_FRESH:g} neutral, "
-    f"< {interpret.TSB_FATIGUED:g} fatigued, < {interpret.TSB_VERY_FATIGUED:g} very fatigued.",
+    f"< {interpret.TSB_FATIGUED:g} fatigued, < {interpret.TSB_VERY_FATIGUED:g} very fatigued. "
+    "`current` is always the last COMPLETE day (never today's own row, which "
+    "assumes zero training_load until something syncs) — today's same-day "
+    "projection, if any, rides along separately under `projected_end_of_day`.",
     {},
 )
 async def training_load_status(_args: dict) -> dict:
@@ -1204,7 +1322,22 @@ async def training_load_status(_args: dict) -> dict:
         anchor = (date.today() - timedelta(days=brief_planner._LOOKBACK_DAYS)).isoformat()
         ctl_then = brief_planner.ctl_at_or_before(conn, anchor)
 
-    current = recent[0]
+    # Fix 9 (2026-07-27): "current" is the last COMPLETE day (date < today),
+    # never today's own row — baselines.recompute walks the CTL/ATL EWMA
+    # forward assuming today's training_load is whatever's posted so far (0
+    # before any activity syncs), so treating today's row as current form
+    # pre-credits a zero-load rest day that hasn't happened. Measured live:
+    # TSB read -12.74 today vs -22.41 yesterday, crossing the
+    # very-fatigued/fatigued zone boundary purely because no run had posted
+    # yet. `recent` is already DESC by date, so the first date < today wins.
+    today_str = date.today().isoformat()
+    current = next((r for r in recent if r["date"] < today_str), None)
+    projected_row = next((r for r in recent if r["date"] == today_str), None)
+    if current is None:
+        return _err(
+            "no training-load data yet — call sync_garmin_data to pull "
+            "activities (baselines recompute automatically once data lands)"
+        )
     ctl_pct = interpret.pct_change(current.get("ctl"), ctl_then)
     if ctl_pct is not None:
         ctl_pct = round(ctl_pct, 1)
@@ -1212,7 +1345,21 @@ async def training_load_status(_args: dict) -> dict:
     # A scalar %-delta, not a slope/series — delta_direction, not trend_direction.
     ctl_direction = interpret.delta_direction(ctl_pct)
 
-    for row in recent:  # current IS recent[0] — rounding recent rounds current too.
+    projected_end_of_day = None
+    if projected_row is not None:
+        # Today's own (same-day-projection) row, exposed separately — never
+        # reported as "current".
+        projected_end_of_day = {
+            "ctl": projected_row.get("ctl"),
+            "atl": projected_row.get("atl"),
+            "tsb": projected_row.get("tsb"),
+            "interpretation": interpret.tsb_zone(projected_row.get("tsb")),
+        }
+        for field in ("ctl", "atl", "tsb"):
+            if projected_end_of_day.get(field) is not None:
+                projected_end_of_day[field] = round(projected_end_of_day[field], 2)
+
+    for row in recent:  # `current` is one of these rows — rounding recent rounds it too.
         for field in ("ctl", "atl", "tsb"):
             if row.get(field) is not None:
                 row[field] = round(row[field], 2)
@@ -1223,6 +1370,7 @@ async def training_load_status(_args: dict) -> dict:
         "tsb_zone": tsb_zone,
         "ctl_pct_change_14d": ctl_pct,
         "ctl_direction": ctl_direction,
+        "projected_end_of_day": projected_end_of_day,
         "interpretation": {
             "ctl": "chronic training load (fitness) — 42-day EWMA of activity training_load",
             "atl": "acute training load (fatigue) — 7-day EWMA",
@@ -1315,7 +1463,7 @@ _RECOVERY_SCHEMA = {
 
 @tool(
     "recovery_pattern",
-    "After workouts matching the filter, how many days does body battery max and RHR typically take to return to within 95% / 103% of baseline? Returns averages, the 10 most-recent matched workouts, and how many were skipped for want of a baseline.",
+    "After workouts matching the filter, how many days does body battery max and RHR typically take to return to within 95% / 103% of baseline? Returns averages, the 10 most-recent matched workouts, and how many were skipped for want of a baseline. A workout matches as long as EITHER channel has a usable baseline for its date — the other channel reads null with a bb_baseline_note/rhr_baseline_note explaining why, never a false 'recovered instantly'.",
     _RECOVERY_SCHEMA,
 )
 async def recovery_pattern(args: dict) -> dict:
@@ -1378,13 +1526,38 @@ async def recovery_pattern(args: dict) -> dict:
             ).fetchall()}
 
     results = []
+    # Whole-workout skip only when NEITHER channel has a usable baseline for
+    # that date — the original gate skipped the entire workout (including a
+    # perfectly good rhr baseline) whenever body_battery_max_60day_mean was
+    # NULL, which is every date after 2026-01-27 (that baseline column derived
+    # from the now-dead body_battery_max ingest — see the daily.py fix). A
+    # 90-day recovery_pattern call was therefore returning 0 matched no matter
+    # what, even though rhr_60day_mean was alive the whole time.
     n_skipped_no_baseline = 0
+    # Of the workouts that DID match, how many had no usable baseline for one
+    # specific channel — that channel is n/a on the workout (see
+    # bb_baseline_note/rhr_baseline_note) rather than silently 0/None looking
+    # like "recovered instantly".
+    n_skipped_no_bb_baseline = 0
+    n_skipped_no_rhr_baseline = 0
     for w in workouts:
         wdate = date.fromisoformat(w["date"])
         baseline = baselines_by_date.get(w["date"])
-        if not baseline or baseline["bb"] is None:
+        bb_baseline = baseline["bb"] if baseline else None
+        rhr_baseline = baseline["rhr"] if baseline else None
+        if bb_baseline is None and rhr_baseline is None:
             n_skipped_no_baseline += 1
             continue
+
+        bb_note = None
+        rhr_note = None
+        if bb_baseline is None:
+            n_skipped_no_bb_baseline += 1
+            bb_note = "no body-battery baseline for this date"
+        if rhr_baseline is None:
+            n_skipped_no_rhr_baseline += 1
+            rhr_note = "no RHR baseline for this date"
+
         bb_recovery = None
         rhr_recovery = None
         for offset in range(1, 8):
@@ -1393,31 +1566,44 @@ async def recovery_pattern(args: dict) -> dict:
                 continue
             if (
                 bb_recovery is None
+                and bb_baseline is not None
                 and row["body_battery_max"]
-                and row["body_battery_max"] >= baseline["bb"] * 0.95
+                and row["body_battery_max"] >= bb_baseline * 0.95
             ):
                 bb_recovery = offset
             if (
                 rhr_recovery is None
-                and baseline["rhr"]
+                and rhr_baseline is not None
                 and row["rhr"]
-                and row["rhr"] <= baseline["rhr"] * 1.03
+                and row["rhr"] <= rhr_baseline * 1.03
             ):
                 rhr_recovery = offset
         results.append(_augment_workout({
             **w,
             "recovery_days_to_bb_baseline": bb_recovery,
             "recovery_days_to_rhr_baseline": rhr_recovery,
+            "bb_baseline_note": bb_note,
+            "rhr_baseline_note": rhr_note,
         }))
 
     bb_vals = [r["recovery_days_to_bb_baseline"] for r in results if r["recovery_days_to_bb_baseline"]]
     rhr_vals = [r["recovery_days_to_rhr_baseline"] for r in results if r["recovery_days_to_rhr_baseline"]]
     return _text({
         "n_workouts_matched": len(results),
-        # Workouts that cleared the filter but had no usable baselines row for
-        # their own date. These were always dropped silently, which made
-        # "3 matched" unreadable — 3 of 3 and 3 of 40 printed identically.
+        # Workouts that cleared the filter but had NEITHER channel's baseline
+        # for their own date, so nothing at all could be computed for them.
+        # These were always dropped silently, which made "3 matched"
+        # unreadable — 3 of 3 and 3 of 40 printed identically.
         "n_skipped_no_baseline": n_skipped_no_baseline,
+        # Of the MATCHED workouts, how many had no usable baseline for just
+        # one channel (that channel's recovery is n/a on the workout, with a
+        # note, rather than silently reading as "recovered instantly"). A
+        # whole-workout skip used to be driven by body-battery baseline alone
+        # (dead since 2026-01-27 — see daily.py's body_battery_min/max fix),
+        # which zeroed out every recent-window match even when rhr baselines
+        # were fine.
+        "n_skipped_no_bb_baseline": n_skipped_no_bb_baseline,
+        "n_skipped_no_rhr_baseline": n_skipped_no_rhr_baseline,
         "avg_recovery_days_body_battery": round(sum(bb_vals) / len(bb_vals), 2) if bb_vals else None,
         "avg_recovery_days_rhr": round(sum(rhr_vals) / len(rhr_vals), 2) if rhr_vals else None,
         "recent_workouts": results[-10:],
@@ -2854,6 +3040,48 @@ async def get_training_plan_progress(args: dict) -> dict:
     })
 
 
+@tool(
+    "get_training_plan_draft",
+    "The DRAFT training plan awaiting a decision, if one exists — created by "
+    "propose_training_plan/revise_training_plan and otherwise invisible: "
+    "get_training_plan_status/get_training_plan_progress report the ACTIVE "
+    "plan only, never a draft. Returns {draft: false} when there is no "
+    "draft. Once you have the plan_id from here, hand it to "
+    "commit_training_plan to activate the draft or discard_training_plan_draft "
+    "to drop it.",
+    {},
+)
+async def get_training_plan_draft(_args: dict) -> dict:
+    draft = plans.get_draft_plan()
+    if draft is None:
+        return _text({"draft": False})
+
+    workouts = [plans._slim_workout(w) for w in draft["workouts"]]
+    for w in workouts:
+        _augment_plan_workout(w)
+        duration_formatted = units.format_duration(w.get("target_duration_sec"))
+        if duration_formatted is not None:
+            w["target_duration_formatted"] = duration_formatted
+
+    race = plans._parse_iso(draft.get("race_date"))
+    today_d = plans._parse_iso(date.today().isoformat())
+    days_to_race = (race - today_d).days if race and today_d else None
+
+    return _text({
+        "draft": True,
+        "plan_id": draft["plan_id"],
+        "title": draft.get("title"),
+        "goal_type": draft.get("goal_type"),
+        "race_date": draft.get("race_date"),
+        "target_time_seconds": draft.get("target_time_seconds"),
+        "target_time_formatted": units.format_duration(draft.get("target_time_seconds")),
+        "days_to_race": days_to_race,
+        "created_at": draft.get("created_at"),
+        "workout_count": len(workouts),
+        "workouts": workouts,
+    })
+
+
 def _save_brief_input_schema() -> dict:
     """Advertise the real Brief JSON Schema as the tool's input contract, not an
     opaque ``{"brief": dict}``.
@@ -3909,6 +4137,7 @@ ALL_TOOLS = [
     abandon_active_plan,
     get_training_plan_status,
     get_training_plan_progress,
+    get_training_plan_draft,
     save_brief,
     generate_chart,
     list_report_cards,

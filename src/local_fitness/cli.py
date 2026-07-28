@@ -5,6 +5,7 @@ Subcommands:
   pull                  — pull from Garmin Connect since last success
   backfill <zip>        — load historical Garmin data export
   recompute-baselines   — recompute rolling baselines + CTL/ATL/TSB
+  recompute-body-battery — backfill body_battery_min/max from stored samples
   brief                 — pull + recompute + generate today's briefing
   status                — show DB stats and last ingest run
 """
@@ -137,6 +138,19 @@ def recompute_baselines(lookback: int):
     """Recompute 60-day rolling baselines and CTL/ATL/TSB."""
     n = baselines.recompute(lookback_days=lookback)
     click.echo(f"Recomputed baselines for {n} dates.")
+
+
+@main.command(name="recompute-body-battery")
+def recompute_body_battery():
+    """Backfill daily_metrics.body_battery_min/max from stored samples.
+
+    One-time (or as-needed) repair for historical rows ingested before
+    body_battery_min/max derivation existed — never runs automatically on
+    `pull`. Idempotent: safe to re-run, never overwrites a non-NULL value.
+    """
+    n = daily_ingest.recompute_body_battery_minmax()
+    click.echo(f"Backfilled body_battery_min/max for {n} date(s).")
+
 
 
 def _notify(message: str) -> None:

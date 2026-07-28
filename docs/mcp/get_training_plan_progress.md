@@ -190,4 +190,5 @@ a dump of the workout array.
 - [`get_training_plan_status`](./get_training_plan_status.md) — the slim, today-only read
 - [`update_plan_workout`](./update_plan_workout.md) — change a day you see here
 - [`propose_training_plan`](./propose_training_plan.md) · [`commit_training_plan`](./commit_training_plan.md) — how this plan got here
+- [`get_training_plan_draft`](./get_training_plan_draft.md) — the equivalent read for a plan not yet committed
 - [`abandon_active_plan`](./abandon_active_plan.md) — what makes this return `{"active": false}`

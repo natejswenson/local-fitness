@@ -390,6 +390,23 @@ def test_memory_block_carries_the_grounding_contract():
     assert prompts.coach_memory_block("Alex", "") == ""
 
 
+def test_memory_block_carries_the_relationship_doctrine():
+    """The offensive half of "using your memory" ('a fact is a receipt —
+    spend it', 'a promise is a debt', a broken streak named back once) used
+    to live only in coach_profiles/hardass.md's prose — so a conversational
+    tune (personality.render_spec_persona REPLACES the profile prose
+    wholesale) silently deleted it from every surface the moment Nate tuned
+    the Sarge persona. Living in coach_memory_block instead makes it
+    tune-proof by construction: no spec patch can reach into a different
+    module's string. Non-compact only — V2 must not grow."""
+    full = prompts.coach_memory_block("Alex", _MEMORY)
+    assert "is a debt you collect on" in full
+    assert "streak that broke" in full
+    compact = prompts.coach_memory_block("Alex", _MEMORY, compact=True)
+    assert "is a debt you collect on" not in compact
+    assert len(compact) < len(full)
+
+
 def test_system_prompt_carries_capture_and_recall_instructions(no_saved_notes):
     """The MCP instructions payload must keep both halves of conversation
     memory: the capture directive (save durable facts + session notes) and

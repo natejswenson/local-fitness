@@ -6,6 +6,107 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-07-27
+
+Evidence-driven audit across accuracy, persona, UX and speed. Every item
+below was found by measuring against the real live database, not by
+reading code — the "why it mattered" numbers are live observations.
+
+### Fixed
+- **Body Battery has been dead since January.** `_ingest_day` read
+  `min`/`max` keys Garmin does not return, so both columns were NULL on
+  all 2,156 rows while `charged`/`drained` landed fine. They are now
+  derived from the per-minute `bodyBatteryValuesArray` the same payload
+  already yields (no extra API call), with
+  `recompute_body_battery_minmax()` + `fitness recompute-body-battery`
+  to repair history from the 13,603 stored samples.
+- **The morning brief compared partial-day metrics against full-day
+  baselines.** A 06:30 brief printed `Avg Stress 17 vs 32 baseline,
+  -47%` and narrated it three times as recovery evidence — the 17 came
+  from 50 stress samples covering 00:00–02:27. Cumulative metrics
+  (`PARTIAL_DAY_METRICS`) now anchor derived comparisons on the last
+  complete day; raw point-in-time reads keep today's value but are
+  flagged. Point-in-time metrics (rhr, sleep, vo2_max) are untouched.
+- **TSB pre-credited today as a completed rest day.** At 06:30 with no
+  activity logged, form read `-12.74` ("fatigued") against yesterday's
+  completed `-22.41` ("very fatigued") — a full zone flip that inverted
+  again the moment a run synced. `current form` is now the last complete
+  day (`current_form_date`), with today's value preserved and clearly
+  labelled `projected_end_of_day`.
+- **A walking session could score an A against a prescribed run.** A
+  4.00 mi walk at 14:09/mi took pace `A+`/overall `A` against an
+  "Easy 4mi @ 9:39/mi" prescription, and a 2.42 mi walking-desk session
+  at 83:49/mi graded overall `A`. Three compounding causes: the easy/long
+  pace arm had no slow-side floor, `build_card`'s plan branch never
+  applied the 0.27.0 measured-locomotion rule, and `_select_activity`
+  took the day's *first* session (a walk on 26 of 52 multi-activity
+  days). Walk-effort activities taking an A-band pace grade on a
+  plan-prescribed running day went 8/10 → 0/10. Plan adherence and
+  `_foot_distance` are deliberately unchanged — walking still counts.
+- **The coach quoted receipts that were false.** `notable_results`
+  promoted any `done` quality day to a quotable receipt without
+  consulting its graded card, so "Jul 21: interval day done as
+  prescribed" shipped into every voice surface for a session graded
+  **D** — directly above the journal entry correcting it. Overachievement
+  was also measured on on-foot distance, so a day whose run matched its
+  target to within a metre (plus a 17:06/mi walk) printed "ran past its
+  target", and a pure-walk day with zero running would too. Both now
+  gate on graded results and run distance.
+- **Journal entries carried letter grades and CTL numbers** into
+  `workout_coach`'s prompt — the exact surface 0.28.1 scrubbed after
+  measuring leakage. `parse_reflection` now enforces deterministically
+  (signed grades, `graded X`, slash-runs like `(A/A+/A+)`, CTL/ATL/TSB)
+  and strips a model-written leading date.
+- **The compact memory block shipped a dangling empty header.** The
+  600-char cap evicted every journal line but left
+  "Your journal (what you wrote down):" standing — an invitation to
+  invent. Ledger and journal now budget separately.
+- **`recovery_pattern` was a dead tool.** A missing body-battery
+  baseline discarded the whole workout, so every window inside six
+  months returned 0 matched while the rhr baseline was current. Now
+  gated per channel, with a stated reason when a channel is n/a.
+- **Sample timestamps were host-timezone-dependent.** `_ingest_day`
+  converted epoch-ms with no `tz=`, so the stored wall-clock inherited
+  the ingesting process's zone — a measured +5h split across 49 days.
+  Conversion now uses each payload entry's own local/GMT delta.
+- **The grounding monitor could not detect a sign inversion.** Matching
+  on `abs()` meant a cited `+22.4` against a real `-22.4` — "rested, go
+  hard" vs "very fatigued, back off" — scored clean, and the reported
+  delta was wrong by ~2x. It now matches signed values with a distinct
+  `sign` flag class, pools raw values rather than tokens scraped from
+  display strings, matches within-unit, and includes `workouts_14d` /
+  `plan_today` / `anomalies` in the pool.
+
+### Added
+- `effort` (`"run"`/`"walk"`/`null`) on workout payloads, measured by
+  pace via `interpret.is_running_effort` — Garmin labels walking-desk
+  sessions `treadmill_running`, and 28 of the last 61 activities
+  labelled as runs were walks.
+- `get_training_plan_draft` — a draft plan had no read tool at all, so a
+  real 59-workout draft could not be listed, committed or discarded
+  (both lifecycle tools require a `plan_id` nothing surfaced).
+- `projected_end_of_day` on the training-load payloads.
+
+### Changed
+- Payload floats round at the `_text()` boundary (2dp, 4dp for pace and
+  training-effect) — `"distance_meters": 6436.27978515625` became
+  `6436.28`, ~10% smaller on the highest-traffic tool.
+- The coach's memory doctrine moved into `prompts.coach_memory_block`,
+  which takes no profile or spec argument — a tuned personality spec
+  replaces the profile wholesale, which had silently deleted it from
+  every surface.
+- `matplotlib` pre-warms on `mcp-stdio` start (~200 ms off the first
+  chart of a session).
+
+### Notes
+- A historical repair for the timezone drift was written and
+  **withdrawn**: rebuilding samples from `raw_json` destroyed 699 of
+  13,603 rows (that payload holds only the last pull, while the table
+  accumulates the union across pulls). The forward fix ships; repairing
+  the ~18,000 already-misfiled rows needs a design that cannot lose
+  data. Stress history is additionally unrepairable — `raw_json` never
+  carried the stress payload.
+
 ## [0.38.1] - 2026-07-26
 
 Live-session polish: two warts caught while grading a real run on the
