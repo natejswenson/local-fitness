@@ -3593,7 +3593,7 @@ def test_report_card_coach_read_failure_falls_back_and_still_renders(
 def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monkeypatch):
     async def _read(*a, **k):
         return {"distance": "You covered the ground.", "pace": "Too quick.",
-                "hr": "Stayed low.", "load": "Banked what it should."}
+                "hr": "Stayed low.", "stimulus": "Banked what it should."}
 
     monkeypatch.setattr(tools.workout_coach, "generate_read_cached", _read)
     payload, err = call(tools.workout_report_card, {})
@@ -3601,7 +3601,7 @@ def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monke
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
     # All four paragraphs render, each under its metric label.
-    for label in ("DISTANCE", "PACE", "HEART RATE", "TRAINING LOAD"):
+    for label in ("DISTANCE", "PACE", "HEART RATE", "STIMULUS"):
         assert label in text
     for para in ("You covered the ground.", "Too quick.", "Stayed low.",
                  "Banked what it should."):
@@ -3983,7 +3983,7 @@ _RC_READ_TEXT = (
     "DISTANCE: covered the ground today.\n"
     "PACE: quick stuff throughout.\n"
     "HEART RATE: low and easy the whole way.\n"
-    "TRAINING LOAD: banked plenty for the week."
+    "STIMULUS: banked plenty for the week."
 )
 
 
@@ -4144,7 +4144,10 @@ def test_list_report_cards_payload_filters_and_order(rc_cards, reports_tmp, monk
     # activity 103 is 3 days ago, 105 is 5 days ago — newest run first.
     assert [c["activity_id"] for c in payload["cards"]] == [103, 105]
     top = payload["cards"][0]
-    assert set(top["grades"]) == {"distance", "pace", "hr", "load"}
+    assert set(top["grades"]) == {"distance", "pace", "hr", "continuity", "load"}
+    # `load` is present as a key but is always NULL from 0.40.0 — it is a
+    # stimulus metric now. Every other key is a real compliance grade.
+    assert top["grades"]["load"] is None
     assert top["overall"] is not None and top["graded_at"]
     # The date filter pins actual rows, not just a count.
     cutoff = (date.today() - timedelta(days=4)).isoformat()

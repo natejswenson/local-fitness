@@ -583,6 +583,52 @@ def test_update_plan_workout_rest_clears_distance(seeded):
     assert row["type"] == "rest" and row["target_distance_m"] is None and row["target_pace_sec_per_km"] is None
 
 
+def test_update_plan_workout_writes_and_echoes_the_hr_cap(seeded):
+    """0.40.0: the cap has to land in a COLUMN. Before it existed, "keep HR under
+    140" lived only in the prose description and the report card could not read
+    it — HR was graded against 0.97x the rolling median instead."""
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout,
+                     {"date": d, "type": "easy", "distance_mi": 5,
+                      "hr_max": 140, "description": "Easy 5mi, HR under 140"})
+    assert not err
+    assert body["target_hr_max"] == 140.0          # echoed, not silently dropped
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT target_hr_max FROM plan_workouts WHERE date=?", (d,)).fetchone()
+    assert row["target_hr_max"] == 140.0
+
+
+def test_update_plan_workout_rest_clears_the_hr_cap_too(seeded):
+    """The cap is part of the prescription, so a rest-flip must clear it with the
+    rest — a stale 140 ceiling on a rest day would grade a bonus run against a
+    prescription that no longer exists."""
+    d = _active_plan(seeded)
+    call(tools.update_plan_workout, {"date": d, "type": "easy", "hr_max": 140})
+    _body, err = call(tools.update_plan_workout, {"date": d, "type": "rest"})
+    assert not err
+    with db.connect(seeded) as conn:
+        row = conn.execute(
+            "SELECT target_hr_max FROM plan_workouts WHERE date=?", (d,)).fetchone()
+    assert row["target_hr_max"] is None
+
+
+@pytest.mark.parametrize("bad", [40, 89, 211, 400])
+def test_update_plan_workout_rejects_an_implausible_hr_cap(seeded, bad):
+    """A cap outside 90-210 bpm is a transposed or unit-confused argument. It
+    matters more than the pace bound because the card grades against it directly."""
+    d = _active_plan(seeded)
+    body, err = call(tools.update_plan_workout, {"date": d, "hr_max": bad})
+    assert err and "90-210 bpm range" in body["error"]
+
+
+def test_update_plan_workout_hr_cap_alone_is_enough_to_update(seeded):
+    """Passing only hr_max must not trip the "nothing to update" guard."""
+    d = _active_plan(seeded)
+    _body, err = call(tools.update_plan_workout, {"date": d, "hr_max": 145})
+    assert not err
+
+
 def test_update_plan_workout_no_active_plan(seeded):
     call(tools.propose_training_plan, _args())  # a draft, not active
     body, err = call(tools.update_plan_workout, {"date": (date.today() + timedelta(days=1)).isoformat(), "type": "long"})

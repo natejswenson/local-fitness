@@ -41,7 +41,7 @@ FOUR_SECTIONS = (
     "DISTANCE: covered the ground.\n"
     "PACE: too quick.\n"
     "HEART RATE: stayed low.\n"
-    "TRAINING LOAD: banked what it should."
+    "STIMULUS: banked what it should."
 )
 
 
@@ -50,7 +50,8 @@ def a_card(activity=None, **kw):
                          kw.pop("plan", None), kw.pop("reference", REF),
                          kw.pop("context", {}), kw.pop("hr_samples", None),
                          kw.pop("recent_activities", None),
-                         kw.pop("upcoming_workouts", None))
+                         kw.pop("upcoming_workouts", None),
+                         kw.pop("hr_zones", None))
 
 
 # --- build_prompt: what the model is actually told --------------------------
@@ -67,8 +68,14 @@ def test_prompt_carries_the_computed_grades_and_forbids_re_grading():
     # it is forbidden to repeat. This is the invariant, not a style choice.
     assert workout_coach.grade_severity(card["overall"]["grade"]) in user
     assert f"Overall grade {card['overall']['grade']}" not in user
-    for label in ("Distance", "Pace", "Avg HR", "Training Load"):
+    for label in ("Distance", "Pace", "Avg HR"):
         assert label in user
+    # Training load is NOT among the per-metric verdicts any more (0.40.0) — it
+    # rides in its own block, explicitly marked unjudged, so the model cannot
+    # read it as a fourth thing it is being asked to grade.
+    assert "Training load" not in user.split("Training stimulus")[0]
+    assert "Training stimulus (REPORTED, not graded" in user
+    assert "do not ask for more work" in user
 
 
 def test_the_user_prompt_never_contains_a_letter_grade():
@@ -231,7 +238,7 @@ def test_cache_write_failure_still_returns_the_generated_text(tmp_path, monkeypa
 def test_fallback_returns_all_four_sections():
     card = a_card({"distance_meters": 4000, "avg_hr": 150})
     out = workout_coach.fallback_read(card)
-    assert set(out) == {"distance", "pace", "hr", "load"}
+    assert set(out) == {"distance", "pace", "hr", "stimulus"}
     assert all(v.strip() for v in out.values())
 
 
@@ -253,7 +260,57 @@ def test_fallback_survives_a_card_with_no_grades_at_all():
 
 def test_fallback_flags_a_load_spike():
     out = workout_coach.fallback_read(a_card({"training_load": 500}))
-    assert "double your median day" in out["load"]
+    assert "double your median day" in out["stimulus"]
+
+
+def test_prompt_stimulus_block_carries_zones_and_training_effect():
+    """The facts the STIMULUS paragraph is written from. Aerobic share is the one
+    number that makes "this really was easy" checkable rather than asserted — a
+    97%-aerobic run and a 30%-aerobic one can share an average HR."""
+    card = a_card({"aerobic_te": 2.0, "anaerobic_te": 0.4})
+    card["stimulus"]["zones"] = {
+        "seconds_by_zone": {1: 372.0, 2: 2490.0, 3: 86.0},
+        "total_seconds": 2948.0, "aerobic_pct": 97,
+    }
+    _system, user = workout_coach.build_prompt(PROFILE, card)
+    assert "97% of the run sat in the aerobic zones (Z1-Z2)." in user
+    assert "Aerobic training effect: 2.0 on a 0-5 scale." in user
+    assert "Anaerobic training effect: 0.4 on a 0-5 scale." in user
+
+
+def test_prompt_flags_a_higher_than_intended_stimulus():
+    """The one stimulus case the read SHOULD push on — it borrows from the next
+    session. Everything below the spike ceiling must not be nagged about."""
+    card = a_card({"training_load": 500})
+    _system, user = workout_coach.build_prompt(PROFILE, card)
+    assert "HIGHER than the day intended" in user
+    assert "SPIKE" in user
+
+
+def test_fallback_stimulus_distinguishes_no_history_from_no_load():
+    """Two different facts that were being conflated: a load figure the watch
+    never recorded, versus one it recorded but nothing comparable to scale it
+    against. The second used to claim the watch recorded nothing."""
+    no_history = a_card(reference={"mode": "insufficient_data", "n": 1,
+                                   "pool": "running"})
+    assert no_history["stimulus"]["level"] is None
+    out = workout_coach.fallback_read(no_history)["stimulus"]
+    assert "Training load 100" in out
+    assert "Not enough comparable history" in out
+
+    no_load = a_card({"training_load": None})
+    assert (workout_coach.fallback_read(no_load)["stimulus"]
+            == "No training-load figure recorded for this run.")
+
+
+def test_fallback_stimulus_says_a_low_number_is_not_a_shortfall():
+    """The template has to carry the 0.40.0 reading too — a failed Claude call
+    must not silently revert to scolding a correctly-run easy day."""
+    card = a_card({"training_load": 20, "avg_hr": 120}, plan={"type": "easy", "seq": 1})
+    assert card["stimulus"]["level"] == "LOW"
+    out = workout_coach.fallback_read(card)["stimulus"]
+    assert "Low stimulus" in out
+    assert "not a shortfall" in out
 
 
 def test_fallback_is_deterministic():
@@ -267,7 +324,7 @@ def test_parse_splits_labelled_sections():
     out = workout_coach.parse_read(FOUR_SECTIONS)
     assert out == {
         "distance": "covered the ground.", "pace": "too quick.",
-        "hr": "stayed low.", "load": "banked what it should.",
+        "hr": "stayed low.", "stimulus": "banked what it should.",
     }
 
 
@@ -278,7 +335,7 @@ def test_parse_tolerates_model_cosmetics():
         "**DISTANCE:** covered the ground.\n\n"
         "- Pace: too quick.\n\n"
         "  heart rate: stayed low.\n\n"
-        "TRAINING LOAD: banked what it should.\n"
+        "STIMULUS: banked what it should.\n"
     )
     out = workout_coach.parse_read(messy)
     assert out["distance"] == "covered the ground."
@@ -295,7 +352,7 @@ def test_parse_collapses_wrapped_paragraphs():
 @pytest.mark.parametrize("bad", [
     "",
     "DISTANCE: a. PACE: b. HEART RATE: c.",                    # load missing
-    "DISTANCE: a\nPACE: b\nHEART RATE: c\nTRAINING LOAD:",     # load empty
+    "DISTANCE: a\nPACE: b\nHEART RATE: c\nSTIMULUS:",     # stimulus empty
 ])
 def test_parse_rejects_incomplete_reads(bad):
     # A half-parsed read would render a card with a blank section. Raising
@@ -340,7 +397,7 @@ def test_cached_text_that_no_longer_parses_is_a_miss_not_a_failure(tmp_path, mon
 
 def test_prompt_demands_four_labelled_sections_and_forbids_letter_grades():
     system, _ = workout_coach.build_prompt(PROFILE, a_card())
-    for label in ("DISTANCE:", "PACE:", "HEART RATE:", "TRAINING LOAD:"):
+    for label in ("DISTANCE:", "PACE:", "HEART RATE:", "STIMULUS:"):
         assert label in system
     assert "Do not name one" in system
     assert "never about a score" in system
@@ -411,11 +468,11 @@ def test_markdown_card_renders_four_labelled_paragraphs():
     card = a_card()
     card["coach_read"] = {
         "distance": "You covered the ground.", "pace": "Too quick.",
-        "hr": "Stayed low.", "load": "Banked what it should.",
+        "hr": "Stayed low.", "stimulus": "Banked what it should.",
     }
     md = rc.render_markdown(card)
     assert md.index("## Overall:") < md.index("You covered the ground.")
-    for label in ("**Distance**", "**Pace**", "**Heart Rate**", "**Training Load**"):
+    for label in ("**Distance**", "**Pace**", "**Heart Rate**", "**Stimulus**"):
         assert label in md
     # Distance's paragraph precedes pace's, matching the table's order.
     assert md.index("You covered the ground.") < md.index("Too quick.")
@@ -449,7 +506,7 @@ class _FakeAssistantMessage:
 
 _WELL_FORMED = (
     "DISTANCE: You covered it.\nPACE: Too quick.\n"
-    "HEART RATE: Stayed low.\nTRAINING LOAD: Banked it."
+    "HEART RATE: Stayed low.\nSTIMULUS: Banked it."
 )
 
 
@@ -603,7 +660,7 @@ def test_find_grade_leak_tolerates_empty_sections():
 
 def _read(pace: str) -> str:
     return (f"DISTANCE: clean\nPACE: {pace}\n"
-            "HEART RATE: clean\nTRAINING LOAD: clean")
+            "HEART RATE: clean\nSTIMULUS: clean")
 
 
 def _stub_generate(monkeypatch, texts):

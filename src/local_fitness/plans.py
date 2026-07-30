@@ -114,7 +114,7 @@ _DURATION_TYPES = frozenset({"interval", "tempo"})
 
 # numeric workout fields that, when present, must be finite and non-negative
 _NUMERIC_FIELDS = ("target_distance_m", "target_pace_sec_per_km",
-                   "target_duration_sec", "week_index", "seq")
+                   "target_duration_sec", "target_hr_max", "week_index", "seq")
 
 
 # --- helpers ---------------------------------------------------------------
@@ -602,14 +602,16 @@ _EDITABLE_PLAN_COLS = frozenset(
 
 _WORKOUT_COLS = (
     "date", "seq", "week_index", "type",
-    "target_distance_m", "target_pace_sec_per_km", "target_duration_sec", "description",
+    "target_distance_m", "target_pace_sec_per_km", "target_duration_sec",
+    "target_hr_max", "description",
 )
 
 #: the prescription columns the agent may edit on an ACTIVE plan's workout.
 #: date/seq/week_index/plan_id/workout_id are identity/structure — never editable
 #: here, so a day can be re-prescribed but the plan can't be re-keyed or moved.
 _EDITABLE_WORKOUT_COLS = frozenset(
-    {"type", "target_distance_m", "target_pace_sec_per_km", "target_duration_sec", "description"}
+    {"type", "target_distance_m", "target_pace_sec_per_km", "target_duration_sec",
+     "target_hr_max", "description"}
 )
 
 #: valid plan_workouts.type values (mirrors the schema CHECK in db.py).
@@ -1142,6 +1144,7 @@ def _slim_workout(workout: dict | None) -> dict | None:
         "target_distance_m": workout.get("target_distance_m"),
         "target_pace_sec_per_km": workout.get("target_pace_sec_per_km"),
         "target_duration_sec": workout.get("target_duration_sec"),
+        "target_hr_max": workout.get("target_hr_max"),
         "description": desc,
         "verdict": workout.get("verdict"),
     }

@@ -114,14 +114,37 @@ _GRADE_TONE = (
     "Those are printed elsewhere and are not what this card is about."
 )
 
+#: The STIMULUS paragraph is the one that is NOT about compliance, and the model
+#: has to be told so explicitly. Before 0.40.0 training load carried a letter,
+#: and on a correctly-run easy day that letter was an F — which the read then
+#: dutifully explained as a failure of effort ("you banked distance and pace,
+#: then let the work evaporate. Show up loaded, not coasting." — a real card,
+#: 2026-07-29, written about a run that had followed its prescription exactly).
+#: Removing the letter is not enough on its own: the model will re-derive the
+#: same scolding from a low number unless it is told what a low number MEANS.
+_STIMULUS_BLOCK = (
+    "# The STIMULUS paragraph is not a verdict\n"
+    "Training load is intensity multiplied by duration. An easy or recovery day "
+    "run correctly therefore banks a LOW number, and that is the prescription "
+    "working — not a shortfall, not coasting, not effort left on the table. "
+    "Never treat a low stimulus on an easy day as a criticism, never tell him to "
+    "work harder because of it, and never imply he owes the difference back.\n\n"
+    "Say what the run did to his body and whether that matches what the day was "
+    "for. The card itself states whether the level was as intended; agree with "
+    "it. The ONE case worth flagging is a stimulus HIGHER than the day intended "
+    "— an easy day that ran hot, or a flagged spike — because that borrows from "
+    "the next session."
+)
+
 _FORMAT_RULES = (
     "# Output format — follow exactly\n"
-    "Write FOUR short paragraphs, one per graded area, each on its own line "
-    "and prefixed with its label and a colon:\n\n"
+    "Write FOUR short paragraphs, each on its own line and prefixed with its "
+    "label and a colon. The first three are graded areas; the fourth reports "
+    "training stimulus and is not graded:\n\n"
     "DISTANCE: <paragraph>\n"
     "PACE: <paragraph>\n"
     "HEART RATE: <paragraph>\n"
-    "TRAINING LOAD: <paragraph>\n\n"
+    "STIMULUS: <paragraph>\n\n"
     "All four labels must appear, exactly once, in that order. Nothing before "
     "the first label and nothing after the last paragraph — no heading, no "
     "summary, no markdown, no bullets, no quotation marks.\n\n"
@@ -134,6 +157,45 @@ _FORMAT_RULES = (
     "sense the week of a race. Reach backward or forward only when it "
     "actually informs THAT paragraph's metric; do not narrate the calendar."
 )
+
+
+def _stimulus_prompt_lines(card: dict) -> list[str]:
+    """The stimulus facts, explicitly labelled as reported rather than graded.
+
+    Every other fact in this prompt is a verdict the model must phrase and never
+    re-derive. Without the distinction stated inline — not just in the system
+    block — the model treats the load number as one more thing it is being asked
+    to judge, which is how a compliant easy day got written up as coasting.
+    """
+    stim = card.get("stimulus") or {}
+    level = stim.get("level")
+    if not level:
+        return []
+    intent = card.get("intent_class") or "steady"
+    lines = ["", "Training stimulus (REPORTED, not graded — do not judge it):"]
+    load, expected = stim.get("load"), stim.get("expected_load")
+    detail = f"  Level: {level}"
+    if load and expected:
+        detail += (f" — load {round(load)} against about {round(expected)} "
+                   f"typical for a {intent} day")
+    lines.append(detail + ".")
+    if stim.get("as_intended") is True:
+        lines.append("  This is consistent with what the day was for. Agree with "
+                     "it; do not ask for more work.")
+    elif stim.get("as_intended") is False:
+        lines.append("  This is HIGHER than the day intended — worth flagging, it "
+                     "borrows from the next session.")
+    if stim.get("spike"):
+        lines.append("  Flagged a SPIKE — more than double his median day.")
+    zones = stim.get("zones")
+    if zones:
+        lines.append(f"  {zones['aerobic_pct']}% of the run sat in the aerobic "
+                     "zones (Z1-Z2).")
+    for key, label in (("aerobic_te", "Aerobic training effect"),
+                       ("anaerobic_te", "Anaerobic training effect")):
+        if stim.get(key) is not None:
+            lines.append(f"  {label}: {stim[key]:.1f} on a 0-5 scale.")
+    return lines
 
 
 def build_prompt(
@@ -161,7 +223,7 @@ def build_prompt(
         "report card for ONE run he just finished. One short paragraph per "
         "graded area, each covering only that area.\n\n"
         f"{prompts.coach_voice_block(user_name, profile)}\n\n"
-        f"{_GRADE_TONE}\n\n{_METRIC_TRANSLATION_BLOCK}\n\n"
+        f"{_GRADE_TONE}\n\n{_METRIC_TRANSLATION_BLOCK}\n\n{_STIMULUS_BLOCK}\n\n"
         "Write in second person, present tense, the way you'd say it to his "
         "face.\n\n"
         f"{_FORMAT_RULES}"
@@ -209,8 +271,7 @@ def build_prompt(
         lines.append(line + ".")
         if m.get("note"):
             lines.append(f"    note: {m['note']}")
-    if (card.get("metrics") or {}).get("load", {}).get("spike"):
-        lines.append("  Training load was a SPIKE — more than double his median day.")
+    lines += _stimulus_prompt_lines(card)
 
     splits = card.get("splits") or {}
     if splits.get("available"):
@@ -618,6 +679,35 @@ async def generate_read_cached(
     return sections
 
 
+def _fallback_stimulus_sentence(card: dict) -> str:
+    """The template STIMULUS paragraph. States plainly that a low number on an
+    intended-easy day is not a shortfall — the fallback has to carry that too,
+    or a failed Claude call silently reverts to the pre-0.40.0 reading."""
+    stim = card.get("stimulus") or {}
+    level = stim.get("level")
+    load, expected = stim.get("load"), stim.get("expected_load")
+    if not level:
+        # A missing LEVEL means no comparable history to scale against, which is
+        # a different fact from a missing load figure. Conflating them told the
+        # reader the watch recorded nothing when it had.
+        if load:
+            return (f"Training load {round(load)}. Not enough comparable history "
+                    "to say whether that is high or low for this intent.")
+        return "No training-load figure recorded for this run."
+    sentence = f"{level.capitalize()} stimulus"
+    if load and expected:
+        sentence += (f" — load {round(load)} against about {round(expected)} "
+                     "typical for this intent")
+    sentence += "."
+    if stim.get("as_intended") is True:
+        sentence += " That is what this day was for, not a shortfall."
+    elif stim.get("as_intended") is False:
+        sentence += " That is higher than this day intended."
+    if stim.get("spike"):
+        sentence += " More than double your median day."
+    return sentence
+
+
 def fallback_read(card: dict) -> dict[str, str]:
     """Deterministic, template-based four-paragraph read — used only when
     ``generate_read`` fails or its output cannot be parsed. Pure: identical
@@ -629,6 +719,11 @@ def fallback_read(card: dict) -> dict[str, str]:
     """
     out: dict[str, str] = {}
     for key, _label in READ_SECTIONS:
+        if key == "stimulus":
+            # Not in `metrics` and carries no grade by design — it reads off the
+            # card's stimulus block instead of the metric machinery.
+            out[key] = _fallback_stimulus_sentence(card)
+            continue
         m = ((card.get("metrics") or {}).get(key)) or {}
         actual = report_card.actual_text(key, m)
         if not m.get("grade"):
@@ -642,8 +737,6 @@ def fallback_read(card: dict) -> dict[str, str]:
             sentence += f" {delta.capitalize()}."
         if m.get("note"):
             sentence += f" {m['note'].capitalize()}."
-        if key == "load" and m.get("spike"):
-            sentence += " More than double your median day."
         out[key] = sentence
     return out
 
