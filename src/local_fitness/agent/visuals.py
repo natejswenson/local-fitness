@@ -1230,6 +1230,46 @@ def _render_metric_table_html(card: dict) -> str:
     """
 
 
+def _render_stimulus_html(card: dict) -> str:
+    """The Stimulus section — deliberately a two-column Signal/Value table with
+    NO Grade column, so the page cannot imply a letter that does not exist.
+
+    Returns "" when the activity has no load figure to report, rather than an
+    empty section: the density ladder has no content to drop, so every section
+    that renders has to earn its vertical space.
+    """
+    from . import report_card as rc
+
+    if not rc.has_stimulus(card):
+        return ""
+
+    # Rows and notes come from report_card so the PDF and the markdown table can
+    # never disagree — the same reason render_report_card_pdf takes an
+    # already-built card instead of grading anything itself.
+    rows = "".join(f"""
+        <tr>
+          <td class="metric-name">{html.escape(label)}</td>
+          <td>{html.escape(value)}</td>
+        </tr>
+        """ for label, value in rc.stimulus_rows(card))
+    notes_html = ('<ul class="card-notes">'
+                  + "".join(f"<li>{html.escape(n)}</li>"
+                            for n in rc.stimulus_notes(card))
+                  + "</ul>")
+
+    return f"""
+  <section>
+    <h2 class="card-heading">{html.escape(rc.stimulus_heading(card, markdown=False))}</h2>
+    <table class="metric-table">
+      <colgroup><col style="width:26%"><col style="width:74%"></colgroup>
+      <thead><tr><th>Signal</th><th>Value</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    {notes_html}
+  </section>
+    """
+
+
 def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
     """The per-mile section, or the honest one-liner when the activity has no
     splits — which is the common case (~88% of the history is backfilled and
@@ -1350,8 +1390,8 @@ def _build_report_card_html(
 
     notes = [f"{label}: {card['metrics'][key]['note']}"
              for key, label in rc._METRIC_LABELS if card["metrics"][key].get("note")]
-    if card["metrics"]["load"].get("spike"):
-        notes.append("Training Load: spike — more than double your median day.")
+    # The load spike note lives in the Stimulus section now (0.40.0) — it is a
+    # statement about stimulus, not about compliance with the prescription.
     if overall.get("capped_by") == "F":
         notes.append(f"Overall: capped at {overall['grade']} — a metric graded F.")
     notes_html = (
@@ -1401,11 +1441,13 @@ def _build_report_card_html(
   </tr></table>
 
   <section>
-    <h2 class="card-heading">Grades</h2>
+    <h2 class="card-heading">Compliance</h2>
     {_render_metric_table_html(card)}
     {notes_html}
     {ctx_html}
   </section>
+
+  {_render_stimulus_html(card)}
 
   {_render_splits_html(card, split_chart)}
 </body>

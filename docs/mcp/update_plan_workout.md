@@ -57,10 +57,11 @@ between "adjust today's run" and "silently rewrite the plan's structure".
 | `distance_mi` | number | no | unchanged | Miles. Converted to metres (`units.from_miles`, `× 1609.344`). |
 | `pace_min_per_mi` | string \| number | no | unchanged | **`"M:SS"` preferred** — `"9:39"`. A bare number is *decimal minutes*: `9.65` is 9:39/mi. Bounded to 3:00–30:00/mi. See the trap below. |
 | `duration_min` | number | no | unchanged | Minutes. Converted to seconds and rounded. The **graded** field for `tempo`/`interval`. |
+| `hr_max` | number | no | unchanged | Prescribed heart-rate **ceiling** in bpm. Bounded to 90–210. Pass it whenever the day has a cap: [`workout_report_card`](workout_report_card.md) grades average HR **and** time-above-cap against this column, and a cap written only into `description` is invisible to the grader (0.40.0). |
 | `description` | string | no | unchanged | Prose prescription. |
 | `seq` | integer | no | `1` | Intra-day session: 1 = first/AM, 2 = second/PM. Must be a positive int. |
 
-At least one of `type` / `distance_mi` / `pace_min_per_mi` / `duration_min` / `description` is
+At least one of `type` / `distance_mi` / `pace_min_per_mi` / `duration_min` / `hr_max` / `description` is
 required — a call with only `date` errors with `nothing to update`.
 
 **`type: "rest"` is special:** it clears `target_distance_m`, `target_pace_sec_per_km`, and

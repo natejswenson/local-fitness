@@ -6,6 +6,7 @@ wrapping) — data is handed in exactly as agent/tools.py would supply it.
 """
 from __future__ import annotations
 
+import html
 import io
 
 import pdfplumber
@@ -627,6 +628,49 @@ def _report_card_with_splits(n_splits: int, long_read: bool = True) -> dict:
         )
         card["coach_read"] = {key: read for key, _ in workout_coach.READ_SECTIONS}
     return card
+
+
+def test_report_card_pdf_prints_the_stimulus_section_without_a_grade_column():
+    """0.40.0: the PDF grows a Stimulus section. It must carry the numbers and
+    the not-graded explanation, and must NOT print a Grade column beside them —
+    the whole failure being fixed is a reader inferring a letter from a low
+    load."""
+    card = _report_card_with_splits(2, long_read=False)
+    pdf, pages = visuals.render_report_card_pdf(card, None)
+    assert pages == 1
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        text = "\n".join(p.extract_text() or "" for p in doc.pages)
+    # Section headings and table headers are uppercased by CSS text-transform,
+    # so compare case-insensitively rather than pinning the presentation. Line
+    # wrapping is collapsed for the same reason — a phrase broken across two
+    # rendered lines is still on the page.
+    upper = " ".join(text.split()).upper()
+    assert "STIMULUS" in upper
+    assert "COMPLIANCE" in upper          # the graded table was renamed
+    assert "NOT GRADED" in upper
+    assert "BANK LESS OF IT" in upper
+    # The compliance table still has its Grade column; the stimulus table has
+    # Signal/Value only.
+    assert "GRADE" in upper
+    assert "SIGNAL" in upper and "VALUE" in upper
+
+
+def test_pdf_and_markdown_stimulus_sections_cannot_diverge():
+    """Both renderers read the same rows/notes helpers. Pin that, because they
+    HAD diverged (the PDF dropped the section with no level while the markdown
+    kept it) and a card whose table and PDF disagree is the exact failure
+    render_report_card_pdf's already-built-card contract exists to prevent."""
+    from local_fitness.agent import report_card as rc
+
+    card = _report_card_with_splits(2, long_read=False)
+    md = rc.render_markdown(card)
+    html_doc = visuals._build_report_card_html(card, None, visuals.DENSITY_PRESETS[0])
+    for _label, value in rc.stimulus_rows(card):
+        assert value in md
+        assert value in html_doc or html.escape(value) in html_doc
+    for note in rc.stimulus_notes(card):
+        assert note in md
+        assert note in html_doc or html.escape(note) in html_doc
 
 
 def test_render_report_card_pdf_returns_page_count():

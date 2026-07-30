@@ -68,7 +68,7 @@ INTENT_CLASSES = ("easy", "long", "quality", "steady")
 _LIST_COLUMNS = (
     "activity_id, activity_date, graded_at, intent, intent_class, "
     "intent_source, overall_grade, gpa, capped_by, distance_grade, "
-    "pace_grade, hr_grade, load_grade"
+    "pace_grade, hr_grade, continuity_grade, load_grade"
 )
 
 # The branch rules live entirely in this WHERE guard — no SELECT precedes the
@@ -82,10 +82,12 @@ _UPSERT_SQL = """
 INSERT INTO report_cards
     (activity_id, activity_date, graded_at, intent, intent_class,
      intent_source, overall_grade, gpa, capped_by, distance_grade,
-     pace_grade, hr_grade, load_grade, read_cache_key, card_json)
+     pace_grade, hr_grade, continuity_grade, load_grade, read_cache_key,
+     card_json)
 VALUES (:activity_id, :activity_date, :graded_at, :intent, :intent_class,
      :intent_source, :overall_grade, :gpa, :capped_by, :distance_grade,
-     :pace_grade, :hr_grade, :load_grade, :read_cache_key, :card_json)
+     :pace_grade, :hr_grade, :continuity_grade, :load_grade, :read_cache_key,
+     :card_json)
 ON CONFLICT(activity_id) DO UPDATE SET
     activity_date  = excluded.activity_date,
     graded_at      = excluded.graded_at,
@@ -98,6 +100,7 @@ ON CONFLICT(activity_id) DO UPDATE SET
     distance_grade = excluded.distance_grade,
     pace_grade     = excluded.pace_grade,
     hr_grade       = excluded.hr_grade,
+    continuity_grade = excluded.continuity_grade,
     load_grade     = excluded.load_grade,
     read_cache_key = excluded.read_cache_key,
     card_json      = excluded.card_json
@@ -136,6 +139,11 @@ def card_row(card: dict, *, read_cache_key: str | None) -> dict:
         "distance_grade": _grade("distance"),
         "pace_grade": _grade("pace"),
         "hr_grade": _grade("hr"),
+        "continuity_grade": _grade("continuity"),
+        # Always NULL from 0.40.0 on — load is a stimulus metric and carries no
+        # grade. The column is retained rather than dropped because rows graded
+        # before the split hold real letters, and a SQLite column drop is a table
+        # rebuild for no gain.
         "load_grade": _grade("load"),
         "read_cache_key": read_cache_key,
         "card_json": json.dumps(stored, default=str),

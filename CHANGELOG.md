@@ -6,6 +6,103 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-07-29
+
+The report-card rubric was **inverted**, and this splits it in two. Found by
+grading two real sessions from the same week against the same prescription
+("Easy 5mi. Keep HR under 140.") and comparing the letters.
+
+### Changed
+- **Compliance and stimulus are now separate surfaces on the card.** The graded
+  letter answers "did you execute the prescription?" (distance, pace, HR). A new
+  **Stimulus** section reports training load, aerobic/anaerobic TE, HR-zone
+  distribution and drift with a `LOW|MODERATE|HIGH|VERY HIGH` descriptor and
+  **no letter at all**.
+
+  **Why:** Garmin's training load is essentially `duration × f(HR)`, so grading
+  load *and* HR graded one variable twice with the sign reversed — obeying an
+  easy day's HR cap mechanically drove the load number down, and load's
+  undershoot penalty then punished exactly the compliance the HR grade had just
+  rewarded. Measured against the live DB on 2026-07-29 (`median_hr` 143,
+  `median_load` 99.7 over 23 comparable treadmill runs):
+
+  | Session | dist | pace | HR | load | GPA | Overall |
+  |---|---|---|---|---|---|---|
+  | 5.01mi, HR 126, even splits — prescription followed exactly | A+ | A+ | A+ | **F** | 3.60 | **C** |
+  | 5.00mi, HR 144, cap blown from mile 3 (splits 150/144/159) | A+ | A+ | A− | A+ | 4.00 | **A** |
+
+  The obedient run scored C; the disobedient one scored A. A compliant sub-cap
+  50-minute run tops out near 70 load and a *properly* easy one lands near 25,
+  so load's F threshold sat **above the physical maximum of a compliant easy
+  run** — the grade was unreachable, not merely strict. Load is now absent from
+  every `INTENT_METRIC_WEIGHTS` table, which makes "load cannot lower your
+  grade" a property of the data structure rather than of a small weight.
+- **The F-cap is kept, its scope narrowed.** A card printing "Overall: A" above
+  an F row is still averaging away a finding, so the cap stays; `overall_grade`
+  now tests only the *weighted* metrics, so a stimulus row can never fire it.
+  The cap was never the wrong rule — load was the wrong thing to apply it to.
+- **`LOAD_FACTORS["easy"]` 0.75 → 0.61**, measured: the 9 sessions at or under
+  the easy HR ceiling in the live 60-day pool median 60.5 load against the
+  pool's 99.7. Descriptor-only now, so it can be recalibrated freely. Recorded
+  because it is instructive: recalibrating *alone* would not have fixed the
+  card (a 25-load easy run still deviates 0.58 against a 61 expectation — an F).
+- **`reference_line` no longer blames the reference pool for metrics that don't
+  use it.** The scoped "…ungraded — only 2 comparable activities in the last 60
+  days" caveat now lists only metrics whose reference IS the pool. Continuity
+  measures a run against its own splits and a by-feel pace has no target at all,
+  so naming either promised a grade more history could not unlock.
+- **Card sections renamed**: the graded table is "Compliance"; the coach read's
+  4th section is `STIMULUS` (was `TRAINING LOAD`). Same arity, so
+  `read_is_complete` and the prompt contract keep their shape — but
+  `read_cache_key` changes, so stored reads regenerate once on next view. That
+  is intended: an old read argues about a load *letter* the card no longer prints.
+
+### Added
+- **`plan_workouts.target_hr_max`** and `update_plan_workout`'s `hr_max`
+  parameter — a prescribed HR ceiling is now a **column**. Before this, "Keep HR
+  under 140" lived only in the prose `description` and *no grade could read it*;
+  HR was measured against `0.97 × rolling median`, which happened to equal 139,
+  so blowing a prescribed 140 cap by 5 bpm cost a single +/− modifier. Added via
+  a guarded `ALTER` (the `activities.source` pattern), so existing DBs migrate
+  in place. Bounded to 90–210 bpm, and cleared on a `type='rest'` flip.
+- **HR is graded on time-above-cap, not just the average** — the worse of
+  *average over the cap* and *fraction of split time over it past
+  `HR_CAP_GRACE_FRACTION` (5%)*. The average alone is what let a run spending
+  miles 3–5 at 150/144/159 read A−. With the cap present, the same three
+  sessions now grade **A / C / B** where they previously graded **C / A / C**.
+- **`continuity`, a 4th compliance metric** — slowest full split / median full
+  split, penalized past `CONTINUITY_TOLERANCE` (1.15) as the raw excess. It
+  answers the one question distance, pace and HR all average away: *was this one
+  continuous session, or did it contain a break?* Measured 2026-07-28: a tempo
+  day whose 4th mile ran **12:31 among ~9:20 miles** graded A+ on distance, A+ on
+  HR, and nothing on the card mentioned it. It now grades C+ and the note names
+  the mile.
+
+  Two design choices worth recording, both aimed at not inventing a new
+  unfairness while fixing the old one:
+  - **Not a standard deviation.** The opening mile is routinely the outlier —
+    2026-07-27 measured SD 22.2 s/mi across the run and 4.9 s/mi once the warm-up
+    is dropped. A metric that failed a run for starting conservatively would
+    recreate exactly what the compliance/stimulus split just removed. The
+    slowest-vs-own-median ratio leaves that session at 1.08, comfortably inside
+    the gate.
+  - **Not absolute walk-pace detection.** 12:31/mi is *under*
+    `RUN_PACE_CEILING_SEC_PER_MI` (13:00), so the existing run/walk boundary
+    would have missed the very session this metric exists for.
+
+  Verified independent rather than redundant before shipping: three sessions in
+  the live 90-day window pass distance, pace **and** HR while carrying a slowest
+  split 30-41% off their own median. Threshold 1.15 separates cleanly — 33 of 40
+  split-bearing sessions sit at or under it, and all 7 above are genuine run/walk
+  sessions. Requires 3 full paced splits; below that it is n/a with the reason
+  stated and its weight redistributes, which also excludes manually-lapped
+  interval sessions by construction. Stored in the new
+  `report_cards.continuity_grade` column.
+- **HR-zone aerobic share** on the card (`zone_summary`), reading
+  `activity_hr_zones` — populated for 90 of the last 90 days. It is the number
+  that makes "this really was easy" checkable: the two easy days above share a
+  prescription but split **97% vs 30%** aerobic.
+
 ## [0.39.0] - 2026-07-27
 
 Evidence-driven audit across accuracy, persona, UX and speed. Every item
