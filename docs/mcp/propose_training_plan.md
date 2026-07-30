@@ -35,7 +35,7 @@ invent a schedule. The tool validates *structure*, not *sensibility*.
 |---|---|---|---|---|
 | `goal_type` | string | yes | — | One of `5k`, `10k`, `half`, `full`, `custom`. Anything else is rejected. |
 | `race_date` | string | yes | — | ISO `YYYY-MM-DD`. Upper bound for every workout date. |
-| `workouts` | array | yes | — | Full schedule. Each item: `{date, week_index, type, target_distance_m?, target_pace_sec_per_km?, target_duration_sec?, description, seq?}`. Max 200. |
+| `workouts` | array | yes | — | Full schedule. Each item: `{date, week_index, type, target_distance_m?, target_pace_sec_per_km?, target_duration_sec?, target_hr_max?, description, seq?}`. Max 200. |
 | `target_time_seconds` | integer | no | `null` | Goal finish time. Nullable for a "just finish" plan. Must be finite and non-negative. |
 | `goal_distance_m` | number | no | derived from `goal_type` | `5k`→5000, `10k`→10000, `half`→21097.5, `full`→42195. `custom` derives **nothing** — pass it explicitly or the Riegel projection stays `null`. |
 | `title` | string | no | `null` | Free text. |
@@ -52,6 +52,7 @@ invent a schedule. The tool validates *structure*, not *sensibility*.
 | `target_distance_m` | number | no | Metres. The graded field for `easy` / `long` / `race`. |
 | `target_pace_sec_per_km` | number | no | Seconds per km. Never graded — display/coaching only. |
 | `target_duration_sec` | number | no | Seconds. The graded field for `tempo` / `interval`. |
+| `target_hr_max` | number | no | Prescribed HR ceiling in bpm (90–210). Set it on any day with a cap — the report card grades against this column, and a cap stated only in `description` cannot be read by the grader (0.40.0). |
 | `seq` | integer | no | Intra-day session on a double day; defaults to 1. `(date, seq)` must be unique across the schedule. |
 
 ## Returns

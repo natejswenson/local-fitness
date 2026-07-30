@@ -6,6 +6,70 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-07-29
+
+The report-card rubric was **inverted**, and this splits it in two. Found by
+grading two real sessions from the same week against the same prescription
+("Easy 5mi. Keep HR under 140.") and comparing the letters.
+
+### Changed
+- **Compliance and stimulus are now separate surfaces on the card.** The graded
+  letter answers "did you execute the prescription?" (distance, pace, HR). A new
+  **Stimulus** section reports training load, aerobic/anaerobic TE, HR-zone
+  distribution and drift with a `LOW|MODERATE|HIGH|VERY HIGH` descriptor and
+  **no letter at all**.
+
+  **Why:** Garmin's training load is essentially `duration × f(HR)`, so grading
+  load *and* HR graded one variable twice with the sign reversed — obeying an
+  easy day's HR cap mechanically drove the load number down, and load's
+  undershoot penalty then punished exactly the compliance the HR grade had just
+  rewarded. Measured against the live DB on 2026-07-29 (`median_hr` 143,
+  `median_load` 99.7 over 23 comparable treadmill runs):
+
+  | Session | dist | pace | HR | load | GPA | Overall |
+  |---|---|---|---|---|---|---|
+  | 5.01mi, HR 126, even splits — prescription followed exactly | A+ | A+ | A+ | **F** | 3.60 | **C** |
+  | 5.00mi, HR 144, cap blown from mile 3 (splits 150/144/159) | A+ | A+ | A− | A+ | 4.00 | **A** |
+
+  The obedient run scored C; the disobedient one scored A. A compliant sub-cap
+  50-minute run tops out near 70 load and a *properly* easy one lands near 25,
+  so load's F threshold sat **above the physical maximum of a compliant easy
+  run** — the grade was unreachable, not merely strict. Load is now absent from
+  every `INTENT_METRIC_WEIGHTS` table, which makes "load cannot lower your
+  grade" a property of the data structure rather than of a small weight.
+- **The F-cap is kept, its scope narrowed.** A card printing "Overall: A" above
+  an F row is still averaging away a finding, so the cap stays; `overall_grade`
+  now tests only the *weighted* metrics, so a stimulus row can never fire it.
+  The cap was never the wrong rule — load was the wrong thing to apply it to.
+- **`LOAD_FACTORS["easy"]` 0.75 → 0.61**, measured: the 9 sessions at or under
+  the easy HR ceiling in the live 60-day pool median 60.5 load against the
+  pool's 99.7. Descriptor-only now, so it can be recalibrated freely. Recorded
+  because it is instructive: recalibrating *alone* would not have fixed the
+  card (a 25-load easy run still deviates 0.58 against a 61 expectation — an F).
+- **Card sections renamed**: the graded table is "Compliance"; the coach read's
+  4th section is `STIMULUS` (was `TRAINING LOAD`). Same arity, so
+  `read_is_complete` and the prompt contract keep their shape — but
+  `read_cache_key` changes, so stored reads regenerate once on next view. That
+  is intended: an old read argues about a load *letter* the card no longer prints.
+
+### Added
+- **`plan_workouts.target_hr_max`** and `update_plan_workout`'s `hr_max`
+  parameter — a prescribed HR ceiling is now a **column**. Before this, "Keep HR
+  under 140" lived only in the prose `description` and *no grade could read it*;
+  HR was measured against `0.97 × rolling median`, which happened to equal 139,
+  so blowing a prescribed 140 cap by 5 bpm cost a single +/− modifier. Added via
+  a guarded `ALTER` (the `activities.source` pattern), so existing DBs migrate
+  in place. Bounded to 90–210 bpm, and cleared on a `type='rest'` flip.
+- **HR is graded on time-above-cap, not just the average** — the worse of
+  *average over the cap* and *fraction of split time over it past
+  `HR_CAP_GRACE_FRACTION` (5%)*. The average alone is what let a run spending
+  miles 3–5 at 150/144/159 read A−. With the cap present, the same three
+  sessions now grade **A / C / B** where they previously graded **C / A / C**.
+- **HR-zone aerobic share** on the card (`zone_summary`), reading
+  `activity_hr_zones` — populated for 90 of the last 90 days. It is the number
+  that makes "this really was easy" checkable: the two easy days above share a
+  prescription but split **97% vs 30%** aerobic.
+
 ## [0.39.0] - 2026-07-27
 
 Evidence-driven audit across accuracy, persona, UX and speed. Every item

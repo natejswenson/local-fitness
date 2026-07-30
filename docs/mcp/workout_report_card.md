@@ -1,13 +1,13 @@
 # `workout_report_card`
 
-> Graded report card for ONE workout — four letter grades plus an overall, a coach's read, and a PRESS-themed PDF. **Availability:** stdio only — local
+> Graded report card for ONE workout — three compliance grades plus an overall, an ungraded training-stimulus report, a coach's read, and a PRESS-themed PDF. **Availability:** stdio only — local
 
 ## What it does
 
 Answers "how did that run go", "was that any good", "grade my workout". It
-grades one activity on four metrics — distance, pace, HR, training load — in
-deterministic Python, then has the coach *phrase* those grades rather than
-derive them. Use it instead of [`get_workout_detail`](get_workout_detail.md)
+grades one activity on three compliance metrics — distance, pace, HR — in
+deterministic Python, reports training stimulus separately and ungraded, then
+has the coach *phrase* those grades rather than derive them. Use it instead of [`get_workout_detail`](get_workout_detail.md)
 whenever the question is a judgment: `get_workout_detail` reports columns, this
 one renders a verdict with a named yardstick. Use
 [`plan_chart`](plan_chart.md) instead when the question is about the plan as a
@@ -42,9 +42,28 @@ with distance and duration.
 
 ## The rubric
 
-**Four metrics, one band table.** Each metric reduces to a single non-negative
-relative deviation `d`, and every `d` goes through the same `GRADE_BANDS`. Four
-small deviation functions, one grader — that is what keeps the rubric testable.
+**Two surfaces: compliance is graded, stimulus is only reported** (0.40.0).
+
+| Surface | Metrics | Output |
+|---|---|---|
+| **Compliance** — "did you execute the prescription?" | distance, pace, HR | letter grades + the overall |
+| **Stimulus** — "what did this run do to your body?" | training load, aerobic/anaerobic TE, HR-zone share, drift | numbers + a `LOW`/`MODERATE`/`HIGH`/`VERY HIGH` descriptor, **never a letter** |
+
+Grading load *and* HR graded one variable twice with the sign reversed: Garmin's
+training load is essentially `duration x f(HR)`, so obeying an easy day's HR cap
+mechanically drove the load number down, and load's undershoot penalty then
+punished the compliance the HR grade had just rewarded. Measured 2026-07-29, two
+easy days under the same prescription ("Easy 5mi. Keep HR under 140."): the run
+that followed it exactly scored **C** — a 3.60-GPA A destroyed by the F-cap on
+load — while the one that blew the cap from mile 3 scored **A**, earning A+ on
+load for the extra work. The rubric was inverted, not merely blunt.
+
+Load is absent from every `INTENT_METRIC_WEIGHTS` table, so "load cannot lower
+your grade" is structural rather than a small weight a cap could bypass.
+
+**Each compliance metric reduces to a single non-negative relative deviation
+`d`**, and every `d` goes through the same `GRADE_BANDS`. Three small deviation
+functions, one grader — that is what keeps the rubric testable.
 
 | `d` ≤ | Grade |
 |---|---|
@@ -71,9 +90,9 @@ Two band-width multipliers exist:
 
 | Mode | What it is |
 |---|---|
-| `plan` | The active plan's prescribed workout for that date. **Distance and pace only** — `plan_workouts` has no HR or load column, so those two always fall back to the rolling reference. A `rest` prescription is an intent signal only; its null targets never grade anything. |
+| `plan` | The active plan's prescribed workout for that date — distance, pace, and **HR when the day sets `target_hr_max`** (0.40.0). Without a stated cap HR falls back to the rolling band; training load has no plan column and is no longer graded at all. A `rest` prescription is an intent signal only; its null targets never grade anything. |
 | `rolling_60d` | Trailing-60-day **medians** over comparable activities, computed on the fly. Median, not mean, because the history carries real training-load outliers. Not the `baselines` table — that holds no per-workout aggregates at all. |
-| `insufficient_data` | Fewer than `MIN_REFERENCE_ACTIVITIES` (**5**) comparable activities even after widening. Grading against noise is worse than not grading: the affected metrics return n/a and the card says so. **The two modes compose** — a thin rolling pool does not stop the plan from grading distance and pace, so the disclaimer is scoped to the metrics it applies to ("HR and training load ungraded — only 2 comparable activities…") instead of printing a blanket "not enough comparable history to grade" under two letters the plan just graded. |
+| `insufficient_data` | Fewer than `MIN_REFERENCE_ACTIVITIES` (**5**) comparable activities even after widening. Grading against noise is worse than not grading: the affected metrics return n/a and the card says so. **The two modes compose** — a thin rolling pool does not stop the plan from grading distance and pace, so the disclaimer is scoped to the metrics it applies to ("HR ungraded — only 2 comparable activities…") instead of printing a blanket "not enough comparable history to grade" under two letters the plan just graded. |
 
 The rolling window **ends the day before** the graded activity, so a workout can
 never move its own goalposts.
@@ -96,15 +115,16 @@ every recovery run an F.
 | Pace, steady | both directions, bands widened by `STEADY_WIDEN`. |
 | Distance vs plan | both directions — a 12-miler on a 10-mile prescription is over-cooking the plan. |
 | Distance vs rolling median | short only. Going longer than your norm is never a penalty. |
-| HR | outside the intent's band only; inside is a flat 0.0 (an A). HR is judged on appropriateness, never "lower is better". |
-| Load | short always; over only past `LOAD_SPIKE_FACTOR` (2.0×), measured from the threshold. A big day is not a failure; double your median day is. |
+| HR vs a prescribed `target_hr_max` | over the cap only — the worse of *average over cap* and *fraction of split time over it past `HR_CAP_GRACE_FRACTION` (5%)*. Graded on the BASE bands, not `PLAN_TIGHTEN`: tightening a time fraction would double-count strictness. |
+| HR vs the rolling band | outside the intent's band only; inside is a flat 0.0 (an A). HR is judged on appropriateness, never "lower is better". |
+| Load | **not graded** (0.40.0). The deviation is still computed for display and drives the stimulus descriptor; `LOAD_SPIKE_FACTOR` (2.0×) now decides `as_intended` and the spike flag instead of a letter. |
 
 Each expectation is intent-scaled off the rolling median (a plan states its own
 targets and needs no scaling):
 
-| Intent class | `DISTANCE_FACTORS` / `LOAD_FACTORS` | `PACE_FACTORS` | `HR_BANDS` (× median HR) |
+| Intent class | `DISTANCE_FACTORS` / `LOAD_FACTORS` | `PACE_FACTORS` | `HR_BANDS` (× median HR) — used only when the plan states no cap |
 |---|---|---|---|
-| easy | 0.75 | 1.10 | ≤ 0.97 |
+| easy | 0.75 / **0.61** | 1.10 | ≤ 0.97 |
 | long | 1.40 | 1.05 | ≤ 1.00 |
 | quality | 1.00 | 0.95 | ≥ 1.00 |
 | steady | 1.00 | 1.00 | 0.93 – 1.07 |

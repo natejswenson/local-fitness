@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     target_distance_m      REAL,                 -- null for rest / by-feel
     target_pace_sec_per_km REAL,                 -- null for rest / easy-by-feel
     target_duration_sec    INTEGER,              -- used for interval/tempo/cross adherence
+    target_hr_max          REAL,                 -- prescribed HR ceiling, null = no cap stated
     description            TEXT NOT NULL         -- prose prescription
 );
 CREATE INDEX IF NOT EXISTS idx_plan_workouts_plan ON plan_workouts(plan_id);
@@ -360,6 +361,16 @@ def init_schema(db_path: Path | None = None) -> None:
         if hr_cols and "elapsed_seconds" not in hr_cols:
             conn.execute(
                 "ALTER TABLE activity_hr_samples ADD COLUMN elapsed_seconds REAL")
+        # Same guard, same reason: `plan_workouts.target_hr_max` landed in
+        # 0.40.0 so the report card can grade HR against the cap the plan
+        # actually prescribed. Before it, "Keep HR under 140" lived only in the
+        # prose `description` and no grade could read it — HR was measured
+        # against 0.97x the rolling median instead, which on live data meant
+        # blowing a prescribed 140 cap by 5 bpm cost a single +/- modifier.
+        pw_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(plan_workouts)")}
+        if pw_cols and "target_hr_max" not in pw_cols:
+            conn.execute("ALTER TABLE plan_workouts ADD COLUMN target_hr_max REAL")
         # Same guard again: journal entries beyond the 60-entry hot cap are
         # archived (flag flip), never deleted — pre-0.33.0 DBs get the column.
         # Ordered BEFORE the FTS block so a failed FTS setup still leaves the

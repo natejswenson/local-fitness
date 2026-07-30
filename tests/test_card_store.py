@@ -29,7 +29,7 @@ ACTIVITY = {
 }
 READ = {
     "distance": "covered the ground.", "pace": "too quick.",
-    "hr": "stayed low.", "load": "banked what it should.",
+    "hr": "stayed low.", "stimulus": "banked what it should.",
 }
 
 
@@ -94,7 +94,13 @@ def test_card_row_extracts_the_actual_grades():
     assert row["distance_grade"] == card["metrics"]["distance"]["grade"]
     assert row["pace_grade"] == card["metrics"]["pace"]["grade"]
     assert row["hr_grade"] == card["metrics"]["hr"]["grade"]
-    assert row["load_grade"] == card["metrics"]["load"]["grade"]
+    # Always NULL from 0.40.0 on — load is a stimulus metric and carries no
+    # grade. The column is kept (rows graded before the split hold real letters,
+    # and dropping a SQLite column is a table rebuild), so this asserts the
+    # value rather than the round-trip: `== card[...]["grade"]` would pass
+    # vacuously with both sides None and would not notice a letter reappearing.
+    assert row["load_grade"] is None
+    assert card["metrics"]["load"]["grade"] is None
     assert row["read_cache_key"] == "k1"
     # Pure: graded_at is save_card's concern, never card_row's.
     assert "graded_at" not in row
@@ -113,7 +119,7 @@ def test_read_is_complete_requires_all_four_nonempty_sections():
     assert card_store.read_is_complete(READ) is True
     assert card_store.read_is_complete(None) is False
     assert card_store.read_is_complete("DISTANCE: text") is False
-    assert card_store.read_is_complete({**READ, "load": ""}) is False
+    assert card_store.read_is_complete({**READ, "stimulus": ""}) is False
     assert card_store.read_is_complete(
         {k: v for k, v in READ.items() if k != "hr"}) is False
 

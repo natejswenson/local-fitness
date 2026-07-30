@@ -7,10 +7,41 @@ makes the judgment tested Python, per the repo convention that the LLM phrases
 a judgment but never derives one that code can compute (the ``interpret.py``
 pattern).
 
-Four metrics are graded — distance, pace, HR, training load — each reduced to
-a single non-negative relative deviation ``d`` and passed through ONE shared
-band table. That is the whole trick: four small deviation functions, one
-grader, so the rubric stays testable.
+Metrics are partitioned into two kinds, and the split is the point of the
+module (0.40.0):
+
+- **compliance** — distance, pace, HR. "Did you execute the prescription?"
+  Graded, and the only thing the overall letter averages.
+- **stimulus** — training load, aerobic/anaerobic TE, HR-zone distribution,
+  drift. "What did this run do to your body?" Reported with numbers and a
+  descriptor, never a letter, and structurally unable to move the overall.
+
+Each compliance metric still reduces to a single non-negative relative
+deviation ``d`` passed through ONE shared band table. That is the whole trick:
+three small deviation functions, one grader, so the rubric stays testable.
+
+The partition exists because grading load *and* HR is grading one variable
+twice with the sign reversed. Garmin's training load is essentially
+``duration x f(HR)``, so obeying an easy day's HR cap mechanically drives the
+load number down — and load's own undershoot penalty then punished exactly the
+compliance the HR grade had just rewarded.
+
+Measured 2026-07-29 (median_hr 143, median_load 99.7 over 23 comparable
+treadmill runs), the two easy days that week, both prescribed
+"Easy 5mi. Keep HR under 140.":
+
+- executed correctly (5.01 mi, avg HR 126, even splits): distance A+, pace A+,
+  HR A+, load **F** (25 against a ~75 expectation) -> GPA 3.60, an A, thrown
+  away by the F-cap to a **C**.
+- cap blown from mile 3 (5.00 mi, avg HR 144, splits hitting 150 and 159):
+  distance A+, pace A+, HR A-, load A+ (82, comfortably "enough work")
+  -> GPA 4.00, an uncapped **A**.
+
+The rubric was inverted: it handed the disobedient run an A and the obedient
+one a C. A compliant sub-cap 50-minute run tops out near 70 load (median 1.42
+load/min across the window's sub-140 sessions) and a *properly* easy one lands
+near 25, so load's F threshold sat above the physical maximum of a compliant
+easy run — the grade was unreachable, not merely strict.
 
 Two reference points, and the card always says which it used:
 
@@ -76,9 +107,13 @@ __all__ = [
     "grade_from_deviation", "intent_class", "infer_intent", "resolve_intent",
     "distance_deviation", "pace_deviation", "hr_deviation", "load_deviation",
     "overall_grade", "label_splits", "hr_drift_pct", "build_card",
+    "stimulus_level", "zone_summary", "stimulus_block", "stimulus_lines",
+    "has_stimulus", "stimulus_rows", "stimulus_notes", "stimulus_heading",
+    "COMPLIANCE_METRICS", "STIMULUS_METRICS",
     "render_markdown", "reference_line", "bin_hr_trace", "expected_text",
     "actual_text", "hr_band_bounds", "hr_expectation",
     "is_running_effort", "fastest_rep_split", "fastest_rep_split_pace",
+    "time_above_cap_fraction", "hr_cap_deviation",
     "READ_SECTIONS",
     "load_report_card_inputs", "rolling_reference",
 ]
@@ -175,30 +210,60 @@ GRADE_POINTS = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "F": 0.0}
 # a full minute per mile too hot, which is the *only* way an easy day fails —
 # scored an overall B (3.40), because HR and load together carried 40% and both
 # landed A. The card's own read called it "not recovery, that's a race finish".
-METRIC_WEIGHTS = {"distance": 0.30, "pace": 0.30, "hr": 0.25, "load": 0.15}
+# Load is deliberately ABSENT from every table below — it is a stimulus metric
+# now, not a compliance one (see the module docstring). Membership in these
+# tables is what `overall_grade` iterates, so removing the key is what makes
+# load structurally unable to move the overall: there is no weight small
+# enough to be safe, because the failure was the F-cap, not the weight (load
+# was already only 10% of an easy day when it turned a 3.60 GPA into a C).
+#
+# The remaining three keep their pre-0.40.0 proportions exactly — each table is
+# the old one with load dropped and renormalized to sum to 1.0, which is the
+# same thing `overall_grade`'s redistribution would have computed anyway.
+METRIC_WEIGHTS = {"distance": 0.35, "pace": 0.35, "hr": 0.30}
 INTENT_METRIC_WEIGHTS: dict[str, dict[str, float]] = {
-    "easy": {"distance": 0.20, "pace": 0.45, "hr": 0.25, "load": 0.10},
-    "quality": {"distance": 0.20, "pace": 0.45, "hr": 0.25, "load": 0.10},
-    "long": {"distance": 0.45, "pace": 0.20, "hr": 0.20, "load": 0.15},
+    "easy": {"distance": 0.22, "pace": 0.50, "hr": 0.28},
+    "quality": {"distance": 0.22, "pace": 0.50, "hr": 0.28},
+    "long": {"distance": 0.53, "pace": 0.24, "hr": 0.23},
     # No stated intent means no metric can claim to be the point of the day —
     # keep the neutral split.
     "steady": METRIC_WEIGHTS,
 }
+# The graded set, derived from the weight tables rather than re-listed, so a
+# metric can never be in one and not the other.
+COMPLIANCE_METRICS: frozenset[str] = frozenset(METRIC_WEIGHTS)
+STIMULUS_METRICS: frozenset[str] = frozenset({"load"})
 _GPA_CUTS: tuple[tuple[float, str], ...] = (
     (3.5, "A"), (2.5, "B"), (1.5, "C"), (0.5, "D"),
 )
-# An F anywhere caps the overall here. A card that prints "Overall: A" above a
-# row reading F is not reporting a grade, it is averaging away the finding.
+# An F on a COMPLIANCE metric caps the overall here. A card that prints
+# "Overall: A" above a row reading F is not reporting a grade, it is averaging
+# away the finding — that reasoning is unchanged and the cap is deliberately
+# kept. What changed in 0.40.0 is only its scope: `overall_grade` now tests the
+# weighted metrics rather than every metric, so a stimulus row can never fire
+# it. The cap was never the wrong rule; load was the wrong thing to apply it to.
 _F_FLOOR_GRADE = "C"
 
 # Intent scaling. An easy day is EXPECTED to be shorter and slower than the
 # median; a long day longer. Applied to the rolling reference only — a plan
 # states its own targets and needs no scaling.
 DISTANCE_FACTORS = {"easy": 0.75, "long": 1.40, "quality": 1.00, "steady": 1.00}
-# Training load tracks distance closely enough at a fixed intent that a second,
-# independently-tuned table would be false precision — deliberately the same
-# numbers, named separately so they can diverge if evidence ever says they should.
-LOAD_FACTORS = dict(DISTANCE_FACTORS)
+# Load was `dict(DISTANCE_FACTORS)` until 0.40.0, on the reasoning that a
+# separately-tuned table would be false precision — "named separately so they can
+# diverge if evidence ever says they should". Evidence now says so, for easy.
+#
+# Measured 2026-07-29 over the live 60-day treadmill pool: the 9 sessions at or
+# under the easy HR ceiling (139 bpm) have a median load of 60.5 against the
+# pool's 99.7 — a ratio of 0.61, not the 0.75 inherited from distance. An easy
+# day banks proportionally less load than it does distance, because load is
+# intensity-weighted and distance is not.
+#
+# This only ever drives the STIMULUS descriptor now, never a letter, which is
+# why it can be recalibrated freely. Worth recording that recalibrating alone
+# would NOT have fixed the 2026-07-29 card: at 0.61 the expectation is 60, and
+# a correct 25-load easy run still deviates 0.58 — an F. The structural fix
+# (load carries no grade) was necessary; this is honesty in the descriptor.
+LOAD_FACTORS = {"easy": 0.61, "long": 1.40, "quality": 1.00, "steady": 1.00}
 PACE_FACTORS = {"easy": 1.10, "long": 1.05, "quality": 0.95, "steady": 1.00}
 # (floor, ceiling) as fractions of the rolling median HR; None = unbounded on
 # that side. HR is graded on appropriateness to intent, never "lower is better".
@@ -234,6 +299,10 @@ HR_BANDS: dict[str, tuple[float | None, float | None]] = {
 # A steady/unknown-intent run has no stated target, so its two-sided pace
 # bands are widened rather than held to prescription-grade tolerance.
 STEADY_WIDEN = 1.5
+# Fraction of a run allowed above a prescribed HR cap before it counts as a
+# breach. A few seconds over on a hill, a treadmill surge, or a sensor artifact
+# is not disobedience; a fifth of the session over the stated ceiling is.
+HR_CAP_GRACE_FRACTION = 0.05
 # ...and the converse: a PLAN target is an explicit instruction, not a fuzzy
 # reference, so it is held tighter. Without this the two were graded on the
 # same scale, and a prescribed 10:28 easy run executed at 9:28 — a full minute
@@ -457,6 +526,69 @@ def hr_deviation(hr: float | None, median_hr: float | None, cls: str) -> float |
     return 0.0
 
 
+def time_above_cap_fraction(labelled: dict, cap: float | None) -> float | None:
+    """Fraction of split time whose average HR sat above ``cap``, or ``None``.
+
+    This is the module's SECOND grade that reads splits, and it earns the
+    exception the same way quality-day pace does: the alternative number is not
+    stricter but wrong. An average sits under a cap that the middle of the run
+    spent minutes above — measured 2026-07-27, avg HR 144 against a prescribed
+    140 is a 2.9% average breach, while miles 3-5 actually ran 150/144/159 and
+    only 30% of the session was aerobic.
+
+    Unlike the pace exception this one DEGRADES rather than abstains: with no
+    splits the cap is still graded on the average alone, which is strictly better
+    than the pre-0.40.0 behavior of not reading the prescribed cap at all. So it
+    adds no new availability cliff.
+
+    Per-split averages, deliberately NOT the per-sample trace: `get_hr_samples`
+    can reach the network, and no grade may depend on an input that might not
+    resolve locally (see `load_report_card_inputs`'s `hr_trace` default).
+    """
+    if not cap or cap <= 0:
+        return None
+    rows = [r for r in (labelled.get("rows") or [])
+            if r.get("avg_hr") and r.get("duration_seconds")]
+    total = sum(r["duration_seconds"] for r in rows)
+    if not total:
+        return None
+    above = sum(r["duration_seconds"] for r in rows if r["avg_hr"] > cap)
+    return above / total
+
+
+def hr_cap_deviation(
+    hr: float | None,
+    cap: float | None,
+    time_above_fraction: float | None = None,
+) -> float | None:
+    """Deviation from an EXPLICIT prescribed HR ceiling (``target_hr_max``).
+
+    Two independent ways to breach a stated cap; the grade takes the worse:
+
+    - **average** over the cap — the run as a whole ran too hot.
+    - **time** over the cap, past a small grace fraction — which is the one that
+      actually catches disobedience. See ``time_above_cap_fraction`` for the
+      measured case where the average alone cost a single +/- modifier.
+
+    ``None`` when there is no cap, which is what makes the caller fall back to
+    the rolling ``HR_BANDS`` — a plan without a stated cap grades exactly as it
+    did before 0.40.0.
+
+    Note this is graded with the BASE bands, not ``PLAN_TIGHTEN``. Tightening
+    exists to hold an explicit pace/distance target to prescription tolerance;
+    applying it to a time fraction would double-count strictness, turning "8% of
+    the run drifted over" into a D. On the base bands the time axis reads as it
+    should: ~5% is noise, 20% over is a C, a third of the run over is an F.
+    """
+    if not hr or not cap or cap <= 0:
+        return None
+    over_avg = max(0.0, (hr - cap) / cap)
+    over_time = 0.0
+    if time_above_fraction is not None:
+        over_time = max(0.0, time_above_fraction - HR_CAP_GRACE_FRACTION)
+    return max(over_avg, over_time)
+
+
 def load_deviation(load: float | None, expected_load: float | None) -> float | None:
     """Deviation from the intent-scaled rolling median, penalized in BOTH
     directions — but only once an overshoot becomes a spike.
@@ -490,21 +622,122 @@ def load_deviation(load: float | None, expected_load: float | None) -> float | N
     return max(0.0, 1.0 - ratio)
 
 
+# --- stimulus (reported, never graded) -------------------------------------
+
+# Descriptor bands on `load / intent-scaled expected load`. The top boundary is
+# LOAD_SPIKE_FACTOR itself so the descriptor and the `spike` flag can never
+# disagree — that exact contradiction (a load row reading A+ directly above a
+# note reading "spike — more than double your median day") is what
+# `load_deviation`'s two-sided rewrite was written to fix in 0.37.x, and the
+# same discipline applies now that the output is a word instead of a letter.
+STIMULUS_LEVELS: tuple[tuple[float, str], ...] = (
+    (0.60, "LOW"), (1.40, "MODERATE"), (LOAD_SPIKE_FACTOR, "HIGH"),
+)
+_STIMULUS_TOP_LEVEL = "VERY HIGH"
+# Zones 1-2 are the aerobic-base zones. Their share of total time is what makes
+# "this was actually an easy run" checkable instead of asserted — a 96%-aerobic
+# run and a 60%-aerobic one can carry the same average HR.
+_AEROBIC_ZONES = frozenset({1, 2})
+
+
+def stimulus_level(ratio: float | None) -> str | None:
+    """``load / expected_load`` → LOW | MODERATE | HIGH | VERY HIGH.
+
+    ``None`` in, ``None`` out — an activity with no load, or no comparable
+    history to scale an expectation from, gets no descriptor rather than a
+    made-up one.
+    """
+    if ratio is None:
+        return None
+    for threshold, level in STIMULUS_LEVELS:
+        if ratio <= threshold + _EPS:
+            return level
+    return _STIMULUS_TOP_LEVEL
+
+
+def zone_summary(zones: list[dict] | None) -> dict | None:
+    """``activity_hr_zones`` rows → seconds per zone plus the aerobic share.
+
+    ``None`` when the activity has no zone rows at all. Populated for 90 of the
+    last 90 days (the daily-sync path writes them, as it does splits), so the
+    None branch is the pre-sync backfilled history — same availability shape as
+    ``label_splits``, and handled the same way: omit the line, never guess it.
+    """
+    by_zone: dict[int, float] = {}
+    for z in zones or []:
+        zone, seconds = z.get("zone"), z.get("seconds_in_zone")
+        if zone is None or not seconds:
+            continue
+        by_zone[int(zone)] = by_zone.get(int(zone), 0.0) + float(seconds)
+    total = sum(by_zone.values())
+    if not total:
+        return None
+    aerobic = sum(s for zn, s in by_zone.items() if zn in _AEROBIC_ZONES)
+    return {
+        "seconds_by_zone": dict(sorted(by_zone.items())),
+        "total_seconds": total,
+        "aerobic_pct": round(aerobic / total * 100),
+    }
+
+
+def stimulus_block(
+    activity: dict,
+    load_metric: dict,
+    zones: list[dict] | None = None,
+    drift_pct: float | None = None,
+) -> dict:
+    """The reported-not-graded half of the card.
+
+    Carries no letter by construction — ``level``/``as_intended`` are words, and
+    nothing downstream turns them into GPA (``overall_grade`` iterates the
+    weight tables, which have no load key).
+
+    ``as_intended`` reuses ``LOAD_SPIKE_FACTOR`` rather than inventing a second
+    threshold: undershooting an intent-scaled expectation is ALWAYS fine — that
+    is the entire point of the 0.40.0 partition, an easy day is supposed to bank
+    less — so the only thing worth flagging is an overshoot big enough to be a
+    spike.
+    """
+    load = activity.get("training_load")
+    expected = load_metric.get("expected")
+    ratio = (load / expected) if load and expected and expected > 0 else None
+    return {
+        "load": load,
+        "expected_load": expected,
+        "ratio": None if ratio is None else round(ratio, 3),
+        "level": stimulus_level(ratio),
+        # None (not True) when there is nothing to compare against — "as
+        # intended" is a claim, and an unverifiable claim is not made.
+        "as_intended": None if ratio is None else ratio <= LOAD_SPIKE_FACTOR + _EPS,
+        "spike": bool(load_metric.get("spike")),
+        "aerobic_te": activity.get("aerobic_te"),
+        "anaerobic_te": activity.get("anaerobic_te"),
+        "zones": zone_summary(zones),
+        "drift_pct": drift_pct,
+    }
+
+
 def overall_grade(metrics: dict[str, dict], cls: str = "steady") -> dict:
-    """Intent-weighted GPA over gradeable metrics only.
+    """Intent-weighted GPA over gradeable COMPLIANCE metrics only.
 
     ``cls`` selects the weight table — see ``INTENT_METRIC_WEIGHTS`` for why the
     weights aren't flat. It defaults to the neutral split so an older caller
     passing only ``metrics`` keeps the previous behavior.
+
+    Stimulus metrics (``STIMULUS_METRICS``) are absent from every weight table,
+    so they drop out here the same way an ``n/a`` does — by not being iterated.
+    That is deliberate and is the whole 0.40.0 fix: it makes "training load can
+    never lower your grade" a property of the data structure rather than of a
+    small weight that a cap could still bypass.
 
     An ``n/a`` metric drops out and its weight redistributes proportionally,
     so a by-feel plan day with no pace target isn't silently scored as if pace
     were worth 30% of nothing. Zero gradeable metrics yields "n/a" — never
     "F", which would read as a judgment we did not actually make.
 
-    Finally, an F on any single metric caps the overall at ``_F_FLOOR_GRADE``.
-    Redistribution plus generous weighting can otherwise let three good metrics
-    average an outright failure up into a passing letter.
+    Finally, an F on any single *weighted* metric caps the overall at
+    ``_F_FLOOR_GRADE``. Redistribution plus generous weighting can otherwise let
+    two good metrics average an outright failure up into a passing letter.
     """
     weights = INTENT_METRIC_WEIGHTS.get(cls, METRIC_WEIGHTS)
     pairs = [
@@ -522,7 +755,11 @@ def overall_grade(metrics: dict[str, dict], cls: str = "steady") -> dict:
             letter = candidate
             break
     out = {"grade": letter, "gpa": round(gpa, 2), "graded_metrics": len(pairs)}
-    if any(base_letter(m.get("grade")) == "F" for m in metrics.values()):
+    # Scoped to the WEIGHTED metrics on purpose — an ungraded stimulus row has
+    # no letter to cap with, and a future one that grew a letter still must not
+    # be able to. See _F_FLOOR_GRADE.
+    if any(base_letter(m.get("grade")) == "F"
+           for k, m in metrics.items() if k in weights):
         # Report the cap rather than quietly rewriting the letter — the GPA
         # stays honest and the card can say why the two disagree.
         if GRADE_POINTS[letter] > GRADE_POINTS[_F_FLOOR_GRADE]:
@@ -728,6 +965,7 @@ def build_card(
     hr_samples: list[tuple[float, int]] | None = None,
     recent_activities: list[dict] | None = None,
     upcoming_workouts: list[dict] | None = None,
+    hr_zones: list[dict] | None = None,
 ) -> dict:
     """Assemble the full report card. Pure — every input is a plain dict, so
     the whole rubric is testable without a DB.
@@ -735,6 +973,10 @@ def build_card(
     ``hr_samples`` is the optional per-sample ``(distance_m, hr)`` trace. Like
     ``splits`` it is presentation-only: no grade reads it, so a card renders
     identically whether or not the trace was available.
+
+    ``hr_zones`` is the optional ``activity_hr_zones`` rows, feeding the
+    stimulus block's aerobic share. Appended last so every existing positional
+    caller keeps working; absent, the zone line is simply omitted.
     """
     intent, intent_source = resolve_intent(activity, plan_workout, reference)
     cls = intent_class(intent)
@@ -857,29 +1099,55 @@ def build_card(
     if pace_display:
         pace["actual_display"] = pace_display
 
-    # -- HR and load: always rolling. plan_workouts has neither column.
+    # -- HR: the plan's own ceiling when it states one (0.40.0), else rolling.
     med_hr = reference.get("median_hr") if has_rolling else None
     actual_hr = activity.get("avg_hr")
-    d = hr_deviation(actual_hr, med_hr, cls)
-    # Expected is the BOUND that governed the grade, not the median — see
-    # hr_expectation. The band itself is carried for display so the reader can
-    # see the range rather than infer it from one edge.
-    hr_lo, hr_hi = hr_band_bounds(med_hr, cls)
-    hr = _metric(
-        grade_from_deviation(d), actual_hr,
-        hr_expectation(actual_hr, med_hr, cls), d,
-        "rolling_60d" if has_rolling else reference.get("mode"))
-    if med_hr:
-        hr["band"] = {"floor": hr_lo, "ceiling": hr_hi}
+    plan_cap = (plan_workout or {}).get("target_hr_max") if plan_ref_ok else None
+    if plan_cap:
+        # An explicit instruction beats a statistical band. Before this existed
+        # "Keep HR under 140" was unreadable prose in `description` and HR was
+        # measured against 0.97x the rolling median — which on 2026-07-29 was
+        # 139 by coincidence, so a genuine breach of the prescription registered
+        # as a rounding error.
+        above = time_above_cap_fraction(labelled_splits, plan_cap)
+        d = hr_cap_deviation(actual_hr, plan_cap, above)
+        hr = _metric(grade_from_deviation(d), actual_hr, plan_cap, d, "plan")
+        hr["cap"] = plan_cap
+        hr["expected_display"] = f"≤ {round(plan_cap)} bpm"
         hr["in_band"] = d == 0.0
-        hr["median_hr"] = med_hr
-        hr["expected_display"] = _fmt_hr_band(hr_lo, hr_hi)
+        if above is not None:
+            hr["time_above_cap_pct"] = round(above * 100)
+            if above > HR_CAP_GRACE_FRACTION:
+                # The number that produced the grade, stated. The average alone
+                # would leave a reader unable to reconstruct why 144-vs-140 is
+                # not a near-miss.
+                hr["note"] = (f"{round(above * 100)}% of the run sat above the "
+                              f"prescribed {round(plan_cap)} bpm cap")
+    else:
+        d = hr_deviation(actual_hr, med_hr, cls)
+        # Expected is the BOUND that governed the grade, not the median — see
+        # hr_expectation. The band itself is carried for display so the reader can
+        # see the range rather than infer it from one edge.
+        hr_lo, hr_hi = hr_band_bounds(med_hr, cls)
+        hr = _metric(
+            grade_from_deviation(d), actual_hr,
+            hr_expectation(actual_hr, med_hr, cls), d,
+            "rolling_60d" if has_rolling else reference.get("mode"))
+        if med_hr:
+            hr["band"] = {"floor": hr_lo, "ceiling": hr_hi}
+            hr["in_band"] = d == 0.0
+            hr["median_hr"] = med_hr
+            hr["expected_display"] = _fmt_hr_band(hr_lo, hr_hi)
 
     med_load = reference.get("median_load") if has_rolling else None
     expected_load = LOAD_FACTORS[cls] * med_load if med_load else None
+    # `grade=None` unconditionally: load is a STIMULUS metric (see the module
+    # docstring). The deviation is still computed and carried, because the card
+    # shows the gap and the descriptor is derived from the same ratio — what is
+    # withheld is the letter, not the comparison.
     d = load_deviation(activity.get("training_load"), expected_load)
     load = _metric(
-        grade_from_deviation(d), activity.get("training_load"), expected_load, d,
+        None, activity.get("training_load"), expected_load, d,
         "rolling_60d" if has_rolling else reference.get("mode"))
     actual_load = activity.get("training_load")
     # The spike flag compares against the UNSCALED median: "double your normal
@@ -889,6 +1157,8 @@ def build_card(
 
     metrics = {"distance": distance, "pace": pace, "hr": hr, "load": load}
     return {
+        "stimulus": stimulus_block(
+            activity, load, hr_zones, labelled_splits.get("hr_drift_pct")),
         "activity": dict(activity),
         "intent": intent,
         "intent_source": intent_source,
@@ -916,22 +1186,32 @@ def build_card(
 #: card_store all consume it, and housing it in workout_coach forced each of
 #: them to import from the module that judges the card rather than the one
 #: that defines it. workout_coach re-exports it unchanged.
+#: The 4th key became ``stimulus`` in 0.40.0 (was ``load``). The ARITY is what
+#: the downstream contract depends on — ``card_store.read_is_complete`` requires
+#: all four, ``workout_coach`` prompts for all four — so renaming rather than
+#: dropping keeps every consumer's shape intact while the section stops being
+#: about a grade that no longer exists. Renaming the key changes
+#: ``read_cache_key``, so stored reads for already-graded cards miss and
+#: regenerate once; that is intended, since an old read argues about a load
+#: LETTER the card no longer prints.
 READ_SECTIONS: tuple[tuple[str, str], ...] = (
     ("distance", "DISTANCE"),
     ("pace", "PACE"),
     ("hr", "HEART RATE"),
-    ("load", "TRAINING LOAD"),
+    ("stimulus", "STIMULUS"),
 )
 
+#: Compliance metrics only — this drives the graded table, and load is no longer
+#: in it. Load renders in the stimulus section instead (see
+#: ``_stimulus_lines``), which is what stops a reader from seeing a letter
+#: column beside it and inferring one.
 _METRIC_LABELS = [
-    ("distance", "Distance"), ("pace", "Pace"),
-    ("hr", "Avg HR"), ("load", "Training Load"),
+    ("distance", "Distance"), ("pace", "Pace"), ("hr", "Avg HR"),
 ]
 
 # The same metrics named for prose rather than for a table column: "Avg HR"
 # reads wrong mid-sentence.
-_METRIC_PROSE = {"distance": "distance", "pace": "pace",
-                 "hr": "HR", "load": "training load"}
+_METRIC_PROSE = {"distance": "distance", "pace": "pace", "hr": "HR"}
 
 
 def _prose_list(items: list[str]) -> str:
@@ -1040,6 +1320,124 @@ def _delta_text(key: str, metric: dict) -> str:
     return f"{pct:+.0f}%"
 
 
+def _fmt_minutes(seconds: float | None) -> str:
+    """Whole minutes, for the zone breakdown. Sub-minute reads "<1m" rather than
+    "0m", which looks like the zone was never entered."""
+    if not seconds:
+        return "0m"
+    minutes = seconds / 60
+    return f"{minutes:.0f}m" if minutes >= 1 else "<1m"
+
+
+#: How the intent reads in the stimulus line — "typical for an easy day" is the
+#: honest gloss on `LOAD_FACTORS[cls] * median`, which is what `expected` is.
+_INTENT_PROSE = {"easy": "an easy day", "long": "a long run",
+                 "quality": "a quality day", "steady": "your median day"}
+
+
+def has_stimulus(card: dict) -> bool:
+    """Whether there is anything to REPORT — deliberately not "is there a level".
+
+    An activity with load but no comparable history still has facts worth
+    stating; it just cannot be called low or high. Only a card with nothing at
+    all renders nothing, because the PDF's density ladder has no content to drop
+    and an empty section would cost vertical space for no information.
+    """
+    stim = card.get("stimulus") or {}
+    return bool(stim.get("load") or stim.get("aerobic_te") is not None
+                or stim.get("zones"))
+
+
+def stimulus_rows(card: dict) -> list[list[str]]:
+    """The Signal/Value pairs, shared by the markdown card and the PDF.
+
+    Shared rather than written twice: the two renderers diverged within an hour
+    of being written (the PDF dropped the whole section when there was no level
+    while the markdown kept it), and a card whose table and PDF disagree is the
+    one failure mode `render_report_card_pdf` exists to prevent.
+    """
+    stim = card.get("stimulus") or {}
+    intent_prose = _INTENT_PROSE.get(card.get("intent_class"), "your median day")
+    load_text = _fmt_load(stim.get("load"))
+    expected = stim.get("expected_load")
+    if expected:
+        load_text += f" (vs ~{_fmt_load(expected)} typical for {intent_prose})"
+    rows = [["Training load", load_text]]
+    for key, label in (("aerobic_te", "Aerobic TE"), ("anaerobic_te", "Anaerobic TE")):
+        if stim.get(key) is not None:
+            rows.append([label, f"{stim[key]:.1f}"])
+    zones = stim.get("zones")
+    if zones:
+        detail = " · ".join(
+            f"Z{zone} {_fmt_minutes(secs)}"
+            for zone, secs in zones["seconds_by_zone"].items())
+        rows.append(["HR zones", f"{detail} — {zones['aerobic_pct']}% aerobic"])
+    return rows
+
+
+def stimulus_notes(card: dict) -> list[str]:
+    """Plain-text notes under the stimulus table, shared by both renderers.
+
+    The last one is not optional. The reason there is no letter has to be stated
+    ON the card: an unexplained absence reads as an omission, and the single most
+    likely misreading is the one the 0.40.0 partition exists to prevent — that a
+    LOW number is a bad result.
+    """
+    stim = card.get("stimulus") or {}
+    intent_prose = _INTENT_PROSE.get(card.get("intent_class"), "your median day")
+    notes = []
+    if stim.get("spike"):
+        notes.append("Spike — more than double your median day.")
+    if not stim.get("level"):
+        notes.append("Not enough comparable history to say whether that is high "
+                     "or low for this intent.")
+    notes.append(
+        f"Not graded. Training load is intensity x duration, so running "
+        f"{intent_prose} correctly is supposed to bank less of it — it is "
+        "reported here and cannot affect the grade above.")
+    return notes
+
+
+def stimulus_heading(card: dict, *, markdown: bool = True) -> str:
+    """"Stimulus: LOW — as intended", or a bare "Stimulus" with no level.
+
+    ``markdown=False`` drops the emphasis for the PDF, whose HTML is escaped
+    rather than rendered — the same convention ``reference_line`` uses.
+    """
+    stim = card.get("stimulus") or {}
+    level = stim.get("level")
+    as_intended = stim.get("as_intended")
+    em = "**" if markdown else ""
+    # `as_intended is None` means there was no expectation to compare against, so
+    # neither claim is assertable and the qualifier is omitted entirely.
+    if as_intended is True:
+        qualifier = " — as intended"
+    elif as_intended is False:
+        qualifier = f" — {em}higher than intended{em}"
+    else:
+        qualifier = ""
+    return f"Stimulus: {level}{qualifier}" if level else "Stimulus"
+
+
+def stimulus_lines(card: dict) -> list[str]:
+    """The Stimulus section: numbers and a descriptor, and NO grade column.
+
+    Kept structurally separate from the compliance table rather than rendered as
+    a 4th row with "n/a" in the Grade column, because "n/a" reads as *we could
+    not grade this* — a missing measurement. Load is not missing; it is
+    deliberately not judged, and a reader has to be able to tell those apart.
+    """
+    if not has_stimulus(card):
+        return []
+    return [
+        f"## {stimulus_heading(card)}",
+        "",
+        render.render_table(["Signal", "Value"], stimulus_rows(card)),
+        "",
+        *(f"- {n}" for n in stimulus_notes(card)),
+    ]
+
+
 def reference_line(card: dict, *, markdown: bool = True) -> str:
     """One sentence naming the yardstick. The card must never leave this
     ambiguous — the same run grades differently under a plan than under the
@@ -1090,9 +1488,14 @@ def reference_line(card: dict, *, markdown: bool = True) -> str:
             return (f"{plan_sentence} {ungraded} ungraded — only {n} comparable "
                     f"{'activity' if n == 1 else 'activities'} in the last "
                     f"{REFERENCE_WINDOW_DAYS} days (need {MIN_REFERENCE_ACTIVITIES}).")
-        return (f"{plan_sentence} HR and training load "
-                f"have no plan target, so they use your 60-day median of "
-                f"{ref.get('n', 0)} {pool} activities.{widened}")
+        # Training load dropped out of this sentence in 0.40.0: it is no longer
+        # graded, so naming its yardstick here implied a judgment the card does
+        # not make. The Stimulus section states its own comparison instead.
+        hr_ref = (card["metrics"].get("hr") or {}).get("reference") or ""
+        if hr_ref.startswith("plan"):
+            return f"{plan_sentence}{widened}"
+        return (f"{plan_sentence} HR has no plan target, so it uses your "
+                f"60-day median of {ref.get('n', 0)} {pool} activities.{widened}")
     return (f"Graded against your {em}60-day rolling median{em} of {ref.get('n', 0)} "
             f"{pool} activities (intent: {card['intent']}, {intent_src}).{widened}")
 
@@ -1136,8 +1539,9 @@ def render_markdown(card: dict) -> str:
 
     notes = [f"- {label}: {card['metrics'][key]['note']}"
              for key, label in _METRIC_LABELS if card["metrics"][key].get("note")]
-    if card["metrics"]["load"].get("spike"):
-        notes.append("- Training Load: **spike** — more than double your median day.")
+    # The load spike note moved to the Stimulus section in 0.40.0 — it is a
+    # statement about stimulus, and leaving it under the graded table was half
+    # the reason a low-load easy day read as a failure.
     if card["overall"].get("capped_by") == "F":
         notes.append(
             f"- Overall: capped at {card['overall']['grade']} — a metric graded F.")
@@ -1149,6 +1553,10 @@ def render_markdown(card: dict) -> str:
     # which median a run is measured against is a real decision the card makes,
     # and the reader can't reconstruct it from the numbers.
     lines += ["", f"_{reference_line(card)}_"]
+
+    stimulus = stimulus_lines(card)
+    if stimulus:
+        lines += ["", *stimulus]
 
     lines += ["", f"## Per-{card['splits']['unit'].lower()} breakdown", ""]
     if not card["splits"]["available"]:
@@ -1384,6 +1792,12 @@ def load_report_card_inputs(
     splits = [dict(r) for r in conn.execute(
         "SELECT * FROM activity_splits WHERE activity_id = ? ORDER BY split_index", (aid,)
     ).fetchall()]
+    # Stimulus input, not a grade input — an activity with no zone rows (the
+    # pre-sync backfilled history) simply renders without the zone line.
+    hr_zones = [dict(r) for r in conn.execute(
+        "SELECT zone, seconds_in_zone FROM activity_hr_zones "
+        "WHERE activity_id = ? ORDER BY zone", (aid,)
+    ).fetchall()]
 
     plan_workout = None
     upcoming_workouts: list[dict] = []
@@ -1430,6 +1844,7 @@ def load_report_card_inputs(
     return {
         "activity": activity,
         "splits": splits,
+        "hr_zones": hr_zones,
         "hr_samples": hr_samples,
         "plan_workout": plan_workout,
         "recent_activities": recent_activities,

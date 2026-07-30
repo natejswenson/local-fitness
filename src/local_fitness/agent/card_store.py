@@ -136,6 +136,10 @@ def card_row(card: dict, *, read_cache_key: str | None) -> dict:
         "distance_grade": _grade("distance"),
         "pace_grade": _grade("pace"),
         "hr_grade": _grade("hr"),
+        # Always NULL from 0.40.0 on — load is a stimulus metric and carries no
+        # grade. The column is retained rather than dropped because rows graded
+        # before the split hold real letters, and a SQLite column drop is a table
+        # rebuild for no gain.
         "load_grade": _grade("load"),
         "read_cache_key": read_cache_key,
         "card_json": json.dumps(stored, default=str),

@@ -625,15 +625,36 @@ These are settled — don't redesign without a reason.
 - **Workout grading is deterministic Python, not model judgment** (0.25.0).
   `agent/report_card.py` backs the `workout_report_card` tool and follows the
   `interpret.py` rule: the LLM phrases a judgment, it never derives one code
-  can compute. Four metrics (distance, pace, HR, training load) each reduce
-  to ONE non-negative relative deviation `d` fed through ONE shared
-  `GRADE_BANDS` table — four small deviation functions, one grader, so the
-  rubric stays testable. Design constraints that are load-bearing, not
-  incidental:
-  - **The card always names its yardstick.** Plan-prescribed (distance and
-    pace only — `plan_workouts` has no HR or load column) or a 60-day rolling
-    *median* of comparable activities. Median, not mean: the history carries
-    real training-load outliers. Under `MIN_REFERENCE_ACTIVITIES` (5) it
+  can compute. **Compliance** metrics (distance, pace, HR) each reduce to ONE
+  non-negative relative deviation `d` fed through ONE shared `GRADE_BANDS`
+  table — three small deviation functions, one grader, so the rubric stays
+  testable. Design constraints that are load-bearing, not incidental:
+  - **Compliance is graded; stimulus is only reported** (0.40.0). Training
+    load, aerobic/anaerobic TE, HR-zone distribution and drift live in a
+    separate `stimulus` block with a `LOW|MODERATE|HIGH|VERY HIGH` descriptor
+    and **no letter**. Load is absent from every `INTENT_METRIC_WEIGHTS` table,
+    which is what makes "load can never lower your grade" structural rather
+    than a small weight a cap could bypass. **Why:** Garmin's load is
+    `duration × f(HR)`, so grading load *and* HR graded one variable twice with
+    the sign reversed — obeying an easy day's HR cap mechanically failed the
+    load metric. Measured 2026-07-29, the rubric was *inverted*: a perfectly
+    executed easy run (5.01mi, HR 126, prescription followed exactly) scored
+    **C** — a 3.60 GPA A thrown away by the F-cap — while the same week's run
+    that blew its cap from mile 3 (HR 144, splits at 150/159) scored **A**,
+    earning A+ on load for the extra work. The F-cap itself is *kept*; only its
+    scope narrowed to weighted metrics.
+  - **A prescribed HR cap is a column, not prose** (0.40.0).
+    `plan_workouts.target_hr_max` + `update_plan_workout`'s `hr_max`. Before
+    it, "Keep HR under 140" existed only in the prose `description` and no
+    grade could read it — HR was measured against `0.97 × rolling median`,
+    which was 139 by coincidence, so a real breach read as a rounding error.
+    When a cap is present HR grades against it (reference `"plan"`) on the
+    worse of *average over cap* and *time over cap past `HR_CAP_GRACE_FRACTION`*;
+    absent, it falls back to `HR_BANDS` exactly as before.
+  - **The card always names its yardstick.** Plan-prescribed (distance, pace,
+    and HR when `target_hr_max` is set) or a 60-day rolling *median* of
+    comparable activities. Median, not mean: the history carries real
+    training-load outliers. Under `MIN_REFERENCE_ACTIVITIES` (5) it
     returns n/a and says so rather than grading against noise.
   - **Direction gating.** An easy run is *supposed* to be slow — grading
     `|actual − expected|` would hand every recovery run an F. Easy/long days
@@ -663,11 +684,16 @@ These are settled — don't redesign without a reason.
     runs BEFORE widening, since widening is what would otherwise drag the whole
     walking corpus into a thin running pool. `reference_line` states the
     exclusion count on the card — it is invisible in the numbers otherwise.
-  - **Splits are presentation-only, with exactly ONE documented exception** —
-    no grade reads `activity_splits`. Only 87 of 747 activities have them
+  - **Splits are presentation-only, with exactly TWO documented exceptions** —
+    no other grade reads `activity_splits`. Only ~97 of 757 activities have them
     (daily-sync ingest writes them, backfill never does), so a splits-dependent
-    grade would be unavailable on ~88% of history and mean different things on
-    different rows. The exception is **quality-day pace against a prescribed
+    grade would be unavailable on ~87% of history and mean different things on
+    different rows. **Both exceptions must handle absence explicitly**, and they
+    do it differently on purpose: quality-day pace *abstains* (n/a + note, weight
+    redistributes), while the HR-cap time check (`time_above_cap_fraction`,
+    0.40.0) *degrades* — with no splits the cap is still graded on the average
+    alone, so it adds no new availability cliff. The first exception is
+    **quality-day pace against a prescribed
     rep target**, and it exists because the alternative wasn't a strict grade
     but a broken one: a plan's interval pace describes the *reps*, while
     `avg_pace_sec_per_km` averages in the warmup, recovery jogs and cooldown,

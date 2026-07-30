@@ -2454,7 +2454,7 @@ _PROPOSE_PLAN_SCHEMA = {
         "ability_snapshot": {"type": "object", "description": "Current-ability estimate you derived from the athlete's data"},
         "workouts": {
             "type": "array",
-            "description": "Full schedule: each {date, week_index, type, target_distance_m?, target_pace_sec_per_km?, target_duration_sec?, description, seq?}",
+            "description": "Full schedule: each {date, week_index, type, target_distance_m?, target_pace_sec_per_km?, target_duration_sec?, target_hr_max?, description, seq?}. Set target_hr_max (bpm) on any day with a heart-rate ceiling — the report card grades against it, and a cap written only into the description is invisible to the grader.",
             "items": {"type": "object"},
         },
     },
@@ -2577,6 +2577,14 @@ _UPDATE_WORKOUT_SCHEMA = {
                            "copy a display string as a number.",
         },
         "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
+        "hr_max": {
+            "type": "number",
+            "description": "prescribed heart-rate CEILING in bpm (e.g. 140 for "
+                           "'keep HR under 140'). The report card grades average "
+                           "HR and time-above-cap against this number, so state "
+                           "it here rather than only in the description — prose "
+                           "in the description is not readable by the grader.",
+        },
         "description": {"type": "string", "description": "prose prescription for the day"},
         "seq": {"type": "integer", "description": "intra-day session on a double day: 1 = first/AM (default), 2 = second/PM"},
     },
@@ -2587,11 +2595,14 @@ _UPDATE_WORKOUT_SCHEMA = {
 @tool(
     "update_plan_workout",
     "Re-prescribe ONE day on the ACTIVE training plan. Pass the date plus any "
-    "of type/distance_mi/pace_min_per_mi/duration_min/description — use it to "
-    "move a long run, swap days, or adjust a session (tempo/interval sessions "
-    "are graded on duration_min). type='rest' clears distance/pace/duration "
-    "and defaults the description to 'Rest day' unless you pass one. Edits "
-    "the prescription only; it cannot re-key or restructure the plan.",
+    "of type/distance_mi/pace_min_per_mi/duration_min/hr_max/description — use "
+    "it to move a long run, swap days, or adjust a session (tempo/interval "
+    "sessions are graded on duration_min). Pass hr_max whenever the day has a "
+    "heart-rate ceiling: the report card grades against it, and a cap stated "
+    "only in the description is invisible to the grader. type='rest' clears "
+    "distance/pace/duration/hr_max and defaults the description to 'Rest day' "
+    "unless you pass one. Edits the prescription only; it cannot re-key or "
+    "restructure the plan.",
     _UPDATE_WORKOUT_SCHEMA,
 )
 async def update_plan_workout(args: dict) -> dict:
@@ -2626,6 +2637,16 @@ async def update_plan_workout(args: dict) -> dict:
         fields["target_pace_sec_per_km"] = units.pace_sec_per_mi_to_sec_per_km(sec_per_mi)
     if args.get("duration_min") is not None:
         fields["target_duration_sec"] = round(float(args["duration_min"]) * 60)
+    if args.get("hr_max") is not None:
+        hr_max = float(args["hr_max"])
+        # Sanity bound: a prescribed ceiling outside 90-210 bpm is a transposed
+        # or unit-confused argument, not a coaching decision. Same discipline as
+        # the pace bound above, and it matters more here because the report card
+        # grades against this number directly.
+        if not (90.0 <= hr_max <= 210.0):
+            return _err(f"hr_max of {hr_max:.0f} bpm is outside the plausible "
+                        "90-210 bpm range")
+        fields["target_hr_max"] = hr_max
     if args.get("description") is not None:
         fields["description"] = args["description"]
     # A rest day carries no distance/pace/duration — clear them so a stale
@@ -2637,11 +2658,12 @@ async def update_plan_workout(args: dict) -> dict:
         fields["target_distance_m"] = None
         fields["target_pace_sec_per_km"] = None
         fields["target_duration_sec"] = None
+        fields["target_hr_max"] = None
         if args.get("description") is None:
             fields["description"] = "Rest day"
     if not fields:
         return _err("nothing to update — pass type / distance_mi / "
-                    "pace_min_per_mi / duration_min / description")
+                    "pace_min_per_mi / duration_min / hr_max / description")
 
     seq = args.get("seq")
     if seq is None:
@@ -2668,6 +2690,7 @@ async def update_plan_workout(args: dict) -> dict:
         "distance_meters": row["target_distance_m"],
         "avg_pace_sec_per_km": row["target_pace_sec_per_km"],
         "duration_seconds": row["target_duration_sec"],
+        "target_hr_max": row["target_hr_max"],
         "description": row["description"],
     }))
 
@@ -2961,6 +2984,7 @@ async def get_training_plan_progress(args: dict) -> dict:
             "target_distance_m": w.get("target_distance_m"),
             "target_pace_sec_per_km": w.get("target_pace_sec_per_km"),
             "target_duration_sec": w.get("target_duration_sec"),
+            "target_hr_max": w.get("target_hr_max"),
             "description": w.get("description"),
             "verdict": w.get("verdict"),
             "actual_distance_m": w.get("actual_distance_m"),
@@ -3813,6 +3837,7 @@ async def workout_report_card(args: dict) -> dict:
             inputs["activity"], inputs["splits"], inputs["plan_workout"],
             inputs["reference"], inputs["context"], inputs.get("hr_samples"),
             inputs.get("recent_activities"), inputs.get("upcoming_workouts"),
+            inputs.get("hr_zones"),
         )
 
         # The coach's verbal read leads the card. Claude-generated behind the

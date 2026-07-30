@@ -3593,7 +3593,7 @@ def test_report_card_coach_read_failure_falls_back_and_still_renders(
 def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monkeypatch):
     async def _read(*a, **k):
         return {"distance": "You covered the ground.", "pace": "Too quick.",
-                "hr": "Stayed low.", "load": "Banked what it should."}
+                "hr": "Stayed low.", "stimulus": "Banked what it should."}
 
     monkeypatch.setattr(tools.workout_coach, "generate_read_cached", _read)
     payload, err = call(tools.workout_report_card, {})
@@ -3601,7 +3601,7 @@ def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monke
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
     # All four paragraphs render, each under its metric label.
-    for label in ("DISTANCE", "PACE", "HEART RATE", "TRAINING LOAD"):
+    for label in ("DISTANCE", "PACE", "HEART RATE", "STIMULUS"):
         assert label in text
     for para in ("You covered the ground.", "Too quick.", "Stayed low.",
                  "Banked what it should."):
@@ -3983,7 +3983,7 @@ _RC_READ_TEXT = (
     "DISTANCE: covered the ground today.\n"
     "PACE: quick stuff throughout.\n"
     "HEART RATE: low and easy the whole way.\n"
-    "TRAINING LOAD: banked plenty for the week."
+    "STIMULUS: banked plenty for the week."
 )
 
 
