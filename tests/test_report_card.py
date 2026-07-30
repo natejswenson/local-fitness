@@ -141,7 +141,9 @@ def test_by_feel_plan_day_gets_no_pace_grade():
     )
     assert card["metrics"]["pace"]["grade"] is None
     assert card["metrics"]["pace"]["note"]
-    assert card["overall"]["graded_metrics"] == 2  # 3 compliance metrics, one n/a
+    # 4 compliance metrics; pace n/a for its own reason and continuity n/a for
+    # want of splits, leaving distance and HR.
+    assert card["overall"]["graded_metrics"] == 2
 
 
 # --- HR: appropriateness to intent, never "lower is better" ---------------
@@ -501,8 +503,8 @@ def test_overall_renormalizes_over_gradeable_metrics():
     all_a["pace"] = {"grade": None}
     out = rc.overall_grade(all_a)
     assert out["grade"] == "A"
-    # Three compliance metrics since 0.40.0, so one n/a leaves two.
-    assert out["graded_metrics"] == 2
+    # Four compliance metrics since 0.40.0, so one n/a leaves three.
+    assert out["graded_metrics"] == 3
 
 
 def test_overall_with_no_gradeable_metrics_is_na_not_f():
@@ -566,15 +568,132 @@ def test_hr_drift_needs_enough_laps():
     assert rc.hr_drift_pct([{"avg_hr": 140}, {"avg_hr": 150}]) is None
 
 
-def test_no_grade_reads_splits():
-    """The load-bearing invariant: ~88% of activities have no splits, so a
-    splits-dependent grade would mean different things on different rows."""
+def test_only_the_documented_exceptions_read_splits():
+    """~87% of activities have no splits, so a splits-dependent grade would mean
+    different things on different rows. The rule is therefore: splits may change
+    a grade ONLY through a documented exception, and absence must be EXPLICIT
+    (n/a plus a stated reason, weight redistributing) rather than silent.
+
+    Distance, pace-on-a-non-quality-day, and HR-without-a-prescribed-cap must be
+    byte-identical with and without splits.
+    """
     activity = {"date": "2026-07-19", "distance_meters": 10000,
                 "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100}
     with_splits = card_for(activity, splits=MILE_SPLITS)
     without = card_for(activity)
-    assert with_splits["metrics"] == without["metrics"]
-    assert with_splits["overall"] == without["overall"]
+    for key in ("distance", "pace", "hr", "load"):
+        assert with_splits["metrics"][key] == without["metrics"][key], key
+
+
+#: MILE_SPLITS carries no pace (other tests depend on that shape), and
+#: continuity is a pace measure — so it gets its own paced fixture. Even miles.
+PACED_SPLITS = [
+    {"split_index": i, "distance_meters": 1609.34, "duration_seconds": 600,
+     "avg_hr": 140, "avg_pace_sec_per_km": 372.0 + i}
+    for i in range(4)
+]
+
+
+def test_continuity_abstains_explicitly_when_splits_are_missing():
+    """The third splits exception (0.40.0), held to the same contract as the
+    quality-pace one: no splits means n/a WITH a reason, never a fabricated
+    grade, and the weight redistributes over the metrics that could be graded."""
+    activity = {"date": "2026-07-19", "distance_meters": 10000,
+                "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100}
+    without = card_for(activity)
+    cont = without["metrics"]["continuity"]
+    assert cont["grade"] is None
+    assert cont["note"] == "no splits recorded — continuity can't be measured"
+    assert without["overall"]["graded_metrics"] == 3   # the other three
+
+    with_splits = card_for(activity, splits=PACED_SPLITS)
+    assert with_splits["metrics"]["continuity"]["grade"] == "A+"
+    assert with_splits["overall"]["graded_metrics"] == 4
+
+
+def test_continuity_says_so_when_splits_carry_no_pace():
+    """Distinct from "no splits": a run WITH a split table but no pace column
+    would otherwise report "only 0 full splits", which reads as a card bug."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=MILE_SPLITS,
+    )
+    cont = card["metrics"]["continuity"]
+    assert cont["grade"] is None
+    assert cont["note"] == ("splits recorded without pace — continuity can't be "
+                            "measured")
+
+
+def test_continuity_catches_a_walk_mile_nothing_else_sees():
+    """The reason this axis exists. Modelled on 2026-07-28: a tempo session whose
+    4th mile ran 12:31 among ~9:20 miles. Distance was A+, HR was A+, and the
+    average pace absorbed the break — nothing on the card said a mile had been
+    walked.
+
+    Note 12:31/mi is UNDER the 13:00 run/walk boundary, so absolute walk-pace
+    detection would have missed it. The ratio against the run's own median is
+    what catches it.
+    """
+    # The real 2026-07-28 per-mile paces (10:19, 8:40, 9:19, 12:31), in sec/km
+    # because that is the column's unit.
+    paces = (384.6, 323.1, 347.4, 466.6)
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 6437, "duration_seconds": 2745,
+         "avg_pace_sec_per_km": 426.0, "avg_hr": 143, "training_load": 85},
+        plan={"type": "easy", "target_distance_m": 6437, "seq": 1},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": round(p * 1.60934), "avg_hr": 140,
+                 "avg_pace_sec_per_km": p}
+                for i, p in enumerate(paces)],
+    )
+    cont = card["metrics"]["continuity"]
+    # 466.6 / median(366.0) = 1.275 -> d = 1.275 - 1.15 = 0.125 -> C
+    assert cont["ratio"] == pytest.approx(1.275, abs=0.001)
+    assert cont["deviation"] == pytest.approx(0.125, abs=0.001)
+    assert rc.base_letter(cont["grade"]) == "C"
+    # The note names the offending split so the reader can act on it.
+    assert cont["note"] == ("mile 4 ran 12:31/mi — 27% slower than your median "
+                            "mile for this run")
+    # And it is genuinely independent: the metrics that missed it still pass.
+    assert card["metrics"]["distance"]["grade"] == "A+"
+    assert rc.base_letter(card["metrics"]["hr"]["grade"]) == "A"
+
+
+def test_continuity_ignores_a_conservative_opening_mile():
+    """The false-positive guard, and the reason this is a slowest-vs-median ratio
+    rather than a standard deviation. Measured 2026-07-27: SD across the run was
+    22.2 s/mi, but 4.9 s/mi once the warm-up mile is dropped. Starting easy and
+    settling in must not read as a break."""
+    # The real 2026-07-27 per-mile paces (10:41 opener, then 9:48-9:59), sec/km.
+    paces = (398.3, 365.4, 367.9, 372.2, 366.6)
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 8046, "duration_seconds": 3011,
+         "avg_pace_sec_per_km": 374.0, "avg_hr": 144, "training_load": 82},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": round(p * 1.60934), "avg_hr": 140,
+                 "avg_pace_sec_per_km": p}
+                for i, p in enumerate(paces)],
+    )
+    cont = card["metrics"]["continuity"]
+    assert cont["ratio"] == pytest.approx(1.083, abs=0.001)   # under the 1.15 gate
+    assert cont["deviation"] == 0.0
+    assert cont["grade"] == "A+"
+    assert "note" not in cont
+
+
+def test_continuity_needs_three_full_splits_to_say_anything():
+    """Two splits cannot separate a slowest from a median. The note says which
+    of the two reasons applies rather than reusing the no-splits wording."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=PACED_SPLITS[:2],
+    )
+    cont = card["metrics"]["continuity"]
+    assert cont["grade"] is None
+    assert cont["note"] == ("only 2 full splits with pace — need 3 to compare a "
+                            "slowest against a median")
 
 
 # --- insufficient reference ------------------------------------------------
@@ -675,7 +794,10 @@ def test_scoped_caveat_counts_one_activity_in_the_singular():
     )
     # A by-feel prescription grades distance only, so pace joins the caveat.
     assert rc.reference_line(card, markdown=False).endswith(
-        "Pace and HR ungraded — only 1 comparable activity in "
+        # Pace is NOT listed: a by-feel prescription has no pace target, so
+        # blaming its n/a on a thin pool would promise a grade more history
+        # cannot unlock. Same reason continuity is absent (0.40.0).
+        "HR ungraded — only 1 comparable activity in "
         "the last 60 days (need 5).")
 
 
@@ -1583,7 +1705,9 @@ def test_interval_pace_is_na_without_splits_not_a_fabricated_f():
     assert pace["actual_display"] == "10:42/mi avg"
     assert "no splits recorded" in pace["note"]
     # ...and the weight redistributes rather than scoring pace as zero.
-    assert card["overall"]["graded_metrics"] == 2  # 3 compliance metrics, one n/a
+    # 4 compliance metrics; pace n/a for its own reason and continuity n/a for
+    # want of splits, leaving distance and HR.
+    assert card["overall"]["graded_metrics"] == 2
 
 
 def test_manual_lap_interval_is_graded_on_the_rep_not_the_warmup():
@@ -1624,7 +1748,10 @@ def test_interval_pace_is_na_when_no_split_is_rep_sized():
     assert pace["note"] == ("interval day, no split long enough to be a rep — "
                             "average pace can't be graded against a rep target")
     assert pace["actual_display"] == "10:42/mi avg"
-    assert card["overall"]["graded_metrics"] == 2  # 3 compliance metrics, one n/a
+    # Continuity IS graded here — 6 evenly-paced 200 m splits, none partial, so
+    # they clear MIN_CONTINUITY_SPLITS even though none is rep-sized. Distance,
+    # HR and continuity remain; only pace redistributes.
+    assert card["overall"]["graded_metrics"] == 3
 
 
 def test_ungraded_metric_prints_no_delta():
@@ -1673,10 +1800,11 @@ def test_intent_weights_let_pace_carry_an_easy_day():
     }
     easy = rc.overall_grade(metrics, "easy")
     long_run = rc.overall_grade(metrics, "long")
-    # easy: .22*4 + .50*1 + .28*4 = 2.50
-    assert easy["gpa"] == pytest.approx(2.50)
-    # long: .53*4 + .24*1 + .23*4 = 3.28 — distance is the point there.
-    assert long_run["gpa"] == pytest.approx(3.28)
+    # No continuity key in the fixture, so its 0.15 redistributes over the rest.
+    # easy: (.19*4 + .42*1 + .24*4) / .85 = 2.52
+    assert easy["gpa"] == pytest.approx(2.52)
+    # long: (.45*4 + .20*1 + .20*4) / .85 = 3.29 — distance is the point there.
+    assert long_run["gpa"] == pytest.approx(3.29)
     assert easy["grade"] == "B" and long_run["grade"] == "B"
 
 
@@ -1701,9 +1829,9 @@ def test_steady_intent_keeps_the_neutral_split():
         "distance": {"grade": "A"}, "pace": {"grade": "D"},
         "hr": {"grade": "A"}, "load": {"grade": "A"},
     }
-    # .35*4 + .35*1 + .30*4 = 2.95
-    assert rc.overall_grade(metrics, "steady")["gpa"] == pytest.approx(2.95)
-    assert rc.overall_grade(metrics)["gpa"] == pytest.approx(2.95)  # default
+    # (.30*4 + .30*1 + .25*4) / .85 = 2.94 (continuity absent, redistributed)
+    assert rc.overall_grade(metrics, "steady")["gpa"] == pytest.approx(2.94)
+    assert rc.overall_grade(metrics)["gpa"] == pytest.approx(2.94)  # default
 
 
 def test_an_f_caps_the_overall():
@@ -1713,8 +1841,8 @@ def test_an_f_caps_the_overall():
         "hr": {"grade": "A"}, "load": {"grade": "A"},
     }
     out = rc.overall_grade(metrics, "long")
-    # .53*4 + .24*0 + .23*4 = 3.04 -> B, capped to C.
-    assert out["gpa"] == pytest.approx(3.04)
+    # (.45*4 + .20*0 + .20*4) / .85 = 3.06 -> B, capped to C.
+    assert out["gpa"] == pytest.approx(3.06)
     assert out["grade"] == "C"
     assert out["capped_by"] == "F"
 

@@ -4144,7 +4144,10 @@ def test_list_report_cards_payload_filters_and_order(rc_cards, reports_tmp, monk
     # activity 103 is 3 days ago, 105 is 5 days ago — newest run first.
     assert [c["activity_id"] for c in payload["cards"]] == [103, 105]
     top = payload["cards"][0]
-    assert set(top["grades"]) == {"distance", "pace", "hr", "load"}
+    assert set(top["grades"]) == {"distance", "pace", "hr", "continuity", "load"}
+    # `load` is present as a key but is always NULL from 0.40.0 — it is a
+    # stimulus metric now. Every other key is a real compliance grade.
+    assert top["grades"]["load"] is None
     assert top["overall"] is not None and top["graded_at"]
     # The date filter pins actual rows, not just a count.
     cutoff = (date.today() - timedelta(days=4)).isoformat()

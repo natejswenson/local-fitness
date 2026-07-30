@@ -46,6 +46,11 @@ grading two real sessions from the same week against the same prescription
   pool's 99.7. Descriptor-only now, so it can be recalibrated freely. Recorded
   because it is instructive: recalibrating *alone* would not have fixed the
   card (a 25-load easy run still deviates 0.58 against a 61 expectation — an F).
+- **`reference_line` no longer blames the reference pool for metrics that don't
+  use it.** The scoped "…ungraded — only 2 comparable activities in the last 60
+  days" caveat now lists only metrics whose reference IS the pool. Continuity
+  measures a run against its own splits and a by-feel pace has no target at all,
+  so naming either promised a grade more history could not unlock.
 - **Card sections renamed**: the graded table is "Compliance"; the coach read's
   4th section is `STIMULUS` (was `TRAINING LOAD`). Same arity, so
   `read_is_complete` and the prompt contract keep their shape — but
@@ -65,6 +70,34 @@ grading two real sessions from the same week against the same prescription
   `HR_CAP_GRACE_FRACTION` (5%)*. The average alone is what let a run spending
   miles 3–5 at 150/144/159 read A−. With the cap present, the same three
   sessions now grade **A / C / B** where they previously graded **C / A / C**.
+- **`continuity`, a 4th compliance metric** — slowest full split / median full
+  split, penalized past `CONTINUITY_TOLERANCE` (1.15) as the raw excess. It
+  answers the one question distance, pace and HR all average away: *was this one
+  continuous session, or did it contain a break?* Measured 2026-07-28: a tempo
+  day whose 4th mile ran **12:31 among ~9:20 miles** graded A+ on distance, A+ on
+  HR, and nothing on the card mentioned it. It now grades C+ and the note names
+  the mile.
+
+  Two design choices worth recording, both aimed at not inventing a new
+  unfairness while fixing the old one:
+  - **Not a standard deviation.** The opening mile is routinely the outlier —
+    2026-07-27 measured SD 22.2 s/mi across the run and 4.9 s/mi once the warm-up
+    is dropped. A metric that failed a run for starting conservatively would
+    recreate exactly what the compliance/stimulus split just removed. The
+    slowest-vs-own-median ratio leaves that session at 1.08, comfortably inside
+    the gate.
+  - **Not absolute walk-pace detection.** 12:31/mi is *under*
+    `RUN_PACE_CEILING_SEC_PER_MI` (13:00), so the existing run/walk boundary
+    would have missed the very session this metric exists for.
+
+  Verified independent rather than redundant before shipping: three sessions in
+  the live 90-day window pass distance, pace **and** HR while carrying a slowest
+  split 30-41% off their own median. Threshold 1.15 separates cleanly — 33 of 40
+  split-bearing sessions sit at or under it, and all 7 above are genuine run/walk
+  sessions. Requires 3 full paced splits; below that it is n/a with the reason
+  stated and its weight redistributes, which also excludes manually-lapped
+  interval sessions by construction. Stored in the new
+  `report_cards.continuity_grade` column.
 - **HR-zone aerobic share** on the card (`zone_summary`), reading
   `activity_hr_zones` — populated for 90 of the last 90 days. It is the number
   that makes "this really was easy" checkable: the two easy days above share a

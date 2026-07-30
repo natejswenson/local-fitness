@@ -643,6 +643,20 @@ These are settled — don't redesign without a reason.
     that blew its cap from mile 3 (HR 144, splits at 150/159) scored **A**,
     earning A+ on load for the extra work. The F-cap itself is *kept*; only its
     scope narrowed to weighted metrics.
+  - **`continuity` is the 4th compliance metric** (0.40.0) — slowest full split
+    / median full split, penalized past `CONTINUITY_TOLERANCE` (1.15) as the raw
+    excess. It answers the one question distance/pace/HR all miss: *was this one
+    session, or did it contain a break?* Measured 2026-07-28: a tempo day whose
+    4th mile ran 12:31 among ~9:20 miles graded A+ on distance and A+ on HR and
+    nothing mentioned it. Deliberately **not** a standard deviation — the opening
+    mile is routinely the outlier (2026-07-27: SD 22.2 s/mi across the run, 4.9
+    once the warm-up is dropped), and failing a run for starting conservatively
+    would recreate the unfairness the compliance/stimulus split just fixed. Also
+    not absolute walk-pace detection: 12:31/mi is *under*
+    `RUN_PACE_CEILING_SEC_PER_MI`, so the boundary would have missed the exact
+    session it exists for. Verified independent, not redundant: three sessions in
+    the live 90-day window pass distance, pace AND HR while carrying a slowest
+    split 30-41% off their own median.
   - **A prescribed HR cap is a column, not prose** (0.40.0).
     `plan_workouts.target_hr_max` + `update_plan_workout`'s `hr_max`. Before
     it, "Keep HR under 140" existed only in the prose `description` and no
@@ -684,15 +698,18 @@ These are settled — don't redesign without a reason.
     runs BEFORE widening, since widening is what would otherwise drag the whole
     walking corpus into a thin running pool. `reference_line` states the
     exclusion count on the card — it is invisible in the numbers otherwise.
-  - **Splits are presentation-only, with exactly TWO documented exceptions** —
+  - **Splits are presentation-only, with exactly THREE documented exceptions** —
     no other grade reads `activity_splits`. Only ~97 of 757 activities have them
     (daily-sync ingest writes them, backfill never does), so a splits-dependent
     grade would be unavailable on ~87% of history and mean different things on
-    different rows. **Both exceptions must handle absence explicitly**, and they
-    do it differently on purpose: quality-day pace *abstains* (n/a + note, weight
-    redistributes), while the HR-cap time check (`time_above_cap_fraction`,
-    0.40.0) *degrades* — with no splits the cap is still graded on the average
-    alone, so it adds no new availability cliff. The first exception is
+    different rows. **Every exception must handle absence explicitly**, and they
+    do it differently on purpose: quality-day pace and `continuity` *abstain*
+    (n/a + a stated reason, weight redistributes), while the HR-cap time check
+    (`time_above_cap_fraction`, 0.40.0) *degrades* — with no splits the cap is
+    still graded on the average alone, so it adds no new availability cliff.
+    `tests/test_report_card.py::test_only_the_documented_exceptions_read_splits`
+    pins that distance, non-quality pace and uncapped HR stay byte-identical with
+    and without splits. The first exception is
     **quality-day pace against a prescribed
     rep target**, and it exists because the alternative wasn't a strict grade
     but a broken one: a plan's interval pace describes the *reps*, while

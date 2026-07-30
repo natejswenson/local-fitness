@@ -114,6 +114,7 @@ __all__ = [
     "actual_text", "hr_band_bounds", "hr_expectation",
     "is_running_effort", "fastest_rep_split", "fastest_rep_split_pace",
     "time_above_cap_fraction", "hr_cap_deviation",
+    "continuity_ratio", "continuity_deviation",
     "READ_SECTIONS",
     "load_report_card_inputs", "rolling_reference",
 ]
@@ -220,11 +221,11 @@ GRADE_POINTS = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "F": 0.0}
 # The remaining three keep their pre-0.40.0 proportions exactly — each table is
 # the old one with load dropped and renormalized to sum to 1.0, which is the
 # same thing `overall_grade`'s redistribution would have computed anyway.
-METRIC_WEIGHTS = {"distance": 0.35, "pace": 0.35, "hr": 0.30}
+METRIC_WEIGHTS = {"distance": 0.30, "pace": 0.30, "hr": 0.25, "continuity": 0.15}
 INTENT_METRIC_WEIGHTS: dict[str, dict[str, float]] = {
-    "easy": {"distance": 0.22, "pace": 0.50, "hr": 0.28},
-    "quality": {"distance": 0.22, "pace": 0.50, "hr": 0.28},
-    "long": {"distance": 0.53, "pace": 0.24, "hr": 0.23},
+    "easy": {"distance": 0.19, "pace": 0.42, "hr": 0.24, "continuity": 0.15},
+    "quality": {"distance": 0.19, "pace": 0.42, "hr": 0.24, "continuity": 0.15},
+    "long": {"distance": 0.45, "pace": 0.20, "hr": 0.20, "continuity": 0.15},
     # No stated intent means no metric can claim to be the point of the day —
     # keep the neutral split.
     "steady": METRIC_WEIGHTS,
@@ -303,6 +304,14 @@ STEADY_WIDEN = 1.5
 # breach. A few seconds over on a hill, a treadmill surge, or a sensor artifact
 # is not disobedience; a fifth of the session over the stated ceiling is.
 HR_CAP_GRACE_FRACTION = 0.05
+# How much slower than the run's own median split the SLOWEST split may be before
+# the session is treated as having contained a break rather than a pace
+# variation. See continuity_deviation for the measurement behind 1.15.
+CONTINUITY_TOLERANCE = 1.15
+# Below this many full splits a slowest-vs-median ratio is noise, not a finding —
+# and it is what keeps manually-lapped interval sessions out (see
+# continuity_ratio).
+MIN_CONTINUITY_SPLITS = 3
 # ...and the converse: a PLAN target is an explicit instruction, not a fuzzy
 # reference, so it is held tighter. Without this the two were graded on the
 # same scale, and a prescribed 10:28 easy run executed at 9:28 — a full minute
@@ -524,6 +533,63 @@ def hr_deviation(hr: float | None, median_hr: float | None, cls: str) -> float |
     if floor_f is not None and ratio < floor_f:
         return (floor_f - ratio) / floor_f
     return 0.0
+
+
+def continuity_ratio(labelled: dict) -> float | None:
+    """Slowest full split / median full split, or ``None`` when unmeasurable.
+
+    Answers the one question distance, pace and HR all miss: **was this one
+    continuous session, or did it contain a break?** A walk mile in the middle of
+    a run averages away in every other metric — measured 2026-07-28, a tempo day
+    with a 12:31 mile among ~9:20 miles graded A+ on distance and A+ on HR, and
+    nothing on the card mentioned it.
+
+    Deliberately the slowest split against the run's OWN median, not a standard
+    deviation, and not against a plan target:
+
+    - **SD punishes a legitimate warm-up.** On live data the first split is
+      routinely the outlier (2026-07-27: SD 22.2 s/mi across the run, 4.9 s/mi
+      once the opening mile is dropped). A metric that fails a run for starting
+      conservatively would recreate the unfairness the 0.40.0 split just fixed.
+    - **A ratio against the run's own median is self-scaling**, so it means the
+      same thing on a 9:00 tempo and a 12:00 shakeout, and needs no intent
+      factor.
+    - **Walk-pace detection alone is not enough**: 12:31/mi is under
+      ``RUN_PACE_CEILING_SEC_PER_MI`` (13:00), so the absolute boundary would
+      have missed the exact session this metric exists for.
+
+    ``MIN_CONTINUITY_SPLITS`` (3) full splits are required. That floor also
+    excludes manually-lapped interval sessions by construction: ``label_splits``
+    marks partial relative to the workout's own longest lap, so a
+    2-mile-warmup-then-400s workout has exactly one "full" split, and comparing
+    reps against a warmup would fail every correctly-run interval day — the same
+    trap ``fastest_rep_split`` was written to escape.
+    """
+    paces = [r["avg_pace_sec_per_km"] for r in (labelled.get("rows") or [])
+             if not r.get("partial") and r.get("avg_pace_sec_per_km")]
+    if len(paces) < MIN_CONTINUITY_SPLITS:
+        return None
+    mid = median(paces)
+    return (max(paces) / mid) if mid else None
+
+
+def continuity_deviation(ratio: float | None) -> float | None:
+    """Continuity ratio → deviation, as the RAW excess over the tolerance.
+
+    Not ``(ratio - tol) / tol``: the ratio already lives near 1.0, so dividing by
+    the tolerance compresses every real break into the A/B bands (a 12:31 mile
+    among 9:20s would have scored a B). The raw excess reads as "how much slower
+    than an already-generous allowance the worst split was, in units of a median
+    split", which puts a 20%-slower mile at an A, 35% at a C and 55% at an F.
+
+    Measured against the 40 split-bearing sessions in the live 90-day window,
+    ``CONTINUITY_TOLERANCE`` = 1.15 separates cleanly: 33 sessions sit at or
+    under it (easy days cluster at 1.01-1.08), and the 7 above it are all
+    genuine run/walk sessions.
+    """
+    if ratio is None:
+        return None
+    return max(0.0, ratio - CONTINUITY_TOLERANCE)
 
 
 def time_above_cap_fraction(labelled: dict, cap: float | None) -> float | None:
@@ -1155,7 +1221,47 @@ def build_card(
     if actual_load and med_load and actual_load > LOAD_SPIKE_FACTOR * med_load:
         load["spike"] = True
 
-    metrics = {"distance": distance, "pace": pace, "hr": hr, "load": load}
+    # -- continuity: was this one session, or did it contain a break?
+    ratio = continuity_ratio(labelled_splits)
+    d = continuity_deviation(ratio)
+    continuity = _metric(
+        grade_from_deviation(d), ratio, CONTINUITY_TOLERANCE, d, "own splits")
+    if ratio is None:
+        # Same shape as the quality-pace exception: state the reason rather than
+        # printing a bare n/a, and let the weight redistribute.
+        n_full = len([r for r in (labelled_splits.get("rows") or [])
+                      if not r.get("partial") and r.get("avg_pace_sec_per_km")])
+        if not labelled_splits.get("available"):
+            reason = "no splits recorded — continuity can't be measured"
+        elif not n_full:
+            # Splits exist but none carries a pace. Distinct from "no splits" on
+            # purpose: saying "only 0 full splits" of a run that HAS a split
+            # table reads like a bug in the card rather than a gap in the data.
+            reason = ("splits recorded without pace — continuity can't be "
+                      "measured")
+        else:
+            reason = (f"only {n_full} full "
+                      f"{'split' if n_full == 1 else 'splits'} with pace — need "
+                      f"{MIN_CONTINUITY_SPLITS} to compare a slowest against "
+                      "a median")
+        continuity["note"] = reason
+    else:
+        continuity["actual_display"] = f"{ratio:.2f}x median split"
+        continuity["expected_display"] = f"<= {CONTINUITY_TOLERANCE:.2f}x"
+        continuity["ratio"] = round(ratio, 3)
+        if d and d > 0:
+            slowest = max(
+                (r for r in labelled_splits["rows"]
+                 if not r.get("partial") and r.get("avg_pace_sec_per_km")),
+                key=lambda r: r["avg_pace_sec_per_km"])
+            continuity["note"] = (
+                f"{labelled_splits['unit'].lower()} {slowest['index']} ran "
+                f"{_fmt_pace(slowest['avg_pace_sec_per_km'])} — "
+                f"{round((ratio - 1) * 100)}% slower than your median "
+                f"{labelled_splits['unit'].lower()} for this run")
+
+    metrics = {"distance": distance, "pace": pace, "hr": hr,
+               "continuity": continuity, "load": load}
     return {
         "stimulus": stimulus_block(
             activity, load, hr_zones, labelled_splits.get("hr_drift_pct")),
@@ -1207,11 +1313,13 @@ READ_SECTIONS: tuple[tuple[str, str], ...] = (
 #: column beside it and inferring one.
 _METRIC_LABELS = [
     ("distance", "Distance"), ("pace", "Pace"), ("hr", "Avg HR"),
+    ("continuity", "Continuity"),
 ]
 
 # The same metrics named for prose rather than for a table column: "Avg HR"
 # reads wrong mid-sentence.
-_METRIC_PROSE = {"distance": "distance", "pace": "pace", "hr": "HR"}
+_METRIC_PROSE = {"distance": "distance", "pace": "pace", "hr": "HR",
+                 "continuity": "continuity"}
 
 
 def _prose_list(items: list[str]) -> str:
@@ -1237,6 +1345,12 @@ def _fmt_hr(v):
     return f"{round(v)} bpm" if v else "—"
 
 
+def _fmt_ratio(v):
+    """Continuity's fallback formatter. Both display strings are normally set by
+    build_card; this only fires on a hand-built metric dict."""
+    return f"{v:.2f}x" if v else "\u2014"
+
+
 def _fmt_load(v):
     """Training load is a Garmin index, not a measurement — the stored float
     carries ~13 meaningless decimals. Round it."""
@@ -1245,7 +1359,7 @@ def _fmt_load(v):
 
 _FORMATTERS = {
     "distance": _fmt_distance, "pace": _fmt_pace,
-    "hr": _fmt_hr, "load": _fmt_load,
+    "hr": _fmt_hr, "load": _fmt_load, "continuity": _fmt_ratio,
 }
 
 
@@ -1305,6 +1419,12 @@ def _delta_text(key: str, metric: dict) -> str:
         if abs(diff) < 1:
             return "on target"
         return f"{abs(diff)}s/mi {'slower' if diff > 0 else 'faster'}"
+    if key == "continuity":
+        # A percentage against the tolerance would read as "+10%" for a run whose
+        # worst mile was 27% off its median — the tolerance is not the quantity
+        # the reader cares about. State the excess in units of a median split.
+        excess = actual - expected
+        return "even" if excess <= 0 else f"{round(excess * 100)}% over"
     if key == "hr" and metric.get("in_band"):
         # Inside the band IS the A. A percentage against one edge would imply
         # a miss that did not happen.
@@ -1480,9 +1600,17 @@ def reference_line(card: dict, *, markdown: bool = True) -> str:
             # letters printed directly above it. Scope the disclaimer to the
             # metrics it actually applies to.
             n = ref.get("n", 0)
+            # Only blame the thin pool for metrics that ACTUALLY use the pool.
+            # Continuity measures a run against its own splits and a by-feel
+            # pace has no target at all, so listing either under "only 2
+            # comparable activities in the last 60 days" states a cause that
+            # isn't theirs — and implies more history would unlock a grade it
+            # would not.
             ungraded = _prose_list([
                 _METRIC_PROSE[k] for k, _ in _METRIC_LABELS
-                if not card["metrics"].get(k, {}).get("grade")])
+                if not card["metrics"].get(k, {}).get("grade")
+                and (card["metrics"].get(k, {}).get("reference")
+                     in (None, "rolling_60d", "insufficient_data"))])
             if not ungraded:
                 return plan_sentence
             return (f"{plan_sentence} {ungraded} ungraded — only {n} comparable "

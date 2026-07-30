@@ -59,7 +59,8 @@ by 5 bpm, with miles 3–5 at 150/144/159, cost exactly one `+/−` modifier.
 
 ## The fix: two surfaces, not one letter
 
-- **Compliance** (distance, pace, HR) — graded. "Did you execute the prescription?"
+- **Compliance** (distance, pace, HR — and continuity, added in Phase 3 below) —
+  graded. "Did you execute the prescription?"
 - **Stimulus** (load, aerobic/anaerobic TE, HR-zone share, drift) — reported with
   a `LOW|MODERATE|HIGH|VERY HIGH` descriptor and **no letter**.
 
@@ -130,3 +131,64 @@ was an easy run" checkable instead of asserted, and it's on the card now.
 `HR_CAP_GRACE_FRACTION` is 5% and per-split-average granularity is coarse — a
 single mile a hair over the cap counts fully. If that starts firing on runs that
 were genuinely fine, the grace fraction is the knob, not the bands.
+
+---
+
+## Phase 3 — the metric for "was this one session?"
+
+Splitting stimulus out and reading the cap fixed the *inversion*, but Tuesday
+still bothered me. Its tempo session contained a **12:31 mile among ~9:20 miles**
+and the card graded it A+ on distance, A+ on HR, and said nothing. Every existing
+metric averages a break away.
+
+Before building it I checked whether a 4th axis would actually add information or
+just re-grade something already graded — the exact mistake that caused all of
+this. Across the 40 split-bearing sessions in the live 90-day window, **three
+pass distance, pace AND HR while carrying a slowest split 30-41% off their own
+median.** Independent. Build it.
+
+Two things I expected to use and rejected on the data:
+
+**Standard deviation.** It punishes a conservative opening mile. 2026-07-27
+measures SD 22.2 s/mi across the run and **4.9 s/mi once the warm-up mile is
+dropped** — the first split is routinely the outlier. Failing a run for starting
+easy would have recreated precisely the unfairness I had just spent the day
+removing.
+
+**Absolute walk-pace detection.** 12:31/mi is *under* the measured 13:00 run/walk
+boundary, so `RUN_PACE_CEILING_SEC_PER_MI` would have missed the exact session
+the metric exists for. Embarrassing thing to discover after writing the function.
+
+What works is **slowest full split / median full split**. Self-scaling, so it
+means the same thing on a 9:00 tempo and a 12:00 shakeout and needs no intent
+factor. Threshold 1.15 separates cleanly: 33 of 40 sessions at or under it, and
+all 7 above are genuine run/walk days.
+
+One scaling detail that mattered. `(ratio - tol) / tol` compresses every real
+break into the A/B bands — a 12:31 mile among 9:20s scored a **B**. The ratio
+already lives near 1.0, so dividing by the tolerance is the wrong shape. The raw
+excess (`ratio - tol`) reads as "how much slower than an already-generous
+allowance the worst split was, in units of a median split", which puts 20% slower
+at an A, 35% at a C and 55% at an F.
+
+Result on the three sessions:
+
+| Session | continuity | note |
+|---|---|---|
+| Wed 7/29 easy | **A+** (1.006) | — |
+| Mon 7/27 easy | **A+** (1.082) | — (the 10:41 opener does not fire) |
+| Tue 7/28 tempo | **C+** (1.274) | "mile 4 ran 12:31/mi — 27% slower than your median mile for this run" |
+
+Also fixed en route: `reference_line` was blaming the thin reference pool for
+continuity's n/a — "continuity ungraded, only 2 comparable activities in the last
+60 days" — when continuity never touches the pool. It now lists only metrics whose
+reference actually IS the pool, which also stops a by-feel pace from being blamed
+on missing history. Small lie, but this whole day was about the card not telling
+them.
+
+## What I'd watch (updated)
+
+`CONTINUITY_TOLERANCE` at 1.15 was fitted on 40 sessions, most of them treadmill.
+Outdoor runs with real hills will carry more legitimate mile-to-mile spread. If
+this starts firing on honest hilly runs, the tolerance is the knob — or it becomes
+intent-aware the way `HR_BANDS` already is.

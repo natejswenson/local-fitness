@@ -1,13 +1,13 @@
 # `workout_report_card`
 
-> Graded report card for ONE workout — three compliance grades plus an overall, an ungraded training-stimulus report, a coach's read, and a PRESS-themed PDF. **Availability:** stdio only — local
+> Graded report card for ONE workout — four compliance grades plus an overall, an ungraded training-stimulus report, a coach's read, and a PRESS-themed PDF. **Availability:** stdio only — local
 
 ## What it does
 
 Answers "how did that run go", "was that any good", "grade my workout". It
-grades one activity on three compliance metrics — distance, pace, HR — in
-deterministic Python, reports training stimulus separately and ungraded, then
-has the coach *phrase* those grades rather than derive them. Use it instead of [`get_workout_detail`](get_workout_detail.md)
+grades one activity on four compliance metrics — distance, pace, HR, continuity
+— in deterministic Python, reports training stimulus separately and ungraded,
+then has the coach *phrase* those grades rather than derive them. Use it instead of [`get_workout_detail`](get_workout_detail.md)
 whenever the question is a judgment: `get_workout_detail` reports columns, this
 one renders a verdict with a named yardstick. Use
 [`plan_chart`](plan_chart.md) instead when the question is about the plan as a
@@ -46,7 +46,7 @@ with distance and duration.
 
 | Surface | Metrics | Output |
 |---|---|---|
-| **Compliance** — "did you execute the prescription?" | distance, pace, HR | letter grades + the overall |
+| **Compliance** — "did you execute the prescription?" | distance, pace, HR, continuity | letter grades + the overall |
 | **Stimulus** — "what did this run do to your body?" | training load, aerobic/anaerobic TE, HR-zone share, drift | numbers + a `LOW`/`MODERATE`/`HIGH`/`VERY HIGH` descriptor, **never a letter** |
 
 Grading load *and* HR graded one variable twice with the sign reversed: Garmin's
@@ -62,7 +62,7 @@ Load is absent from every `INTENT_METRIC_WEIGHTS` table, so "load cannot lower
 your grade" is structural rather than a small weight a cap could bypass.
 
 **Each compliance metric reduces to a single non-negative relative deviation
-`d`**, and every `d` goes through the same `GRADE_BANDS`. Three small deviation
+`d`**, and every `d` goes through the same `GRADE_BANDS`. Four small deviation
 functions, one grader — that is what keeps the rubric testable.
 
 | `d` ≤ | Grade |
@@ -117,6 +117,7 @@ every recovery run an F.
 | Distance vs rolling median | short only. Going longer than your norm is never a penalty. |
 | HR vs a prescribed `target_hr_max` | over the cap only — the worse of *average over cap* and *fraction of split time over it past `HR_CAP_GRACE_FRACTION` (5%)*. Graded on the BASE bands, not `PLAN_TIGHTEN`: tightening a time fraction would double-count strictness. |
 | HR vs the rolling band | outside the intent's band only; inside is a flat 0.0 (an A). HR is judged on appropriateness, never "lower is better". |
+| Continuity | slow only, and only the SLOWEST full split against the run's own median, past `CONTINUITY_TOLERANCE` (1.15). Answers "was this one session, or did it contain a break?" — the question distance, pace and HR all average away. |
 | Load | **not graded** (0.40.0). The deviation is still computed for display and drives the stimulus descriptor; `LOAD_SPIKE_FACTOR` (2.0×) now decides `as_intended` and the spike flag instead of a letter. |
 
 Each expectation is intent-scaled off the rolling median (a plan states its own

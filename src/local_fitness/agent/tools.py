@@ -4075,6 +4075,7 @@ async def list_report_cards(args: dict) -> dict:
                 "distance": r["distance_grade"],
                 "pace": r["pace_grade"],
                 "hr": r["hr_grade"],
+                "continuity": r["continuity_grade"],
                 "load": r["load_grade"],
             },
         }

@@ -263,7 +263,8 @@ CREATE TABLE IF NOT EXISTS report_cards (
     distance_grade  TEXT,
     pace_grade      TEXT,
     hr_grade        TEXT,
-    load_grade      TEXT,
+    continuity_grade TEXT,
+    load_grade      TEXT,                  -- always NULL from 0.40.0 (stimulus, not graded)
     read_cache_key  TEXT,                  -- prompt key of the stored read; NULL = template fallback
     card_json       TEXT NOT NULL          -- full card snapshot incl. coach_read
 );
@@ -361,6 +362,14 @@ def init_schema(db_path: Path | None = None) -> None:
         if hr_cols and "elapsed_seconds" not in hr_cols:
             conn.execute(
                 "ALTER TABLE activity_hr_samples ADD COLUMN elapsed_seconds REAL")
+        # Same guard, same reason: `report_cards.continuity_grade` landed in
+        # 0.40.0 with the continuity compliance metric. Rows graded before it
+        # keep NULL — grades are dated snapshots and are never backfilled (see
+        # card_store's module docstring).
+        rc_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(report_cards)")}
+        if rc_cols and "continuity_grade" not in rc_cols:
+            conn.execute("ALTER TABLE report_cards ADD COLUMN continuity_grade TEXT")
         # Same guard, same reason: `plan_workouts.target_hr_max` landed in
         # 0.40.0 so the report card can grade HR against the cap the plan
         # actually prescribed. Before it, "Keep HR under 140" lived only in the
