@@ -42,6 +42,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libpango-1.0-0 libpangoft2-1.0-0 fonts-dejavu-core
 
+      # The brand token block in src/local_fitness/agent/branding.py is a GENERATED region owned by the
+      # `press` skill (github.com/natejswenson/claude-skills). Fails if it was
+      # hand-edited, or if the shared tokens moved without re-emitting here, so
+      # this repo can never silently drift from the brand every other product
+      # renders from. Pinned, not @latest: a token change upstream should surface
+      # as a failing check to be adopted deliberately, never land unreviewed.
+      #   npx -y @natjswenson/press@0.3.0 emit --repo .
+      - name: Brand tokens in sync (press)
+        run: npx -y @natjswenson/press@0.3.0 check --repo .
+
       - name: Lint
         run: uv run ruff check .
 
