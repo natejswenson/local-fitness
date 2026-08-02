@@ -665,6 +665,20 @@ These are settled — don't redesign without a reason.
     When a cap is present HR grades against it (reference `"plan"`) on the
     worse of *average over cap* and *time over cap past `HR_CAP_GRACE_FRACTION`*;
     absent, it falls back to `HR_BANDS` exactly as before.
+  - **The HR row must state the axis that produced the letter** (0.40.1).
+    Those two axes are measured in different units (bpm over a ceiling vs
+    fraction of a run over it), so `hr_cap_axis` names which one won and the
+    row moves to it — `actual_display`, `expected_display` and the Delta
+    together. **Why:** taking the worse of two axes and then displaying only
+    the average printed, on the live 2026-08-02 card,
+    `| Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |` — three numbers all describing
+    the *compliant* average (which scored 0.0) beside an F earned entirely by
+    58% of the run sitting above the cap. A reader cannot reconstruct an F from
+    three passing numbers, so a correct grade read as a broken one. This is the
+    same contract the pace row already kept via `actual_display`: **the Delta
+    column may never compare two different quantities.** The numeric `actual`
+    /`expected` fields stay in bpm — storage, the note and the coach read are
+    unchanged; only the display moves.
   - **The card always names its yardstick.** Plan-prescribed (distance, pace,
     and HR when `target_hr_max` is set) or a 60-day rolling *median* of
     comparable activities. Median, not mean: the history carries real
