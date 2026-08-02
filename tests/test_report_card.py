@@ -351,9 +351,14 @@ def test_a_prescribed_cap_beats_the_rolling_band():
     hr = card["metrics"]["hr"]
     assert hr["reference"] == "plan"
     assert hr["expected"] == 140.0
-    assert hr["expected_display"] == "≤ 140 bpm"
     # 45% of this fixture sits above the cap, so even a 126 average is a breach.
     assert hr["time_above_cap_pct"] == 45
+    # ...and because TIME is what breached, the row states that axis rather than
+    # the compliant average — see
+    # test_the_hr_row_states_the_axis_that_produced_the_grade. The numeric
+    # `expected` above is still the cap in bpm; only the display moves.
+    assert hr["governing_axis"] == "time"
+    assert hr["expected_display"] == "≤ 5% above cap"
     assert "45% of the run sat above the prescribed 140 bpm cap" in hr["note"]
     # 0.45 above the cap minus the 0.05 grace = 0.40, past the D band's 0.35.
     assert hr["deviation"] == pytest.approx(0.40)
@@ -391,6 +396,147 @@ def test_obeying_the_cap_outranks_blowing_it():
     # ...and the load numbers run the OTHER way (25 vs 82), which is exactly the
     # inversion that used to decide the letters.
     assert obeyed["stimulus"]["load"] < blew_it["stimulus"]["load"]
+
+
+#: An average that OBEYS the cap over a run that mostly didn't — 1160 of 2000
+#: seconds above 140, with a 139 average. This is the shape that exposed the
+#: display bug on 2026-08-02; the numbers are fabricated to land on a clean 58%.
+UNDER_AVG_OVER_TIME_SPLITS = [
+    {"split_index": 0, "distance_meters": 1609.34, "duration_seconds": 600, "avg_hr": 134},
+    {"split_index": 1, "distance_meters": 1609.34, "duration_seconds": 580, "avg_hr": 141},
+    {"split_index": 2, "distance_meters": 1609.34, "duration_seconds": 240, "avg_hr": 135},
+    {"split_index": 3, "distance_meters": 1609.34, "duration_seconds": 300, "avg_hr": 143},
+    {"split_index": 4, "distance_meters": 1609.34, "duration_seconds": 280, "avg_hr": 142},
+]
+
+
+@pytest.mark.parametrize(("hr", "cap", "above", "expected_axis"), [
+    (139.0, 140.0, 0.58, "time"),    # average compliant, time is the breach
+    (144.0, 140.0, 0.0, "average"),  # no split data over it, the mean ran hot
+    (144.0, 140.0, 0.59, "time"),    # both breached, time is worse
+    (144.0, 140.0, 0.06, "average"), # both breached, the average is worse
+    (126.0, 140.0, 0.04, None),      # inside the grace fraction — no breach
+    (126.0, 140.0, 0.0, None),       # clean on both axes
+    (126.0, None, 0.5, None),        # no cap to breach
+    (None, 140.0, 0.5, None),        # no HR reading at all
+])
+def test_hr_cap_axis_names_which_breach_produced_the_grade(hr, cap, above, expected_axis):
+    """The attribution the deviation itself discards. A caller that cannot ask
+    which axis won cannot state the number the grade was measured against."""
+    assert rc.hr_cap_axis(hr, cap, above) == expected_axis
+
+
+def test_hr_cap_axis_agrees_with_the_deviation_it_explains():
+    """The two must never disagree: a named axis implies a non-zero deviation,
+    and a zero deviation implies no axis. They are computed from one helper so
+    that stays true, and this is the assertion that would catch them drifting."""
+    for hr, above in ((139.0, 0.58), (144.0, 0.0), (126.0, 0.04), (126.0, 0.0)):
+        d = rc.hr_cap_deviation(hr, 140.0, above)
+        axis = rc.hr_cap_axis(hr, 140.0, above)
+        assert (axis is None) == (d == 0.0)
+
+
+def test_the_hr_row_states_the_axis_that_produced_the_grade():
+    """Regression, live card 2026-08-02. The row printed
+
+        | Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |
+
+    where every number describes the average — which was UNDER the cap and
+    scored 0.0. The F came from 58% of the run sitting above 140, a quantity
+    the row never showed, so three passing numbers sat beside a failing letter
+    and the grade read as broken. Actual, expected and delta must all move to
+    the axis that was graded."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8047, "duration_seconds": 2000,
+         "avg_pace_sec_per_km": 363, "avg_hr": 139, "training_load": 52},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1},
+        splits=UNDER_AVG_OVER_TIME_SPLITS,
+    )
+    hr = card["metrics"]["hr"]
+    assert hr["grade"] == "F"
+    assert hr["governing_axis"] == "time"
+    # 58% over the cap, less the 5% grace, is what the letter was computed from.
+    assert hr["deviation"] == pytest.approx(0.53)
+
+    # The three displayed cells now describe that axis...
+    assert rc.actual_text("hr", hr) == "58% above cap (avg 139 bpm)"
+    assert rc.expected_text("hr", hr) == "≤ 5% above cap"
+    assert rc._delta_text("hr", hr) == "53% over"
+    # ...and specifically no longer report the compliant average as the graded
+    # quantity. "-1%" beside an F is the exact defect.
+    assert rc._delta_text("hr", hr) != "-1%"
+
+    # The numeric fields are untouched — storage and the note still speak bpm.
+    assert hr["actual"] == 139
+    assert hr["expected"] == 140.0
+    assert hr["cap"] == 140.0
+    assert hr["time_above_cap_pct"] == 58
+    assert "58% of the run sat above the prescribed 140 bpm cap" in hr["note"]
+
+
+def test_an_average_breach_keeps_the_row_in_bpm():
+    """The other half of the two-sided assertion. When the AVERAGE is what blew
+    the cap, the average IS the graded quantity — the row must stay in bpm and
+    must not acquire a percentage-of-run display it did not earn.
+
+    Splits carrying no HR is what makes the average the only live axis: it is
+    the documented degrade path (see
+    test_time_above_cap_is_none_without_splits_or_without_a_cap), and a run
+    whose splits DO carry HR above the cap is time-governed by construction —
+    every second over the cap is also weight on the mean."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 3011,
+         "avg_pace_sec_per_km": 374, "avg_hr": 148, "training_load": 82},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 602} for i in range(5)],
+    )
+    hr = card["metrics"]["hr"]
+    assert "time_above_cap_pct" not in hr
+    assert hr["governing_axis"] == "average"
+    assert "actual_display" not in hr
+    assert rc.actual_text("hr", hr) == "148 bpm"
+    assert rc.expected_text("hr", hr) == "≤ 140 bpm"
+    assert rc._delta_text("hr", hr) == "+6%"
+
+
+def test_a_compliant_capped_run_names_no_axis_and_reads_in_range():
+    """A clean run must not be given a breach to explain. `governing_axis` is
+    None, the row keeps the bpm display, and the delta stays "in range"."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 3011,
+         "avg_pace_sec_per_km": 374, "avg_hr": 126, "training_load": 25},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 602, "avg_hr": h}
+                for i, h in enumerate((117, 125, 127, 126, 134))],
+    )
+    hr = card["metrics"]["hr"]
+    assert hr["grade"] == "A+"
+    assert hr["governing_axis"] is None
+    assert "actual_display" not in hr
+    assert rc.actual_text("hr", hr) == "126 bpm"
+    assert rc.expected_text("hr", hr) == "≤ 140 bpm"
+    assert rc._delta_text("hr", hr) == "in range"
+
+
+def test_the_rendered_card_never_prints_a_passing_delta_beside_an_f():
+    """End-to-end through the markdown the user actually reads — the renderer
+    and the PDF share these three helpers, so this covers both surfaces."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8047, "duration_seconds": 2000,
+         "avg_pace_sec_per_km": 363, "avg_hr": 139, "training_load": 52},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1},
+        splits=UNDER_AVG_OVER_TIME_SPLITS,
+    )
+    md = rc.render_markdown(card)
+    hr_row = next(ln for ln in md.splitlines() if ln.startswith("| Avg HR"))
+    assert hr_row == "| Avg HR | 58% above cap (avg 139 bpm) | ≤ 5% above cap | 53% over | F |"
+    assert "| 139 bpm | ≤ 140 bpm | -1% | F |" not in md
 
 
 def test_no_prescribed_cap_still_uses_the_rolling_band():

@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-08-02
+
+### Fixed
+- **The HR row now states the axis that produced its grade.** A prescribed cap
+  is breached two ways — *average* over the ceiling, and *time* over it past the
+  5% grace fraction — and the grade takes the worse. The row displayed only the
+  average, so the live card for 2026-08-02 printed:
+
+  | Metric | Actual | Expected | Delta | Grade |
+  |---|---|---|---|---|
+  | Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |
+
+  Every number there describes the average, which was **under** the cap and
+  scored 0.0. The F came entirely from 58% of the run sitting above 140 — a
+  quantity the row never showed. Three passing numbers beside a failing letter
+  read as a broken grade; the grade was right and the row was lying about why.
+  It now reads `| 58% above cap (avg 139 bpm) | ≤ 5% above cap | 53% over | F |`.
+
+  New `hr_cap_axis()` names the governing breach (`"time"`/`"average"`/`None`)
+  and shares one helper with `hr_cap_deviation()`, so the letter and the row
+  explaining it cannot be computed from different formulas. When the *average*
+  is what breached, the row stays in bpm exactly as before.
+
+  **No grade changes** — deviations, letters and GPAs are byte-identical; this
+  is display only. The numeric `actual`/`expected` fields stay in bpm, so stored
+  cards, the note line and the coach read are untouched. The markdown and PDF
+  surfaces share the three display helpers, so both are fixed.
+
 ## [0.40.0] - 2026-07-29
 
 The report-card rubric was **inverted**, and this splits it in two. Found by

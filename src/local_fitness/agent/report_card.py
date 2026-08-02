@@ -113,7 +113,7 @@ __all__ = [
     "render_markdown", "reference_line", "bin_hr_trace", "expected_text",
     "actual_text", "hr_band_bounds", "hr_expectation",
     "is_running_effort", "fastest_rep_split", "fastest_rep_split_pace",
-    "time_above_cap_fraction", "hr_cap_deviation",
+    "time_above_cap_fraction", "hr_cap_deviation", "hr_cap_axis",
     "continuity_ratio", "continuity_deviation",
     "READ_SECTIONS",
     "load_report_card_inputs", "rolling_reference",
@@ -646,13 +646,64 @@ def hr_cap_deviation(
     the run drifted over" into a D. On the base bands the time axis reads as it
     should: ~5% is noise, 20% over is a C, a third of the run over is an F.
     """
+    axes = _hr_cap_axes(hr, cap, time_above_fraction)
+    return None if axes is None else max(axes)
+
+
+def _hr_cap_axes(
+    hr: float | None,
+    cap: float | None,
+    time_above_fraction: float | None = None,
+) -> tuple[float, float] | None:
+    """The two breach axes as ``(over_average, over_time)``, or ``None`` when
+    there is no cap to breach.
+
+    Shared by ``hr_cap_deviation`` and ``hr_cap_axis`` so the grade and the
+    row explaining it can never be computed from different formulas.
+    """
     if not hr or not cap or cap <= 0:
         return None
     over_avg = max(0.0, (hr - cap) / cap)
     over_time = 0.0
     if time_above_fraction is not None:
         over_time = max(0.0, time_above_fraction - HR_CAP_GRACE_FRACTION)
-    return max(over_avg, over_time)
+    return over_avg, over_time
+
+
+def hr_cap_axis(
+    hr: float | None,
+    cap: float | None,
+    time_above_fraction: float | None = None,
+) -> str | None:
+    """WHICH axis produced the grade — ``"time"``, ``"average"``, or ``None``
+    when nothing was breached (or there was no cap).
+
+    ``hr_cap_deviation`` takes the worse of two axes measured in different
+    units — bpm over a ceiling, and fraction of a run over it — and then throws
+    away which one won. That discard is what printed, on a live card for
+    2026-08-02, the row:
+
+        | Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |
+
+    Every displayed number there describes the average, which was *compliant*
+    and scored 0.0; the F came entirely from 58% of the run sitting above the
+    cap, a quantity the row never showed. A reader cannot reconstruct an F from
+    three passing numbers, so the row read as a bug in the grade rather than as
+    the finding it was.
+
+    Naming the governing axis is what lets the caller state the number the
+    grade was actually measured against — the same contract the pace row keeps
+    via ``actual_display``.
+    """
+    axes = _hr_cap_axes(hr, cap, time_above_fraction)
+    if axes is None:
+        return None
+    over_avg, over_time = axes
+    if max(axes) == 0.0:
+        # Compliant on both axes. There is no breach to attribute, and calling
+        # one of them "governing" would imply one happened.
+        return None
+    return "time" if over_time > over_avg else "average"
 
 
 def load_deviation(load: float | None, expected_load: float | None) -> float | None:
@@ -1189,6 +1240,20 @@ def build_card(
                 # not a near-miss.
                 hr["note"] = (f"{round(above * 100)}% of the run sat above the "
                               f"prescribed {round(plan_cap)} bpm cap")
+        # When TIME over the cap is what produced the letter, the whole row has
+        # to move to that axis — actual, expected and delta together. Leaving
+        # the average in place printed a compliant 139-vs-140 beside an F (see
+        # hr_cap_axis), which reads as a broken grade rather than as a breach.
+        # The average is kept in the cell rather than dropped: it is still the
+        # reason the row LOOKS clean, so the parenthetical is what reconciles
+        # the two numbers for the reader.
+        hr["governing_axis"] = hr_cap_axis(actual_hr, plan_cap, above)
+        if hr["governing_axis"] == "time":
+            hr["actual_display"] = (
+                f"{round(above * 100)}% above cap"
+                + (f" (avg {round(actual_hr)} bpm)" if actual_hr else ""))
+            hr["expected_display"] = (
+                f"≤ {round(HR_CAP_GRACE_FRACTION * 100)}% above cap")
     else:
         d = hr_deviation(actual_hr, med_hr, cls)
         # Expected is the BOUND that governed the grade, not the median — see
@@ -1429,6 +1494,12 @@ def _delta_text(key: str, metric: dict) -> str:
         # Inside the band IS the A. A percentage against one edge would imply
         # a miss that did not happen.
         return "in range"
+    if key == "hr" and metric.get("governing_axis") == "time":
+        # The average is not the graded quantity here, so its percentage is not
+        # the delta — printing "-1%" beside an F stated a gap of the wrong sign
+        # on the wrong axis. State the excess past the grace fraction, in the
+        # same "% over" idiom continuity uses for the same reason.
+        return f"{round(metric['deviation'] * 100)}% over"
     if not expected:
         return "—"
     pct = (actual / expected - 1) * 100
