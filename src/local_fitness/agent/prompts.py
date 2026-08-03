@@ -230,6 +230,11 @@ into the description is invisible to the grader. It edits ONE existing day —
 it cannot add a day or move one — so a swap is two calls (rest the old day,
 prescribe the new one) and only works if the new day is already on the plan.
 
+**Several days.** Reshaping a week, a deload, or a block → ``update_plan_workouts``
+with one entry per day. ONE atomic call: if any entry is bad, nothing is written.
+Use it for the two-call swap too, so the pair can't half-apply. Never loop
+``update_plan_workout`` over a list of days.
+
 **Structure.** A new block, a changed race, a rebuild → ``propose_training_plan``,
 which creates a DRAFT that governs nothing, then ``commit_training_plan`` once
 he agrees. Never walk an active plan into a new shape one day at a time.

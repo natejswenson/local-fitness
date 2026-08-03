@@ -915,3 +915,215 @@ def test_update_plan_workout_rejects_impossible_calendar_date(seeded):
     _active_plan(seeded)
     body, err = call(tools.update_plan_workout, {"date": "2026-02-30", "type": "easy"})
     assert err and "must be a valid YYYY-MM-DD" in body["error"]
+
+
+# --- update_plan_workouts: the batch write path ------------------------------
+# Restructuring used to be ~20 sequential single-day calls: 20 model turns AND
+# 20 independent transactions, so the documented two-call "move the long run"
+# idiom could rest the old day, fail on the new one, and delete the long run.
+# The contract here is all-or-nothing; most of these tests exist to prove the
+# rollback is real rather than merely intended.
+
+
+def _active_multi_day_plan(seeded, n=5):
+    """An ACTIVE plan with n consecutive days, starting tomorrow."""
+    t = date.today()
+    days = [(t + timedelta(days=i + 1)).isoformat() for i in range(n)]
+    body, _ = call(tools.propose_training_plan, _args(workouts=[
+        dict(date=d, week_index=1, type="easy", target_distance_m=5000.0,
+             target_hr_max=140.0, description=f"easy {i}")
+        for i, d in enumerate(days)
+    ]))
+    plans.commit_plan(body["plan_id"], now="2026-06-26T00:00:00", db_path=seeded)
+    return days
+
+
+def _rows(seeded):
+    with db.connect(seeded) as conn:
+        return {r["date"]: dict(r) for r in conn.execute(
+            "SELECT * FROM plan_workouts ORDER BY date")}
+
+
+def test_update_plan_workouts_writes_every_entry(seeded):
+    days = _active_multi_day_plan(seeded)
+    body, err = call(tools.update_plan_workouts, {"updates": [
+        {"date": days[0], "type": "long", "distance_mi": 9, "pace_min_per_mi": "9:23"},
+        {"date": days[1], "type": "rest"},
+        {"date": days[2], "distance_mi": 3, "hr_max": 135},
+    ]})
+    assert not err, body
+    assert body["updated"] == 3
+    rows = _rows(seeded)
+    assert rows[days[0]]["type"] == "long"
+    assert abs(rows[days[0]]["target_distance_m"] - 9 * 1609.344) < 1
+    assert rows[days[1]]["type"] == "rest"
+    assert abs(rows[days[2]]["target_distance_m"] - 3 * 1609.344) < 1
+    assert rows[days[2]]["target_hr_max"] == 135.0
+    # Untouched days keep their original prescription.
+    assert rows[days[3]]["description"] == "easy 3"
+    assert rows[days[3]]["target_hr_max"] == 140.0
+
+
+def test_update_plan_workouts_rest_clears_the_hr_cap_too(seeded):
+    """The rest-clear moved to the write boundary so BOTH tools inherit it. A
+    stale cap on a rest day is a prescription for a session that no longer
+    exists, and the report card grades against that column."""
+    days = _active_multi_day_plan(seeded)
+    _body, err = call(tools.update_plan_workouts,
+                      {"updates": [{"date": days[0], "type": "rest"}]})
+    assert not err
+    row = _rows(seeded)[days[0]]
+    assert row["target_hr_max"] is None
+    assert row["target_distance_m"] is None
+    assert row["target_pace_sec_per_km"] is None
+    assert row["target_duration_sec"] is None
+    assert row["description"] == "Rest day"
+
+
+def test_update_plan_workouts_rolls_back_entirely_on_a_missing_day(seeded):
+    """THE contract. A bad entry in the middle must leave every other day
+    untouched — the whole reason this tool exists over a loop of single calls."""
+    days = _active_multi_day_plan(seeded)
+    before = _rows(seeded)
+    missing = (date.today() + timedelta(days=400)).isoformat()
+    body, err = call(tools.update_plan_workouts, {"updates": [
+        {"date": days[0], "type": "long", "distance_mi": 9},
+        {"date": days[1], "type": "rest"},
+        {"date": missing, "type": "easy", "distance_mi": 4},   # not on the plan
+        {"date": days[2], "type": "tempo", "duration_min": 40},
+    ]})
+    assert err
+    # The rollback is asserted FIRST — it is the contract. A naive loop of
+    # per-entry transactions fails right here (days[0] and days[1] committed
+    # before entry 2 raised), which is exactly the bug this tool removes.
+    assert _rows(seeded) == before, "a failed batch wrote something"
+    assert "update 2" in body["error"] and missing in body["error"]
+    assert "cannot add one" in body["error"]
+
+
+def test_update_plan_workouts_rolls_back_on_a_bad_field_value(seeded):
+    """Validation failure is caught before the DB is touched at all."""
+    days = _active_multi_day_plan(seeded)
+    before = _rows(seeded)
+    body, err = call(tools.update_plan_workouts, {"updates": [
+        {"date": days[0], "type": "long", "distance_mi": 9},
+        {"date": days[1], "hr_max": 14},          # outside 90-210
+    ]})
+    assert err
+    assert "update 1" in body["error"] and "90-210" in body["error"]
+    assert _rows(seeded) == before
+
+
+def test_update_plan_workouts_rejects_the_same_day_twice(seeded):
+    """Last-wins would be silent and order-dependent."""
+    days = _active_multi_day_plan(seeded)
+    before = _rows(seeded)
+    body, err = call(tools.update_plan_workouts, {"updates": [
+        {"date": days[0], "distance_mi": 4},
+        {"date": days[0], "distance_mi": 7},
+    ]})
+    assert err and "appears twice" in body["error"]
+    assert _rows(seeded) == before
+
+
+def test_update_plan_workouts_enforces_the_batch_cap(seeded):
+    days = _active_multi_day_plan(seeded)
+    over = [{"date": days[0], "distance_mi": 3}] * (plans.MAX_BATCH_UPDATES + 1)
+    body, err = call(tools.update_plan_workouts, {"updates": over})
+    assert err
+    assert str(plans.MAX_BATCH_UPDATES) in body["error"]
+
+
+def test_update_plan_workouts_rejects_an_empty_batch(seeded):
+    _active_multi_day_plan(seeded)
+    body, err = call(tools.update_plan_workouts, {"updates": []})
+    assert err and "non-empty" in body["error"]
+
+
+def test_update_plan_workouts_rejects_an_entry_with_only_a_date(seeded):
+    days = _active_multi_day_plan(seeded)
+    body, err = call(tools.update_plan_workouts,
+                     {"updates": [{"date": days[0]}]})
+    assert err and "nothing to update" in body["error"]
+
+
+def test_update_plan_workouts_reports_no_active_plan(seeded):
+    body, err = call(tools.update_plan_workouts, {"updates": [
+        {"date": (date.today() + timedelta(days=1)).isoformat(), "distance_mi": 4}]})
+    assert err and "no active training plan" in body["error"]
+
+
+def test_update_plan_workouts_cannot_edit_identity_columns(seeded):
+    """The batch path shares the single-day whitelist — a batch is many
+    re-prescriptions, never a restructure. week_index/plan_id/seq are not
+    prescription fields and there is no schema route to them."""
+    days = _active_multi_day_plan(seeded)
+    with pytest.raises(ValueError, match="non-editable"):
+        plans.update_active_workouts(
+            [(days[0], 1, {"week_index": 9})], db_path=seeded)
+    with pytest.raises(ValueError, match="non-editable"):
+        plans.update_active_workouts(
+            [(days[0], 1, {"date": days[1]})], db_path=seeded)
+
+
+def test_update_plan_workouts_uses_one_connection_for_the_whole_batch(seeded,
+                                                                     monkeypatch):
+    """One transaction is what makes the rollback real; a per-entry connection
+    would commit each day independently and silently restore the old bug."""
+    days = _active_multi_day_plan(seeded)
+    opens = []
+    real = db.connect
+
+    def counting(*a, **kw):
+        opens.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(db, "connect", counting)
+    _body, err = call(tools.update_plan_workouts, {"updates": [
+        {"date": d, "distance_mi": 4} for d in days[:4]]})
+    assert not err
+    assert len(opens) == 1, f"4-entry batch opened {len(opens)} connections"
+
+
+def test_single_day_tool_still_clears_rest_after_the_boundary_move(seeded):
+    """Regression: the rest-clear moved from tools.py into plans.py. The
+    single-day tool's behaviour must be byte-identical to before the move."""
+    days = _active_multi_day_plan(seeded)
+    _body, err = call(tools.update_plan_workout, {"date": days[0], "type": "rest"})
+    assert not err
+    row = _rows(seeded)[days[0]]
+    assert (row["target_distance_m"], row["target_pace_sec_per_km"],
+            row["target_duration_sec"], row["target_hr_max"]) == (None, None, None, None)
+    assert row["description"] == "Rest day"
+
+
+def test_rest_keeps_an_explicitly_passed_description(seeded):
+    days = _active_multi_day_plan(seeded)
+    _body, err = call(tools.update_plan_workouts, {"updates": [
+        {"date": days[0], "type": "rest", "description": "Off — travelling"}]})
+    assert not err
+    assert _rows(seeded)[days[0]]["description"] == "Off — travelling"
+
+
+# --- plans.apply_rest_semantics (pure) ---------------------------------------
+
+def test_apply_rest_semantics_is_a_noop_for_non_rest():
+    fields = {"type": "easy", "target_distance_m": 5000.0}
+    assert plans.apply_rest_semantics(fields) is fields
+
+
+def test_apply_rest_semantics_clears_every_prescription_column():
+    out = plans.apply_rest_semantics({
+        "type": "rest", "target_distance_m": 5000.0,
+        "target_pace_sec_per_km": 350.0, "target_duration_sec": 1800,
+        "target_hr_max": 140.0})
+    assert out == {
+        "type": "rest", "target_distance_m": None,
+        "target_pace_sec_per_km": None, "target_duration_sec": None,
+        "target_hr_max": None, "description": "Rest day"}
+
+
+def test_apply_rest_semantics_does_not_mutate_its_input():
+    fields = {"type": "rest", "target_distance_m": 5000.0}
+    plans.apply_rest_semantics(fields)
+    assert fields == {"type": "rest", "target_distance_m": 5000.0}

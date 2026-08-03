@@ -53,7 +53,11 @@ def test_tool_schemas_well_formed():
     # archive included — pure JSON, shared surface)
     # +get_training_plan_draft (Fix 12: the draft-plan read path — a draft was
     # otherwise reachable only via run_sql, with no way back to its plan_id)
-    assert len(agent_tools.ALL_TOOLS) == 44
+    # +update_plan_workouts (0.46.0: the atomic batch form of
+    # update_plan_workout — a restructure was ~20 sequential calls and, worse,
+    # 20 independent transactions, so a failed second call could delete a long
+    # run with nothing to roll back)
+    assert len(agent_tools.ALL_TOOLS) == 45
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

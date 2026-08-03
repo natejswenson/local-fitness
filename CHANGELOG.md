@@ -6,6 +6,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-08-03
+
+### Added
+- **`update_plan_workouts` — re-prescribe many days on the active plan in ONE
+  atomic call.** Measured across recorded sessions: 39 `update_plan_workout`
+  calls, ~20 of them a single restructure, and 52 fitness tool calls in one
+  day. Two costs, and the second is the real one:
+
+  - 20 model turns, each carrying the full tool schemas and persona.
+  - **20 independent transactions.** The documented "move Saturday's long run
+    to Sunday" idiom is *two* calls — rest the old day, prescribe the new one.
+    If the second failed, the long run was simply gone, with nothing to roll
+    back.
+
+  One batch is one transaction. Validation runs in three passes before any row
+  changes: per-entry shape through the same `_prescription_fields` the
+  single-day tool uses, then the `_EDITABLE_WORKOUT_COLS` whitelist plus a
+  duplicate-`(date, seq)` check, then an existence pre-flight `SELECT` for
+  every target. A typo'd date aborts before the first write rather than
+  half-applying, and every error names the offending entry by index and date.
+
+  **Not a latency fix.** 20 sequential calls cost ~75 ms of our time end to end
+  (~3.8 ms each); the LLM turns dominate by three orders of magnitude. The win
+  is turns, tokens and atomicity — the docs say so explicitly so nobody
+  justifies it on database performance later.
+
+  The write boundary is unchanged: same whitelist, same keyed `UPDATE`, `date`
+  is still the key and not an editable column. A batch is many
+  re-prescriptions, never a restructure. Capped at 60 entries as a blast-radius
+  bound (the live active plan is 75 workouts).
+
+### Changed
+- **The rest-day clear moved from the tool to the write boundary**
+  (`plans.apply_rest_semantics`). It cleared distance/pace/duration/`hr_max`
+  inside `update_plan_workout`, which was correct only because that tool was
+  the sole caller — the moment a second write path existed, a caller that
+  skipped it would leave a stale HR cap on a rest day, prescribing a session
+  that no longer exists and that the report card grades against directly. Now
+  every caller of `update_active_workout(s)` inherits it. Single-day behaviour
+  is byte-identical, pinned by a regression test.
+- The persona's plan section gains the batch tool ("Never loop
+  `update_plan_workout` over a list of days"). Persona is 12,303 chars, still
+  under the 13,000 ceiling.
+
+### Fixed
+- `update_plan_workout`'s `hr_max` description and `docs/mcp/update_plan_workout.md`
+  both said the report card grades "time-above-cap" against the column. 0.40.2
+  replaced that axis with `hr_exceedance_bpm` precisely because a time fraction
+  fed into bands calibrated for relative magnitudes was a category error; the
+  fraction survives as reporting only. The docs page also listed
+  `_EDITABLE_WORKOUT_COLS` as five columns, omitting `target_hr_max` — added in
+  0.40.0. `test_docs_drift.py` checks page existence and availability claims,
+  never body accuracy, so this class of drift is unguarded.
+- `docs/mcp/README.md` described `get_training_plan_draft` as "the only way to
+  see a pending draft"; 0.44.0 made `get_training_plan_status` report one.
+
 ## [0.45.0] - 2026-08-03
 
 ### Changed
