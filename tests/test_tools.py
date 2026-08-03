@@ -28,12 +28,16 @@ import pytest
 from local_fitness import db, plans
 from local_fitness.agent import (
     branding,
+    card_store,
     interpret,
     journal,
+    ledger,
+    memory,
     report_card,
     tools,
     units,
     visuals,
+    workout_coach,
 )
 from local_fitness.ingest import daily as daily_ingest_mod
 
@@ -3325,6 +3329,136 @@ def rc_seeded(tmp_path, monkeypatch):
                 (idx, hr),
             )
     return p
+
+
+@pytest.fixture
+def day_sensitive_memory(rc_seeded, monkeypatch):
+    """Seed a ledger whose text genuinely changes from one day to the next.
+
+    The step-streak line renders a counter computed as-of-yesterday, so with
+    steps over goal on every recent day the block reads differently on each
+    calendar day. That is the real-world driver of the bug the tests below
+    pin; without it they would pass vacuously, which is why they assert the
+    precondition rather than assume it.
+    """
+    with db.connect(rc_seeded) as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('daily_step_goal', ?)",
+            ("8000",))
+        for back in range(0, 40):
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_metrics (date, steps) "
+                "VALUES (?, ?)",
+                ((date.today() - timedelta(days=back)).isoformat(), 8500))
+    return rc_seeded
+
+
+def _freeze_ledger_clock(monkeypatch, day):
+    """Move the clock `ledger` reads when nobody hands it a date."""
+    class _FakeDate(date):
+        @classmethod
+        def today(cls):
+            return day
+
+    monkeypatch.setattr(ledger, "date", _FakeDate)
+
+
+def test_the_memory_block_used_here_really_does_move_with_the_calendar(
+    day_sensitive_memory, monkeypatch
+):
+    """Precondition for the two tests below: unanchored, this block differs
+    from one day to the next. If this ever stops being true the regression
+    tests are no longer testing anything and must be re-seeded."""
+    _freeze_ledger_clock(monkeypatch, date.today())
+    first = memory.render_memory_for_prompt(user_name="Alex")
+    _freeze_ledger_clock(monkeypatch, date.today() + timedelta(days=3))
+    assert memory.render_memory_for_prompt(user_name="Alex") != first
+
+
+def test_the_read_cache_key_does_not_move_with_the_calendar(
+    day_sensitive_memory, reports_tmp, monkeypatch
+):
+    """A card's read is cached under a hash of its prompt, and the coach's
+    memory is in that prompt. Resolved against the CLOCK, the block carried a
+    daily-incrementing step streak, so every stored card's key rotated
+    overnight and re-rendering yesterday's run paid a fresh SDK call — 14 of
+    15 stored cards missed on the live corpus (2026-08-02). Anchoring the
+    memory to the ACTIVITY's date is what makes a past card's prompt, and
+    therefore its key, stand still.
+    """
+    generated = []
+
+    async def fake_generate(*_a, **_k):
+        generated.append(1)
+        return ("DISTANCE: covered the ground.\n\nPACE: quick enough.\n\n"
+                "HEART RATE: sat where it should.\n\n"
+                "STIMULUS: banked what it was worth.")
+
+    monkeypatch.setattr(workout_coach, "generate_read", fake_generate)
+    # Reflect writes a journal entry of its own; silence it so this test
+    # measures the calendar and nothing else. Memory itself stays ENABLED —
+    # the ledger block is the whole subject.
+    async def _no_reflect(_card):
+        return None
+
+    monkeypatch.setattr(tools.reflect, "reflect_after_report_card", _no_reflect)
+
+    _freeze_ledger_clock(monkeypatch, date.today())
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+    assert len(generated) == 1
+    first_key, first_read = card_store.load_read(1)
+    assert first_key is not None
+
+    # Three days pass. Nothing about the run, the plan or the grades changed.
+    _freeze_ledger_clock(monkeypatch, date.today() + timedelta(days=3))
+    payload, err = call(tools.workout_report_card, {"format": "table"})
+    assert not err
+
+    assert len(generated) == 1, (
+        "the read was regenerated for a card nothing had changed about")
+    assert card_store.load_read(1) == (first_key, first_read)
+
+
+def test_a_journal_entry_written_later_does_not_move_a_past_cards_key(
+    day_sensitive_memory, reports_tmp, monkeypatch
+):
+    """The other half of the anchoring: the journal layer is capped at the
+    card's date, so writing an entry about a LATER day cannot rewrite an older
+    card's prompt. Without the cap the block is an unbounded latest-N list and
+    any new entry — a brief reflection, another card's reflection — rotated
+    every stored card's key at once."""
+    generated = []
+
+    async def fake_generate(*_a, **_k):
+        generated.append(1)
+        return ("DISTANCE: covered the ground.\n\nPACE: quick enough.\n\n"
+                "HEART RATE: sat where it should.\n\n"
+                "STIMULUS: banked what it was worth.")
+
+    monkeypatch.setattr(workout_coach, "generate_read", fake_generate)
+
+    async def _no_reflect(_card):
+        return None
+
+    monkeypatch.setattr(tools.reflect, "reflect_after_report_card", _no_reflect)
+
+    older = (date.today() - timedelta(days=5)).isoformat()
+    payload, err = call(
+        tools.workout_report_card, {"date": older, "format": "table"})
+    assert not err
+    aid = payload["activity_id"]
+    before = card_store.load_read(aid)
+    assert len(generated) == 1
+
+    journal.save_entry("wrote this days after that run", source="chat",
+                       entry_date=date.today().isoformat())
+
+    payload, err = call(
+        tools.workout_report_card, {"date": older, "format": "table"})
+    assert not err
+    assert len(generated) == 1
+    assert card_store.load_read(aid) == before
 
 
 def test_report_card_defaults_to_the_most_recent_activity(rc_seeded, reports_tmp):

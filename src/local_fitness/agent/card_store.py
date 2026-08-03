@@ -165,6 +165,39 @@ def read_is_complete(read: object) -> bool:
     return True
 
 
+#: The 0.40.0 rename of the read's 4th section. Rows written before it carry
+#: ``load`` where ``READ_SECTIONS`` now says ``stimulus``, which is a pure
+#: naming change — the paragraph itself is the same training-load prose. See
+#: ``migrate_read_section_names``.
+_RENAMED_READ_SECTIONS = (("load", "stimulus"),)
+
+
+def rename_read_sections(read: object) -> dict | None:
+    """A stored read with ``_RENAMED_READ_SECTIONS`` applied, or ``None`` when
+    there is nothing to do. Pure — no DB, no clock.
+
+    ``None`` (not "the unchanged dict") is the no-op signal, so the caller
+    writes only the rows that genuinely move. That is what makes the migration
+    idempotent: a second pass finds the old key gone and returns ``None`` for
+    every row.
+
+    The rename is positional, not append-then-delete: the new key takes the
+    old one's slot so the re-serialized JSON keeps its original key order and
+    the row's bytes differ only where the rename does. A read already carrying
+    the new key is left ALONE even if the old one is also present — two
+    populated sections is not a case this can resolve by guessing, and
+    silently discarding one of them would destroy a paragraph.
+    """
+    if not isinstance(read, dict):
+        return None
+    pending = [(old, new) for old, new in _RENAMED_READ_SECTIONS
+               if old in read and new not in read]
+    if not pending:
+        return None
+    swap = dict(pending)
+    return {swap.get(k, k): v for k, v in read.items()}
+
+
 def _decode_card(card_json: str) -> dict | None:
     """card_json → card dict with the stripped keys re-defaulted, or ``None``
     on a corrupt row — the loaders' fail-silent contract."""
@@ -200,6 +233,74 @@ def save_card(card: dict, *, read_cache_key: str | None,
             conn.execute(_UPSERT_SQL, row)
     except Exception:
         _LOG.warning("report-card save failed (ignored)", exc_info=True)
+
+
+def migrate_read_section_names(
+    db_path: Path | None = None, conn: sqlite3.Connection | None = None
+) -> int:
+    """Apply ``rename_read_sections`` to every stored row. Returns rows written.
+
+    The one-time repair for the 0.40.0 section rename. Rows written before it
+    hold ``$.coach_read.load`` where ``read_is_complete`` now demands
+    ``stimulus``, so they fail that check and can never be reused however well
+    their cache key matches — the render regenerates the read it is already
+    holding, at full SDK cost. Measured on the live corpus 2026-08-02: 12 of 15
+    stored rows.
+
+    **Idempotent** — a second pass finds no row with the old key and writes
+    nothing (``rename_read_sections`` returns ``None``), so this is safe to run
+    on every ``init_schema``.
+
+    **Does not disturb the snapshot.** The UPDATE touches ``card_json`` and
+    nothing else: ``graded_at``, ``read_cache_key`` and every grade column are
+    left exactly as the render that produced them wrote them. Within
+    ``card_json`` the only edit is the key name — the paragraph text, the key
+    order and every other field survive, and the re-serialization uses
+    ``card_row``'s own ``json.dumps(..., default=str)`` so a migrated row is
+    byte-identical to what that render would write today. This is a repair of a
+    field NAME the schema renamed underneath the row, not a regrade: no card's
+    words, letters or date move.
+
+    Never raises — a migration failure must not stop a DB from opening. Rows
+    with corrupt or non-object ``card_json`` are skipped, not repaired.
+    """
+    def _run(c: sqlite3.Connection) -> int:
+        rows = c.execute(
+            "SELECT activity_id, card_json FROM report_cards").fetchall()
+        written = 0
+        for row in rows:
+            try:
+                # NOT _decode_card: that re-defaults the stripped keys, which
+                # would ADD hr_trace/recent_activities/upcoming_workouts to a
+                # row that deliberately stores without them.
+                card = json.loads(row["card_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(card, dict):
+                continue
+            renamed = rename_read_sections(card.get("coach_read"))
+            if renamed is None:
+                continue
+            card["coach_read"] = renamed
+            c.execute(
+                "UPDATE report_cards SET card_json = ? WHERE activity_id = ?",
+                (json.dumps(card, default=str), row["activity_id"]),
+            )
+            written += 1
+        if written:
+            _LOG.info("migrated %d stored report-card read(s) to the current "
+                      "section names", written)
+        return written
+
+    try:
+        if conn is not None:
+            return _run(conn)
+        with db.connect(db_path) as c:
+            return _run(c)
+    except Exception:
+        _LOG.warning("report-card read-section migration failed (ignored)",
+                     exc_info=True)
+        return 0
 
 
 def load_card(activity_id: int, *, db_path: Path | None = None) -> dict | None:

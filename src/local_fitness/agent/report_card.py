@@ -73,20 +73,24 @@ So easy/long days are penalized only for running too FAST, quality days only
 for running too SLOW, and each metric's expectation is scaled by the workout's
 intent (from the plan when present, inferred otherwise).
 
-Splits are presentation-only, with exactly one documented exception. No grade
-reads ``activity_splits`` — only 87 of 747 activities have them (they are
+Splits are presentation-only, with exactly THREE documented exceptions. No other
+grade reads ``activity_splits`` — only 100 of 760 activities have them (they are
 written by the daily-sync ingest path, never by backfill), so a splits-dependent
-grade would be unavailable on ~88% of the history and would silently mean
-different things on different rows.
+grade would be unavailable on ~87% of the history and would silently mean
+different things on different rows. Every exception must handle absence
+explicitly, and they do it two different ways on purpose.
 
-The exception is **quality-day pace against a prescribed rep target**, and it
-exists because the alternative was not a strict grade but a broken one: a plan's
-interval pace describes the reps, while ``avg_pace_sec_per_km`` averages in the
-warmup, the recovery jogs and the cooldown, so that comparison returns F for
-every correctly-executed interval session. The fastest full split is the only
-available number that can answer "did you hit the reps". Where splits are
-missing the metric returns n/a with a stated reason and its weight
-redistributes — it never falls back to the average-vs-rep comparison.
+1. **quality-day pace against a prescribed rep target** — see
+   ``fastest_rep_split``. It exists because the alternative was not a strict
+   grade but a broken one: a plan's interval pace describes the reps, while
+   ``avg_pace_sec_per_km`` averages in the warmup, the recovery jogs and the
+   cooldown, so that comparison returns F for every correctly-executed interval
+   session. *Abstains* when splits are missing — n/a with a stated reason, and
+   the weight redistributes.
+2. **continuity** — see ``continuity_ratio``. Also *abstains*.
+3. **the prescribed-HR-cap exceedance** — see ``hr_exceedance_bpm``. This one
+   *degrades* instead: with no splits the cap is still graded on the average
+   alone, so it adds no new availability cliff.
 
 The pure section below is import-light (stdlib + ``render``/``units``) and
 unit-testable with plain dicts; DB access lives under the persistence divider,
@@ -113,7 +117,8 @@ __all__ = [
     "render_markdown", "reference_line", "bin_hr_trace", "expected_text",
     "actual_text", "hr_band_bounds", "hr_expectation",
     "is_running_effort", "fastest_rep_split", "fastest_rep_split_pace",
-    "time_above_cap_fraction", "hr_cap_deviation", "hr_cap_axis",
+    "time_above_cap_fraction", "hr_exceedance_bpm", "hr_cap_severity",
+    "hr_cap_deviation", "hr_cap_axis",
     "continuity_ratio", "continuity_deviation",
     "READ_SECTIONS",
     "load_report_card_inputs", "rolling_reference",
@@ -300,14 +305,53 @@ HR_BANDS: dict[str, tuple[float | None, float | None]] = {
 # A steady/unknown-intent run has no stated target, so its two-sided pace
 # bands are widened rather than held to prescription-grade tolerance.
 STEADY_WIDEN = 1.5
-# Fraction of a run allowed above a prescribed HR cap before it counts as a
-# breach. A few seconds over on a hill, a treadmill surge, or a sensor artifact
-# is not disobedience; a fifth of the session over the stated ceiling is.
+# Fraction of a run above a prescribed HR cap worth REPORTING. This is a
+# reporting threshold only — it has not driven the grade since 0.40.2, because
+# a time fraction cannot be graded (see `hr_exceedance_bpm`). A few seconds over
+# on a hill or a treadmill surge is not worth a note; most of the session over
+# the stated ceiling is, whichever way the letter lands.
 HR_CAP_GRACE_FRACTION = 0.05
+# --- the HR-cap severity scale (0.40.2) ------------------------------------
+# A breach of a prescribed cap is measured in *bpm above the ceiling*, sustained
+# over time — not as a fraction of the cap, and not as a fraction of the run.
+#
+# Not a fraction of the cap, for the same reason `continuity_deviation` takes a
+# raw excess: HR has a huge non-zero offset, so dividing by the cap compresses
+# every real breach into the A/B bands. Measured over the 19 completed capped
+# days in the live plan, `exceedance / cap` puts the WORST session in the window
+# (avg 157 against a 140 cap, splits hitting 185, 48% of it in Garmin zones 4-5)
+# at 0.139 — a C. The absolute bpm excursion is the quantity that means
+# something physiologically; 12 bpm over a ceiling is 12 bpm over a ceiling
+# whether the ceiling is 130 or 150.
+#
+# HR_CAP_NOISE_BPM is the floor below which a split-average breach is not
+# distinguishable from rounding. Calibrated, not guessed: over those 19 days,
+# the two runs whose AVERAGE obeyed the cap (139 and 136 against 140) carry a
+# time-weighted exceedance of 1.15 and 1.37 bpm, and both spent 0% of their
+# time in zones 4-5. They are compliant runs and must read A+. The smallest
+# exceedance belonging to a run that broke the cap on average is 4.55 bpm.
+# 1.5 separates the two populations with margin on both sides.
+HR_CAP_NOISE_BPM = 1.5
+# ...and the scale that turns real bpm-over into the shared bands, so an F
+# begins at HR_CAP_NOISE_BPM + 0.35 * HR_CAP_BPM_SCALE = 11.3 bpm sustained
+# above the ceiling.
+#
+# Validated against a signal the grade does not read: Garmin's own zone-4+5
+# time fraction, computed on the device from the per-sample trace and therefore
+# independent of both avg_hr and the splits. In the live window exactly three
+# sessions carry an exceedance at or above 11.3 bpm (11.9, 13.6, 19.5) and they
+# are exactly the three whose zone-4+5 share is 42% or more — the runs that
+# stopped being aerobic runs at all. The highest zone-4+5 share below the
+# boundary is 37%. So the F set is "this was not the workout that was
+# prescribed", drawn on evidence rather than on intuition.
+HR_CAP_BPM_SCALE = 28.0
 # How much slower than the run's own median split the SLOWEST split may be before
 # the session is treated as having contained a break rather than a pace
 # variation. See continuity_deviation for the measurement behind 1.15.
 CONTINUITY_TOLERANCE = 1.15
+# Distance gap below which the Delta column says "on target" instead of a
+# number. ~32 m — GPS wobble and treadmill rounding, not a miss.
+_DISTANCE_ON_TARGET_MI = 0.02
 # Below this many full splits a slowest-vs-median ratio is noise, not a finding —
 # and it is what keeps manually-lapped interval sessions out (see
 # continuity_ratio).
@@ -481,6 +525,56 @@ def pace_deviation(
     return abs(actual_sec_per_km / expected_sec_per_km - 1.0)
 
 
+def pace_bound_kind(cls: str) -> str:
+    """Which side of the pace expectation ``pace_deviation`` actually penalizes:
+    ``"floor"``, ``"ceiling"`` or ``"point"``.
+
+    Exists so the Expected column can state the bound the grade was measured
+    against rather than a bare number. Before this, an easy day printed
+
+        | Pace | 9:44/mi | 9:39/mi | 5s/mi slower | A+ |
+
+    — a stated target, a stated 5s/mi miss, and an A+. Every number there is
+    correct and the row still reads as a broken grade, because 9:39 is not a
+    point target on an easy day: ``pace_deviation`` gates easy/long to the FAST
+    side only, so running slower than it is compliance, not a shortfall. That
+    display is the whole reason 91% of the A-band grades on real cards look
+    like a participation trophy (measured over 15 stored cards: 9 of 15 pace
+    deviations are exactly 0.0, which is mechanically an A+).
+
+    Mirrors ``pace_deviation``'s own branches, and
+    ``test_pace_bound_kind_matches_pace_deviation_gating`` re-derives it from
+    that function so the two cannot drift.
+
+    Note the bound described is the one relative to the TARGET. easy/long also
+    carry ``pace_deviation``'s absolute walk floor
+    (``RUN_PACE_CEILING_SEC_PER_MI``), which is an anti-abuse guard rather than
+    a prescription and is deliberately not printed here — a card that read
+    "9:39-13:00/mi" would imply the plan asked for a range it never asked for.
+    """
+    if cls in ("easy", "long"):
+        # Only too FAST costs, so the expectation is a floor on the pace value
+        # (sec/km — bigger is slower).
+        return "floor"
+    if cls == "quality":
+        return "ceiling"
+    return "point"
+
+
+def bounded_display(kind: str, text: str) -> str:
+    """A formatted expectation prefixed with the bound it represents.
+
+    Reuses the ``≤`` / ``≥`` idiom ``_fmt_hr_band`` already established, so a
+    one-sided pace or distance target reads the same way a one-sided HR band
+    does and the reader learns one convention instead of three.
+    """
+    if kind == "floor":
+        return f"≥ {text}"
+    if kind == "ceiling":
+        return f"≤ {text}"
+    return text
+
+
 def hr_band_bounds(
     median_hr: float | None, cls: str
 ) -> tuple[float | None, float | None]:
@@ -595,21 +689,12 @@ def continuity_deviation(ratio: float | None) -> float | None:
 def time_above_cap_fraction(labelled: dict, cap: float | None) -> float | None:
     """Fraction of split time whose average HR sat above ``cap``, or ``None``.
 
-    This is the module's SECOND grade that reads splits, and it earns the
-    exception the same way quality-day pace does: the alternative number is not
-    stricter but wrong. An average sits under a cap that the middle of the run
-    spent minutes above — measured 2026-07-27, avg HR 144 against a prescribed
-    140 is a 2.9% average breach, while miles 3-5 actually ran 150/144/159 and
-    only 30% of the session was aerobic.
-
-    Unlike the pace exception this one DEGRADES rather than abstains: with no
-    splits the cap is still graded on the average alone, which is strictly better
-    than the pre-0.40.0 behavior of not reading the prescribed cap at all. So it
-    adds no new availability cliff.
-
-    Per-split averages, deliberately NOT the per-sample trace: `get_hr_samples`
-    can reach the network, and no grade may depend on an input that might not
-    resolve locally (see `load_report_card_inputs`'s `hr_trace` default).
+    **Reported, never graded** (0.40.2). It answers "for how much of the run?",
+    which is worth printing beside the breach — but on its own it cannot say
+    whether the run was 1 bpm over or 20, and HR is autocorrelated enough that
+    it barely varies between those two cases. Over the 19 completed capped days
+    in the live plan it took only two values in practice: 0%, or 58-76%. See
+    ``hr_exceedance_bpm`` for the number that carries the severity.
     """
     if not cap or cap <= 0:
         return None
@@ -622,88 +707,147 @@ def time_above_cap_fraction(labelled: dict, cap: float | None) -> float | None:
     return above / total
 
 
+def hr_exceedance_bpm(labelled: dict, cap: float | None) -> float | None:
+    """Time-weighted mean bpm ABOVE ``cap`` across the splits, or ``None``.
+
+    ``sum(duration * max(0, split_hr - cap)) / total_duration`` — the integral
+    of the breach over the run, divided by the run. It reads as "you sat, on
+    average across the whole session, N bpm above the ceiling you were given",
+    and it is the module's SECOND grade to read splits (after quality-day rep
+    pace). It earns the exception the same way that one does: the alternative
+    number is not stricter but wrong. An average HR sits under a cap that the
+    middle of the run spent minutes above — measured 2026-07-27, avg 144 against
+    a prescribed 140 is a 2.9% average breach while miles 3-5 ran 150/144/159.
+
+    This REPLACES the 0.40.0 time-fraction axis, which was a category error. A
+    fraction of a run and a relative magnitude are different units, so feeding a
+    time fraction through ``GRADE_BANDS`` — a table calibrated for "how far off
+    target" — graded a quantity the table does not describe, and taking
+    ``max()`` over the two compared incommensurable numbers. Its measured
+    consequence: across the 19 completed capped days in the live plan, that axis
+    produced **only A+ or F, never a letter in between**. On 2026-08-02 a run
+    whose average (139) obeyed a 140 cap, whose peak was 148, and which Garmin
+    recorded as 0% in zones 4-5, graded **F** — because three of its miles
+    averaged 141/143/142, one to three bpm over, and were each counted as 100%
+    above the cap. It even ranked the mildest breach in the window (2026-07-16,
+    1% of it in zones 4-5) as the single WORST session, at 75% of time over.
+    The exceedance integral separates those cases by construction: 1.15 bpm
+    against 19.5 bpm.
+
+    Per-split averages, deliberately NOT the per-sample trace: ``get_hr_samples``
+    can reach the network, and no grade may depend on an input that might not
+    resolve locally (see ``load_report_card_inputs``'s ``hr_trace`` default).
+    The locally-cached ``activity_hr_samples`` table is not an escape hatch
+    either — it holds 11 of 760 activities, so reading it "when present" would
+    make the metric mean one thing on 1.4% of history and another on the rest,
+    which is the exact availability trap the splits rule exists to prevent.
+
+    Like the time fraction before it this DEGRADES rather than abstains: with no
+    splits the cap is still graded on the average alone.
+    """
+    if not cap or cap <= 0:
+        return None
+    rows = [r for r in (labelled.get("rows") or [])
+            if r.get("avg_hr") and r.get("duration_seconds")]
+    total = sum(r["duration_seconds"] for r in rows)
+    if not total:
+        return None
+    over = sum(r["duration_seconds"] * max(0.0, r["avg_hr"] - cap) for r in rows)
+    return over / total
+
+
+def hr_cap_severity(bpm_over: float | None) -> float:
+    """bpm above a prescribed cap → a deviation the shared bands can grade.
+
+    The raw excess past ``HR_CAP_NOISE_BPM``, scaled by ``HR_CAP_BPM_SCALE``.
+    One function so both cap axes are measured identically — that is what makes
+    ``max()`` over them meaningful, and it is precisely what 0.40.0 lacked.
+    """
+    if bpm_over is None:
+        return 0.0
+    return max(0.0, bpm_over - HR_CAP_NOISE_BPM) / HR_CAP_BPM_SCALE
+
+
 def hr_cap_deviation(
     hr: float | None,
     cap: float | None,
-    time_above_fraction: float | None = None,
+    exceedance_bpm: float | None = None,
 ) -> float | None:
     """Deviation from an EXPLICIT prescribed HR ceiling (``target_hr_max``).
 
-    Two independent ways to breach a stated cap; the grade takes the worse:
+    Two ways to breach a stated cap; the grade takes the worse:
 
     - **average** over the cap — the run as a whole ran too hot.
-    - **time** over the cap, past a small grace fraction — which is the one that
-      actually catches disobedience. See ``time_above_cap_fraction`` for the
-      measured case where the average alone cost a single +/- modifier.
+    - **exceedance** — the time-weighted bpm over it, from splits, which catches
+      the run whose middle blew the ceiling while its mean did not.
+
+    Both are now *bpm above the ceiling* put through ``hr_cap_severity``, so
+    ``max()`` compares like with like. Before 0.40.2 the second axis was a time
+    fraction and the comparison had no meaning; see ``hr_exceedance_bpm``.
+
+    (The exceedance normally dominates — by Jensen's inequality the mean of the
+    positive part is at least the positive part of the mean. It is still a
+    ``max``, not a substitution, because the two are computed from different
+    sources: Garmin's activity-level ``avg_hr``, and the splits, which may cover
+    only part of the session or carry no HR at all.)
 
     ``None`` when there is no cap, which is what makes the caller fall back to
     the rolling ``HR_BANDS`` — a plan without a stated cap grades exactly as it
     did before 0.40.0.
 
-    Note this is graded with the BASE bands, not ``PLAN_TIGHTEN``. Tightening
-    exists to hold an explicit pace/distance target to prescription tolerance;
-    applying it to a time fraction would double-count strictness, turning "8% of
-    the run drifted over" into a D. On the base bands the time axis reads as it
-    should: ~5% is noise, 20% over is a C, a third of the run over is an F.
+    Graded with the BASE bands, not ``PLAN_TIGHTEN``: ``HR_CAP_BPM_SCALE`` is
+    already calibrated against prescribed-cap sessions specifically, so
+    tightening on top of it would double-count the same strictness.
     """
-    axes = _hr_cap_axes(hr, cap, time_above_fraction)
+    axes = _hr_cap_axes(hr, cap, exceedance_bpm)
     return None if axes is None else max(axes)
 
 
 def _hr_cap_axes(
     hr: float | None,
     cap: float | None,
-    time_above_fraction: float | None = None,
+    exceedance_bpm: float | None = None,
 ) -> tuple[float, float] | None:
-    """The two breach axes as ``(over_average, over_time)``, or ``None`` when
-    there is no cap to breach.
+    """The two breach axes as ``(over_average, over_exceedance)``, or ``None``
+    when there is no cap to breach.
 
     Shared by ``hr_cap_deviation`` and ``hr_cap_axis`` so the grade and the
     row explaining it can never be computed from different formulas.
     """
     if not hr or not cap or cap <= 0:
         return None
-    over_avg = max(0.0, (hr - cap) / cap)
-    over_time = 0.0
-    if time_above_fraction is not None:
-        over_time = max(0.0, time_above_fraction - HR_CAP_GRACE_FRACTION)
-    return over_avg, over_time
+    return hr_cap_severity(hr - cap), hr_cap_severity(exceedance_bpm)
 
 
 def hr_cap_axis(
     hr: float | None,
     cap: float | None,
-    time_above_fraction: float | None = None,
+    exceedance_bpm: float | None = None,
 ) -> str | None:
-    """WHICH axis produced the grade — ``"time"``, ``"average"``, or ``None``
-    when nothing was breached (or there was no cap).
+    """WHICH axis produced the grade — ``"exceedance"``, ``"average"``, or
+    ``None`` when nothing was breached (or there was no cap).
 
-    ``hr_cap_deviation`` takes the worse of two axes measured in different
-    units — bpm over a ceiling, and fraction of a run over it — and then throws
-    away which one won. That discard is what printed, on a live card for
-    2026-08-02, the row:
+    ``hr_cap_deviation`` takes the worse of two axes and then throws away which
+    one won. That discard is what printed, on a live card for 2026-08-02:
 
         | Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |
 
     Every displayed number there describes the average, which was *compliant*
-    and scored 0.0; the F came entirely from 58% of the run sitting above the
-    cap, a quantity the row never showed. A reader cannot reconstruct an F from
-    three passing numbers, so the row read as a bug in the grade rather than as
-    the finding it was.
-
-    Naming the governing axis is what lets the caller state the number the
-    grade was actually measured against — the same contract the pace row keeps
-    via ``actual_display``.
+    and scored 0.0. A reader cannot reconstruct an F from three passing numbers,
+    so the row read as a bug in the grade. (That card was in fact a bug in the
+    grade — see ``hr_exceedance_bpm`` — but the display contract stands on its
+    own: the row must state the quantity the letter was measured against, the
+    same contract the pace row keeps via ``actual_display``.)
     """
-    axes = _hr_cap_axes(hr, cap, time_above_fraction)
+    axes = _hr_cap_axes(hr, cap, exceedance_bpm)
     if axes is None:
         return None
-    over_avg, over_time = axes
+    over_avg, over_exc = axes
     if max(axes) == 0.0:
         # Compliant on both axes. There is no breach to attribute, and calling
         # one of them "governing" would imply one happened.
         return None
-    return "time" if over_time > over_avg else "average"
+    return "exceedance" if over_exc > over_avg else "average"
 
 
 def load_deviation(load: float | None, expected_load: float | None) -> float | None:
@@ -1143,6 +1287,14 @@ def build_card(
         distance = _metric(
             grade_from_deviation(d), activity.get("distance_meters"), expected or None,
             d, "rolling_60d", note=walk_note)
+        # `two_sided=False` above: going LONGER than your rolling norm is never
+        # a penalty, so this expectation is a floor and has to print as one.
+        # The plan branch stays a bare number because it genuinely is a point
+        # target — over-running a prescription costs you there.
+        if expected:
+            distance["bound"] = "floor"
+            distance["expected_display"] = bounded_display(
+                "floor", _fmt_distance(expected))
     else:
         distance = _metric(
             None, activity.get("distance_meters"), None, None, reference.get("mode"),
@@ -1215,6 +1367,12 @@ def build_card(
         expected_pace, d, pace_ref, note=pace_note)
     if pace_display:
         pace["actual_display"] = pace_display
+    # State the BOUND, not a bare number — see pace_bound_kind. Only when there
+    # is an expectation at all: a by-feel day has none, and "≥ —" is noise.
+    if expected_pace is not None:
+        pace["bound"] = pace_bound_kind(cls)
+        pace["expected_display"] = bounded_display(
+            pace["bound"], _fmt_pace(expected_pace))
 
     # -- HR: the plan's own ceiling when it states one (0.40.0), else rolling.
     med_hr = reference.get("median_hr") if has_rolling else None
@@ -1227,33 +1385,41 @@ def build_card(
         # 139 by coincidence, so a genuine breach of the prescription registered
         # as a rounding error.
         above = time_above_cap_fraction(labelled_splits, plan_cap)
-        d = hr_cap_deviation(actual_hr, plan_cap, above)
+        exceedance = hr_exceedance_bpm(labelled_splits, plan_cap)
+        d = hr_cap_deviation(actual_hr, plan_cap, exceedance)
         hr = _metric(grade_from_deviation(d), actual_hr, plan_cap, d, "plan")
         hr["cap"] = plan_cap
         hr["expected_display"] = f"≤ {round(plan_cap)} bpm"
         hr["in_band"] = d == 0.0
+        if exceedance is not None:
+            hr["exceedance_bpm"] = round(exceedance, 1)
         if above is not None:
             hr["time_above_cap_pct"] = round(above * 100)
-            if above > HR_CAP_GRACE_FRACTION:
-                # The number that produced the grade, stated. The average alone
-                # would leave a reader unable to reconstruct why 144-vs-140 is
-                # not a near-miss.
-                hr["note"] = (f"{round(above * 100)}% of the run sat above the "
-                              f"prescribed {round(plan_cap)} bpm cap")
-        # When TIME over the cap is what produced the letter, the whole row has
-        # to move to that axis — actual, expected and delta together. Leaving
-        # the average in place printed a compliant 139-vs-140 beside an F (see
-        # hr_cap_axis), which reads as a broken grade rather than as a breach.
-        # The average is kept in the cell rather than dropped: it is still the
-        # reason the row LOOKS clean, so the parenthetical is what reconciles
-        # the two numbers for the reader.
-        hr["governing_axis"] = hr_cap_axis(actual_hr, plan_cap, above)
-        if hr["governing_axis"] == "time":
-            hr["actual_display"] = (
-                f"{round(above * 100)}% above cap"
-                + (f" (avg {round(actual_hr)} bpm)" if actual_hr else ""))
-            hr["expected_display"] = (
-                f"≤ {round(HR_CAP_GRACE_FRACTION * 100)}% above cap")
+        # When the split-derived exceedance is what produced the letter, the
+        # whole row has to move to that axis — actual, expected and delta
+        # together. Leaving the average in place printed a compliant 139-vs-140
+        # beside an F (see hr_cap_axis), which reads as a broken grade.
+        hr["governing_axis"] = hr_cap_axis(actual_hr, plan_cap, exceedance)
+        if hr["governing_axis"] == "exceedance":
+            # One decimal, matching the delta below it, so the three cells
+            # reconcile by arithmetic: actual - expected = delta. Rounding the
+            # actual to whole bpm made a 19.5 print as "+20" beside a "+18"
+            # delta against a 1.5 expectation, which does not add up on the page.
+            hr["actual_display"] = f"+{exceedance:.1f} bpm over cap" + (
+                f" ({round(above * 100)}% of run)" if above else "")
+            hr["expected_display"] = f"≤ +{HR_CAP_NOISE_BPM:g} bpm over cap"
+        if above is not None and above > HR_CAP_GRACE_FRACTION:
+            # State the fraction over the cap AND how far over, always together.
+            # The fraction alone is what 0.40.0 graded on and it is not a
+            # severity: printing it by itself beside an A+ reads as the card
+            # having noticed a breach and then ignored it, which is the prose
+            # contradicting the grade from the other direction.
+            over = exceedance or 0.0
+            hr["note"] = (
+                f"{round(above * 100)}% of the run sat above the prescribed "
+                f"{round(plan_cap)} bpm cap, by "
+                + (f"{over:.1f} bpm on average — inside sensor noise"
+                   if d == 0.0 else f"{over:.1f} bpm on average"))
     else:
         d = hr_deviation(actual_hr, med_hr, cls)
         # Expected is the BOUND that governed the grade, not the median — see
@@ -1312,7 +1478,10 @@ def build_card(
         continuity["note"] = reason
     else:
         continuity["actual_display"] = f"{ratio:.2f}x median split"
-        continuity["expected_display"] = f"<= {CONTINUITY_TOLERANCE:.2f}x"
+        # Typographic ≤, matching _fmt_hr_band and bounded_display. This was
+        # the one bound on the card still written in ASCII, and the two forms
+        # rendered side by side in the same column.
+        continuity["expected_display"] = f"≤ {CONTINUITY_TOLERANCE:.2f}x"
         continuity["ratio"] = round(ratio, 3)
         if d and d > 0:
             slowest = max(
@@ -1469,7 +1638,23 @@ def actual_text(key: str, metric: dict) -> str:
 
 def _delta_text(key: str, metric: dict) -> str:
     """Signed, human delta between actual and expected — the granularity a
-    bare letter loses."""
+    bare letter loses.
+
+    ONE grammar: ``{magnitude in the row's own unit} {direction}``, or
+    ``"on target"`` inside rounding. The direction vocabulary is per-unit
+    ("slower" beats "over" for a pace) but the SHAPE never varies, and the rule
+    that makes it coherent is: **a delta is never a percentage.** A live card
+    printed four dialects in four rows — ``on target`` / ``5s/mi slower`` /
+    ``53% over`` / ``even`` — where the percentages were a percentage of a
+    distance, a percentage of a ratio, and a percentage of a percentage. Those
+    are three different quantities wearing one symbol, which is the same defect
+    the Delta column's "never compare two quantities" contract exists to
+    prevent, one level down in the units.
+
+    The two HR branches below are deliberately left on their own text: they
+    are correct under this grammar already, and they are being reworked
+    elsewhere.
+    """
     actual, expected = metric.get("actual"), metric.get("expected")
     if actual is None or expected is None or not isinstance(expected, (int, float)):
         return "—"
@@ -1484,29 +1669,57 @@ def _delta_text(key: str, metric: dict) -> str:
         if abs(diff) < 1:
             return "on target"
         return f"{abs(diff)}s/mi {'slower' if diff > 0 else 'faster'}"
+    if key == "distance":
+        # Was `+N%`. A percentage of a distance is the least useful form of a
+        # number a runner already thinks about in miles, and it was the only
+        # row on the card whose delta was not in its own unit.
+        diff_mi = (units.to_miles(actual) or 0) - (units.to_miles(expected) or 0)
+        if abs(diff_mi) < _DISTANCE_ON_TARGET_MI:
+            # Within rounding IS on target; say so. The predecessor of this
+            # branch printed "-0%" for a 4.00-of-4.00 mi run off by meters,
+            # which reads like a typo beside an A+. The threshold is a real
+            # tolerance rather than a display epsilon: 5.01 against a 5.00
+            # prescription is 16 m, which is treadmill rounding, and printing
+            # "0.01 mi long" for it invents a miss the grade did not find.
+            return "on target"
+        return f"{abs(diff_mi):.2f} mi {'long' if diff_mi > 0 else 'short'}"
     if key == "continuity":
         # A percentage against the tolerance would read as "+10%" for a run whose
         # worst mile was 27% off its median — the tolerance is not the quantity
-        # the reader cares about. State the excess in units of a median split.
+        # the reader cares about. State the gap in units of a median split,
+        # which is what both `actual` and `expected` are already measured in.
         excess = actual - expected
-        return "even" if excess <= 0 else f"{round(excess * 100)}% over"
+        if abs(excess) < 0.005:
+            return "on target"
+        return f"{abs(excess):.2f}x {'over' if excess > 0 else 'under'}"
     if key == "hr" and metric.get("in_band"):
         # Inside the band IS the A. A percentage against one edge would imply
         # a miss that did not happen.
         return "in range"
-    if key == "hr" and metric.get("governing_axis") == "time":
+    if key == "hr" and metric.get("governing_axis") == "exceedance":
         # The average is not the graded quantity here, so its percentage is not
         # the delta — printing "-1%" beside an F stated a gap of the wrong sign
-        # on the wrong axis. State the excess past the grace fraction, in the
-        # same "% over" idiom continuity uses for the same reason.
-        return f"{round(metric['deviation'] * 100)}% over"
+        # on the wrong axis. State the excess past the noise floor, in bpm,
+        # which is actual minus expected on the axis that was graded — the same
+        # shape continuity uses against its tolerance.
+        excess = metric.get("exceedance_bpm", 0.0) - HR_CAP_NOISE_BPM
+        return f"{excess:+.1f} bpm"
+    if key == "hr":
+        # The rolling-band case, reached only when the run sat OUTSIDE the band
+        # (in_band returns above). bpm, not a percentage: the Expected column
+        # beside it is already in bpm, and "+4%" next to "≤ 141 bpm" made the
+        # reader do the arithmetic to find out it meant 6 beats.
+        diff = round(actual) - round(expected)
+        if diff == 0:
+            return "on target"
+        return f"{abs(diff)} bpm {'over' if diff > 0 else 'under'}"
     if not expected:
         return "—"
+    # Anything with no unit of its own (today: nothing rendered — load is a
+    # stimulus metric and has no table row). Kept as a percentage rather than
+    # deleted so a future metric degrades to something readable.
     pct = (actual / expected - 1) * 100
     if round(pct) == 0:
-        # A sub-half-percent shortfall printed "-0%" on a live card (4.00 of
-        # 4.00 mi, off by meters) — negative zero reads like a typo beside an
-        # A+. Within rounding of zero IS on target; say so.
         return "on target"
     return f"{pct:+.0f}%"
 
@@ -1587,6 +1800,67 @@ def stimulus_notes(card: dict) -> list[str]:
         f"{intent_prose} correctly is supposed to bank less of it — it is "
         "reported here and cannot affect the grade above.")
     return notes
+
+
+def split_table(card: dict) -> tuple[list[str], list[list[str]]]:
+    """``(headers, rows)`` for the per-split breakdown, with dead columns gone.
+
+    Shared by the markdown card and the PDF for the same reason
+    ``stimulus_rows`` is: the two renderers had this table written out twice,
+    and a column dropped in one and kept in the other is precisely the
+    divergence ``render_report_card_pdf`` takes a pre-built card to avoid.
+
+    Elevation and heart rate are both frequently absent, and the table used to
+    print a full column of em-dashes for them regardless. Measured over the
+    live DB: **13 of 15 stored cards have an entirely empty Elev column**, and
+    362 of 428 ``activity_splits`` rows (85%) carry no elevation at all — a
+    treadmill run never has any. On a page whose density ladder was already
+    bottoming out, that is ~15% of the table's width spent on nothing.
+
+    A column survives if ANY row has a value for it. `vs run` additionally
+    needs the activity average to subtract from, and it is kept whenever it
+    has data — it is what makes a hot mile visible at a glance, which is not
+    something to make the reader do by hand.
+    """
+    splits = card.get("splits") or {}
+    rows = splits.get("rows") or []
+    unit = splits.get("unit", "Lap")
+    avg_hr = (card.get("activity") or {}).get("avg_hr")
+
+    has_pace = any(r.get("pace_min_per_mi") for r in rows)
+    has_hr = any(r.get("avg_hr") for r in rows)
+    has_elev = any(r.get("elevation_gain_meters") is not None for r in rows)
+    has_vs = has_hr and bool(avg_hr)
+
+    headers = [unit]
+    if has_pace:
+        headers.append("Pace")
+    if has_hr:
+        headers.append("Avg HR")
+    if has_vs:
+        headers.append("vs run")
+    if has_elev:
+        headers.append("Elev")
+
+    out = []
+    for r in rows:
+        # The label already carries the partial lap's distance, which is why
+        # there is no Distance column: for every full lap it would read
+        # "1.00 mi" beside a column literally headed "Mile".
+        cells = [f"{unit} {r['index']}" if not r.get("partial")
+                 else f"final {r['distance_mi']:.2f} mi"]
+        hr = r.get("avg_hr")
+        elev = r.get("elevation_gain_meters")
+        if has_pace:
+            cells.append(f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—")
+        if has_hr:
+            cells.append(f"{hr} bpm" if hr else "—")
+        if has_vs:
+            cells.append(f"{hr - avg_hr:+d}" if hr else "—")
+        if has_elev:
+            cells.append(f"{elev:.0f} m" if elev is not None else "—")
+        out.append(cells)
+    return headers, out
 
 
 def stimulus_heading(card: dict, *, markdown: bool = True) -> str:
@@ -1763,26 +2037,8 @@ def render_markdown(card: dict) -> str:
             "_No per-mile splits recorded for this activity. Splits are captured "
             "only by the daily sync path — backfilled activities have none._")
     else:
-        avg_hr = act.get("avg_hr")
-        split_rows = []
-        for r in card["splits"]["rows"]:
-            # The label already carries the partial lap's distance, which is
-            # why there is no Distance column: for every full lap it would
-            # read "1.00 mi" beside a column literally headed "Mile".
-            label = (f"{card['splits']['unit']} {r['index']}" if not r["partial"]
-                     else f"final {r['distance_mi']:.2f} mi")
-            hr = r.get("avg_hr")
-            elev = r.get("elevation_gain_meters")
-            split_rows.append([
-                label,
-                f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—",
-                f"{hr} bpm" if hr else "—",
-                f"{hr - avg_hr:+d}" if hr and avg_hr else "—",
-                f"{elev:.0f} m" if elev is not None else "—",
-            ])
-        lines.append(render.render_table(
-            [card["splits"]["unit"], "Pace", "Avg HR", "vs run", "Elev"],
-            split_rows))
+        headers, split_rows = split_table(card)
+        lines.append(render.render_table(headers, split_rows))
         drift = card["splits"]["hr_drift_pct"]
         if drift is not None:
             lines += ["", f"_HR drift back-half vs front-half: {drift:+.1f}%_"]
