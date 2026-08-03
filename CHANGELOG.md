@@ -25,9 +25,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   continuity.
 
   Measured across all 19 completed capped days in the active plan, the time
-  axis had produced **only A+ or F — never a letter in between** — and it ranked
-  the mildest breach in the window (1% of it in zones 4-5) as the single worst
-  session of the nine it failed.
+  axis used **2 of 5 bands** — only A and F, never a letter in between, 9 of 19
+  failing — and it ranked the mildest breach in the window (1% of it in zones
+  4-5) as the single worst session of the nine it failed. Widened to the
+  trailing 90 days (43 runs with HR-carrying splits, cap 140): **F 32 (74%), A
+  7, D 4, B and C empty**, with 7 runs failed despite an average at or under the
+  cap. The corrected axis grades that same population A 15 / B 3 / C 8 / D 4 /
+  F 13 — 5 of 5 bands — and fails **zero** runs whose average obeyed the cap.
+  The `hr_cap_deviation` docstring's claim that "20% over is a C" was an
+  unvalidated assertion introduced by the same commit as the axis; no run in the
+  window ever landed in that band. It is gone.
 
   The graded quantity is now `hr_exceedance_bpm`: the time-weighted mean bpm
   *above* the ceiling, put through the raw-excess-past-a-noise-floor treatment

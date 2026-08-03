@@ -51,6 +51,63 @@ active plan:
 
 Nine of nineteen days graded F. Six of those nine were wrong.
 
+## The primary evidence: the grade histogram
+
+A grading axis that emits two letters is not grading. This is the measurement
+0.40.0 never ran on the constant it introduced.
+
+**Trailing 90 days, every run with HR-carrying splits, graded against a 140 bpm
+cap** (43 runs, walks excluded by `is_running_effort`):
+
+| grade | old (0.40.0) | new (0.40.2) |
+|---|---|---|
+| A | 7 (16%) | 15 (35%) |
+| B | **0 (0%)** | 3 (7%) |
+| C | **0 (0%)** | 8 (19%) |
+| D | 4 (9%) | 4 (9%) |
+| F | **32 (74%)** | 13 (30%) |
+| **bands used** | **3 / 5** | **5 / 5** |
+
+Runs with a compliant average (≤ 140) that still scored F: **7 → 0.**
+
+Caveat on that population, which matters for reading the 30%: it applies a 140
+cap retroactively to 90 days of runs that mostly never had one prescribed —
+tempo days, intervals and long runs included. It measures the *formula's*
+sensitivity, not Nate's obedience.
+
+**The honest acceptance measure is the 19 days that carried a real prescribed
+cap on the active plan**, graded against their own targets:
+
+| grade | old | new |
+|---|---|---|
+| A | 10 (53%) | 12 (63%) |
+| B | 0 | 0 |
+| C | 0 | 3 (16%) |
+| D | 0 | 1 (5%) |
+| F | 9 (47%) | 3 (16%) |
+| **bands used** | **2 / 5** | **4 / 5** |
+
+Two bands. On the sessions the axis was actually written for, it was a coin
+flip between perfect and failure — the same degeneracy CLAUDE.md already
+records for the old 0.88 easy-HR ceiling ("a bound that appeared in 1 of 13
+runs"): a standing penalty wearing a rubric's clothes.
+
+(The corrected axis leaves B empty here only because 19 samples is thin and the
+B band is 1.4 bpm wide — 2.9 to 4.3. It populates on the 90-day set.)
+
+## The docstring was not evidence
+
+`hr_cap_deviation` claimed "~5% is noise, 20% over is a C, a third of the run
+over is an F". `git log -S` puts that sentence in **c2f0e58 — the same commit
+that introduced the axis**. It was an authorial assertion about a table the
+author had not checked the axis against, and against real data it is simply
+false: 20% over never produced a C because no run in the window landed between
+1.2% and 44% time-over. The 0.40.1 pass then cited that docstring as grounds to
+conclude the grade was correct and only its display was wrong.
+
+Deleted, not softened. Every numeric claim in the replacement names the
+population it was measured on.
+
 ## The fix
 
 `hr_exceedance_bpm` — the time-weighted mean bpm **above** the ceiling:
@@ -195,12 +252,51 @@ fixed one direction; this is the other.
 - `test_the_time_fraction_alone_cannot_tell_a_1_bpm_drift_from_a_20_bpm_blowup`
   — the discrimination test. Any future severity measure has to keep those two
   sessions an order of magnitude apart.
+- `test_the_cap_grade_actually_uses_its_bands` — the histogram, frozen as an
+  assertion over the 19 real capped days. Pins that the old axis used exactly
+  `{A, F}` and that the new one uses ≥ 4 bands and fails no run whose average
+  obeyed its ceiling. This is the test whose absence let the defect ship.
+- `test_the_grade_tracks_a_signal_it_does_not_read` — every failed session is
+  ≥ 42% in Garmin zones 4-5, every passed one ≤ 37%, and the populations are
+  separated rather than merely ordered. Fails on `dev` with
+  `assert 0.0 >= 0.42` — the old axis failed a run with *zero* time in zones 4-5.
 - `test_the_f_boundary_sits_where_the_run_stopped_being_aerobic` — the
   calibration guard. Moving either constant forces the zone-4+5 comparison to be
   re-run.
+- `test_obeying_straddling_and_blowing_the_cap_are_three_different_verdicts` —
+  the discrimination, asserted on the **overall letter**. Three runs, one
+  prescription: never touched the cap (A), straddled it by 1-3 bpm for 60% of
+  the run (A), genuinely blew it (B, HR C-). 0.40.0 graded the middle one
+  identically to the third.
+
+Every parametrized case that asserts a deviation float now also asserts the
+letter it becomes. That gap is how this survived 0.40.1: the old
+`test_hr_cap_deviation_takes_the_worse_of_average_and_time` checked that
+`(126, 140, 0.25)` produced `0.20` and never asked what grade `0.20` was.
 - Plus: no splits (degrades to the average), no cap (falls through to the
   rolling band), zero breach, sub-noise breach, marginal, severe, and a walked
   day refusing the cap along with the rest of the plan.
 
-`uv run pytest -x` — 2094 passed, 5 skipped. `report_card.py` at 98%, total
+`uv run pytest -x` — 2096 passed, 5 skipped. `report_card.py` at 98%, total
 95.23%. `ruff check` clean.
+
+## Checked while in here, not changed: `CONTINUITY_TOLERANCE`
+
+c2f0e58 introduced two constants without a distribution check —
+`HR_CAP_GRACE_FRACTION` (degenerate, fixed above) and `CONTINUITY_TOLERANCE`.
+Same test on the same 39 split-bearing runs:
+
+| grade | count |
+|---|---|
+| A | 30 (77%) |
+| B | 1 (3%) |
+| C | 3 (8%) |
+| D | 2 (5%) |
+| F | 3 (8%) |
+
+Bands used **5 / 5**. Ratio distribution: min 1.006, p50 1.083, p90 1.442, max
+3.563; 28 of 39 at or under the 1.15 tolerance.
+
+**It survives.** The mass at A is expected and correct — most runs *are*
+continuous, so a metric asking "did this contain a break?" should mostly say no,
+and the tail is populated rather than empty. No change made, none needed.

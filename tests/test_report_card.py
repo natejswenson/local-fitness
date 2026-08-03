@@ -9,6 +9,7 @@ without direction gating, every recovery run fails on pace.
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, timedelta
 
 import pytest
@@ -418,6 +419,97 @@ def test_hr_cap_severity_is_the_raw_excess_past_the_noise_floor(bpm_over, expect
     assert rc.hr_cap_severity(bpm_over) == expected
 
 
+#: Every completed day in the live plan that carried a prescribed cap, as
+#: (avg_hr, cap, time-above-cap fraction, time-weighted exceedance bpm, Garmin
+#: zone-4+5 share). Real measured numbers, frozen here so the calibration can be
+#: re-checked without the DB. The last two columns are what the two axes see;
+#: the zone share is what neither of them reads.
+LIVE_CAPPED_DAYS = [
+    (120, 140, 0.000, 0.00, 0.00),   # 2026-07-06
+    (152, 140, 0.755, 13.58, 0.43),  # 2026-07-07
+    (114, 140, 0.000, 0.00, 0.00),   # 2026-07-08
+    (103, 140, 0.000, 0.00, 0.00),   # 2026-07-09
+    (96, 140, 0.000, 0.00, 0.00),    # 2026-07-11
+    (149, 140, 0.703, 9.32, 0.14),   # 2026-07-12
+    (116, 140, 0.000, 0.00, 0.00),   # 2026-07-13
+    (142, 140, 0.734, 5.48, 0.37),   # 2026-07-15
+    (143, 140, 0.754, 4.55, 0.01),   # 2026-07-16
+    (106, 140, 0.012, 0.31, 0.03),   # 2026-07-18
+    (136, 140, 0.649, 1.37, 0.00),   # 2026-07-19
+    (112, 140, 0.000, 0.00, 0.00),   # 2026-07-20
+    (157, 140, 0.748, 19.51, 0.48),  # 2026-07-22
+    (94, 140, 0.000, 0.00, 0.00),    # 2026-07-26
+    (149, 140, 0.724, 11.91, 0.42),  # 2026-07-26
+    (144, 140, 0.592, 6.49, 0.16),   # 2026-07-27
+    (126, 140, 0.000, 0.00, 0.00),   # 2026-07-29
+    (113, 130, 0.000, 0.00, 0.00),   # 2026-07-30
+    (139, 140, 0.579, 1.15, 0.00),   # 2026-08-02
+]
+
+
+def test_the_cap_grade_actually_uses_its_bands():
+    """The acceptance measure 0.40.0 never ran, and the one that condemns its
+    axis outright.
+
+    A grading axis that emits two letters is not grading. Over the nineteen
+    completed capped days in the live plan the time-fraction axis produced
+    **only A and F** — 9 F's, 10 A's, nothing between — and seven of the runs it
+    failed had an average at or under the cap. That is the same degeneracy
+    CLAUDE.md records for the old 0.88 easy-HR ceiling ("a bound that appeared
+    in 1 of 13 runs"): a standing penalty wearing a rubric's clothes.
+
+    This asserts the corrected axis spreads over the bands AND never fails a run
+    whose average obeyed its ceiling."""
+    old, new = Counter(), Counter()
+    failed_despite_a_compliant_average = {"old": 0, "new": 0}
+    for avg, cap, frac, exc, _z45 in LIVE_CAPPED_DAYS:
+        # 0.40.0 verbatim: max(relative average, time fraction past the grace).
+        old_g = rc.base_letter(rc.grade_from_deviation(
+            max(max(0.0, (avg - cap) / cap), max(0.0, frac - 0.05))))
+        new_g = rc.base_letter(rc.grade_from_deviation(
+            rc.hr_cap_deviation(avg, float(cap), exc)))
+        old[old_g] += 1
+        new[new_g] += 1
+        if avg <= cap:
+            failed_despite_a_compliant_average["old"] += old_g == "F"
+            failed_despite_a_compliant_average["new"] += new_g == "F"
+
+    # The defect: two bands, and a run is either perfect or a failure.
+    assert set(old) == {"A", "F"}
+    assert old["F"] == 9
+
+    # The fix: at least four of the five bands carry real sessions.
+    assert len(new) >= 4, f"only {len(new)} bands used: {dict(new)}"
+    assert new["F"] == 3
+
+    # ...and no run whose average obeyed its own ceiling is failed any more.
+    assert failed_despite_a_compliant_average == {"old": 2, "new": 0}
+
+
+def test_the_grade_tracks_a_signal_it_does_not_read():
+    """Calibration evidence, not a restatement of the formula.
+
+    Garmin's zone-4+5 share is computed on-device from the per-sample trace, so
+    it is independent of both avg_hr and the splits. Every session the corrected
+    axis fails must be one that signal also calls hard, and vice versa — that
+    correspondence is what makes HR_CAP_BPM_SCALE calibration rather than taste.
+
+    The old axis fails this outright: it graded a run with 0% in zones 4-5 an F.
+    """
+    z45_of_failed, z45_of_passed = [], []
+    for avg, cap, _frac, exc, z45 in LIVE_CAPPED_DAYS:
+        if rc.base_letter(rc.grade_from_deviation(
+                rc.hr_cap_deviation(avg, float(cap), exc))) == "F":
+            z45_of_failed.append(z45)
+        else:
+            z45_of_passed.append(z45)
+    # Every failed session was >= 42% in zones 4-5; every passed one <= 37%.
+    assert min(z45_of_failed) >= 0.42
+    assert max(z45_of_passed) <= 0.37
+    # The two populations are separated, not merely ordered.
+    assert min(z45_of_failed) > max(z45_of_passed)
+
+
 @pytest.mark.parametrize(("bpm_over", "letter"), [
     (2.9, "A"), (3.0, "B"),      # the A edge: 1.5 + 0.05*28
     (11.3, "D"), (11.4, "F"),    # the F boundary: 1.5 + 0.35*28
@@ -434,22 +526,29 @@ def test_the_f_boundary_sits_where_the_run_stopped_being_aerobic(bpm_over, lette
     assert rc.base_letter(rc.grade_from_deviation(rc.hr_cap_severity(bpm_over))) == letter
 
 
-@pytest.mark.parametrize(("hr", "cap", "exceedance", "expected_d"), [
-    (126.0, 140.0, 0.0, 0.0),       # under the cap and never over it
-    (126.0, 140.0, 1.2, 0.0),       # drifted over, but inside the noise floor
-    (126.0, 140.0, 8.0, pytest.approx(6.5 / 28)),   # average fine, middle blew it
-    (144.0, 140.0, None, pytest.approx(2.5 / 28)),  # no splits: average axis only
-    (144.0, 140.0, 6.5, pytest.approx(5.0 / 28)),   # exceedance dominates
-    (152.0, 140.0, 1.0, pytest.approx(10.5 / 28)),  # ...and here the average does
-    (126.0, None, 8.0, None),       # no cap -> no deviation, caller falls back
-    (None, 140.0, 8.0, None),       # no HR reading -> ungradeable
+@pytest.mark.parametrize(("hr", "cap", "exceedance", "expected_d", "letter"), [
+    (126.0, 140.0, 0.0, 0.0, "A"),      # under the cap and never over it
+    (126.0, 140.0, 1.2, 0.0, "A"),      # drifted over, inside the noise floor
+    (126.0, 140.0, 8.0, pytest.approx(6.5 / 28), "D"),   # middle blew it
+    (144.0, 140.0, None, pytest.approx(2.5 / 28), "B"),  # no splits: average only
+    (144.0, 140.0, 6.5, pytest.approx(5.0 / 28), "C"),   # exceedance dominates
+    (152.0, 140.0, 1.0, pytest.approx(10.5 / 28), "F"),  # ...here the average does
+    (126.0, None, 8.0, None, None),     # no cap -> caller falls back
+    (None, 140.0, 8.0, None, None),     # no HR reading -> ungradeable
 ])
 def test_hr_cap_deviation_takes_the_worse_of_two_commensurable_axes(
-        hr, cap, exceedance, expected_d):
+        hr, cap, exceedance, expected_d, letter):
     """0.40.0 took max() over a relative magnitude and a time fraction — two
     different units, so the comparison had no meaning and the fraction won
-    almost every time. Both axes are bpm-over-cap now."""
+    almost every time. Both axes are bpm-over-cap now.
+
+    Every case pins the resulting LETTER as well as the float. Asserting the
+    arithmetic alone is how the defect survived 0.40.1: the old version of this
+    test checked that (126, 140, 0.25) produced 0.20 and never asked what grade
+    0.20 became, so it passed while the axis emitted only A+ and F."""
     assert rc.hr_cap_deviation(hr, cap, exceedance) == expected_d
+    assert rc.base_letter(
+        rc.grade_from_deviation(rc.hr_cap_deviation(hr, cap, exceedance))) == letter
 
 
 def test_a_prescribed_cap_beats_the_rolling_band():
@@ -478,10 +577,18 @@ def test_a_prescribed_cap_beats_the_rolling_band():
     assert hr["grade"] == "C+"
 
 
-def test_obeying_the_cap_outranks_blowing_it():
-    """The ordering assertion, and the whole point of the 0.40.0 change. Before
-    it, the obedient run scored C (load F-capped) and the disobedient one scored
-    A — the rubric was inverted, not merely blunt."""
+def test_obeying_straddling_and_blowing_the_cap_are_three_different_verdicts():
+    """The discrimination the axis exists to provide, asserted on the OVERALL
+    letter — the verdict a reader actually acts on, not a deviation float.
+
+    Three runs against one prescription, and the middle one is the case that
+    matters. `obeyed` never touches the cap, which is the easy fixture and
+    proves nothing on its own. `straddled` is the real shape of the 2026-08-02
+    failure: the average obeys, but most of the run sits one to three bpm over —
+    0.40.0 graded that identically to `blew_it`, because it counted a split as
+    wholly above the cap for a single beat.
+
+    A correct rubric has to separate all three, in this order."""
     plan = {"type": "easy", "target_distance_m": 8047,
             "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1}
     obeyed = card_for(
@@ -492,6 +599,14 @@ def test_obeying_the_cap_outranks_blowing_it():
                  "duration_seconds": 594, "avg_hr": hr}
                 for i, hr in enumerate((117, 125, 127, 126, 134))],
     )
+    straddled = card_for(
+        {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 2971,
+         "avg_pace_sec_per_km": 374, "avg_hr": 139, "training_load": 52},
+        plan=plan,
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 594, "avg_hr": hr}
+                for i, hr in enumerate((134, 141, 135, 143, 142))],
+    )
     blew_it = card_for(
         {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 3011,
          "avg_pace_sec_per_km": 374, "avg_hr": 144, "training_load": 82},
@@ -500,20 +615,34 @@ def test_obeying_the_cap_outranks_blowing_it():
                  "duration_seconds": 602, "avg_hr": hr}
                 for i, hr in enumerate((128, 139, 150, 144, 159))],
     )
-    assert obeyed["metrics"]["hr"]["grade"] == "A+"
+
+    # Verdict level first — this is the assertion that would have caught the bug.
     assert obeyed["overall"]["grade"] == "A"
+    assert straddled["overall"]["grade"] == "A"
+    assert blew_it["overall"]["grade"] == "B"
     assert obeyed["overall"].get("capped_by") is None
-    # 6.6 bpm over the cap across the session. A real penalty — three full
-    # letters below the obedient run's HR grade, and it drags the overall off
-    # an A — but not the F that 0.40.0 handed every session with any breach.
+    assert straddled["overall"].get("capped_by") is None
+    assert blew_it["overall"].get("capped_by") is None
+
+    # Straddling by a beat is over the cap for 60% of the run — the exact
+    # quantity 0.40.0 graded — and is still compliant, because 1.2 bpm is not
+    # a breach of a 140 ceiling.
+    assert straddled["metrics"]["hr"]["time_above_cap_pct"] == 60
+    assert straddled["metrics"]["hr"]["exceedance_bpm"] == pytest.approx(1.2, abs=0.05)
+    assert straddled["metrics"]["hr"]["grade"] == "A+"
+
+    # ...while the genuine breach is 5x further over and is penalised for it:
+    # three full letters below, and it drags the overall off an A. Not the F
+    # that 0.40.0 handed every session with any breach at all.
     assert blew_it["metrics"]["hr"]["exceedance_bpm"] == pytest.approx(6.6, abs=0.05)
     assert blew_it["metrics"]["hr"]["grade"] == "C-"
-    assert blew_it["overall"]["grade"] == "B"
+
     assert (rc.GRADE_POINTS[obeyed["overall"]["grade"]]
             > rc.GRADE_POINTS[blew_it["overall"]["grade"]])
-    # ...and the load numbers run the OTHER way (25 vs 82), which is exactly the
-    # inversion that used to decide the letters.
-    assert obeyed["stimulus"]["load"] < blew_it["stimulus"]["load"]
+    # ...and the load numbers run the OTHER way (25 / 52 / 82), which is exactly
+    # the inversion that used to decide the letters.
+    assert (obeyed["stimulus"]["load"] < straddled["stimulus"]["load"]
+            < blew_it["stimulus"]["load"])
 
 
 @pytest.mark.parametrize(("hr", "cap", "exceedance", "expected_axis"), [
