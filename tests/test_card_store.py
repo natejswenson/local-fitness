@@ -445,8 +445,12 @@ def test_migration_does_not_disturb_the_snapshot(cdb, clock):
         assert after[column] == before[column], column
     # Inside card_json, only coach_read moves.
     b, a = json.loads(before["card_json"]), json.loads(after["card_json"])
-    assert b.pop("coach_read") == LEGACY_READ
-    assert a.pop("coach_read") == READ
+    # Pop OUTSIDE the assert: the `assert a == b` below is only meaningful
+    # because coach_read has been removed from both, so that removal must not
+    # live in an expression `python -O` would strip.
+    before_read, after_read = b.pop("coach_read"), a.pop("coach_read")
+    assert before_read == LEGACY_READ
+    assert after_read == READ
     assert a == b
     # The stripped keys stay stripped — a decode-and-rewrite that re-defaulted
     # them would silently fatten every stored row.
