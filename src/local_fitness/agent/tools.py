@@ -2580,16 +2580,82 @@ _UPDATE_WORKOUT_SCHEMA = {
         "hr_max": {
             "type": "number",
             "description": "prescribed heart-rate CEILING in bpm (e.g. 140 for "
-                           "'keep HR under 140'). The report card grades average "
-                           "HR and time-above-cap against this number, so state "
-                           "it here rather than only in the description — prose "
-                           "in the description is not readable by the grader.",
+                           "'keep HR under 140'). The report card grades the "
+                           "run's average HR and how far above this ceiling it "
+                           "ran (in bpm) against this number, so state it here "
+                           "rather than only in the description — prose in the "
+                           "description is not readable by the grader.",
         },
         "description": {"type": "string", "description": "prose prescription for the day"},
         "seq": {"type": "integer", "description": "intra-day session on a double day: 1 = first/AM (default), 2 = second/PM"},
     },
     "required": ["date"],
 }
+
+
+def _prescription_fields(args: dict) -> tuple[dict | None, str | None]:
+    """Build the DB-column fields dict for one day's prescription.
+
+    Returns ``(fields, None)`` or ``(None, error_message)``. Shared by
+    ``update_plan_workout`` and ``update_plan_workouts`` so the two cannot
+    drift — every unit conversion and every sanity bound is defined once. The
+    rest-day clear is deliberately NOT here: it lives at the write boundary in
+    ``plans.apply_rest_semantics`` so it protects any caller, not just these
+    two.
+    """
+    fields: dict = {}
+    wtype = args.get("type")
+    if wtype is not None:
+        if wtype not in plans.WORKOUT_TYPES:
+            return None, f"unknown type '{wtype}' (allowed: {sorted(plans.WORKOUT_TYPES)})"
+        fields["type"] = wtype
+    if args.get("distance_mi") is not None:
+        fields["target_distance_m"] = units.from_miles(float(args["distance_mi"]))
+    if args.get("pace_min_per_mi") is not None:
+        # "M:SS" string (preferred, round-trips the app's own display format)
+        # or decimal minutes. The parse exists because a model copying the
+        # display string "9:39" as the float 9.39 silently prescribed
+        # 9:23/mi — a 16 s/mi error invisible in the echo.
+        sec_per_mi = units.parse_pace_min_per_mi(args["pace_min_per_mi"])
+        if sec_per_mi is None:
+            return None, ('pace_min_per_mi must be "M:SS" (e.g. "9:39") or decimal '
+                          "minutes (9.65 = 9:39/mi)")
+        # Sanity bound: 3:00–30:00/mi. Catches transposed args and
+        # unit-confused numbers before they land on the active plan.
+        if not (180.0 <= sec_per_mi <= 1800.0):
+            return None, (
+                f"pace_min_per_mi of {units.format_pace_min_per_mi(units.pace_sec_per_mi_to_sec_per_km(sec_per_mi))}/mi "
+                "is outside the plausible 3:00–30:00/mi range")
+        fields["target_pace_sec_per_km"] = units.pace_sec_per_mi_to_sec_per_km(sec_per_mi)
+    if args.get("duration_min") is not None:
+        fields["target_duration_sec"] = round(float(args["duration_min"]) * 60)
+    if args.get("hr_max") is not None:
+        hr_max = float(args["hr_max"])
+        # Sanity bound: a prescribed ceiling outside 90-210 bpm is a transposed
+        # or unit-confused argument, not a coaching decision. Same discipline as
+        # the pace bound above, and it matters more here because the report card
+        # grades against this number directly.
+        if not (90.0 <= hr_max <= 210.0):
+            return None, (f"hr_max of {hr_max:.0f} bpm is outside the plausible "
+                          "90-210 bpm range")
+        fields["target_hr_max"] = hr_max
+    if args.get("description") is not None:
+        fields["description"] = args["description"]
+    if not fields:
+        return None, ("nothing to update — pass type / distance_mi / "
+                      "pace_min_per_mi / duration_min / hr_max / description")
+    return fields, None
+
+
+def _validate_seq(seq) -> tuple[int | None, str | None]:
+    """``seq`` defaults to 1 (the first/AM session) and must be a positive int.
+    ``bool`` is excluded explicitly — it is an ``int`` subclass, so ``True``
+    would otherwise pass as seq 1."""
+    if seq is None:
+        return 1, None
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        return None, "seq must be a positive integer (1 = first/AM session)"
+    return seq, None
 
 
 @tool(
@@ -2610,66 +2676,13 @@ async def update_plan_workout(args: dict) -> dict:
     if msg := _validate_date(date_str):
         return _err(msg)
 
-    fields: dict = {}
-    wtype = args.get("type")
-    if wtype is not None:
-        if wtype not in plans.WORKOUT_TYPES:
-            return _err(f"unknown type '{wtype}'", allowed=sorted(plans.WORKOUT_TYPES))
-        fields["type"] = wtype
-    if args.get("distance_mi") is not None:
-        fields["target_distance_m"] = units.from_miles(float(args["distance_mi"]))
-    if args.get("pace_min_per_mi") is not None:
-        # "M:SS" string (preferred, round-trips the app's own display format)
-        # or decimal minutes. The parse exists because a model copying the
-        # display string "9:39" as the float 9.39 silently prescribed
-        # 9:23/mi — a 16 s/mi error invisible in the echo.
-        sec_per_mi = units.parse_pace_min_per_mi(args["pace_min_per_mi"])
-        if sec_per_mi is None:
-            return _err(
-                'pace_min_per_mi must be "M:SS" (e.g. "9:39") or decimal '
-                "minutes (9.65 = 9:39/mi)")
-        # Sanity bound: 3:00–30:00/mi. Catches transposed args and
-        # unit-confused numbers before they land on the active plan.
-        if not (180.0 <= sec_per_mi <= 1800.0):
-            return _err(
-                f"pace_min_per_mi of {units.format_pace_min_per_mi(units.pace_sec_per_mi_to_sec_per_km(sec_per_mi))}/mi "
-                "is outside the plausible 3:00–30:00/mi range")
-        fields["target_pace_sec_per_km"] = units.pace_sec_per_mi_to_sec_per_km(sec_per_mi)
-    if args.get("duration_min") is not None:
-        fields["target_duration_sec"] = round(float(args["duration_min"]) * 60)
-    if args.get("hr_max") is not None:
-        hr_max = float(args["hr_max"])
-        # Sanity bound: a prescribed ceiling outside 90-210 bpm is a transposed
-        # or unit-confused argument, not a coaching decision. Same discipline as
-        # the pace bound above, and it matters more here because the report card
-        # grades against this number directly.
-        if not (90.0 <= hr_max <= 210.0):
-            return _err(f"hr_max of {hr_max:.0f} bpm is outside the plausible "
-                        "90-210 bpm range")
-        fields["target_hr_max"] = hr_max
-    if args.get("description") is not None:
-        fields["description"] = args["description"]
-    # A rest day carries no distance/pace/duration — clear them so a stale
-    # prescription can't linger when a session becomes a rest. The description
-    # column is NOT NULL and surfaces in every plan payload + the PDF, so a
-    # rest-flip without a new description must not leave the old hard-run
-    # prose attached to a rest day (round-2 facet review, plan-tools MED-2).
-    if fields.get("type") == "rest":
-        fields["target_distance_m"] = None
-        fields["target_pace_sec_per_km"] = None
-        fields["target_duration_sec"] = None
-        fields["target_hr_max"] = None
-        if args.get("description") is None:
-            fields["description"] = "Rest day"
-    if not fields:
-        return _err("nothing to update — pass type / distance_mi / "
-                    "pace_min_per_mi / duration_min / hr_max / description")
+    fields, err = _prescription_fields(args)
+    if err is not None:
+        return _err(err)
 
-    seq = args.get("seq")
-    if seq is None:
-        seq = 1
-    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
-        return _err("seq must be a positive integer (1 = first/AM session)")
+    seq, err = _validate_seq(args.get("seq"))
+    if err is not None:
+        return _err(err)
 
     try:
         row = plans.update_active_workout(date_str, fields, seq=seq)
@@ -2693,6 +2706,90 @@ async def update_plan_workout(args: dict) -> dict:
         "target_hr_max": row["target_hr_max"],
         "description": row["description"],
     }))
+
+
+def _echo_workout(row: dict) -> dict:
+    """The written prescription, in the shape the single-day tool echoes."""
+    return _augment_workout({
+        "date": row["date"], "type": row["type"], "seq": row["seq"],
+        "distance_meters": row["target_distance_m"],
+        "avg_pace_sec_per_km": row["target_pace_sec_per_km"],
+        "duration_seconds": row["target_duration_sec"],
+        "target_hr_max": row["target_hr_max"],
+        "description": row["description"],
+    })
+
+
+# Item properties are LIFTED from the single-day schema rather than restated,
+# so a new prescription field or a reworded unit note can never describe one
+# tool and not the other.
+_UPDATE_WORKOUTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "updates": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": plans.MAX_BATCH_UPDATES,
+            "description": (
+                "One entry per day to re-prescribe. Each needs `date` plus the "
+                "fields that change. Applied atomically: if any entry is "
+                "invalid or names a day not on the plan, NOTHING is written."
+            ),
+            "items": {
+                "type": "object",
+                "properties": dict(_UPDATE_WORKOUT_SCHEMA["properties"]),
+                "required": ["date"],
+            },
+        },
+    },
+    "required": ["updates"],
+}
+
+
+@tool(
+    "update_plan_workouts",
+    "Re-prescribe MANY days on the ACTIVE training plan in ONE atomic call — "
+    "the batch form of update_plan_workout, and the right tool for reshaping a "
+    "week or a training block. Each entry takes the same fields as the "
+    "single-day tool. ALL-OR-NOTHING: every entry is validated and every date "
+    "checked to exist before anything is written, so a bad entry leaves the "
+    "plan untouched rather than half-rewritten. Like the single-day tool it "
+    "re-prescribes EXISTING days only — it cannot add, move or delete a day, "
+    "so a swap is two entries (rest the old day, prescribe the new one) and "
+    "the new day must already be on the plan. For a whole new structure use "
+    f"propose_training_plan instead. Max {plans.MAX_BATCH_UPDATES} entries.",
+    _UPDATE_WORKOUTS_SCHEMA,
+)
+async def update_plan_workouts(args: dict) -> dict:
+    raw = args.get("updates")
+    if not isinstance(raw, list) or not raw:
+        return _err("updates must be a non-empty array of {date, ...} objects")
+
+    prepared: list[tuple[str, int, dict]] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            return _err(f"update {i}: each entry must be an object")
+        date_str = entry.get("date")
+        if msg := _validate_date(date_str):
+            return _err(f"update {i}: {msg}")
+        fields, err = _prescription_fields(entry)
+        if err is not None:
+            return _err(f"update {i} ({date_str}): {err}")
+        seq, err = _validate_seq(entry.get("seq"))
+        if err is not None:
+            return _err(f"update {i} ({date_str}): {err}")
+        prepared.append((date_str, seq, fields))
+
+    try:
+        rows = plans.update_active_workouts(prepared)
+    except plans.NoActivePlanError:
+        return _err("no active training plan")
+    except ValueError as e:
+        return _err(str(e))
+
+    # Echo every written row, so a 20-day restructure can be confirmed from
+    # this one result without a follow-up read.
+    return _text({"updated": len(rows), "workouts": [_echo_workout(r) for r in rows]})
 
 
 @tool(
@@ -4186,6 +4283,7 @@ ALL_TOOLS = [
     propose_training_plan,
     revise_training_plan,
     update_plan_workout,
+    update_plan_workouts,
     commit_training_plan,
     discard_training_plan_draft,
     abandon_active_plan,

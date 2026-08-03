@@ -286,6 +286,23 @@ today", "how's my training load", "what did I run last week"):
   is enforced in `plans.py` (`update_active_workout` whitelists prescription
   columns only — it can't re-key/re-status/restructure). Don't hand-write
   `UPDATE` SQL — the tool exists.
+- **Reshaping more than one day is `update_plan_workouts`, ONE atomic call**
+  (0.46.0) — never a loop of `update_plan_workout`. Same fields, same
+  whitelist, same keyed `UPDATE` (`date` is the key, not an editable column),
+  so a batch is many re-prescriptions and never a restructure; capped at
+  `plans.MAX_BATCH_UPDATES` (60) as a blast-radius bound. All-or-nothing:
+  entries are validated, deduped on `(date, seq)`, and every target checked to
+  exist BEFORE the first write, then applied in one transaction. **The
+  atomicity is the point, not the speed** — 20 sequential calls cost ~75 ms of
+  our time (~3.8 ms each) and the LLM turns dominate by three orders of
+  magnitude; what they also cost was 20 independent transactions, so the
+  two-call "move the long run" idiom could rest the old day, fail on the new
+  one, and delete the run with nothing to roll back. The two-call swap now goes
+  in one batch. **The rest-day clear lives at the write boundary**
+  (`plans.apply_rest_semantics`), not in the tool — it was tool-side while
+  `update_plan_workout` was the only caller, which is exactly the shape of bug
+  a second write path exposes: a caller that skipped it would leave a stale
+  `target_hr_max` on a rest day, and the report card grades that column.
 - **A pending draft is a loose end, and `get_training_plan_status` now names
   it** (0.44.0, `pending_draft`). A draft governs nothing until
   `commit_training_plan` runs, and `plans.insert_draft` **archives any existing
