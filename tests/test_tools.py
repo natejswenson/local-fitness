@@ -188,13 +188,18 @@ def test_get_metric_trend(seeded):
 
 
 def test_get_metric_trend_unknown(seeded):
-    _payload, err = call(tools.get_metric_trend, {"metric": "nope", "days": 14})
+    payload, err = call(tools.get_metric_trend, {"metric": "nope", "days": 14})
     assert err
+    assert "unknown metric 'nope'" in payload["error"]
 
 
 def test_get_metric_trend_no_data(seeded):
-    _payload, err = call(tools.get_metric_trend, {"metric": "vo2_max", "days": 14})
-    assert err  # vo2_max never seeded → no rows in window
+    payload, err = call(tools.get_metric_trend, {"metric": "vo2_max", "days": 14})
+    assert err
+    # vo2_max is a REAL metric with no rows in the window — the message must
+    # say "no data", not "unknown metric", or the two failures are the same
+    # to a caller trying to work out what went wrong.
+    assert payload["error"] == "no data in window"
 
 
 # --------------------------------------------------------------------------- #
@@ -388,7 +393,8 @@ def test_chart_unknown_style(seeded):
 
 def test_chart_no_data(seeded):
     payload, err = call(tools.chart, {"metric": "vo2_max", "days": 14})
-    assert err  # vo2_max never seeded → no rows in window
+    assert err
+    assert payload["error"] == "no data in window"   # not "unknown metric"
 
 
 def test_chart_value_fmt_vo2_max_keeps_a_decimal():
@@ -443,8 +449,9 @@ def test_get_workout_detail_found(seeded):
 
 
 def test_get_workout_detail_missing(seeded):
-    _payload, err = call(tools.get_workout_detail, {"activity_id": 999})
+    payload, err = call(tools.get_workout_detail, {"activity_id": 999})
     assert err
+    assert payload["error"] == "activity not found"
 
 
 # --------------------------------------------------------------------------- #
@@ -558,12 +565,13 @@ def test_compare_periods_training_load(seeded):
 
 
 def test_compare_periods_unknown(seeded):
-    _payload, err = call(
+    payload, err = call(
         tools.compare_periods,
         {"metric": "xyz", "period_a_start": "2026-01-01", "period_a_end": "2026-01-02",
          "period_b_start": "2026-01-03", "period_b_end": "2026-01-04"},
     )
     assert err
+    assert "unknown metric 'xyz'" in payload["error"]
 
 
 def test_find_anomalies(seeded):
@@ -574,8 +582,11 @@ def test_find_anomalies(seeded):
 
 
 def test_find_anomalies_unsupported_metric(seeded):
-    _payload, err = call(tools.find_anomalies, {"metric": "steps"})
+    payload, err = call(tools.find_anomalies, {"metric": "steps"})
     assert err
+    # steps is a REAL metric that simply isn't baseline-tracked — the message
+    # must say that, not "unknown metric".
+    assert "only baseline-tracked metrics supported" in payload["error"]
 
 
 def test_training_load_status(seeded):
@@ -588,8 +599,12 @@ def test_training_load_status_empty(tmp_path, monkeypatch):
     p = tmp_path / "fitness.db"
     monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
     db.init_schema(p)
-    _payload, err = call(tools.training_load_status, {})
+    payload, err = call(tools.training_load_status, {})
     assert err
+    # An EMPTY db, not a broken one — the message has to send the user to the
+    # fix (sync) rather than read as a generic failure.
+    assert "no training-load data yet" in payload["error"]
+    assert "sync_garmin_data" in payload["error"]
 
 
 # --------------------------------------------------------------------------- #
@@ -695,13 +710,15 @@ def test_correlate_with_lag(seeded):
 
 
 def test_correlate_bad_metric(seeded):
-    _payload, err = call(tools.correlate, {"metric_a": "foo", "metric_b": "rhr", "days": 30})
+    payload, err = call(tools.correlate, {"metric_a": "foo", "metric_b": "rhr", "days": 30})
     assert err
+    assert "metrics must be daily numeric" in payload["error"]
 
 
 def test_correlate_insufficient(seeded):
-    _payload, err = call(tools.correlate, {"metric_a": "sleep_seconds", "metric_b": "rhr", "days": 2})
-    assert err  # < 5 paired points
+    payload, err = call(tools.correlate, {"metric_a": "sleep_seconds", "metric_b": "rhr", "days": 2})
+    assert err
+    assert "insufficient paired data" in payload["error"]  # NOT 'metrics must be daily numeric' — both metrics are valid
 
 
 def test_recovery_pattern(seeded):
@@ -1291,8 +1308,9 @@ def test_save_and_list_user_notes(seeded):
 
 
 def test_save_user_note_empty(seeded):
-    _payload, err = call(tools.save_user_note, {"note": "   "})
+    payload, err = call(tools.save_user_note, {"note": "   "})
     assert err
+    assert "note text is required" in payload["error"]
 
 
 def test_update_user_note(seeded):
@@ -1303,12 +1321,18 @@ def test_update_user_note(seeded):
 
 
 def test_update_user_note_bad_line(seeded):
-    _payload, err = call(tools.update_user_note, {"line": None, "note": "x"})
+    """Three DIFFERENT rejections. Asserting only `assert err` three times
+    could not tell them apart — nor tell any of them from an
+    update_user_note that refused everything."""
+    payload, err = call(tools.update_user_note, {"line": None, "note": "x"})
     assert err
-    _payload, err = call(tools.update_user_note, {"line": 0, "note": ""})
+    assert "line index is required" in payload["error"]
+    payload, err = call(tools.update_user_note, {"line": 0, "note": ""})
     assert err
-    _payload, err = call(tools.update_user_note, {"line": 99, "note": "x"})
-    assert err  # no note at that line
+    assert "new note text is required" in payload["error"]   # the TEXT, not the line
+    payload, err = call(tools.update_user_note, {"line": 99, "note": "x"})
+    assert err
+    assert "no note at line 99" in payload["error"]           # the LINE, not the text
 
 
 def test_delete_user_note(seeded):
@@ -1318,10 +1342,12 @@ def test_delete_user_note(seeded):
 
 
 def test_delete_user_note_bad_line(seeded):
-    _payload, err = call(tools.delete_user_note, {"line": None})
+    payload, err = call(tools.delete_user_note, {"line": None})
     assert err
-    _payload, err = call(tools.delete_user_note, {"line": 42})
+    assert "line index is required" in payload["error"]      # missing argument
+    payload, err = call(tools.delete_user_note, {"line": 42})
     assert err
+    assert "no note at line 42" in payload["error"]          # argument fine, row absent
 
 
 def test_server_and_tool_names():
@@ -1603,14 +1629,22 @@ def test_delete_manual_workout_recompute_failure_reports_deleted(seeded, monkeyp
 
 
 def test_delete_manual_workout_guardrails(seeded):
-    # Refuses non-negative ids (Garmin data protection).
-    _payload, err = call(tools.delete_manual_workout, {"activity_id": 1})
+    """The guardrail rejection and the not-found rejection are different
+    things, and this test could not distinguish them until 0.47.0 — so a
+    delete_manual_workout that had DROPPED the Garmin-data protection and
+    merely returned "not found" for everything would have passed.
+
+    Manual workouts carry negative ids; anything >= 0 came from Garmin and
+    must never be deletable through this tool."""
+    for garmin_id in (1, 0):
+        payload, err = call(tools.delete_manual_workout, {"activity_id": garmin_id})
+        assert err
+        assert "refusing to delete non-manual activity" in payload["error"], (
+            f"id {garmin_id} was not refused BY THE GUARDRAIL: {payload['error']}")
+    # A negative id clears the guardrail and fails for the other reason.
+    payload, err = call(tools.delete_manual_workout, {"activity_id": -99})
     assert err
-    _payload, err = call(tools.delete_manual_workout, {"activity_id": 0})
-    assert err
-    # Absent negative id → _err.
-    _payload, err = call(tools.delete_manual_workout, {"activity_id": -99})
-    assert err
+    assert payload["error"] == "no manual workout at id -99"
 
 
 def test_delete_manual_workout_detaches_observation(seeded):
@@ -4263,9 +4297,16 @@ def test_update_coach_personality_reset_returns_to_stock(seeded):
 
 
 def test_update_coach_personality_spec_size_cap(seeded):
+    payload, err = call(tools.update_coach_personality,
+                        {"identity": "x" * 4001})
+    assert err
+    # Names the cap and the overage — a bare `assert err` would pass on a
+    # tool that rejected every personality edit.
+    assert "identity too long (4001 chars, max 4000)" in payload["error"]
+    # One under the cap still writes, so the boundary is real, not a blanket no.
     _payload, err = call(tools.update_coach_personality,
-                         {"identity": "x" * 4001})
-    assert err  # identity over its own cap is rejected before storage
+                         {"identity": "y" * 4000})
+    assert not err
 
 
 # --- report-card persistence: fast path + query tools ------------------------
