@@ -1821,7 +1821,11 @@ def metric_table(card: dict) -> tuple[list[str], list[list[str]]]:
     """
     rows = []
     for key, label in _METRIC_LABELS:
-        m = card["metrics"][key]
+        # `.get`, not `[key]`: a card STORED before a metric existed has no
+        # entry for it (`continuity` landed in 0.40.0), and `get_report_card`
+        # hands those rows straight back. A missing metric renders as n/a
+        # rather than raising KeyError halfway through a render.
+        m = card["metrics"].get(key) or {}
         rows.append([
             label,
             actual_text(key, m),
@@ -1835,9 +1839,9 @@ def metric_table(card: dict) -> tuple[list[str], list[list[str]]]:
 def metric_notes(card: dict) -> list[tuple[str, str]]:
     """``(label, note)`` for every graded metric carrying a note, in table
     order. Both renderers built this list inline from ``_METRIC_LABELS``."""
-    return [(label, card["metrics"][key]["note"])
+    return [(label, (card["metrics"].get(key) or {})["note"])
             for key, label in _METRIC_LABELS
-            if card["metrics"][key].get("note")]
+            if (card["metrics"].get(key) or {}).get("note")]
 
 
 def split_table(card: dict) -> tuple[list[str], list[list[str]]]:

@@ -1173,6 +1173,28 @@ These are settled — don't redesign without a reason.
   consumes the theme for BOTH the WeasyPrint report CSS (`_build_css`)
   and the matplotlib chart styles — the ASCII `chart` tool keeps its
   emoji heat ramp (PRESS is the *print* brand).
+- **The density ladder remembers its winning rung, and that is a TRADE**
+  (0.49.0). `visuals._fit_with_hint` starts a render at `last_winner - 1`
+  instead of rung 0, persisting the hint in `data/density_ladder_hints.json`
+  (disposable by contract — missing/corrupt/out-of-range/unwritable all
+  degrade to rung 0, the old behaviour; `fit_one_page` stays I/O-free and the
+  caller owns the file). **Measured across all 15 live cards with their real
+  reads: winners `{0:1, 1:13, 2:1}`, 342 ms of 3551 ms = 9.6%, 23 ms/card.**
+  An earlier estimate said ~65% by counting all discarded-layout time — that
+  is NOT recoverable, because the one-rung headroom is what lets a document
+  that got shorter climb back, and 13 of 15 cards win at rung 1 where
+  `hint - 1 = 0` skips nothing. Don't "finish the optimisation" by dropping
+  the headroom: density would ratchet permanently dense on a page that has to
+  stay readable. The cost of the hint is that a render can land one rung
+  tighter than optimal until it converges, one rung per render.
+- **After a release that touches `report_card.py` or `workout_coach.py`, warm
+  the stored cards** — `uv run python scripts/warm_report_cards.py` (free
+  survey) then `--yes`. The read cache key covers the whole prompt, so a rubric
+  or read-prompt change invalidates every stored card at once and the 14.5 s
+  miss lands on the next person to open one. Measured 2026-08-03: 15 of 15
+  stale after 0.41-0.45. The survey drives the REAL handler with the SDK call
+  and the write stubbed, so it re-derives no key of its own and cannot drift;
+  `--max-calls` refuses rather than warns.
 - **Both PDFs fit one page, and the fitting is measured, not tuned**
   (0.27.0). `visuals.fit_one_page(build_html, presets)` is renderer-agnostic:
   it takes a callable, renders at each `DENSITY_PRESETS` rung (roomy →

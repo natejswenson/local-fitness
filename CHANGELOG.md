@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-08-03
+
+### Added
+- **`scripts/warm_report_cards.py`** — re-renders stored cards so their coach
+  reads are cached again. A stored card doubles as a per-activity read cache;
+  a MISS costs **14.5 s**, a HIT **0.003 s**. The key covers the whole prompt,
+  so any release touching the rubric or the read prompt legitimately
+  invalidates every card at once — measured 2026-08-03, **15 of 15** were stale
+  (the 0.41–0.43 rubric work plus 0.45.0's persona edit). This pays that cost
+  once, deliberately, off the request path.
+
+  **A survey is free and is the default.** It drives the real
+  `workout_report_card` handler with the SDK call and the row write stubbed
+  out, so it reports exactly which cards would regenerate without spending
+  anything or touching a row — and it cannot drift from the path it measures,
+  because it re-derives no cache key of its own. Nothing is spent without
+  `--yes`, and `--max-calls` REFUSES (exit 2) rather than warning.
+
+  Its own test suite pins the two safety properties — no SDK call escapes a
+  survey, no row is mutated — because a script that decides whether to spend
+  needs one, the same precedent `calibrate_report_card.py` set.
+
+### Changed
+- **The PDF density ladder remembers its winning rung.** Renders start one
+  rung roomier than last time instead of always at the top.
+
+  **Measured, and smaller than projected.** Across all 15 live cards with their
+  real coach reads: winners `{0:1, 1:13, 2:1}`, **342 ms saved of 3551 ms =
+  9.6%, 23 ms/card.** An earlier estimate of ~65% counted all time spent on
+  discarded layouts, which is *not* recoverable: the one-rung headroom is what
+  lets a document that got shorter climb back to a roomier layout, and 13 of 15
+  cards win at rung 1, where `hint − 1 = 0` skips nothing. Dropping the
+  headroom would buy the rest and let density ratchet permanently dense — not
+  a trade worth making for a card that has to stay readable.
+
+  The hint lives in `data/density_ladder_hints.json` (gitignored, beside the
+  coach caches) and is disposable by contract: missing, corrupt, out-of-range
+  or unwritable all degrade to "start at rung 0", i.e. exactly the pre-0.48.0
+  behaviour. `fit_one_page` stays I/O-free — the caller reads and writes the
+  hint.
+
+### Fixed
+- `report_card.metric_table()` / `metric_notes()` index `card["metrics"]` with
+  `.get`, not `[key]`. A card stored before a metric existed has no entry for
+  it (`continuity` landed in 0.40.0) and `get_report_card` hands those rows
+  straight back; the pre-extraction inline code had the same latent
+  `KeyError`. Found by rendering real stored cards while measuring the ladder.
+
 ## [0.48.0] - 2026-08-03
 
 ### Removed

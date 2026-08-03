@@ -1044,3 +1044,99 @@ def test_fit_one_page_decodes_each_asset_once_across_rungs(monkeypatch):
     _pdf, pages, index = visuals.fit_one_page(build)
     assert index == 2  # the ladder genuinely walked all three rungs
     assert len(fetches) == 1  # ...but the image was fetched/decoded ONCE
+
+
+# --- density-ladder hint (0.48.0) -------------------------------------------
+# Remembering the winning rung skips layout passes a previous render already
+# proved too roomy. MEASURED across all 15 live cards with their real coach
+# reads: winners {0:1, 1:13, 2:1}, 342 ms saved of 3551 ms = 9.6% (23 ms/card).
+# NOT the ~65% a first estimate suggested — that figure was "time spent on
+# discarded layouts", which is only recoverable by dropping the one-rung
+# headroom, and without headroom a document that got shorter could never climb
+# back to a roomier layout.
+
+
+def test_ladder_hint_defaults_to_zero_when_absent(tmp_path, monkeypatch):
+    from local_fitness import db
+
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "fitness.db")
+    assert visuals.read_ladder_hint("card") == 0
+
+
+def test_ladder_hint_round_trips_per_kind(tmp_path, monkeypatch):
+    from local_fitness import db
+
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "fitness.db")
+    visuals.write_ladder_hint("card", 2)
+    visuals.write_ladder_hint("brief", 1)
+    assert visuals.read_ladder_hint("card") == 2
+    assert visuals.read_ladder_hint("brief") == 1
+    # The two documents have different ladders and must not share a hint.
+    visuals.write_ladder_hint("card", 3)
+    assert visuals.read_ladder_hint("brief") == 1
+
+
+@pytest.mark.parametrize("corrupt", ["not json at all", "[]", '{"card": "two"}',
+                                     '{"card": -4}', '{"card": null}'])
+def test_a_corrupt_hint_degrades_to_zero(tmp_path, monkeypatch, corrupt):
+    """A disposable performance hint must never be able to break a render."""
+    from local_fitness import db
+
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "fitness.db")
+    (tmp_path / visuals._LADDER_HINT_FILE).write_text(corrupt, encoding="utf-8")
+    assert visuals.read_ladder_hint("card") == 0
+
+
+def test_write_hint_never_raises_on_an_unwritable_path(tmp_path, monkeypatch):
+    import pathlib
+
+    from local_fitness import db
+
+    monkeypatch.setattr(
+        db, "DEFAULT_DB_PATH", pathlib.Path("/proc/nonexistent/fitness.db"))
+    visuals.write_ladder_hint("card", 1)          # must not raise
+    assert visuals.read_ladder_hint("card") == 0
+
+
+def test_start_index_is_clamped_into_the_ladder():
+    """A stale hint pointing past the end must not skip the ladder entirely or
+    IndexError — it clamps to the last rung and still returns a real render."""
+    calls = []
+
+    def build(preset):
+        calls.append(preset["name"])
+        return "<html><body><p>tiny</p></body></html>"
+
+    _pdf, pages, index = visuals.fit_one_page(
+        build, visuals.DENSITY_PRESETS, start_index=99)
+    assert pages == 1
+    assert index == len(visuals.DENSITY_PRESETS) - 1
+    assert calls == [visuals.DENSITY_PRESETS[-1]["name"]]
+
+
+def test_start_index_skips_the_rungs_before_it():
+    """The actual mechanism: rungs below start_index are never laid out."""
+    calls = []
+
+    def build(preset):
+        calls.append(preset["name"])
+        return "<html><body><p>tiny</p></body></html>"
+
+    _pdf, _pages, index = visuals.fit_one_page(
+        build, visuals.DENSITY_PRESETS, start_index=1)
+    assert index == 1
+    assert calls == [visuals.DENSITY_PRESETS[1]["name"]]
+    assert visuals.DENSITY_PRESETS[0]["name"] not in calls
+
+
+def test_negative_start_index_is_treated_as_zero():
+    calls = []
+
+    def build(preset):
+        calls.append(preset["name"])
+        return "<html><body><p>tiny</p></body></html>"
+
+    _pdf, _pages, index = visuals.fit_one_page(
+        build, visuals.DENSITY_PRESETS, start_index=-3)
+    assert index == 0
+    assert calls == [visuals.DENSITY_PRESETS[0]["name"]]
