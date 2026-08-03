@@ -675,12 +675,85 @@ def test_pdf_and_markdown_stimulus_sections_cannot_diverge():
 
 def test_render_report_card_pdf_returns_page_count():
     """render_report_card_pdf mirrors render_brief_pdf's `(bytes, page_count)`
-    contract — a small card fits one page and says so."""
+    contract — a small card fits one page and says so.
+
+    This pair used to be the WHOLE page-count net for the card, and between
+    them they blessed the bug: this one only ever exercised a 2-split card with
+    no chart, and its sibling below asserts `pages > 1`. Nothing asserted that
+    an ordinary card fits — see test_report_card_is_always_exactly_one_page,
+    which is the real guarantee.
+    """
     pdf, pages = visuals.render_report_card_pdf(
         _report_card_with_splits(2), None)
     assert pages == 1
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         assert len(doc.pages) == 1
+
+
+@pytest.mark.parametrize("n_splits", [3, 5, 6, 8, 9, 11, 14])
+def test_report_card_is_always_exactly_one_page(n_splits):
+    """The report card's half of the one-page contract, and the regression net
+    for the bug that made it false.
+
+    `img.split-chart` was capped by WIDTH only, so `chart_h_pt` — the knob the
+    density ladder exists to turn — was never read by the report-card
+    stylesheet at all and no rung could buy vertical room. Measured on the live
+    DB at the time: 3 of 15 stored cards rendered 2 pages, with the HR chart
+    landing alone on page 2 under nine inches of white. `img.chart` had carried
+    the height cap since 2026-07-22 and the lesson was simply never applied
+    here.
+
+    Parametrized across the real range: 3 splits is a short recovery run, 14 is
+    a half marathon (activity 22890867603, which was 2 pages on dev for a
+    SECOND reason — row count, not chart height — and is why
+    CARD_DENSITY_PRESETS has a 4th rung the brief does not).
+
+    Renders the real chart because the chart is the thing that breaks the page;
+    a version of this test that passed `None` would pass against the bug.
+    """
+    card = _report_card_with_splits(n_splits)
+    split_chart = visuals.render_split_hr_png(card)
+    pdf, pages = visuals.render_report_card_pdf(card, split_chart)
+    assert pages == 1
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        assert len(doc.pages) == 1
+
+
+def test_split_chart_is_capped_by_height_not_only_width():
+    """The specific CSS property whose absence caused the two-page card.
+
+    A width-only cap lets the figure's own aspect ratio decide the page budget,
+    which is exactly what `img.chart` documents and what this rule did not do.
+    Asserting the declaration (rather than only the page count above) is what
+    makes a revert fail loudly instead of drifting back in behind a fixture
+    that happens to still fit.
+    """
+    from local_fitness.agent import branding
+
+    css = visuals._report_card_css(
+        branding.load_theme(), visuals.CARD_DENSITY_PRESETS[2])
+    rule = css.split("img.split-chart")[1].split("}")[0]
+    assert "max-height" in rule
+    assert "width: auto" in rule
+    # And it must be the ladder's knob, not a constant — otherwise the rungs
+    # below "roomy" buy nothing.
+    assert f"{visuals.CARD_DENSITY_PRESETS[2]['chart_h_pt']}pt" in rule
+
+
+def test_the_card_ladder_never_changes_the_brief_ladder():
+    """CARD_DENSITY_PRESETS is deliberately a separate tuple.
+
+    The brief reads `page_count > 1` to decide whether to DROP a takeaway, so a
+    roomier chart cap or an extra rung on its ladder silently changes which
+    takeaways get printed. Measured while writing 0.41.0: sharing one tuple
+    made a 4-takeaway brief stop reporting overflow.
+    """
+    assert len(visuals.DENSITY_PRESETS) == 3
+    assert len(visuals.CARD_DENSITY_PRESETS) == 4
+    assert visuals.CARD_DENSITY_PRESETS[:2] == visuals.DENSITY_PRESETS[:2]
+    # The brief's bottom rung keeps its own cap; the card's is tighter.
+    assert visuals.DENSITY_PRESETS[2]["chart_h_pt"] == 82.0
+    assert visuals.CARD_DENSITY_PRESETS[2]["chart_h_pt"] == 68.0
 
 
 def test_report_card_reports_overflow_rather_than_silently_spilling():

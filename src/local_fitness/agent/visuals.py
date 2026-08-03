@@ -78,6 +78,40 @@ DENSITY_PRESETS: tuple[dict, ...] = (
      "card_gap_em": 0.40, "hero_em": 3.6, "split_chart_pct": 68.0},
 )
 
+# The report card's ladder: the three shared rungs plus one the brief must NOT
+# have. A card's overflow has TWO drivers and capping the chart only fixes one
+# of them; the other is split-row count, which a brief never has. Measured with
+# real stored coach reads: at "dense" a 9-split card with a 969-char read still
+# laid out to 2 pages, and a 14-split half marathon (activity 22890867603) did
+# so at every chart height tested down to 46pt — it was 2 pages on dev too, so
+# this rung fixes a spill that predates the chart-cap bug and was never
+# diagnosed.
+#
+# A SEPARATE tuple, not DENSITY_PRESETS plus an entry, and both differences
+# from the brief's ladder are deliberate:
+#
+#  * `dense` caps the chart at 68pt rather than 82. Once `img.split-chart`
+#    started honoring the cap at all, 82 was measured to be on the wrong side
+#    of the cliff for an ordinary 5-mile card: bisecting activity 23825963527
+#    with its HR trace, 80pt still laid out to 2 pages and 78pt was the first
+#    value to fit. 68 sits a deliberate 10pt below that boundary.
+#  * the 4th rung exists at all.
+#
+# Neither may leak into the brief. The brief's exhaustion of its ladder is a
+# SIGNAL — `generate_brief_report` reads `page_count > 1` to decide whether to
+# drop a takeaway — so a roomier cap or an extra rung there silently changes
+# which takeaways get printed. Measured while writing this: sharing the tuple
+# made a 4-takeaway brief stop reporting overflow, which is a real behavior
+# change to a document this work was not asked to touch. The card has no
+# droppable content, so for it the ladder is the whole mechanism.
+CARD_DENSITY_PRESETS: tuple[dict, ...] = (
+    DENSITY_PRESETS[0],
+    DENSITY_PRESETS[1],
+    {**DENSITY_PRESETS[2], "chart_h_pt": 68.0},
+    {"name": "ultra",   "body_pt": 8.6,  "chart_h_pt": 52.0,
+     "card_gap_em": 0.28, "hero_em": 3.0, "split_chart_pct": 62.0},
+)
+
 
 def fit_one_page(
     build_html: Callable[[dict], str], presets: Sequence[dict] = DENSITY_PRESETS
@@ -965,8 +999,22 @@ ul.card-notes {{
 }}
 /* Deliberately not full-bleed: the per-lap HR bars are supporting evidence for
    the table above them, not the page's subject, and at 100% they out-shouted
-   the grades. */
-img.split-chart {{ width: {d["split_chart_pct"]}%; margin-top: 0.7em; }}
+   the grades.
+
+   Capped by HEIGHT as well as width, for exactly the reason `img.chart` above
+   is — and this rule shipped WITHOUT that cap, so `chart_h_pt` was never read
+   by the report-card stylesheet at all and the density ladder could buy no
+   vertical room here. Measured on activity 23825963527 (5 mi, 6 splits, HR
+   trace): every rung laid out to 2 pages, the chart landing alone on page 2
+   under nine inches of white, because a width-only cap lets the figure's own
+   aspect ratio decide the page budget. `width: auto` keeps the aspect while
+   `max-height` makes the cap real. */
+img.split-chart {{
+  max-height: {d["chart_h_pt"]}pt;
+  width: auto;
+  max-width: {d["split_chart_pct"]}%;
+  margin-top: 0.7em;
+}}
 /* Four short paragraphs in the hero's meta cell, one per graded area. Smaller
    than the reference line it replaced, because there are now four of them and
    they have to sit beside the grade letter without pushing the tables down the
@@ -1292,26 +1340,22 @@ def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
           {chart_only}
         </section>
         """
+    from . import report_card as rc
+
     unit = splits["unit"]
-    avg_hr = card["activity"].get("avg_hr")
+    # Headers and cells both come from report_card.split_table so this table and
+    # the markdown one cannot disagree about which columns exist — the same
+    # reason the stimulus rows are shared. It drops columns that are entirely
+    # empty (Elev on every treadmill run; HR when the watch recorded none).
+    headers, split_rows = rc.split_table(card)
     body = ""
-    for r in splits["rows"]:
-        label = (f"{unit} {r['index']}" if not r["partial"]
-                 else f"final {r['distance_mi']:.2f} mi")
-        hr = r.get("avg_hr")
-        elev = r.get("elevation_gain_meters")
-        pace = f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—"
-        # No Distance column: the label already carries the partial lap's
-        # distance, and for every full lap it would print "1.00 mi" beside a
-        # column headed "Mile".
+    # strict=True on purpose: split_table returns exactly one cell-row per
+    # split row, and a silent length mismatch would drop laps off the PDF while
+    # the markdown card still showed them.
+    for r, cells in zip(splits["rows"], split_rows, strict=True):
+        tds = "".join(f"<td>{html.escape(c)}</td>" for c in cells)
         body += f"""
-        <tr class="{'split-partial' if r['partial'] else ''}">
-          <td>{html.escape(label)}</td>
-          <td>{html.escape(pace)}</td>
-          <td>{f"{hr} bpm" if hr else "—"}</td>
-          <td>{f"{hr - avg_hr:+d}" if hr and avg_hr else "—"}</td>
-          <td>{f"{elev:.0f} m" if elev is not None else "—"}</td>
-        </tr>
+        <tr class="{'split-partial' if r['partial'] else ''}">{tds}</tr>
         """
     chart_img = (
         f'<img class="split-chart" src="{_data_uri(split_chart)}" alt="per-lap heart rate">'
@@ -1322,18 +1366,19 @@ def _render_splits_html(card: dict, split_chart: bytes | None) -> str:
         f'<p class="drift-line">HR drift, back half vs front half: {drift:+.1f}%.</p>'
         if drift is not None else ""
     )
+    # Widths follow the surviving column count rather than a hardcoded five:
+    # the label column keeps its 26% and the data columns share the rest, so
+    # dropping Elev widens what remains instead of leaving a gap.
+    rest = (100 - 26) / max(1, len(headers) - 1)
+    cols = '<col style="width:26%">' + "".join(
+        f'<col style="width:{rest:.0f}%">' for _ in headers[1:])
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
     return f"""
     <section>
       <h2 class="card-heading">Per-{html.escape(unit.lower())} breakdown</h2>
       <table class="split-table">
-        <colgroup>
-          <col style="width:26%"><col style="width:20%"><col style="width:19%">
-          <col style="width:16%"><col style="width:15%">
-        </colgroup>
-        <thead><tr>
-          <th>{html.escape(unit)}</th><th>Pace</th>
-          <th>Avg HR</th><th>vs run</th><th>Elev</th>
-        </tr></thead>
+        <colgroup>{cols}</colgroup>
+        <thead><tr>{head}</tr></thead>
         <tbody>{body}</tbody>
       </table>
       {chart_img}
@@ -1474,5 +1519,6 @@ def render_report_card_pdf(
     because CLAUDE.md's contract is that a PDF never spills silently.
     """
     return fit_one_page(
-        lambda preset: _build_report_card_html(card, split_chart, preset)
+        lambda preset: _build_report_card_html(card, split_chart, preset),
+        CARD_DENSITY_PRESETS,
     )[:2]

@@ -2,6 +2,13 @@
 
 ``scripts/`` is a folder of standalone scripts, not a package, so we put it on
 ``sys.path`` and import each script by its stem (e.g. ``import score_prompt``).
+
+``tests/evals/`` holds the fixture BUILDERS (``eval_fixtures`` for the brief,
+``report_cards`` for the report card) alongside the eval tests themselves.
+pytest only puts that directory on the path while collecting a module inside
+it, so a test living elsewhere — ``tests/test_calibrate_report_card.py`` reuses
+the report-card scenarios rather than fabricating a second corpus that could
+drift from them — cannot import the builder without this.
 """
 from __future__ import annotations
 
@@ -10,9 +17,11 @@ from pathlib import Path
 
 import pytest
 
-SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
+_ROOT = Path(__file__).resolve().parent.parent
+for _extra in (_ROOT / "scripts", _ROOT / "tests" / "evals"):
+    if str(_extra) not in sys.path:
+        sys.path.insert(0, str(_extra))
+SCRIPTS = _ROOT / "scripts"
 
 
 @pytest.fixture(autouse=True)

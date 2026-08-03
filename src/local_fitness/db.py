@@ -390,6 +390,16 @@ def init_schema(db_path: Path | None = None) -> None:
             conn.execute(
                 "ALTER TABLE coach_journal "
                 "ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+        # Data repair, not a column add, but the same "the schema moved
+        # underneath an existing row" shape: 0.40.0 renamed the read's 4th
+        # section `load` -> `stimulus`, so cards graded before it fail
+        # card_store.read_is_complete and regenerate a read the DB already
+        # holds. Idempotent (a second run finds nothing) and snapshot-safe
+        # (card_json's key name only — never graded_at, the key or a grade).
+        # Imported here, not at module scope: card_store imports db.
+        from .agent import card_store
+
+        card_store.migrate_read_section_names(conn=conn)
         # FTS5 recall index — guarded, best-effort (see FTS_SCHEMA comment).
         try:
             conn.executescript(FTS_SCHEMA)

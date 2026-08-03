@@ -131,9 +131,20 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   `pytest-benchmark`-based, separate axis from the coverage gate: latency
   AND `db.connect()`-open-count for the brief/plan hot paths
   (`assemble_brief_context`, `get_training_plan_progress`,
-  `get_training_plan_status`, `_build_plan_section`, `daily_snapshot`),
-  run against a synthetic multi-year fixture (`scripts/perf_fixture.py` —
-  fabricated, never derived from real data). Skipped on every ordinary
+  `get_training_plan_status`, `_build_plan_section`, `daily_snapshot`) and,
+  since 0.40.2, the **report-card** path (`workout_report_card` = exactly 2
+  opens; `load_report_card_inputs` = 0, it takes the caller's connection),
+  run against synthetic fixtures (`scripts/perf_fixture.py` —
+  fabricated, never derived from real data). **Two fixture builders, and the
+  split is load-bearing**: the report card needs paced activities (run-vs-walk
+  is decided by measured pace), but `plans.best_recent_effort` EXCLUDES
+  paceless rows, so adding paces to the shared multi-year fixture hands the
+  baselined benchmarks rows they currently skip — measured +7.2% on
+  `get_training_plan_status`, against a 15%-of-min gate that can only be
+  rebaselined on ubuntu CI. Anything the report card needs goes in
+  `build_report_card_fixture_db`, never into the shared one. The PDF path is
+  deliberately OUT of the gate: WeasyPrint/matplotlib latency is font- and
+  machine-dependent and would false-fail the floor. Skipped on every ordinary
   `pytest` run (`--benchmark-skip` in `pyproject.toml`'s `addopts`); the
   `validate` job's "Perf-benchmark regression gate" step explicitly opts
   back in with `--benchmark-only --no-cov`, comparing against the
@@ -410,7 +421,22 @@ These are settled — don't redesign without a reason.
   entries for real; there is no prune path.
   `agent/memory.py` is the ONE resolver; `prompts.coach_memory_block` is the
   pure injection block whose header carries the grounding contract (callbacks
-  may cite only listed facts; empty section → no callbacks). **Memory is
+  may cite only listed facts; empty section → no callbacks).
+  **`render_memory_for_prompt(today=…)` means AS OF that date, on BOTH layers**
+  (0.40.2). The ledger always honoured it; the journal was an unbounded
+  latest-N list beside it, so a caller rendering a past artifact got that
+  date's ledger next to entries written weeks later — one block describing two
+  moments, and *any* new entry rewrote the memory of every past artifact.
+  `journal.list_entries(on_or_before=…)` is the bound; it is off by default, so
+  chat and the MCP persona (which pass no `today`) keep the live view, which is
+  correct for surfaces that are about now. **Every surface rendering a DATED
+  artifact must pass its artifact's date** — `plan_coach` always did
+  (`target_date`), the report card now does (the activity's date). Getting this
+  wrong is not just a cache miss: it is the same category of error as grading a
+  July run against today's plan. It also happens to be what keeps the read
+  cache keys stable, since the ledger renders a step-streak counter that
+  increments daily — unanchored, 14 of 15 stored cards missed the fast path
+  (measured 2026-08-02) and a clock move regenerated every one of them. **Memory is
   passed INTO the four voice surfaces as `memory_text`, never resolved inside
   the builders** — the PDF coaches key disk caches on the prompt hash, and
   `prompts.py` builds `SYSTEM_PROMPT` at import (an internal DB read would
@@ -662,9 +688,66 @@ These are settled — don't redesign without a reason.
     it, "Keep HR under 140" existed only in the prose `description` and no
     grade could read it — HR was measured against `0.97 × rolling median`,
     which was 139 by coincidence, so a real breach read as a rounding error.
-    When a cap is present HR grades against it (reference `"plan"`) on the
-    worse of *average over cap* and *time over cap past `HR_CAP_GRACE_FRACTION`*;
-    absent, it falls back to `HR_BANDS` exactly as before.
+    When a cap is present HR grades against it (reference `"plan"`); absent, it
+    falls back to `HR_BANDS` exactly as before.
+  - **A cap breach is measured in bpm over the ceiling, never as a fraction of
+    the run and never as a fraction of the cap** (0.40.2). The graded quantity
+    is `hr_exceedance_bpm` — time-weighted mean bpm above the cap across the
+    splits — and both cap axes (that, and *average over cap*) go through one
+    `hr_cap_severity` = `max(0, bpm_over − HR_CAP_NOISE_BPM) / HR_CAP_BPM_SCALE`,
+    so the `max()` between them compares like with like. **Why:** 0.40.0 graded
+    the *time fraction* above the cap, counting a split as entirely above it
+    whenever its average exceeded the cap by any amount, then fed that fraction
+    into `GRADE_BANDS` — a table calibrated for relative magnitudes. A time
+    fraction is a different unit, so this was a category error and the `max()`
+    was meaningless. Measured across all 19 completed capped days in the active
+    plan, that axis emitted **only A+ or F, never a letter between**, and ranked
+    the mildest breach in the window (1% of it in Garmin zones 4-5) as the worst
+    session of the nine it failed. The live 2026-08-02 card — avg HR 139 under a
+    140 cap, peak 148, **zero seconds in zones 4-5** — graded F because three
+    miles averaged 141/143/142, and the F-cap turned a 3.60 GPA into a C.
+    Dividing by the cap is the same trap from the other side (HR's large
+    non-zero offset compresses every real breach into the passing bands): it
+    also put a run averaging 168 against a 140 cap at a **C**, now an F.
+    `HR_CAP_GRACE_FRACTION` survives as a **reporting** threshold only.
+  - **Those two constants are calibrated against a signal the grade does not
+    read** — Garmin's own zone-4+5 time fraction, computed on-device from the
+    per-sample trace and independent of both `avg_hr` and the splits.
+    `HR_CAP_NOISE_BPM` (1.5) sits between the two live runs whose average obeyed
+    the cap (exceedance 1.15, 1.37, both 0% in zones 4-5) and the smallest
+    genuine breach (4.55). `HR_CAP_BPM_SCALE` (28.0) puts the F floor at 11.3
+    bpm sustained over the ceiling, where the three sessions at or above it are
+    exactly the three at ≥42% in zones 4-5; the worst below it is 37%.
+    Re-run that comparison before moving either — `test_the_f_boundary_sits_
+    where_the_run_stopped_being_aerobic` is what forces the question. Genuine
+    breaches are untouched by the change: 2026-07-22 (avg 157, splits to 185,
+    19.5 bpm over) stays an F and still caps the overall.
+  - **`activity_hr_samples` is NOT an escape hatch for the exceedance**, even
+    though it is local once fetched. It holds 11 of 760 activities, so grading
+    off it "when present" would make the metric mean one thing on 1.4% of
+    history and another on the rest — the availability trap the splits rule
+    exists to prevent, and worse than the splits case it would improve on.
+    Split averages smooth real within-mile excursions; that is the accepted
+    cost of a metric that means the same thing on every row.
+  - **The HR row must state the axis that produced the letter** (0.40.1;
+    `hr_cap_axis` returns `"exceedance"` / `"average"` / `None` since 0.40.2).
+    When the split-derived exceedance is what graded, the row moves to it —
+    `actual_display`, `expected_display` and the Delta together, and the three
+    cells reconcile by arithmetic (`actual − expected = delta`, hence one
+    decimal on both). **Why:** taking the worse of two axes and then displaying
+    only the average printed, on the live 2026-08-02 card,
+    `| Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |` — three numbers all describing
+    the *compliant* average (which scored 0.0) beside an F. A reader cannot
+    reconstruct an F from three passing numbers. (That card turned out to be a
+    broken grade too — see the bpm bullet above — but the display contract
+    stands on its own.) Same contract the pace row already kept via
+    `actual_display`: **the Delta column may never compare two different
+    quantities.** The numeric `actual`/`expected` fields stay in bpm — storage,
+    the note and the coach read are unchanged; only the display moves. The note
+    must reconcile BOTH ways: a sub-noise breach states the time fraction *and*
+    the bpm ("58% … by 1.2 bpm on average — inside sensor noise"), because the
+    fraction alone beside an A+ reads as the card noticing a breach and
+    ignoring it.
   - **The card always names its yardstick.** Plan-prescribed (distance, pace,
     and HR when `target_hr_max` is set) or a 60-day rolling *median* of
     comparable activities. Median, not mean: the history carries real
@@ -704,9 +787,10 @@ These are settled — don't redesign without a reason.
     grade would be unavailable on ~87% of history and mean different things on
     different rows. **Every exception must handle absence explicitly**, and they
     do it differently on purpose: quality-day pace and `continuity` *abstain*
-    (n/a + a stated reason, weight redistributes), while the HR-cap time check
-    (`time_above_cap_fraction`, 0.40.0) *degrades* — with no splits the cap is
-    still graded on the average alone, so it adds no new availability cliff.
+    (n/a + a stated reason, weight redistributes), while the HR-cap exceedance
+    (`hr_exceedance_bpm`, 0.40.2 — was `time_above_cap_fraction` in 0.40.0)
+    *degrades* — with no splits the cap is still graded on the average alone, so
+    it adds no new availability cliff.
     `tests/test_report_card.py::test_only_the_documented_exceptions_read_splits`
     pins that distance, non-quality pace and uncapped HR stay byte-identical with
     and without splits. The first exception is
@@ -825,12 +909,75 @@ These are settled — don't redesign without a reason.
     the grade. HR is the one metric held to a *range*, so it carries
     `expected_display` (the band), `band`, and `in_band`; `expected_text()`
     prefers that display and everything else formats its number.
-  - **Calibrate bands against real data, not intuition.** The original easy-HR
-    ceiling (0.88x median) demanded a number that appeared in 1 of 13 runs in
-    the window — the median is taken over ALL comparable activities, which for
-    a mostly-easy runner already sits near easy HR. That made HR a standing
-    penalty rather than a judgment. Before changing `HR_BANDS`, check the
-    proposed bound against the actual distribution.
+  - **A one-sided expectation must PRINT as one-sided** (0.41.0). Direction
+    gating means a run on the free side scores an exact `0.0` deviation, which
+    is mechanically an A+ — measured over 15 stored cards, 9 of 15 pace
+    deviations were exactly 0.0 and **A+ was 29 of the 32 A-band grades**. The
+    grades are right; a bare number was making them read as a participation
+    trophy: an easy day printed `| Pace | 9:44/mi | 9:39/mi | 5s/mi slower |
+    A+ |` — a target, a stated miss, and an A+. `pace_deviation` gates
+    easy/long to the FAST side only, so 9:39 is a *floor*. `pace_bound_kind`
+    names the side and `bounded_display` prefixes `≥`/`≤` (the `_fmt_hr_band`
+    idiom). Two-sided expectations — a plan distance, a steady-day pace —
+    keep a bare number, because they really are point targets. Don't fix an
+    A+-inflation complaint by touching `GRADE_BANDS`, `_modifier` or
+    `PLAN_TIGHTEN`; it is a display problem.
+    `test_pace_bound_kind_matches_pace_deviation_gating` derives the bound
+    from `pace_deviation` itself so the two can't drift.
+  - **Every Delta is in its row's own unit — never a percentage** (0.41.0).
+    The card printed four dialects in four rows (`on target` / `5s/mi slower`
+    / `53% over` / `even`) where the percentages meant a percentage of a
+    distance, of a ratio, and of a percentage — three quantities wearing one
+    symbol, which is the "never compare two quantities" contract failing one
+    level down in the units. Distance reads `0.35 mi long`, HR `8 bpm over`,
+    continuity `0.15x over`. Bounds are the typographic `≤`/`≥` everywhere.
+  - **A split-table column renders only if some row has data** (0.41.0). 13 of
+    15 stored cards had an entirely empty `Elev` column and 85% of
+    `activity_splits` rows carry no elevation (a treadmill run never does).
+    `Avg HR` and `vs run` drop together; `vs run` is KEPT when it has data.
+    Both renderers take headers AND cells from `report_card.split_table` —
+    the table was written out twice and a column dropped in one but not the
+    other is the divergence the already-built-card contract exists to
+    prevent, same reason as `stimulus_rows`.
+  - **Calibrate bands against real data, not intuition — and the check is now
+    executable** (0.43.0). The original easy-HR ceiling (0.88x median) demanded
+    a number that appeared in 1 of 13 runs in the window — the median is taken
+    over ALL comparable activities, which for a mostly-easy runner already sits
+    near easy HR. That made HR a standing penalty rather than a judgment. This
+    rule was advisory for four releases and nothing ran it, which is how the
+    0.40.0 HR-cap axis shipped emitting 32 F / 7 A / 4 D over 90 days with B and
+    C empty. **`scripts/calibrate_report_card.py` is the gate**: it regrades a
+    trailing window through the production path (`load_report_card_inputs` ->
+    `build_card`, never a reimplementation) and exits non-zero on *punitive
+    skew* (>60% of runs D/F) or *dead bands* (>=2 letters unused). Run it before
+    changing ANY constant here — `GRADE_BANDS`, `HR_BANDS`, `HR_CAP_NOISE_BPM`,
+    `HR_CAP_BPM_SCALE`, `CONTINUITY_TOLERANCE`, `PLAN_TIGHTEN`,
+    `LOAD_SPIKE_FACTOR`, `*_FACTORS`, `MIN_REFERENCE_ACTIVITIES` — and paste the
+    output into the devlog entry. The two signatures are **deliberately
+    asymmetric**: concentration in a *passing* grade is not evidence of anything
+    (distance grades 79% A because the distances are being hit) and is reported,
+    not gated. A symmetric rule was this check's own first draft and it flagged
+    three of five healthy metrics. **Strictly read-only** (`mode=ro` URI — SQLite
+    refuses the write) and **deliberately not in CI**: it needs a populated
+    `data/fitness.db`, and a fabricated one would only ask the fixture whether it
+    agrees with itself. `test_the_gate_is_not_wired_into_ci` fails if someone
+    wires it up.
+  - **A grade change needs a VERDICT eval, not just a unit test** (0.43.0).
+    `tests/test_report_card.py`'s ~141 tests assert that the rubric computes what
+    it says it computes — a deviation float, a band boundary, a display string —
+    and not one of them can fail when the rubric's *answer* is wrong. That is why
+    every grading defect in this module's history was caught by a human reading a
+    rendered card, never by the suite. `tests/evals/report_cards.py` +
+    `tests/evals/test_report_card_verdicts.py` are the other half: fabricated
+    scenarios asserting **the overall letter a run deserves**, driven through a
+    real SQLite DB so the reference-pool filter is inside what they grade.
+    Expected verdicts are BOUNDS in `EXPECTED_VERDICTS` (a bound is the actual
+    contract and survives ordinary recalibration; an exact letter would fight
+    it), each with a stated reason — and a scenario with no entry fails
+    `test_every_scenario_declares_a_verdict`. **When a user reports a wrong
+    grade, the permanent fix is a new scenario here**, not only a unit test; and
+    never pin the disputed grade as a regression assertion (0.40.1 added
+    `assert hr["grade"] == "F"` for the card under dispute).
   - **A plan target is an instruction; a rolling median is a reference.**
     Plan-referenced distance and pace are graded on bands tightened by
     `PLAN_TIGHTEN` (0.6). Without it both were held to the same tolerance and
@@ -854,7 +1001,20 @@ These are settled — don't redesign without a reason.
   from ONE render; no splicing path exists). The stored read doubles as a
   **per-activity read cache**: `workout_coach.read_cache_key` is the single
   key definition, and a re-render whose prompt key matches the stored row
-  reuses the read with no SDK call. Query surface: `list_report_cards` +
+  reuses the read with no SDK call. **That reuse is only real if the key is
+  stable across days** — see the memory bullet's `today=` anchoring contract;
+  before 0.40.2 the key rotated overnight and the fast path fired for
+  essentially nothing. A one-off check that it still holds: render a card,
+  move the clock, render again, and count SDK calls (`tests/test_tools.py`'s
+  `test_the_read_cache_key_does_not_move_with_the_calendar` is that check,
+  automated). **A renamed `READ_SECTIONS` key silently kills reuse too** — a
+  stored row failing `read_is_complete` regenerates however well its key
+  matches, which is what 0.40.0's `load` → `stimulus` did to 12 of 15 live
+  rows. Renaming a section means adding the pair to
+  `card_store._RENAMED_READ_SECTIONS`; `migrate_read_section_names` (run from
+  `db.init_schema`, idempotent, rewrites `card_json`'s key name and NOTHING
+  else — never `graded_at`, the key or a grade) repairs the stored rows.
+  Query surface: `list_report_cards` +
   `get_report_card` in `ALL_TOOLS` (pure JSON → reachable over stdio AND
   `/mcp/`; `workout_report_card` itself stays stdio-only). Two load-bearing
   assumptions: **no delete/prune path exists** (`load_read` reads outside
@@ -940,8 +1100,24 @@ These are settled — don't redesign without a reason.
   lowest-priority takeaways and prints `N further signals omitted for space`.
   Never let either PDF spill silently, and never hide a takeaway silently.
   When adding page content, add a case to `test_brief_always_fits...` /
-  `test_generate_brief_report_is_always_exactly_one_page` rather than
-  eyeballing a render.
+  `test_generate_brief_report_is_always_exactly_one_page` /
+  `test_report_card_is_always_exactly_one_page` rather than eyeballing a
+  render. **Apply the height cap to EVERY chart element, not just the one you
+  fixed** (0.41.0): `img.split-chart` — the report card's chart — shipped with
+  a width-only cap for over a week, 490 lines below the `img.chart` comment
+  explaining why that doesn't work, so `chart_h_pt` was never read by the
+  report-card stylesheet at all and its ladder was decorative. Measured: 3 of
+  15 stored cards rendered 2 pages with the chart alone on page 2. A lesson
+  written into a comment protects the line it sits on and nothing else.
+  **The card has its own `CARD_DENSITY_PRESETS`** — a tighter `dense`
+  (`chart_h_pt` 68, measured: 80 spilled, 78 was the first fit) plus a 4th
+  `ultra` rung, because a card's overflow has TWO drivers and the chart cap
+  fixes only one; the other is split-row count (a 14-split half marathon was 2
+  pages on dev for that reason alone). Those rungs must **never** be merged
+  into `DENSITY_PRESETS`: the brief's ladder exhaustion is a *signal*
+  `generate_brief_report` reads to decide whether to drop a takeaway, so an
+  extra rung there silently changes what prints.
+  `test_the_card_ladder_never_changes_the_brief_ladder` is the guard.
 - **The brief PDF (`generate_brief_report`) has a 2-column signal-card grid
   and a Training Plan section** (2026-07-09 redesign). `visuals.py`'s
   signal cards (formerly one stacked column) reflow into a flexbox grid

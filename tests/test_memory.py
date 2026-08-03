@@ -231,3 +231,45 @@ def test_resolver_never_raises(mdb, monkeypatch):
 
     monkeypatch.setattr(ledger, "compute_relationship_ledger", boom)
     assert memory.render_memory_for_prompt(user_name="Alex") == ""
+
+
+def test_today_bounds_the_journal_as_well_as_the_ledger(mdb):
+    """`today` means AS OF that date on both layers. Before this, a caller
+    rendering a past artifact got that date's ledger next to journal lines
+    written weeks later — two moments described in one block, and any new
+    entry rewrote the memory of every past artifact."""
+    journal.save_entry("said his calf was tight", source="chat",
+                       entry_date="2026-07-18")
+    journal.save_entry("wrote this a week later", source="chat",
+                       entry_date="2026-07-25")
+
+    as_of = memory.render_memory_for_prompt(
+        today="2026-07-18", user_name="Alex")
+    assert "said his calf was tight" in as_of
+    assert "wrote this a week later" not in as_of
+
+
+def test_a_later_entry_cannot_change_a_past_dates_memory(mdb):
+    """The stability property the report-card read cache key depends on:
+    writing a new entry today must not alter what the block said as of a past
+    date. Unbounded, this returned different text on the second call and every
+    stored card's cache key rotated with it."""
+    journal.save_entry("the entry that was there", source="chat",
+                       entry_date="2026-07-18")
+    before = memory.render_memory_for_prompt(today="2026-07-18",
+                                             user_name="Alex")
+
+    journal.save_entry("graded a run much later", source="report_card",
+                       source_key="99", entry_date="2026-07-30")
+
+    assert memory.render_memory_for_prompt(
+        today="2026-07-18", user_name="Alex") == before
+
+
+def test_no_today_keeps_the_unbounded_live_view(mdb):
+    """Chat and the MCP persona pass no `today` and must keep seeing the
+    newest entries — those surfaces are about now, not about a past date."""
+    journal.save_entry("newest thing he said", source="chat",
+                       entry_date=(date.today() + timedelta(days=0)).isoformat())
+    text = memory.render_memory_for_prompt(user_name="Alex")
+    assert "newest thing he said" in text

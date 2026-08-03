@@ -9,6 +9,7 @@ without direction gating, every recovery run fails on pace.
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, timedelta
 
 import pytest
@@ -293,11 +294,11 @@ def test_no_load_means_no_stimulus_descriptor_rather_than_a_guess():
     assert rc.stimulus_lines(card) == []
 
 
-# --- the prescribed HR cap (0.40.0) ----------------------------------------
+# --- the prescribed HR cap (0.40.0, regraded 0.40.2) -----------------------
 
-#: Five even splits, HR crossing a 140 cap partway through — the shape of the
+#: Five splits, HR crossing a 140 cap partway through — the shape of the
 #: 2026-07-27 session (128 / 139 / 150 / 144 / 159 by mile). Durations differ so
-#: a duration-weighted fraction can't be confused with a plain split count.
+#: a duration-weighted number can't be confused with a plain split count.
 CAP_SPLITS = [
     {"split_index": 0, "distance_meters": 1609.34, "duration_seconds": 600, "avg_hr": 128},
     {"split_index": 1, "distance_meters": 1609.34, "duration_seconds": 500, "avg_hr": 139},
@@ -306,10 +307,38 @@ CAP_SPLITS = [
     {"split_index": 4, "distance_meters": 1609.34, "duration_seconds": 200, "avg_hr": 159},
 ]
 
+#: The REAL 2026-08-02 treadmill easy run (activity 23825963527), unmodified:
+#: five full mile splits plus the 5-second tail Garmin recorded, against a
+#: prescribed 140 bpm cap. Average 139, peak 148, and Garmin logged 0 seconds in
+#: zones 4-5. It is the session that exposed the 0.40.0 mis-grade.
+LIVE_2026_08_02_SPLITS = [
+    {"split_index": 0, "distance_meters": 1609.34, "duration_seconds": 609, "avg_hr": 134},
+    {"split_index": 1, "distance_meters": 1609.34, "duration_seconds": 567, "avg_hr": 141},
+    {"split_index": 2, "distance_meters": 1609.34, "duration_seconds": 615, "avg_hr": 135},
+    {"split_index": 3, "distance_meters": 1609.34, "duration_seconds": 549, "avg_hr": 143},
+    {"split_index": 4, "distance_meters": 1609.34, "duration_seconds": 576, "avg_hr": 142},
+    {"split_index": 5, "distance_meters": 15.55, "duration_seconds": 5, "avg_hr": 140},
+]
+
+#: The REAL 2026-07-22 session (activity 23695862040) against the same 140 cap:
+#: average 157, splits reaching 185, and 48% of it in Garmin zones 4-5. The
+#: genuine-breach anchor — whatever the fix does, this must keep failing.
+LIVE_2026_07_22_SPLITS = [
+    {"split_index": 0, "distance_meters": 1609.34, "duration_seconds": 602, "avg_hr": 129},
+    {"split_index": 1, "distance_meters": 1609.34, "duration_seconds": 588, "avg_hr": 144},
+    {"split_index": 2, "distance_meters": 1609.34, "duration_seconds": 611, "avg_hr": 169},
+    {"split_index": 3, "distance_meters": 1609.34, "duration_seconds": 588, "avg_hr": 185},
+    {"split_index": 4, "distance_meters": 7.78, "duration_seconds": 2, "avg_hr": 193},
+]
+
 
 def test_time_above_cap_is_duration_weighted_not_split_counted():
     """900 of 2000 seconds sit above 140 (the 400s, 300s and 200s splits). A
-    split COUNT would say 3/5 = 60%; the duration weighting says 45%."""
+    split COUNT would say 3/5 = 60%; the duration weighting says 45%.
+
+    Reported, never graded, since 0.40.2 — see
+    test_the_time_fraction_alone_cannot_tell_a_1_bpm_drift_from_a_20_bpm_blowup.
+    """
     labelled = rc.label_splits(CAP_SPLITS)
     assert rc.time_above_cap_fraction(labelled, 140.0) == pytest.approx(0.45)
 
@@ -324,17 +353,202 @@ def test_time_above_cap_is_none_without_splits_or_without_a_cap():
     assert rc.time_above_cap_fraction(rc.label_splits(no_hr), 140.0) is None
 
 
-@pytest.mark.parametrize(("hr", "cap", "above", "expected_d"), [
-    (126.0, 140.0, 0.0, 0.0),      # under the cap and never over it
-    (126.0, 140.0, 0.04, 0.0),     # inside the grace fraction — still clean
-    (126.0, 140.0, 0.25, 0.20),    # average fine, but a quarter of it was over
-    (144.0, 140.0, 0.0, pytest.approx(4 / 140)),   # average breach only
-    (144.0, 140.0, 0.59, pytest.approx(0.54)),  # time breach dominates the average
-    (126.0, None, 0.5, None),      # no cap -> no deviation, caller falls back
-    (None, 140.0, 0.5, None),      # no HR reading -> ungradeable
+def test_the_time_fraction_alone_cannot_tell_a_1_bpm_drift_from_a_20_bpm_blowup():
+    """WHY the time fraction stopped being the graded axis in 0.40.2.
+
+    Two real sessions against the same 140 bpm cap: 2026-08-02 sat 1-3 bpm over
+    for most of the run and never entered Garmin zone 4, while 2026-07-22 hit
+    185 and spent 48% of itself in zones 4-5. Their time-above-cap fractions are
+    within 17 points of each other and both land past the old grace, so the old
+    axis graded BOTH an F. The exceedance integral separates them by 17x.
+
+    This is the discrimination test: any future replacement for the severity
+    measure has to keep these two an order of magnitude apart."""
+    mild = rc.label_splits(LIVE_2026_08_02_SPLITS)
+    severe = rc.label_splits(LIVE_2026_07_22_SPLITS)
+
+    # The old axis: both "breached", and the milder run reads only slightly
+    # better. Feeding either through GRADE_BANDS gives an F.
+    assert rc.time_above_cap_fraction(mild, 140.0) == pytest.approx(0.579, abs=0.01)
+    assert rc.time_above_cap_fraction(severe, 140.0) == pytest.approx(0.748, abs=0.01)
+    assert rc.grade_from_deviation(0.579 - 0.05) == "F"
+    assert rc.grade_from_deviation(0.748 - 0.05) == "F"
+
+    # The graded axis: 1.2 bpm against 19.5 bpm.
+    assert rc.hr_exceedance_bpm(mild, 140.0) == pytest.approx(1.2, abs=0.05)
+    assert rc.hr_exceedance_bpm(severe, 140.0) == pytest.approx(19.5, abs=0.05)
+    assert rc.hr_exceedance_bpm(severe, 140.0) > 15 * rc.hr_exceedance_bpm(mild, 140.0)
+
+
+def test_hr_exceedance_is_the_integral_of_the_breach_not_its_duration():
+    """Time-weighted mean bpm above the cap. On CAP_SPLITS: 150 for 400s is
+    10 bpm over, 144 for 300s is 4, 159 for 200s is 19 — (4000 + 1200 + 3800)
+    over 2000 total seconds = 4.5 bpm. Splits UNDER the cap contribute zero, not
+    a negative credit: a cap is a ceiling, and running easy early must not buy
+    headroom to blow it later."""
+    assert rc.hr_exceedance_bpm(rc.label_splits(CAP_SPLITS), 140.0) == pytest.approx(4.5)
+    # Halving every breach halves the exceedance — it is linear in magnitude,
+    # which is the property the time fraction lacked entirely.
+    halved = [dict(s, avg_hr=140 + (s["avg_hr"] - 140) / 2 if s["avg_hr"] > 140
+                   else s["avg_hr"]) for s in CAP_SPLITS]
+    assert rc.hr_exceedance_bpm(rc.label_splits(halved), 140.0) == pytest.approx(2.25)
+
+
+def test_hr_exceedance_is_none_without_splits_or_without_a_cap():
+    """Same three None paths as the fraction, because the caller degrades on
+    exactly this signal: None here means "grade the average alone"."""
+    assert rc.hr_exceedance_bpm(rc.label_splits([]), 140.0) is None
+    assert rc.hr_exceedance_bpm(rc.label_splits(CAP_SPLITS), None) is None
+    assert rc.hr_exceedance_bpm(rc.label_splits(CAP_SPLITS), 0) is None
+    no_hr = [{"split_index": 0, "distance_meters": 1609.34, "duration_seconds": 600}]
+    assert rc.hr_exceedance_bpm(rc.label_splits(no_hr), 140.0) is None
+
+
+@pytest.mark.parametrize(("bpm_over", "expected"), [
+    (None, 0.0),                       # no splits -> this axis contributes nothing
+    (-5.0, 0.0),                       # under the cap is not a negative breach
+    (0.0, 0.0),
+    (1.5, 0.0),                        # exactly the noise floor
+    (1.2, 0.0),                        # the real 2026-08-02 exceedance
+    (2.9, pytest.approx(1.4 / 28)),
+    (19.5, pytest.approx(18.0 / 28)),  # the real 2026-07-22 exceedance
 ])
-def test_hr_cap_deviation_takes_the_worse_of_average_and_time(hr, cap, above, expected_d):
-    assert rc.hr_cap_deviation(hr, cap, above) == expected_d
+def test_hr_cap_severity_is_the_raw_excess_past_the_noise_floor(bpm_over, expected):
+    """One scaling function for both axes — that shared unit is what makes the
+    max() in hr_cap_deviation mean something."""
+    assert rc.hr_cap_severity(bpm_over) == expected
+
+
+#: Every completed day in the live plan that carried a prescribed cap, as
+#: (avg_hr, cap, time-above-cap fraction, time-weighted exceedance bpm, Garmin
+#: zone-4+5 share). Real measured numbers, frozen here so the calibration can be
+#: re-checked without the DB. The last two columns are what the two axes see;
+#: the zone share is what neither of them reads.
+LIVE_CAPPED_DAYS = [
+    (120, 140, 0.000, 0.00, 0.00),   # 2026-07-06
+    (152, 140, 0.755, 13.58, 0.43),  # 2026-07-07
+    (114, 140, 0.000, 0.00, 0.00),   # 2026-07-08
+    (103, 140, 0.000, 0.00, 0.00),   # 2026-07-09
+    (96, 140, 0.000, 0.00, 0.00),    # 2026-07-11
+    (149, 140, 0.703, 9.32, 0.14),   # 2026-07-12
+    (116, 140, 0.000, 0.00, 0.00),   # 2026-07-13
+    (142, 140, 0.734, 5.48, 0.37),   # 2026-07-15
+    (143, 140, 0.754, 4.55, 0.01),   # 2026-07-16
+    (106, 140, 0.012, 0.31, 0.03),   # 2026-07-18
+    (136, 140, 0.649, 1.37, 0.00),   # 2026-07-19
+    (112, 140, 0.000, 0.00, 0.00),   # 2026-07-20
+    (157, 140, 0.748, 19.51, 0.48),  # 2026-07-22
+    (94, 140, 0.000, 0.00, 0.00),    # 2026-07-26
+    (149, 140, 0.724, 11.91, 0.42),  # 2026-07-26
+    (144, 140, 0.592, 6.49, 0.16),   # 2026-07-27
+    (126, 140, 0.000, 0.00, 0.00),   # 2026-07-29
+    (113, 130, 0.000, 0.00, 0.00),   # 2026-07-30
+    (139, 140, 0.579, 1.15, 0.00),   # 2026-08-02
+]
+
+
+def test_the_cap_grade_actually_uses_its_bands():
+    """The acceptance measure 0.40.0 never ran, and the one that condemns its
+    axis outright.
+
+    A grading axis that emits two letters is not grading. Over the nineteen
+    completed capped days in the live plan the time-fraction axis produced
+    **only A and F** — 9 F's, 10 A's, nothing between — and seven of the runs it
+    failed had an average at or under the cap. That is the same degeneracy
+    CLAUDE.md records for the old 0.88 easy-HR ceiling ("a bound that appeared
+    in 1 of 13 runs"): a standing penalty wearing a rubric's clothes.
+
+    This asserts the corrected axis spreads over the bands AND never fails a run
+    whose average obeyed its ceiling."""
+    old, new = Counter(), Counter()
+    failed_despite_a_compliant_average = {"old": 0, "new": 0}
+    for avg, cap, frac, exc, _z45 in LIVE_CAPPED_DAYS:
+        # 0.40.0 verbatim: max(relative average, time fraction past the grace).
+        old_g = rc.base_letter(rc.grade_from_deviation(
+            max(max(0.0, (avg - cap) / cap), max(0.0, frac - 0.05))))
+        new_g = rc.base_letter(rc.grade_from_deviation(
+            rc.hr_cap_deviation(avg, float(cap), exc)))
+        old[old_g] += 1
+        new[new_g] += 1
+        if avg <= cap:
+            failed_despite_a_compliant_average["old"] += old_g == "F"
+            failed_despite_a_compliant_average["new"] += new_g == "F"
+
+    # The defect: two bands, and a run is either perfect or a failure.
+    assert set(old) == {"A", "F"}
+    assert old["F"] == 9
+
+    # The fix: at least four of the five bands carry real sessions.
+    assert len(new) >= 4, f"only {len(new)} bands used: {dict(new)}"
+    assert new["F"] == 3
+
+    # ...and no run whose average obeyed its own ceiling is failed any more.
+    assert failed_despite_a_compliant_average == {"old": 2, "new": 0}
+
+
+def test_the_grade_tracks_a_signal_it_does_not_read():
+    """Calibration evidence, not a restatement of the formula.
+
+    Garmin's zone-4+5 share is computed on-device from the per-sample trace, so
+    it is independent of both avg_hr and the splits. Every session the corrected
+    axis fails must be one that signal also calls hard, and vice versa — that
+    correspondence is what makes HR_CAP_BPM_SCALE calibration rather than taste.
+
+    The old axis fails this outright: it graded a run with 0% in zones 4-5 an F.
+    """
+    z45_of_failed, z45_of_passed = [], []
+    for avg, cap, _frac, exc, z45 in LIVE_CAPPED_DAYS:
+        if rc.base_letter(rc.grade_from_deviation(
+                rc.hr_cap_deviation(avg, float(cap), exc))) == "F":
+            z45_of_failed.append(z45)
+        else:
+            z45_of_passed.append(z45)
+    # Every failed session was >= 42% in zones 4-5; every passed one <= 37%.
+    assert min(z45_of_failed) >= 0.42
+    assert max(z45_of_passed) <= 0.37
+    # The two populations are separated, not merely ordered.
+    assert min(z45_of_failed) > max(z45_of_passed)
+
+
+@pytest.mark.parametrize(("bpm_over", "letter"), [
+    (2.9, "A"), (3.0, "B"),      # the A edge: 1.5 + 0.05*28
+    (11.3, "D"), (11.4, "F"),    # the F boundary: 1.5 + 0.35*28
+])
+def test_the_f_boundary_sits_where_the_run_stopped_being_aerobic(bpm_over, letter):
+    """Calibration guard, not arithmetic restated. HR_CAP_BPM_SCALE was chosen
+    so an F begins at 11.3 bpm sustained over the ceiling, because in the live
+    window the sessions at or above that are exactly the three whose Garmin
+    zone-4+5 share reached 42% — the runs that were no longer aerobic runs. The
+    worst session BELOW the boundary sat at 37%.
+
+    A change to either constant that moves this boundary has to re-run that
+    comparison; this test is what forces the question."""
+    assert rc.base_letter(rc.grade_from_deviation(rc.hr_cap_severity(bpm_over))) == letter
+
+
+@pytest.mark.parametrize(("hr", "cap", "exceedance", "expected_d", "letter"), [
+    (126.0, 140.0, 0.0, 0.0, "A"),      # under the cap and never over it
+    (126.0, 140.0, 1.2, 0.0, "A"),      # drifted over, inside the noise floor
+    (126.0, 140.0, 8.0, pytest.approx(6.5 / 28), "D"),   # middle blew it
+    (144.0, 140.0, None, pytest.approx(2.5 / 28), "B"),  # no splits: average only
+    (144.0, 140.0, 6.5, pytest.approx(5.0 / 28), "C"),   # exceedance dominates
+    (152.0, 140.0, 1.0, pytest.approx(10.5 / 28), "F"),  # ...here the average does
+    (126.0, None, 8.0, None, None),     # no cap -> caller falls back
+    (None, 140.0, 8.0, None, None),     # no HR reading -> ungradeable
+])
+def test_hr_cap_deviation_takes_the_worse_of_two_commensurable_axes(
+        hr, cap, exceedance, expected_d, letter):
+    """0.40.0 took max() over a relative magnitude and a time fraction — two
+    different units, so the comparison had no meaning and the fraction won
+    almost every time. Both axes are bpm-over-cap now.
+
+    Every case pins the resulting LETTER as well as the float. Asserting the
+    arithmetic alone is how the defect survived 0.40.1: the old version of this
+    test checked that (126, 140, 0.25) produced 0.20 and never asked what grade
+    0.20 became, so it passed while the axis emitted only A+ and F."""
+    assert rc.hr_cap_deviation(hr, cap, exceedance) == expected_d
+    assert rc.base_letter(
+        rc.grade_from_deviation(rc.hr_cap_deviation(hr, cap, exceedance))) == letter
 
 
 def test_a_prescribed_cap_beats_the_rolling_band():
@@ -351,19 +565,30 @@ def test_a_prescribed_cap_beats_the_rolling_band():
     hr = card["metrics"]["hr"]
     assert hr["reference"] == "plan"
     assert hr["expected"] == 140.0
-    assert hr["expected_display"] == "≤ 140 bpm"
-    # 45% of this fixture sits above the cap, so even a 126 average is a breach.
+    # A 126 average, but the run averaged 4.5 bpm over the cap across its
+    # duration — so it is still a breach, and the row says so on that axis.
     assert hr["time_above_cap_pct"] == 45
+    assert hr["exceedance_bpm"] == pytest.approx(4.5)
+    assert hr["governing_axis"] == "exceedance"
+    assert hr["expected_display"] == "≤ +1.5 bpm over cap"
     assert "45% of the run sat above the prescribed 140 bpm cap" in hr["note"]
-    # 0.45 above the cap minus the 0.05 grace = 0.40, past the D band's 0.35.
-    assert hr["deviation"] == pytest.approx(0.40)
-    assert hr["grade"] == "F"
+    # (4.5 - 1.5) / 28 = 0.107, just past the B band's 0.10.
+    assert hr["deviation"] == pytest.approx(3.0 / 28, abs=1e-4)
+    assert hr["grade"] == "C+"
 
 
-def test_obeying_the_cap_outranks_blowing_it():
-    """The ordering assertion, and the whole point of the 0.40.0 change. Before
-    it, the obedient run scored C (load F-capped) and the disobedient one scored
-    A — the rubric was inverted, not merely blunt."""
+def test_obeying_straddling_and_blowing_the_cap_are_three_different_verdicts():
+    """The discrimination the axis exists to provide, asserted on the OVERALL
+    letter — the verdict a reader actually acts on, not a deviation float.
+
+    Three runs against one prescription, and the middle one is the case that
+    matters. `obeyed` never touches the cap, which is the easy fixture and
+    proves nothing on its own. `straddled` is the real shape of the 2026-08-02
+    failure: the average obeys, but most of the run sits one to three bpm over —
+    0.40.0 graded that identically to `blew_it`, because it counted a split as
+    wholly above the cap for a single beat.
+
+    A correct rubric has to separate all three, in this order."""
     plan = {"type": "easy", "target_distance_m": 8047,
             "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1}
     obeyed = card_for(
@@ -374,6 +599,14 @@ def test_obeying_the_cap_outranks_blowing_it():
                  "duration_seconds": 594, "avg_hr": hr}
                 for i, hr in enumerate((117, 125, 127, 126, 134))],
     )
+    straddled = card_for(
+        {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 2971,
+         "avg_pace_sec_per_km": 374, "avg_hr": 139, "training_load": 52},
+        plan=plan,
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 594, "avg_hr": hr}
+                for i, hr in enumerate((134, 141, 135, 143, 142))],
+    )
     blew_it = card_for(
         {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 3011,
          "avg_pace_sec_per_km": 374, "avg_hr": 144, "training_load": 82},
@@ -382,15 +615,254 @@ def test_obeying_the_cap_outranks_blowing_it():
                  "duration_seconds": 602, "avg_hr": hr}
                 for i, hr in enumerate((128, 139, 150, 144, 159))],
     )
+
+    # Verdict level first — this is the assertion that would have caught the bug.
     assert obeyed["overall"]["grade"] == "A"
+    assert straddled["overall"]["grade"] == "A"
+    assert blew_it["overall"]["grade"] == "B"
     assert obeyed["overall"].get("capped_by") is None
-    assert blew_it["metrics"]["hr"]["grade"] == "F"
-    assert blew_it["overall"]["capped_by"] == "F"
+    assert straddled["overall"].get("capped_by") is None
+    assert blew_it["overall"].get("capped_by") is None
+
+    # Straddling by a beat is over the cap for 60% of the run — the exact
+    # quantity 0.40.0 graded — and is still compliant, because 1.2 bpm is not
+    # a breach of a 140 ceiling.
+    assert straddled["metrics"]["hr"]["time_above_cap_pct"] == 60
+    assert straddled["metrics"]["hr"]["exceedance_bpm"] == pytest.approx(1.2, abs=0.05)
+    assert straddled["metrics"]["hr"]["grade"] == "A+"
+
+    # ...while the genuine breach is 5x further over and is penalised for it:
+    # three full letters below, and it drags the overall off an A. Not the F
+    # that 0.40.0 handed every session with any breach at all.
+    assert blew_it["metrics"]["hr"]["exceedance_bpm"] == pytest.approx(6.6, abs=0.05)
+    assert blew_it["metrics"]["hr"]["grade"] == "C-"
+
     assert (rc.GRADE_POINTS[obeyed["overall"]["grade"]]
             > rc.GRADE_POINTS[blew_it["overall"]["grade"]])
-    # ...and the load numbers run the OTHER way (25 vs 82), which is exactly the
-    # inversion that used to decide the letters.
-    assert obeyed["stimulus"]["load"] < blew_it["stimulus"]["load"]
+    # ...and the load numbers run the OTHER way (25 / 52 / 82), which is exactly
+    # the inversion that used to decide the letters.
+    assert (obeyed["stimulus"]["load"] < straddled["stimulus"]["load"]
+            < blew_it["stimulus"]["load"])
+
+
+@pytest.mark.parametrize(("hr", "cap", "exceedance", "expected_axis"), [
+    (139.0, 140.0, 6.0, "exceedance"),   # average compliant, the middle blew it
+    (144.0, 140.0, None, "average"),     # no split data, the mean ran hot
+    (144.0, 140.0, 8.0, "exceedance"),   # both breached, the exceedance is worse
+    (152.0, 140.0, 3.0, "average"),      # both breached, the average is worse
+    (126.0, 140.0, 1.2, None),           # over the cap, but inside the noise floor
+    (126.0, 140.0, 0.0, None),           # clean on both axes
+    (126.0, None, 8.0, None),            # no cap to breach
+    (None, 140.0, 8.0, None),            # no HR reading at all
+])
+def test_hr_cap_axis_names_which_breach_produced_the_grade(
+        hr, cap, exceedance, expected_axis):
+    """The attribution the deviation itself discards. A caller that cannot ask
+    which axis won cannot state the number the grade was measured against."""
+    assert rc.hr_cap_axis(hr, cap, exceedance) == expected_axis
+
+
+def test_hr_cap_axis_agrees_with_the_deviation_it_explains():
+    """The two must never disagree: a named axis implies a non-zero deviation,
+    and a zero deviation implies no axis. They are computed from one helper so
+    that stays true, and this is the assertion that would catch them drifting."""
+    for hr, exceedance in ((139.0, 6.0), (144.0, None), (126.0, 1.2), (126.0, 0.0),
+                           (152.0, 3.0), (168.0, 30.0)):
+        d = rc.hr_cap_deviation(hr, 140.0, exceedance)
+        axis = rc.hr_cap_axis(hr, 140.0, exceedance)
+        assert (axis is None) == (d == 0.0)
+
+
+def test_the_real_2026_08_02_run_is_not_a_failure():
+    """THE regression, on unmodified live numbers (activity 23825963527).
+
+    Prescription: easy 5 mi, keep HR under 140. Executed at 139 average with a
+    148 peak; Garmin recorded 0 seconds in zones 4-5. Three of its five miles
+    averaged 141, 143 and 142 — one to three bpm over the cap, 0.7% to 2.1%.
+
+    0.40.0 counted each of those miles as 100% above the cap, reached 58% of
+    the session "in breach", subtracted the 5% grace and fed 0.53 into
+    GRADE_BANDS — a table calibrated for relative magnitudes, where 0.53 means
+    catastrophic. The card graded HR an **F**, the F-cap pulled a 3.60 GPA
+    down to an overall **C**, and distance, pace and continuity were all A+.
+
+    The run obeyed its prescription. It grades A."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8062.25, "duration_seconds": 2923,
+         "avg_pace_sec_per_km": 362.58, "avg_hr": 139, "max_hr": 148,
+         "training_load": 52.2},
+        plan={"type": "easy", "target_distance_m": 8046.72,
+              "target_pace_sec_per_km": 359.77, "target_hr_max": 140.0, "seq": 1},
+        splits=LIVE_2026_08_02_SPLITS,
+    )
+    hr = card["metrics"]["hr"]
+    assert hr["grade"] == "A+"
+    assert hr["deviation"] == 0.0
+    assert hr["governing_axis"] is None
+    assert hr["exceedance_bpm"] == pytest.approx(1.2, abs=0.05)
+    assert card["overall"]["grade"] == "A"
+    assert card["overall"].get("capped_by") is None
+
+    # The row keeps the bpm display, because the average IS what was graded.
+    assert rc.actual_text("hr", hr) == "139 bpm"
+    assert rc.expected_text("hr", hr) == "≤ 140 bpm"
+    assert rc._delta_text("hr", hr) == "in range"
+
+    # ...and the note reconciles the A+ with the 58% that IS still true, rather
+    # than stating the fraction alone beside a passing grade. A grade must never
+    # contradict the prose beside it, in either direction.
+    assert hr["time_above_cap_pct"] == 58
+    assert hr["note"] == ("58% of the run sat above the prescribed 140 bpm cap, "
+                          "by 1.2 bpm on average — inside sensor noise")
+
+
+def test_the_real_2026_07_22_run_still_fails_hard():
+    """The other half of the fix, on unmodified live numbers (23695862040).
+
+    Same 140 bpm cap, same easy prescription. Splits reaching 185, 48% of the
+    session in Garmin zones 4-5, 19.5 bpm over the ceiling across its duration.
+    A correction that merely deleted the time axis would grade this on the
+    average alone — 157 vs 140, which lands a full two letters higher. It must
+    stay an F, and it must still cap the overall."""
+    card = card_for(
+        {"date": "2026-07-22", "distance_meters": 6445.14, "duration_seconds": 2392,
+         "avg_pace_sec_per_km": 371.2, "avg_hr": 157, "max_hr": 197,
+         "training_load": 249.5},
+        plan={"type": "easy", "target_distance_m": 6437.0,
+              "target_pace_sec_per_km": 360.0, "target_hr_max": 140.0, "seq": 1},
+        splits=LIVE_2026_07_22_SPLITS,
+    )
+    hr = card["metrics"]["hr"]
+    assert hr["exceedance_bpm"] == pytest.approx(19.5, abs=0.05)
+    assert hr["grade"] == "F"
+    assert hr["governing_axis"] == "exceedance"
+    assert card["overall"]["capped_by"] == "F"
+
+    # The average-only grade this would get if the split axis were dropped —
+    # pinned so the two-letter gap is visible, not asserted in prose.
+    assert rc.base_letter(
+        rc.grade_from_deviation(rc.hr_cap_severity(157 - 140))) == "F"
+    assert rc.base_letter(rc.grade_from_deviation((157 - 140) / 140)) == "C"
+
+
+def test_the_row_moves_to_the_exceedance_axis_when_that_is_what_graded():
+    """The 0.40.1 display contract, carried forward onto the new axis.
+
+    The live 2026-08-02 card printed
+
+        | Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |
+
+    where every number describes the average — which scored 0.0. Whenever the
+    split-derived exceedance is what produced the letter, actual, expected and
+    delta must all move to it, and the three cells must reconcile by arithmetic:
+    actual - expected = delta."""
+    card = card_for(
+        {"date": "2026-07-22", "distance_meters": 6445.14, "duration_seconds": 2392,
+         "avg_pace_sec_per_km": 371.2, "avg_hr": 157, "training_load": 249.5},
+        plan={"type": "easy", "target_distance_m": 6437.0,
+              "target_pace_sec_per_km": 360.0, "target_hr_max": 140.0, "seq": 1},
+        splits=LIVE_2026_07_22_SPLITS,
+    )
+    hr = card["metrics"]["hr"]
+    assert hr["governing_axis"] == "exceedance"
+    assert rc.actual_text("hr", hr) == "+19.5 bpm over cap (75% of run)"
+    assert rc.expected_text("hr", hr) == "≤ +1.5 bpm over cap"
+    assert rc._delta_text("hr", hr) == "+18.0 bpm"
+    # 19.5 - 1.5 = 18.0. The cells add up.
+    assert 19.5 - 1.5 == pytest.approx(18.0)
+    # The numeric fields are untouched — storage and the coach read speak bpm.
+    assert hr["actual"] == 157
+    assert hr["expected"] == 140.0
+    assert hr["cap"] == 140.0
+
+
+def test_an_average_breach_keeps_the_row_in_bpm():
+    """The other half of the two-sided assertion. When the AVERAGE is what blew
+    the cap, the average IS the graded quantity — the row must stay in bpm and
+    must not acquire a percentage-of-run display it did not earn.
+
+    Splits carrying no HR is what makes the average the only live axis: it is
+    the documented degrade path (see
+    test_hr_exceedance_is_none_without_splits_or_without_a_cap)."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 3011,
+         "avg_pace_sec_per_km": 374, "avg_hr": 148, "training_load": 82},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 602} for i in range(5)],
+    )
+    hr = card["metrics"]["hr"]
+    assert "time_above_cap_pct" not in hr
+    assert "exceedance_bpm" not in hr
+    assert hr["governing_axis"] == "average"
+    assert "actual_display" not in hr
+    assert hr["deviation"] == pytest.approx(6.5 / 28, abs=1e-4)  # 8 bpm over, less noise
+    assert hr["grade"] == "D+"
+    assert rc.actual_text("hr", hr) == "148 bpm"
+    assert rc.expected_text("hr", hr) == "≤ 140 bpm"
+    # bpm, not a percentage — which is what this test's own name asks for and
+    # what it did NOT assert before 0.41.0. 148 against a 140 cap is 8 beats;
+    # "+6%" made the reader convert it themselves against an Expected column
+    # already written in bpm.
+    assert rc._delta_text("hr", hr) == "8 bpm over"
+
+
+def test_a_compliant_capped_run_names_no_axis_and_reads_in_range():
+    """A clean run must not be given a breach to explain. `governing_axis` is
+    None, the row keeps the bpm display, and the delta stays "in range"."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 8047, "duration_seconds": 3011,
+         "avg_pace_sec_per_km": 374, "avg_hr": 126, "training_load": 25},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "target_hr_max": 140.0, "seq": 1},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 602, "avg_hr": h}
+                for i, h in enumerate((117, 125, 127, 126, 134))],
+    )
+    hr = card["metrics"]["hr"]
+    assert hr["grade"] == "A+"
+    assert hr["exceedance_bpm"] == 0.0
+    assert hr["time_above_cap_pct"] == 0
+    assert "note" not in hr           # nothing happened; say nothing
+    assert hr["governing_axis"] is None
+    assert "actual_display" not in hr
+    assert rc.actual_text("hr", hr) == "126 bpm"
+    assert rc.expected_text("hr", hr) == "≤ 140 bpm"
+    assert rc._delta_text("hr", hr) == "in range"
+
+
+def test_the_rendered_card_never_prints_a_passing_delta_beside_an_f():
+    """End-to-end through the markdown the user actually reads — the renderer
+    and the PDF share these three helpers, so this covers both surfaces."""
+    card = card_for(
+        {"date": "2026-07-22", "distance_meters": 6445.14, "duration_seconds": 2392,
+         "avg_pace_sec_per_km": 371.2, "avg_hr": 157, "training_load": 249.5},
+        plan={"type": "easy", "target_distance_m": 6437.0,
+              "target_pace_sec_per_km": 360.0, "target_hr_max": 140.0, "seq": 1},
+        splits=LIVE_2026_07_22_SPLITS,
+    )
+    md = rc.render_markdown(card)
+    hr_row = next(ln for ln in md.splitlines() if ln.startswith("| Avg HR"))
+    assert hr_row == (
+        "| Avg HR | +19.5 bpm over cap (75% of run) | ≤ +1.5 bpm over cap "
+        "| +18.0 bpm | F |")
+    assert "| 157 bpm | ≤ 140 bpm |" not in md
+
+
+def test_the_rendered_card_shows_a_compliant_run_in_bpm():
+    """The converse, on the live 2026-08-02 numbers: a run that obeyed its cap
+    renders as bpm against bpm with no breach language anywhere in the row."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8062.25, "duration_seconds": 2923,
+         "avg_pace_sec_per_km": 362.58, "avg_hr": 139, "training_load": 52.2},
+        plan={"type": "easy", "target_distance_m": 8046.72,
+              "target_pace_sec_per_km": 359.77, "target_hr_max": 140.0, "seq": 1},
+        splits=LIVE_2026_08_02_SPLITS,
+    )
+    md = rc.render_markdown(card)
+    hr_row = next(ln for ln in md.splitlines() if ln.startswith("| Avg HR"))
+    assert hr_row == "| Avg HR | 139 bpm | ≤ 140 bpm | in range | A+ |"
 
 
 def test_no_prescribed_cap_still_uses_the_rolling_band():
@@ -406,11 +878,17 @@ def test_no_prescribed_cap_still_uses_the_rolling_band():
     assert hr["band"] == {"floor": None, "ceiling": pytest.approx(145.5)}
     assert "cap" not in hr
     assert "time_above_cap_pct" not in hr
+    assert "exceedance_bpm" not in hr
 
 
 def test_a_cap_grades_on_the_average_when_no_splits_exist():
     """The splits read DEGRADES rather than abstaining — a backfilled activity
-    with no splits still gets its cap graded, on the average alone."""
+    with no splits still gets its cap graded, on the average alone.
+
+    28 bpm over a prescribed ceiling for a whole run is an F. Under 0.40.0 the
+    average axis divided by the cap, which put the same run at 0.20 — a **C** —
+    for the same reason the exceedance is not divided by the cap: HR's non-zero
+    offset compresses every real breach into the passing bands."""
     card = card_for(
         {"date": "2026-07-19", "distance_meters": 8000, "duration_seconds": 2400,
          "avg_pace_sec_per_km": 360, "avg_hr": 168, "training_load": 60},
@@ -420,8 +898,9 @@ def test_a_cap_grades_on_the_average_when_no_splits_exist():
     hr = card["metrics"]["hr"]
     assert hr["reference"] == "plan"
     assert "time_above_cap_pct" not in hr      # nothing to measure
-    assert hr["deviation"] == pytest.approx(28 / 140)   # 0.20 -> C
-    assert rc.base_letter(hr["grade"]) == "C"
+    assert hr["deviation"] == pytest.approx(26.5 / 28, abs=1e-4)
+    assert rc.base_letter(hr["grade"]) == "F"
+    assert rc.base_letter(rc.grade_from_deviation(28 / 140)) == "C"   # the old grade
 
 
 def test_a_walked_day_refuses_the_plan_cap_with_the_rest_of_the_plan():
@@ -733,9 +1212,12 @@ def test_render_markdown_tables_are_well_formed():
             blocks[-1].append(line)
         prev_was_row = is_row
     # compliance (Metric/Actual/Expected/Delta/Grade), stimulus (Signal/Value),
-    # splits (Mile/Pace/Avg HR/vs run/Elev — the Distance column was dropped as
-    # duplicative, the row label already IS the distance).
-    assert [b[0].count("|") for b in blocks] == [6, 3, 6]
+    # splits (Mile/Avg HR/vs run — the Distance column was dropped as
+    # duplicative, the row label already IS the distance, and 0.41.0 drops any
+    # column with no data in ANY row. This fixture's splits carry no pace and
+    # no elevation, so those two columns are correctly absent rather than
+    # rendering as a full column of em-dashes).
+    assert [b[0].count("|") for b in blocks] == [6, 3, 4]
     for block in blocks:
         assert len({ln.count("|") for ln in block}) == 1
     assert "Morning Run" in md
@@ -1184,7 +1666,8 @@ def test_hr_expected_is_the_bound_the_grade_was_measured_against():
     assert hr["expected"] == pytest.approx(ceiling)
     assert hr["expected"] != 146.0          # NOT the bare median
     # And the delta agrees with the grade's direction: over the ceiling.
-    assert rc._delta_text("hr", hr).startswith("+")
+    # Stated in bpm since 0.41.0 — 160 against a 141.62 ceiling is 18 beats.
+    assert rc._delta_text("hr", hr) == "18 bpm over"
 
 
 def test_hr_inside_the_band_reads_in_range_not_a_percentage():
@@ -1235,12 +1718,21 @@ def test_easy_hr_ceiling_is_actually_reachable():
 
 
 def test_expected_text_falls_back_to_the_numeric_formatter():
-    # Only HR carries a display string; every other metric formats its number.
-    card = card_for({"date": "2026-07-19", "distance_meters": 10000,
-                     "duration_seconds": 3000, "avg_pace_sec_per_km": 300,
-                     "avg_hr": 150, "training_load": 100})
-    assert rc.expected_text("distance", card["metrics"]["distance"]) == "6.21 mi"
+    """A metric with no `expected_display` formats its raw number.
+
+    Rewritten in 0.41.0: this used to assert the fallback via a card's DISTANCE
+    metric on the claim that "only HR carries a display string". That stopped
+    being true — a rolling-reference distance is one-sided and now prints
+    "≥ 6.21 mi" — so the test is pointed at the fallback itself with a
+    hand-built dict, which is the behavior it was always about.
+    """
+    assert rc.expected_text("distance", {"expected": 10000.0}) == "6.21 mi"
+    assert rc.expected_text("pace", {"expected": 300.0}) == "8:03/mi"
     assert rc.expected_text("load", {"expected": None}) == "—"
+    # A display string, when present, always wins over the formatter.
+    assert rc.expected_text(
+        "distance", {"expected": 10000.0, "expected_display": "≥ 6.21 mi"}
+    ) == "≥ 6.21 mi"
 
 
 # --- a plan target is an instruction, a median is a reference --------------
@@ -1910,10 +2402,234 @@ def test_report_card_imports_without_workout_coach():
 
 def test_delta_text_never_prints_negative_zero_percent():
     """A live card printed 'Distance ... -0%' for 4.00-of-4.00 miles (short
-    by meters): within rounding of zero IS on target — say so."""
+    by meters): within rounding of zero IS on target — say so.
+
+    Since 0.41.0 there is no percentage on this row at all: a real gap reads in
+    miles. The negative-zero case is still the point of the test.
+    """
     just_under = {"actual": 6432.0, "expected": 6437.376, "grade": "A+"}
     assert rc._delta_text("distance", just_under) == "on target"
     just_over = {"actual": 6440.0, "expected": 6437.376, "grade": "A+"}
     assert rc._delta_text("distance", just_over) == "on target"
     real_gap = {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
-    assert rc._delta_text("distance", real_gap) == "+9%"
+    assert rc._delta_text("distance", real_gap) == "0.35 mi long"
+    short = {"actual": 5000.0, "expected": 6437.376, "grade": "D"}
+    assert rc._delta_text("distance", short) == "0.89 mi short"
+
+
+# --- 0.41.0: the card states the bound it graded against -------------------
+# The display half of the A+ problem. Direction gating means a run on the free
+# side of a one-sided expectation scores an exact 0.0 deviation, which is
+# mechanically an A+ — measured over the 15 stored cards at the time, 9 of 15
+# pace deviations were exactly 0.0 and A+ was 29 of the 32 A-band grades. The
+# grades are right; a bare "9:39/mi" in the Expected column beside a stated
+# "5s/mi slower" and an A+ is what made them read as a participation trophy.
+
+def test_pace_bound_kind_matches_pace_deviation_gating():
+    """`pace_bound_kind` is a claim ABOUT `pace_deviation`, so derive the truth
+    from `pace_deviation` itself rather than restating the branches.
+
+    A "floor" means running slower than the expectation is free; a "ceiling"
+    means running faster is free; a "point" means neither is. If the two ever
+    disagree the card prints a bound the grade did not use, which is the exact
+    class of bug this whole change is fixing.
+    """
+    target = 360.0  # 6:00/km
+    for cls in ("easy", "long", "quality", "steady"):
+        slower = rc.pace_deviation(target * 1.10, target, cls)
+        faster = rc.pace_deviation(target * 0.90, target, cls)
+        kind = rc.pace_bound_kind(cls)
+        if kind == "floor":
+            assert slower == 0.0, cls    # slow side free
+            assert faster > 0.0, cls
+        elif kind == "ceiling":
+            assert faster == 0.0, cls    # fast side free
+            assert slower > 0.0, cls
+        else:
+            assert slower > 0.0 and faster > 0.0, cls
+
+
+def test_easy_pace_expected_prints_as_a_floor_not_a_point_target():
+    """The headline case. A prescribed easy day run 5s/mi SLOWER is compliance,
+    and the row has to say so — before this it printed a bare target beside a
+    stated miss and an A+."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8047, "duration_seconds": 2923,
+         "avg_pace_sec_per_km": 363, "avg_hr": 130, "training_load": 52},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "seq": 1},
+    )
+    pace = card["metrics"]["pace"]
+    assert card["intent_class"] == "easy"
+    assert pace["deviation"] == 0.0                 # slower is free
+    assert pace["grade"].startswith("A")
+    assert pace["bound"] == "floor"
+    assert rc.expected_text("pace", pace).startswith("≥ ")
+    assert rc._delta_text("pace", pace).endswith("slower")
+
+
+def test_quality_pace_expected_prints_as_a_ceiling():
+    """The mirror: a rep target is a speed the run must MEET, so beating it is
+    free and the bound points the other way."""
+    assert rc.pace_bound_kind("quality") == "ceiling"
+    assert rc.bounded_display("ceiling", "6:58/mi") == "≤ 6:58/mi"
+
+
+def test_two_sided_expectations_keep_a_bare_number():
+    """A plan DISTANCE is a genuine point target — over-running a prescription
+    costs you — so it must NOT grow a bound prefix. Only the one-sided
+    expectations do."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8047, "duration_seconds": 2923,
+         "avg_pace_sec_per_km": 363, "avg_hr": 130, "training_load": 52},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "seq": 1},
+    )
+    distance = card["metrics"]["distance"]
+    assert distance["reference"] == "plan"
+    assert "bound" not in distance
+    assert rc.expected_text("distance", distance) == "5.00 mi"
+    assert rc.pace_bound_kind("steady") == "point"
+    assert rc.bounded_display("point", "5.00 mi") == "5.00 mi"
+
+
+def test_rolling_distance_expected_prints_as_a_floor():
+    """`distance_deviation(two_sided=False)` against the rolling median: going
+    LONGER than your norm is never a penalty, so the expectation is a floor."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100})
+    distance = card["metrics"]["distance"]
+    assert distance["reference"] == "rolling_60d"
+    assert distance["bound"] == "floor"
+    assert rc.expected_text("distance", distance).startswith("≥ ")
+
+
+# --- 0.41.0: one Delta grammar, never a percentage -------------------------
+
+def test_every_delta_is_in_the_rows_own_unit():
+    """A live card printed four dialects in four rows — `on target` /
+    `5s/mi slower` / `53% over` / `even` — where the percentages meant a
+    percentage of a distance, of a ratio, and of a percentage. Three different
+    quantities wearing one symbol.
+
+    The rule: a delta is stated in the unit its own row is measured in.
+    """
+    assert rc._delta_text(
+        "distance", {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
+    ) == "0.35 mi long"
+    assert rc._delta_text(
+        "pace", {"actual": 375.0, "expected": 360.0, "grade": "B"}
+    ) == "24s/mi slower"
+    assert rc._delta_text(
+        "hr", {"actual": 148.0, "expected": 140.0, "grade": "C"}
+    ) == "8 bpm over"
+    assert rc._delta_text(
+        "continuity", {"actual": 1.30, "expected": 1.15, "grade": "D"}
+    ) == "0.15x over"
+    # None of them may carry a percent sign.
+    for key, metric in (
+        ("distance", {"actual": 7000.0, "expected": 6437.376, "grade": "B"}),
+        ("pace", {"actual": 375.0, "expected": 360.0, "grade": "B"}),
+        ("hr", {"actual": 148.0, "expected": 140.0, "grade": "C"}),
+        ("continuity", {"actual": 1.30, "expected": 1.15, "grade": "D"}),
+    ):
+        assert "%" not in rc._delta_text(key, metric), key
+
+
+def test_continuity_delta_states_the_gap_in_median_splits_both_ways():
+    """`even` lost the magnitude on the compliant side, and `N% over` was a
+    percentage of a ratio on the other. Both are now a gap in the unit
+    `actual` and `expected` are already in."""
+    compliant = {"actual": 1.07, "expected": 1.15, "grade": "A+"}
+    assert rc._delta_text("continuity", compliant) == "0.08x under"
+    assert rc._delta_text(
+        "continuity", {"actual": 1.15, "expected": 1.15, "grade": "A"}
+    ) == "on target"
+
+
+def test_continuity_expected_uses_the_typographic_bound():
+    """The card printed `<= 1.15x` beside `≤ 140 bpm` in the same column."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=MILE_SPLITS)
+    continuity = card["metrics"]["continuity"]
+    if continuity.get("expected_display"):
+        assert continuity["expected_display"].startswith("≤ ")
+        assert "<=" not in continuity["expected_display"]
+
+
+# --- 0.41.0: dead split columns are dropped --------------------------------
+
+def test_split_table_drops_columns_with_no_data_and_keeps_the_rest():
+    """13 of 15 stored cards had an entirely empty Elev column and 85% of
+    `activity_splits` rows carry no elevation — a treadmill run never has any.
+    A full column of em-dashes is ~15% of the table's width spent on nothing,
+    on a page whose density ladder was already bottoming out.
+
+    `vs run` is deliberately KEPT when it has data: it is what makes a hot mile
+    visible at a glance.
+    """
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 600 + i, "avg_hr": 140 + i,
+                 "avg_pace_sec_per_km": 373.0} for i in range(4)])
+    headers, rows = rc.split_table(card)
+    assert "Elev" not in headers            # no elevation anywhere
+    assert "Avg HR" in headers
+    assert "vs run" in headers              # has data — kept
+    assert "Pace" in headers
+    assert all(len(r) == len(headers) for r in rows)
+    assert not any("—" == c for r in rows for c in r)
+
+    # ...and a column WITH data survives.
+    with_elev = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 600 + i, "avg_hr": 140 + i,
+                 "avg_pace_sec_per_km": 373.0,
+                 "elevation_gain_meters": 12.0} for i in range(4)])
+    assert "Elev" in rc.split_table(with_elev)[0]
+
+
+def test_split_table_drops_hr_columns_together_when_the_watch_recorded_none():
+    """No per-split HR means `Avg HR` and `vs run` are both dead. Dropping one
+    and keeping the other would leave a column of dashes headed by a
+    comparison against a number that isn't shown."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "training_load": 100},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 600, "avg_pace_sec_per_km": 373.0}
+                for i in range(4)])
+    headers, _rows = rc.split_table(card)
+    assert "Avg HR" not in headers
+    assert "vs run" not in headers
+    assert headers[0] == "Mile"
+
+
+def test_split_table_is_the_single_source_for_both_renderers():
+    """The markdown card and the PDF had this table written out twice, and a
+    column dropped in one and kept in the other is precisely the divergence
+    `render_report_card_pdf`'s already-built-card contract exists to prevent —
+    the same reason `stimulus_rows` is shared."""
+    from local_fitness.agent import visuals
+
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=MILE_SPLITS)
+    headers, rows = rc.split_table(card)
+    md = rc.render_markdown(card)
+    html_doc = visuals._render_splits_html(card, None)
+    for h in headers:
+        assert f"| {h} " in md or f"|{h}|" in md.replace(" ", "")
+        assert f"<th>{h}</th>" in html_doc
+    assert "<th>Elev</th>" not in html_doc
+    assert html_doc.count("<th>") == len(headers)
+    for cell in rows[0]:
+        assert f"<td>{cell}</td>" in html_doc

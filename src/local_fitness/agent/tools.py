@@ -3854,8 +3854,25 @@ async def workout_report_card(args: dict) -> dict:
         # THIS card's own journal entries are excluded: without that, reflecting
         # on the card would change its next prompt, bust the read cache, and
         # regenerate on every render forever.
+        #
+        # `today` is the ACTIVITY's date, not the clock's (0.40.2, mirroring
+        # the plan-coach call above, which has anchored to `target_date` since
+        # it was written). A read about a run on 2026-07-28 must cite the
+        # relationship as it stood then — the streaks, the plan misses and the
+        # trailing card aggregate that were true when he finished it — not
+        # figures that have moved in the weeks since. Reading today's ledger
+        # onto an old card is the same category of error as grading it against
+        # today's plan, which build_card already refuses to do.
+        #
+        # The cache consequence is a consequence, not the reason: the ledger
+        # renders a step-streak counter that increments daily, so an
+        # unanchored memory block put a fresh value into every card's prompt
+        # every day, rotating the read cache key and turning every re-render of
+        # a past card into a full SDK call. Measured on the live corpus
+        # 2026-08-02: 14 of 15 stored cards missed the fast path.
         _memory_text = memory.render_memory_for_prompt(
             conn=conn,
+            today=inputs["activity"]["date"],
             exclude_source_key=("report_card", _activity_key),
             user_name=_user_name,
         )
