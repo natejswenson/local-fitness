@@ -64,7 +64,18 @@ def _render_status(status: dict[str, Any]) -> str:
     """Readable markdown rendering of ``assemble_status()`` for the coach
     prompt. Snapshot table, training-load read, and recent workouts in miles.
     The active user notes are NOT rendered here — they're already in the
-    persona (``system_prompt`` injects them via ``render_for_prompt``)."""
+    persona (``system_prompt`` injects them via ``render_for_prompt``).
+
+    Rounded through ``agent_tools._round_floats`` first. That helper's own
+    docstring calls it "the ONE choke point every tool payload flows through",
+    but it only ran inside ``_text``/``_err`` — so this renderer, which formats
+    ``assemble_status()`` straight to markdown, bypassed it. The same data
+    therefore reached the model two ways: ``daily_snapshot`` returned
+    ``tsb: -0.08`` while the ``/coach`` prompt printed
+    ``TSB -0.077230305434135``. Raw float64 in a prompt is noise the model has
+    to re-round before it can speak, and it invites a spurious-precision
+    read-back."""
+    status = agent_tools._round_floats(status)
     lines: list[str] = []
     lines.append(f"## Daily snapshot — {status.get('date', '')}")
     lines.append("")
