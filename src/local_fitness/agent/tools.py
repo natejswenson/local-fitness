@@ -4219,9 +4219,28 @@ ALL_TOOLS = [
 LOCAL_ONLY_TOOLS = [generate_brief_report, workout_report_card]
 
 
+def server_version() -> str:
+    """The app version every MCP client sees in ``serverInfo``.
+
+    Read from installed package metadata rather than hardcoded. It was pinned
+    at a literal "0.6.0" from the server's first commit, so by 0.44.0 every
+    client — Claude Desktop, opencode, a phone over /mcp/ — was reporting a
+    version 38 releases stale, which is exactly the number you read off the
+    client while trying to work out whether a fix has shipped.
+
+    Falls back to "0.0.0" when the package isn't installed (a source checkout
+    running without an install); a version string must never be the reason a
+    server fails to start.
+    """
+    try:
+        return importlib.metadata.version("local-fitness")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+        return "0.0.0"
+
+
 def make_server(extra_tools: list | None = None):
     return create_sdk_mcp_server(
-        name=SERVER_NAME, version="0.6.0", tools=ALL_TOOLS + (extra_tools or [])
+        name=SERVER_NAME, version=server_version(), tools=ALL_TOOLS + (extra_tools or [])
     )
 
 
