@@ -1135,19 +1135,41 @@ def test_run_sql_select(seeded):
     assert payload["count"] == 1
 
 
+# These three guard the SQL boundary, and each must fail for its OWN reason.
+# They asserted only `assert err` until 0.47.0 — so a run_sql that rejected
+# EVERY query, including valid SELECTs, would have passed all three. Pinning
+# the error text is what makes them distinguish "rejected correctly" from
+# "rejected for the wrong reason" (and from "rejected everything").
+
+
 def test_run_sql_rejects_non_select(seeded):
-    _payload, err = call(tools.run_sql, {"query": "DELETE FROM daily_metrics"})
+    payload, err = call(tools.run_sql, {"query": "DELETE FROM daily_metrics"})
     assert err
+    assert "only SELECT/WITH queries permitted" in payload["error"]
 
 
 def test_run_sql_rejects_forbidden_keyword(seeded):
-    _payload, err = call(tools.run_sql, {"query": "WITH x AS (SELECT 1) UPDATE settings SET value='x'"})
+    """A statement that STARTS with WITH clears the first gate, so the keyword
+    denylist is what has to catch it."""
+    payload, err = call(tools.run_sql,
+                        {"query": "WITH x AS (SELECT 1) UPDATE settings SET value='x'"})
     assert err
+    assert "forbidden keyword: update" in payload["error"]
 
 
 def test_run_sql_bad_query(seeded):
-    _payload, err = call(tools.run_sql, {"query": "SELECT * FROM does_not_exist"})
+    payload, err = call(tools.run_sql, {"query": "SELECT * FROM does_not_exist"})
     assert err
+    # Reached sqlite and failed there — NOT stopped by either guard above.
+    assert "no such table: does_not_exist" in payload["error"]
+
+
+def test_run_sql_accepts_a_valid_select(seeded):
+    """The other half of the boundary, and the one whose absence let the three
+    tests above pass a reject-everything implementation."""
+    payload, err = call(tools.run_sql, {"query": "SELECT 1 AS n"})
+    assert not err, payload
+    assert payload["rows"] == [{"n": 1}]
 
 
 def test_run_sql_bad_table_points_at_schema_resource(seeded):

@@ -112,6 +112,14 @@ _WALKING_SUBSTRINGS = ("walk", "hik")
 _DISTANCE_TYPES = frozenset({"easy", "long", "race"})
 _DURATION_TYPES = frozenset({"interval", "tempo"})
 
+#: Plausible bounds for a PRESCRIBED heart-rate ceiling (bpm). One definition
+#: shared by both write paths — `validate_plan_input` (plan creation) and
+#: `update_plan_workout` (a single-day edit). They disagreed until 0.47.0: the
+#: edit path bounded it and the create path did not, so the same nonsense value
+#: was rejected on an edit and accepted on a proposal.
+MIN_PRESCRIBED_HR = 90.0
+MAX_PRESCRIBED_HR = 210.0
+
 # numeric workout fields that, when present, must be finite and non-negative
 _NUMERIC_FIELDS = ("target_distance_m", "target_pace_sec_per_km",
                    "target_duration_sec", "target_hr_max", "week_index", "seq")
@@ -297,6 +305,22 @@ def validate_plan_input(
                 return f"workout {i}: {field} must be a number"
             if not math.isfinite(v) or v < 0:
                 return f"workout {i}: {field} must be finite and non-negative"
+
+        # A prescribed HR ceiling outside 90-210 bpm is a transposed or
+        # unit-confused argument, not a coaching decision. `update_plan_workout`
+        # has bounded it since 0.40.0 while this path — how a plan is CREATED —
+        # only checked finite-and-non-negative, so `hr_max: 14` was accepted on
+        # a proposal and rejected on an edit. The blast radius is the whole
+        # plan: the card grades HR against this column via
+        # `hr_cap_severity = (bpm_over - 1.5) / 28`, so a 14 bpm cap puts every
+        # capped day ~120 bpm over, F on HR, and the F-cap drops each of those
+        # days to C for the life of the plan, with no error anywhere.
+        # 90 is deliberately not tightened further — it is a plausible real
+        # recovery-run ceiling.
+        hr_max = w.get("target_hr_max")
+        if hr_max is not None and not (MIN_PRESCRIBED_HR <= hr_max <= MAX_PRESCRIBED_HR):
+            return (f"workout {i}: target_hr_max of {hr_max:.0f} bpm is outside "
+                    f"the plausible {MIN_PRESCRIBED_HR:.0f}-{MAX_PRESCRIBED_HR:.0f} bpm range")
 
         desc = w.get("description")
         # Reject a non-string description with a clean indexed error rather than

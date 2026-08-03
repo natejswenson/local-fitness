@@ -2635,9 +2635,13 @@ def _prescription_fields(args: dict) -> tuple[dict | None, str | None]:
         # or unit-confused argument, not a coaching decision. Same discipline as
         # the pace bound above, and it matters more here because the report card
         # grades against this number directly.
-        if not (90.0 <= hr_max <= 210.0):
-            return None, (f"hr_max of {hr_max:.0f} bpm is outside the plausible "
-                          "90-210 bpm range")
+        # Bounds live in plans.py so the CREATE path (validate_plan_input)
+        # and this EDIT path share one definition — they disagreed until
+        # 0.47.0, and hr_max=14 was rejected here but accepted on a proposal.
+        if not (plans.MIN_PRESCRIBED_HR <= hr_max <= plans.MAX_PRESCRIBED_HR):
+            return None, (
+                f"hr_max of {hr_max:.0f} bpm is outside the plausible "
+                f"{plans.MIN_PRESCRIBED_HR:.0f}-{plans.MAX_PRESCRIBED_HR:.0f} bpm range")
         fields["target_hr_max"] = hr_max
     if args.get("description") is not None:
         fields["description"] = args["description"]

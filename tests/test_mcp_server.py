@@ -73,6 +73,34 @@ def test_render_status_sleep_row_uses_format_hm():
     assert "25500" not in text
 
 
+def test_render_status_rounds_floats_like_every_tool_payload():
+    """The /coach prompt and daily_snapshot must show the SAME numbers.
+
+    `_round_floats` calls itself "the ONE choke point every tool payload flows
+    through", but it only ran inside `_text`/`_err` — and this renderer formats
+    `assemble_status()` straight to markdown. Live, the prompt printed
+    `TSB -0.077230305434135` and `baseline 31.616666666666667` where the tool
+    returned `-0.08` and `31.62`."""
+    status = {
+        "date": "2026-08-03",
+        "metrics": [
+            {"metric": "avg_stress", "value": 27, "treatment": "baseline_delta",
+             "baseline": 31.616666666666667, "delta_pct": -14.6, "arrow": "↓"},
+        ],
+        "training_load": {
+            "ctl": 58.957722002523454, "atl": 59.03495230795759,
+            "tsb": -0.077230305434135, "interpretation": "neutral"},
+        "recent_workouts": [],
+    }
+    text = mcp_server._render_status(status)
+    assert "58.96" in text and "59.03" in text and "-0.08" in text
+    assert "31.62" in text
+    # The raw float64 tails must be gone, not merely accompanied.
+    for raw in ("58.957722002523454", "-0.077230305434135",
+                "31.616666666666667", "59.03495230795759"):
+        assert raw not in text, f"raw float leaked into the coach prompt: {raw}"
+
+
 def test_render_status_falls_back_to_raw_value_when_unformatted():
     # A metric with no value_formatted key (every metric but sleep_seconds)
     # renders its raw value exactly as before.

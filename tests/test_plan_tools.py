@@ -1127,3 +1127,50 @@ def test_apply_rest_semantics_does_not_mutate_its_input():
     fields = {"type": "rest", "target_distance_m": 5000.0}
     plans.apply_rest_semantics(fields)
     assert fields == {"type": "rest", "target_distance_m": 5000.0}
+
+
+# --- prescribed HR bounds are the SAME on both write paths -------------------
+# `update_plan_workout` has bounded hr_max since 0.40.0; `validate_plan_input`
+# (how a plan is CREATED) only checked finite-and-non-negative, so the same
+# nonsense value was rejected on an edit and accepted on a proposal. The blast
+# radius is the whole plan: the card grades HR via
+# hr_cap_severity = (bpm_over - 1.5) / 28, so a 14 bpm cap puts every capped
+# day ~120 bpm over -> F on HR -> the F-cap drops each to C for the plan's life.
+
+
+@pytest.mark.parametrize("bad_hr", [14, 0.5, 89, 211, 900])
+def test_propose_rejects_an_implausible_hr_cap(seeded, bad_hr):
+    t = date.today()
+    body, err = call(tools.propose_training_plan, _args(workouts=[
+        dict(date=(t + timedelta(days=1)).isoformat(), week_index=1, type="easy",
+             target_distance_m=6000.0, target_hr_max=bad_hr, description="easy")]))
+    assert err, f"hr_max={bad_hr} was accepted on a proposal"
+    assert "target_hr_max" in body["error"]
+    assert "90-210" in body["error"]
+    assert plans.get_draft_plan(db_path=seeded) is None, "a rejected plan was stored"
+
+
+@pytest.mark.parametrize("ok_hr", [90, 140, 210])
+def test_propose_accepts_a_plausible_hr_cap(seeded, ok_hr):
+    """The bound must not be so tight it rejects real prescriptions — 90 is a
+    plausible recovery ceiling and 210 a plausible max-effort one."""
+    t = date.today()
+    body, err = call(tools.propose_training_plan, _args(workouts=[
+        dict(date=(t + timedelta(days=1)).isoformat(), week_index=1, type="easy",
+             target_distance_m=6000.0, target_hr_max=ok_hr, description="easy")]))
+    assert not err, body
+    stored = plans.get_draft_plan(db_path=seeded)["workouts"][0]
+    assert stored["target_hr_max"] == ok_hr
+
+
+def test_both_write_paths_share_one_hr_bound(seeded):
+    """The create and edit paths must agree. They didn't until 0.47.0; this
+    drives the SAME value through both and asserts both reject it."""
+    t = date.today()
+    d = (t + timedelta(days=1)).isoformat()
+    _body, create_err = call(tools.propose_training_plan, _args(workouts=[
+        dict(date=d, week_index=1, type="easy", target_distance_m=6000.0,
+             target_hr_max=14, description="easy")]))
+    _active_plan(seeded)
+    _body2, edit_err = call(tools.update_plan_workout, {"date": d, "hr_max": 14})
+    assert create_err and edit_err, (create_err, edit_err)

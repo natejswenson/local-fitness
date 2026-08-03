@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-08-03
+
+### Fixed
+- **The `/coach` prompt leaked raw float64 that every tool payload rounds
+  away.** `_round_floats` describes itself as "the ONE choke point every tool
+  payload flows through", but it only ran inside `_text`/`_err` —
+  `mcp_server._render_status` formats `assemble_status()` straight to markdown
+  and bypassed it. The same data reached the model two ways, live:
+
+  ```
+  /coach prompt:       CTL 58.957722002523454 · TSB -0.077230305434135
+                       avg_stress ↓ -14.6% vs baseline 31.616666666666667
+  daily_snapshot tool: ctl 58.96, tsb -0.08, baseline 31.62
+  ```
+
+  Now routed through the same helper. Raw float64 in a prompt is noise the
+  model must re-round before it can speak, and it invites a spurious-precision
+  read-back.
+
+- **A prescribed HR cap was bounded on edit but not on create.**
+  `update_plan_workout` has rejected anything outside 90–210 bpm since 0.40.0;
+  `plans.validate_plan_input` — how a plan is *created* — only checked
+  finite-and-non-negative, so `target_hr_max: 14` was rejected on an edit and
+  accepted on a proposal. The blast radius is the whole plan, silently: the
+  report card grades HR via `hr_cap_severity = (bpm_over − 1.5) / 28`, so a
+  14 bpm cap puts every capped day ~120 bpm over the ceiling → F on HR → the
+  F-cap drops each of those days to C for the life of the plan, with no error
+  anywhere. The bounds now live once in `plans.MIN_PRESCRIBED_HR` /
+  `MAX_PRESCRIBED_HR` and both write paths read them. 90 is deliberately not
+  tightened further — it is a plausible real recovery-run ceiling.
+
+### Tests
+- **The three `run_sql` boundary tests would have passed a `run_sql` that
+  rejected every query, valid ones included.** Each asserted only `assert err`,
+  so none could tell "rejected correctly" from "rejected for the wrong reason".
+  They now pin the distinguishing message — `only SELECT/WITH queries
+  permitted`, `forbidden keyword: update`, `no such table: does_not_exist` —
+  and a fourth test asserts a valid `SELECT` still *succeeds*, which is the
+  half whose absence made the reject-everything implementation pass.
+
 ## [0.46.0] - 2026-08-03
 
 ### Added
