@@ -6,6 +6,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.43.1] - 2026-08-03
+
+### Security
+- **A crafted `Host` header could skip the bearer gate entirely.** The auth
+  middleware decided public-vs-private from `request.url.path`. Starlette
+  rebuilds `request.url` out of the `Host` header
+  (`f"{scheme}://{host}{path}"`) and re-parses it, so a `/` in that header
+  moves the path boundary: a `POST /mcp/` sent with
+  `Host: fitness.home.local/health#` presented a `url.path` of `/health`,
+  `_is_public_path` returned True, and `require_api_token` returned before
+  checking the token (starlette <1.0.1, GHSA-86qp-5c8j-p5mr).
+
+  `_is_public_path` was never wrong — the bug was what got *passed* to it.
+  Both middlewares now read `_request_path(request)` → `request.scope["path"]`,
+  the string the ASGI server parsed from the request line and the one the
+  router actually dispatches on. No header can influence it, so the gate and
+  the router cannot disagree.
+
+  **What was containing it, and why that wasn't good enough.** The request
+  still died at 421 in the MCP transport's own DNS-rebinding guard, which
+  compares the Host against its allowlist *exactly* — and a poisoned Host,
+  containing a `/`, can never match. That is an accident of the attack's
+  shape, not a control. Under the supported wildcard-port form
+  (`LOCAL_FITNESS_MCP_ALLOWED_HOSTS='fitness.home.local:*'`) the guard's
+  `startswith` branch accepts it and the identical unauthenticated request
+  completed a full MCP `initialize` — and from there `tools/list` and every
+  read and write tool. Traefik filters the proxied path but not traffic
+  reaching the container directly on the Docker network.
+
+  Fixed in two independent layers: the `scope["path"]` change (holds
+  regardless of dependency version) and the starlette bump below (closes
+  today's CVE). The code change is the durable one — bumping alone would fix
+  this instance and leave the class open.
+
+- **Dependency bumps for 6 HIGH advisories.** `starlette` 1.0.0 → 1.3.1
+  (the above, plus the HIGH form-limit DoS GHSA-82w8-qh3p-5jfq),
+  `python-multipart` 0.0.26 → 0.0.32 (quadratic-querystring DoS, unbounded
+  multipart headers), `pydantic-settings` 2.14.0 → 2.14.2.
+
+### Tests
+- Three cases in `tests/test_security.py`. `test_poisoned_host_header_cannot
+  _bypass_the_bearer_gate` fails on the pre-fix middleware by raising
+  `RuntimeError: Task group is not initialized` from inside the mounted MCP
+  app — reaching the mount at all is the proof the gate was skipped.
+  `test_request_path_is_invariant_under_any_host_header` pins the invariant
+  across five hostile Host forms and is deliberately version-independent: an
+  earlier draft asserted that `url.path` *does* relocate, which the starlette
+  bump immediately falsified, turning the test into a CVE detector that
+  silently passes once the library is patched.
+  `test_health_stays_public_with_an_ordinary_host_header` guards the
+  over-correction — the container's liveness probe must stay unauthenticated.
+
 ## [0.43.0] - 2026-08-02
 
 ### Added

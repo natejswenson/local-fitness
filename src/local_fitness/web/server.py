@@ -89,6 +89,25 @@ app.mount("/mcp", app=_MCP_MANAGER.handle_request)
 # Order: outermost wraps innermost. Defined later in the file = outer.
 # Rate-limit runs OUTSIDE auth so a flood with bad tokens is still capped.
 
+def _request_path(request: Request) -> str:
+    """The path the ROUTER will dispatch on — the only safe input to a
+    path-based security decision.
+
+    Never use ``request.url.path`` here. Starlette rebuilds ``request.url``
+    from the ``Host`` header (``f"{scheme}://{host}{path}"``) and re-parses
+    it, so a ``/`` or ``#`` in an attacker-supplied Host relocates the path
+    boundary: ``Host: example.local/health#`` turns a POST to ``/mcp/`` into
+    a ``url.path`` of ``/health``, which ``_is_public_path`` then waves
+    through unauthenticated (starlette <1.0.1, GHSA-86qp-5c8j-p5mr).
+
+    ``scope["path"]`` is set by the ASGI server from the request line and is
+    untouched by any header, so the gate and the router can never disagree.
+    Keeping this independent of the starlette version is the point: the
+    dependency bump alone would fix today's CVE and leave the class open.
+    """
+    return request.scope["path"]
+
+
 def _is_public_path(path: str) -> bool:
     """Routes anyone can hit: only the liveness probe. Deny-by-default for
     everything else — there's no SPA shell left that needs to load
@@ -105,8 +124,10 @@ async def require_api_token(request: Request, call_next):
     loopback). On when set: every non-public request must carry
     ``Authorization: Bearer <token>``. Constant-time comparison prevents
     timing-side-channel guessing.
+
+    Reads ``scope["path"]``, NEVER ``request.url.path`` — see ``_request_path``.
     """
-    path = request.url.path
+    path = _request_path(request)
     if API_TOKEN is None or _is_public_path(path):
         return await call_next(request)
     auth_header = request.headers.get("authorization", "")
@@ -124,7 +145,7 @@ async def rate_limit(request: Request, call_next):
     its own tooling. The bucket is purely in-memory; restart resets state,
     which is fine for a single-instance personal app.
     """
-    path = request.url.path
+    path = _request_path(request)
     if not any(path.startswith(p) for p in RATE_LIMITED_PREFIXES):
         return await call_next(request)
     client_ip = request.client.host if request.client else "unknown"
