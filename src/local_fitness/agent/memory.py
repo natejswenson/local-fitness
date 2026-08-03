@@ -97,6 +97,16 @@ def render_memory_for_prompt(
     can't cascade: without it, reflecting on a card would change that same
     card's next prompt, bust its cache, and regenerate forever.
 
+    ``today`` means *as of* that date and is honoured by BOTH layers: the
+    ledger already computed its facts against it, and the journal is now
+    capped at it too (``on_or_before``). Half-anchoring was a real defect
+    rather than an omission — a caller rendering a past artifact got that
+    date's ledger beside journal lines written weeks later, so the block
+    described two different moments at once, and any entry written anywhere
+    changed the text of every past artifact's prompt. ``None`` (chat, the MCP
+    persona) keeps the unbounded live view, which is correct there: those
+    surfaces are about now.
+
     Never raises — a memory failure must never cost a brief, a card, or a
     chat session. Failure → ``""`` + a logged warning.
     """
@@ -114,7 +124,8 @@ def render_memory_for_prompt(
 
         limit = COMPACT_ENTRIES if compact else FULL_ENTRIES
         entries = journal.list_entries(
-            limit=limit + 10, db_path=db_path, conn=conn)
+            limit=limit + 10, db_path=db_path, conn=conn,
+            on_or_before=today)
         if exclude_source_key is not None:
             src, key = exclude_source_key
             entries = [

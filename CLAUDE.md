@@ -131,9 +131,20 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   `pytest-benchmark`-based, separate axis from the coverage gate: latency
   AND `db.connect()`-open-count for the brief/plan hot paths
   (`assemble_brief_context`, `get_training_plan_progress`,
-  `get_training_plan_status`, `_build_plan_section`, `daily_snapshot`),
-  run against a synthetic multi-year fixture (`scripts/perf_fixture.py` —
-  fabricated, never derived from real data). Skipped on every ordinary
+  `get_training_plan_status`, `_build_plan_section`, `daily_snapshot`) and,
+  since 0.40.2, the **report-card** path (`workout_report_card` = exactly 2
+  opens; `load_report_card_inputs` = 0, it takes the caller's connection),
+  run against synthetic fixtures (`scripts/perf_fixture.py` —
+  fabricated, never derived from real data). **Two fixture builders, and the
+  split is load-bearing**: the report card needs paced activities (run-vs-walk
+  is decided by measured pace), but `plans.best_recent_effort` EXCLUDES
+  paceless rows, so adding paces to the shared multi-year fixture hands the
+  baselined benchmarks rows they currently skip — measured +7.2% on
+  `get_training_plan_status`, against a 15%-of-min gate that can only be
+  rebaselined on ubuntu CI. Anything the report card needs goes in
+  `build_report_card_fixture_db`, never into the shared one. The PDF path is
+  deliberately OUT of the gate: WeasyPrint/matplotlib latency is font- and
+  machine-dependent and would false-fail the floor. Skipped on every ordinary
   `pytest` run (`--benchmark-skip` in `pyproject.toml`'s `addopts`); the
   `validate` job's "Perf-benchmark regression gate" step explicitly opts
   back in with `--benchmark-only --no-cov`, comparing against the
@@ -410,7 +421,22 @@ These are settled — don't redesign without a reason.
   entries for real; there is no prune path.
   `agent/memory.py` is the ONE resolver; `prompts.coach_memory_block` is the
   pure injection block whose header carries the grounding contract (callbacks
-  may cite only listed facts; empty section → no callbacks). **Memory is
+  may cite only listed facts; empty section → no callbacks).
+  **`render_memory_for_prompt(today=…)` means AS OF that date, on BOTH layers**
+  (0.40.2). The ledger always honoured it; the journal was an unbounded
+  latest-N list beside it, so a caller rendering a past artifact got that
+  date's ledger next to entries written weeks later — one block describing two
+  moments, and *any* new entry rewrote the memory of every past artifact.
+  `journal.list_entries(on_or_before=…)` is the bound; it is off by default, so
+  chat and the MCP persona (which pass no `today`) keep the live view, which is
+  correct for surfaces that are about now. **Every surface rendering a DATED
+  artifact must pass its artifact's date** — `plan_coach` always did
+  (`target_date`), the report card now does (the activity's date). Getting this
+  wrong is not just a cache miss: it is the same category of error as grading a
+  July run against today's plan. It also happens to be what keeps the read
+  cache keys stable, since the ledger renders a step-streak counter that
+  increments daily — unanchored, 14 of 15 stored cards missed the fast path
+  (measured 2026-08-02) and a clock move regenerated every one of them. **Memory is
   passed INTO the four voice surfaces as `memory_text`, never resolved inside
   the builders** — the PDF coaches key disk caches on the prompt hash, and
   `prompts.py` builds `SYSTEM_PROMPT` at import (an internal DB read would
@@ -942,7 +968,20 @@ These are settled — don't redesign without a reason.
   from ONE render; no splicing path exists). The stored read doubles as a
   **per-activity read cache**: `workout_coach.read_cache_key` is the single
   key definition, and a re-render whose prompt key matches the stored row
-  reuses the read with no SDK call. Query surface: `list_report_cards` +
+  reuses the read with no SDK call. **That reuse is only real if the key is
+  stable across days** — see the memory bullet's `today=` anchoring contract;
+  before 0.40.2 the key rotated overnight and the fast path fired for
+  essentially nothing. A one-off check that it still holds: render a card,
+  move the clock, render again, and count SDK calls (`tests/test_tools.py`'s
+  `test_the_read_cache_key_does_not_move_with_the_calendar` is that check,
+  automated). **A renamed `READ_SECTIONS` key silently kills reuse too** — a
+  stored row failing `read_is_complete` regenerates however well its key
+  matches, which is what 0.40.0's `load` → `stimulus` did to 12 of 15 live
+  rows. Renaming a section means adding the pair to
+  `card_store._RENAMED_READ_SECTIONS`; `migrate_read_section_names` (run from
+  `db.init_schema`, idempotent, rewrites `card_json`'s key name and NOTHING
+  else — never `graded_at`, the key or a grade) repairs the stored rows.
+  Query surface: `list_report_cards` +
   `get_report_card` in `ALL_TOOLS` (pure JSON → reachable over stdio AND
   `/mcp/`; `workout_report_card` itself stays stdio-only). Two load-bearing
   assumptions: **no delete/prune path exists** (`load_read` reads outside

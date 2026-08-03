@@ -103,11 +103,21 @@ def list_entries(
     conn: sqlite3.Connection | None = None,
     *,
     include_archived: bool = False,
+    on_or_before: str | None = None,
 ) -> list[dict]:
     """Newest-first entries, optionally restricted to the trailing ``days``.
 
     Default is the hot (unarchived) set — what injection and reflect see;
-    ``include_archived=True`` opens the whole journal for browsing."""
+    ``include_archived=True`` opens the whole journal for browsing.
+
+    ``on_or_before`` (ISO date) caps the window at the top, so a caller can ask
+    what the journal held *as of* a past date rather than what it holds now.
+    Off by default — every existing caller keeps the unbounded latest-N view.
+    ``memory.render_memory_for_prompt`` passes it whenever it is given a
+    ``today``, which is what makes a past report card's prompt (and therefore
+    its read cache key) stop moving every time an unrelated entry is written:
+    an entry dated after the card can no longer enter that card's memory.
+    """
     sql = ("SELECT entry_id, created_at, entry_date, source, source_key, seq, "
            "text, archived FROM coach_journal")
     conditions: list[str] = []
@@ -117,6 +127,9 @@ def list_entries(
     if days is not None:
         conditions.append("entry_date >= date('now', ?)")
         params.append(f"-{int(days)} days")
+    if on_or_before is not None:
+        conditions.append("entry_date <= ?")
+        params.append(str(on_or_before))
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
     # entry_date DESC first: a report_card reflection can be graded on-demand

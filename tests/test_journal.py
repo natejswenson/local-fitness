@@ -215,3 +215,40 @@ def test_render_journal_block_formats_dates_and_skips_blanks():
         "- not-a-date: odd date survives verbatim"
     )
     assert journal.render_journal_block([], "Alex") == ""
+
+
+def test_list_entries_on_or_before_caps_the_window_at_the_top(jdb):
+    journal.save_entry("before the card", source="chat",
+                       entry_date="2026-07-20")
+    journal.save_entry("the day itself", source="chat",
+                       entry_date="2026-07-22")
+    journal.save_entry("written afterwards", source="chat",
+                       entry_date="2026-07-25")
+
+    texts = [e["text"] for e in
+             journal.list_entries(db_path=jdb, on_or_before="2026-07-22")]
+    # Inclusive of the bound day, exclusive of everything after it.
+    assert texts == ["the day itself", "before the card"]
+
+    # Default is unchanged for every other caller: no bound, everything.
+    assert len(journal.list_entries(db_path=jdb)) == 3
+
+
+def test_list_entries_on_or_before_composes_with_the_other_filters(jdb):
+    journal.save_entry("old hot", source="chat", entry_date="2026-07-01")
+    journal.save_entry("recent hot", source="chat", entry_date="2026-07-22")
+    journal.save_entry("later hot", source="chat", entry_date="2026-07-25")
+    with db.connect(jdb) as conn:
+        conn.execute("UPDATE coach_journal SET archived = 1 "
+                     "WHERE entry_date = '2026-07-01'")
+
+    # archived stays excluded by default even inside the bounded window...
+    assert [e["text"] for e in journal.list_entries(
+        db_path=jdb, on_or_before="2026-07-22")] == ["recent hot"]
+    # ...and include_archived widens only that axis, never the date bound.
+    assert [e["text"] for e in journal.list_entries(
+        db_path=jdb, on_or_before="2026-07-22",
+        include_archived=True)] == ["recent hot", "old hot"]
+    # limit still applies on top.
+    assert len(journal.list_entries(
+        db_path=jdb, on_or_before="2026-07-25", limit=1)) == 1

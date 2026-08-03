@@ -6,6 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-08-02
+
+### Fixed
+- **A report card's coach memory is now resolved as of the ACTIVITY's date, not
+  the clock.** A read about a run on 2026-07-28 has to cite the relationship as
+  it stood then — the streaks, the plan misses, the trailing card aggregate that
+  were true when he finished it — not figures that have moved in the weeks
+  since. Reading today's ledger onto an old card is the same category of error
+  as grading it against today's plan, which `build_card` already refuses to do.
+  `tools.workout_report_card` passes `today=<activity date>` into
+  `memory.render_memory_for_prompt`, mirroring the plan-coach call beside it,
+  which has anchored to `target_date` since it was written.
+
+  The cache consequence is a consequence, not the reason. The coach's memory is
+  inside the prompt the read cache keys on, and the ledger renders a step-streak
+  counter that increments every day, so every stored card's key rotated
+  overnight and re-rendering any past card paid a full ~10s SDK call. Measured
+  on the live corpus 2026-08-02: **14 of 15 stored cards missed the fast path**;
+  only the card rendered that same day hit.
+
+- **`memory.render_memory_for_prompt`'s `today` now anchors both layers.** The
+  ledger honoured it; the journal was an unbounded latest-N list beside it, so
+  the block described two different moments at once and *any* new entry —
+  another card's reflection, the morning brief's — rewrote the memory of every
+  past artifact. `journal.list_entries` takes an `on_or_before` bound (off by
+  default; every other caller keeps the live view).
+
+- **Stored reads written before 0.40.0 are repaired on open.** That release
+  renamed the read's 4th section `load` → `stimulus`, so 12 of 15 live rows
+  failed `card_store.read_is_complete` and could never be reused however well
+  their key matched. `card_store.migrate_read_section_names` (run from
+  `db.init_schema`) renames the key in place. Idempotent, and it touches
+  `card_json` and nothing else — `graded_at`, `read_cache_key` and every grade
+  column stay exactly as the render that produced them wrote them. A stored card
+  is a historical record; this repairs a field name the schema moved underneath
+  it, and regrades nothing.
+
+### Added
+- **The report-card path is in the perf-benchmark gate.** It was not benchmarked
+  at all. `test_workout_report_card_opens_two_connections` pins the whole
+  handler at exactly two `db.connect()` opens (one shared by every read, plus
+  `save_card`'s own — it runs on a worker thread and cannot share), and
+  `test_load_report_card_inputs_opens_no_connection` pins that the inputs load
+  never opens one of its own. Plus a latency benchmark on the deterministic half
+  (inputs + `build_card`), guarded by assertions so it can't silently start
+  measuring a degenerate n/a card. The PDF path is deliberately excluded —
+  WeasyPrint/matplotlib latency is font- and machine-dependent and would
+  false-fail a 15% floor.
+- `scripts/perf_fixture.py` gains `build_report_card_fixture_db`: a separate,
+  smaller DB with paced runs *and* paced walking-desk sessions logged as
+  `treadmill_running`, per-lap splits with one slow lap, HR zones, and a plan
+  prescribing `target_hr_max` — so the benchmark exercises the locomotion
+  filter, all three documented split exceptions and the HR-cap path instead of
+  their abstain branches. Separate rather than folded into the shared fixture
+  because adding paces there moved `get_training_plan_status` +7.2% and
+  `get_training_plan_progress` +4.4% against a 15%-of-min gate whose baseline
+  may only be recaptured on ubuntu CI.
+
 ## [0.41.0] - 2026-08-02
 
 ### Fixed

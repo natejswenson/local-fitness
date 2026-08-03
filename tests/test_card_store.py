@@ -346,3 +346,146 @@ def test_load_read_is_fail_silent_on_db_errors(cdb, monkeypatch):
 
     monkeypatch.setattr(card_store.db, "connect", boom)
     assert card_store.load_read(1) is None  # a miss, never a failed render
+
+
+# --- the 0.40.0 read-section rename migration --------------------------------
+
+#: A read as rows written before 0.40.0 hold it: the 4th section is `load`.
+LEGACY_READ = {
+    "distance": "covered the ground.", "pace": "too quick.",
+    "hr": "stayed low.", "load": "banked what it should.",
+}
+
+
+def _store_legacy_read(activity_id=1):
+    """Put a pre-0.40.0 read into the store, the only way a real one gets
+    there: save a normal card, then rewrite the section name in card_json.
+    Everything else about the row stays a genuine save_card write."""
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT card_json FROM report_cards WHERE activity_id = ?",
+            (activity_id,)).fetchone()
+        card = json.loads(row["card_json"])
+        card["coach_read"] = dict(LEGACY_READ)
+        conn.execute(
+            "UPDATE report_cards SET card_json = ? WHERE activity_id = ?",
+            (json.dumps(card, default=str), activity_id))
+
+
+def test_rename_read_sections_moves_load_into_the_stimulus_slot():
+    out = card_store.rename_read_sections(LEGACY_READ)
+    assert out == {
+        "distance": "covered the ground.", "pace": "too quick.",
+        "hr": "stayed low.", "stimulus": "banked what it should.",
+    }
+    # In place, not appended: a migrated row's JSON differs only where the
+    # rename does, so the stored bytes stay comparable to a fresh write.
+    assert list(out) == ["distance", "pace", "hr", "stimulus"]
+    # The prose is carried across untouched — this is a rename, not a regrade.
+    assert out["stimulus"] == LEGACY_READ["load"]
+
+
+def test_rename_read_sections_returns_none_when_there_is_nothing_to_do():
+    assert card_store.rename_read_sections(READ) is None      # already current
+    assert card_store.rename_read_sections({}) is None
+    assert card_store.rename_read_sections(None) is None
+    assert card_store.rename_read_sections("not a dict") is None
+
+
+def test_rename_read_sections_leaves_a_row_holding_both_keys_alone():
+    both = {**READ, "load": "the old paragraph"}
+    # Guessing which of two populated sections wins would silently destroy a
+    # paragraph; the row is left for a human instead.
+    assert card_store.rename_read_sections(both) is None
+
+
+def test_migration_restores_reuse_for_a_legacy_row(cdb):
+    card_store.save_card(a_card(), read_cache_key="k1")
+    _store_legacy_read()
+    assert card_store.read_is_complete(card_store.load_read(1)[1]) is False
+
+    assert card_store.migrate_read_section_names() == 1
+
+    key, read = card_store.load_read(1)
+    assert key == "k1"
+    assert read == READ                       # the same four paragraphs
+    # The whole point: the row can be reused by the render fast path again.
+    assert card_store.read_is_complete(read) is True
+
+
+def test_migration_is_idempotent(cdb):
+    card_store.save_card(a_card(), read_cache_key="k1")
+    _store_legacy_read()
+
+    assert card_store.migrate_read_section_names() == 1
+    first = raw_row()
+    assert card_store.migrate_read_section_names() == 0
+    assert card_store.migrate_read_section_names() == 0
+    # Byte-identical: a second pass writes nothing at all, so re-running this
+    # on every init_schema can never churn the store.
+    assert raw_row() == first
+
+
+def test_migration_does_not_disturb_the_snapshot(cdb, clock):
+    card_store.save_card(a_card(), read_cache_key="k1")
+    _store_legacy_read()
+    before = raw_row()
+    clock(minute=30)  # a later clock must NOT leak into the migrated row
+
+    card_store.migrate_read_section_names()
+
+    after = raw_row()
+    # A stored card is a historical record: the migration repairs a field NAME
+    # the schema renamed underneath it and touches nothing else.
+    assert after["graded_at"] == before["graded_at"]
+    assert after["read_cache_key"] == before["read_cache_key"]
+    for column in ("activity_date", "intent", "intent_class", "intent_source",
+                   "overall_grade", "gpa", "capped_by", "distance_grade",
+                   "pace_grade", "hr_grade", "continuity_grade", "load_grade"):
+        assert after[column] == before[column], column
+    # Inside card_json, only coach_read moves.
+    b, a = json.loads(before["card_json"]), json.loads(after["card_json"])
+    assert b.pop("coach_read") == LEGACY_READ
+    assert a.pop("coach_read") == READ
+    assert a == b
+    # The stripped keys stay stripped — a decode-and-rewrite that re-defaulted
+    # them would silently fatten every stored row.
+    assert "hr_trace" not in a
+
+
+def test_migration_skips_corrupt_rows_without_touching_the_good_ones(cdb):
+    card_store.save_card(a_card(), read_cache_key="k1")
+    _store_legacy_read(1)
+    card_store.save_card(a_card({"activity_id": 2}), read_cache_key="k2")
+    _store_legacy_read(2)
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE report_cards SET card_json = 'not json' "
+            "WHERE activity_id = 2")
+
+    assert card_store.migrate_read_section_names() == 1
+
+    assert card_store.read_is_complete(card_store.load_read(1)[1]) is True
+    assert raw_row(2)["card_json"] == "not json"   # left exactly as found
+
+
+def test_migration_never_raises_on_a_db_failure(cdb, monkeypatch):
+    @contextmanager
+    def boom(db_path=None):
+        raise RuntimeError("db unavailable")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(card_store.db, "connect", boom)
+    assert card_store.migrate_read_section_names() == 0
+
+
+def test_init_schema_runs_the_migration(tmp_path, monkeypatch):
+    p = tmp_path / "fitness.db"
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    db.init_schema(p)
+    card_store.save_card(a_card(), read_cache_key="k1", db_path=p)
+    _store_legacy_read()
+
+    db.init_schema(p)   # opening the DB again is what repairs the row
+
+    assert card_store.read_is_complete(card_store.load_read(1, db_path=p)[1])

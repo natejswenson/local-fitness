@@ -33,10 +33,10 @@ import asyncio
 from datetime import date, timedelta
 
 import pytest
-from perf_fixture import build_perf_fixture_db
+from perf_fixture import build_perf_fixture_db, build_report_card_fixture_db
 
 from local_fitness import db
-from local_fitness.agent import brief_planner, tools
+from local_fitness.agent import brief_planner, report_card, tools
 from local_fitness.agent.status import assemble_status
 
 _TODAY = date(2026, 7, 9)
@@ -54,6 +54,21 @@ def default_db(perf_db, monkeypatch):
     plans.* calls) at the perf fixture, for the tools.py-level targets."""
     monkeypatch.setattr(db, "DEFAULT_DB_PATH", perf_db)
     return perf_db
+
+
+@pytest.fixture(scope="module")
+def rc_fixture(tmp_path_factory):
+    """The report-card path's own fixture DB — see perf_fixture's comment on
+    why it is a separate file and not extra rows in `perf_db`."""
+    dest = tmp_path_factory.mktemp("perf_rc") / "fitness.db"
+    return build_report_card_fixture_db(dest, today=_TODAY)
+
+
+@pytest.fixture
+def rc_db(rc_fixture, monkeypatch):
+    path, activity_id = rc_fixture
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", path)
+    return path, activity_id
 
 
 def _count_connect_opens(monkeypatch):
@@ -101,6 +116,38 @@ def test_bench_daily_snapshot(benchmark, default_db):
     assert result["metrics"]
 
 
+def test_bench_report_card_inputs_and_build(benchmark, rc_db):
+    """The deterministic half of a report-card render: every DB read plus all
+    the grading. Deliberately NOT the whole handler — that resolves the coach's
+    memory and (on a cache miss) makes an SDK call, so its latency would
+    measure the model, not this code.
+
+    The PDF path is left out of the gate on purpose: WeasyPrint/matplotlib
+    latency is font- and machine-dependent and would false-fail a 15% floor.
+    """
+    path, activity_id = rc_db
+
+    def _render():
+        with db.connect(path) as conn:
+            inputs = report_card.load_report_card_inputs(
+                conn, activity_id=activity_id)
+            return report_card.build_card(
+                inputs["activity"], inputs["splits"], inputs["plan_workout"],
+                inputs["reference"], inputs["context"], inputs.get("hr_samples"),
+                inputs.get("recent_activities"),
+                inputs.get("upcoming_workouts"), inputs.get("hr_zones"))
+
+    card = benchmark(_render)
+    # Guard the benchmark against measuring a degenerate card: if the fixture
+    # ever stops resolving a real reference pool, every metric returns n/a
+    # early and the timing silently stops describing the graded path.
+    assert card["reference"]["mode"] == "rolling_60d"
+    assert card["reference"]["excluded_other_mode"] > 0    # the locomotion filter ran
+    assert card["splits"]["available"] is True             # the split exceptions ran
+    assert card["metrics"]["continuity"]["grade"] is not None
+    assert card["overall"]["graded_metrics"] == 4
+
+
 # --- connection-open COUNT: explicit assertions, not just latency ----------
 
 def test_assemble_brief_context_opens_one_connection(perf_db, monkeypatch):
@@ -131,6 +178,51 @@ def test_daily_snapshot_opens_one_connection(default_db, monkeypatch):
     counts = _count_connect_opens(monkeypatch)
     assemble_status(_TODAY.isoformat())
     assert counts["n"] == 1
+
+
+def test_load_report_card_inputs_opens_no_connection(rc_db, monkeypatch):
+    """It takes the caller's connection and must never open one of its own —
+    that contract is what lets the handler hold ONE connection for the whole
+    render. Every read in it (activity, splits, HR zones, plan, recent
+    activities, baselines, the 60-day reference pool, the same-date siblings)
+    rides that connection or the count moves."""
+    path, activity_id = rc_db
+    with db.connect(path) as conn:
+        counts = _count_connect_opens(monkeypatch)
+        inputs = report_card.load_report_card_inputs(
+            conn, activity_id=activity_id)
+    assert counts["n"] == 0
+    assert inputs is not None
+
+
+def test_workout_report_card_opens_two_connections(rc_db, monkeypatch):
+    """The whole handler, end to end, opens EXACTLY two connections: one
+    shared by every read, plus save_card's own (which cannot share — it runs on
+    a worker thread via asyncio.to_thread, and sqlite3 connections are
+    same-thread-checked).
+
+    This is the assertion that catches the regression that actually matters on
+    this path. It was ~8 opens before the shared-connection fix, and the shape
+    that would bring them back — a per-split or per-metric lookup inside the
+    grading loop — is invisible to a latency gate on a small fixture but
+    obvious here.
+    """
+    _path, activity_id = rc_db
+
+    # Reflect is fire-and-forget and NOT part of the render; leaving it live
+    # would race its own connection into the count depending on when the loop
+    # tore down. The SDK is blocked suite-wide (conftest), so the coach read
+    # takes its deterministic fallback — the DB work is identical either way.
+    async def _no_reflect(_card):
+        return None
+
+    monkeypatch.setattr(tools.reflect, "reflect_after_report_card", _no_reflect)
+
+    counts = _count_connect_opens(monkeypatch)
+    result = _run(tools.workout_report_card.handler(
+        {"activity_id": activity_id, "format": "table"}))
+    assert not result.get("is_error"), result
+    assert counts["n"] == 2
 
 
 # --- fix #3 regression: bounded activities lookback -------------------------
