@@ -662,23 +662,66 @@ These are settled — don't redesign without a reason.
     it, "Keep HR under 140" existed only in the prose `description` and no
     grade could read it — HR was measured against `0.97 × rolling median`,
     which was 139 by coincidence, so a real breach read as a rounding error.
-    When a cap is present HR grades against it (reference `"plan"`) on the
-    worse of *average over cap* and *time over cap past `HR_CAP_GRACE_FRACTION`*;
-    absent, it falls back to `HR_BANDS` exactly as before.
-  - **The HR row must state the axis that produced the letter** (0.40.1).
-    Those two axes are measured in different units (bpm over a ceiling vs
-    fraction of a run over it), so `hr_cap_axis` names which one won and the
-    row moves to it — `actual_display`, `expected_display` and the Delta
-    together. **Why:** taking the worse of two axes and then displaying only
-    the average printed, on the live 2026-08-02 card,
+    When a cap is present HR grades against it (reference `"plan"`); absent, it
+    falls back to `HR_BANDS` exactly as before.
+  - **A cap breach is measured in bpm over the ceiling, never as a fraction of
+    the run and never as a fraction of the cap** (0.40.2). The graded quantity
+    is `hr_exceedance_bpm` — time-weighted mean bpm above the cap across the
+    splits — and both cap axes (that, and *average over cap*) go through one
+    `hr_cap_severity` = `max(0, bpm_over − HR_CAP_NOISE_BPM) / HR_CAP_BPM_SCALE`,
+    so the `max()` between them compares like with like. **Why:** 0.40.0 graded
+    the *time fraction* above the cap, counting a split as entirely above it
+    whenever its average exceeded the cap by any amount, then fed that fraction
+    into `GRADE_BANDS` — a table calibrated for relative magnitudes. A time
+    fraction is a different unit, so this was a category error and the `max()`
+    was meaningless. Measured across all 19 completed capped days in the active
+    plan, that axis emitted **only A+ or F, never a letter between**, and ranked
+    the mildest breach in the window (1% of it in Garmin zones 4-5) as the worst
+    session of the nine it failed. The live 2026-08-02 card — avg HR 139 under a
+    140 cap, peak 148, **zero seconds in zones 4-5** — graded F because three
+    miles averaged 141/143/142, and the F-cap turned a 3.60 GPA into a C.
+    Dividing by the cap is the same trap from the other side (HR's large
+    non-zero offset compresses every real breach into the passing bands): it
+    also put a run averaging 168 against a 140 cap at a **C**, now an F.
+    `HR_CAP_GRACE_FRACTION` survives as a **reporting** threshold only.
+  - **Those two constants are calibrated against a signal the grade does not
+    read** — Garmin's own zone-4+5 time fraction, computed on-device from the
+    per-sample trace and independent of both `avg_hr` and the splits.
+    `HR_CAP_NOISE_BPM` (1.5) sits between the two live runs whose average obeyed
+    the cap (exceedance 1.15, 1.37, both 0% in zones 4-5) and the smallest
+    genuine breach (4.55). `HR_CAP_BPM_SCALE` (28.0) puts the F floor at 11.3
+    bpm sustained over the ceiling, where the three sessions at or above it are
+    exactly the three at ≥42% in zones 4-5; the worst below it is 37%.
+    Re-run that comparison before moving either — `test_the_f_boundary_sits_
+    where_the_run_stopped_being_aerobic` is what forces the question. Genuine
+    breaches are untouched by the change: 2026-07-22 (avg 157, splits to 185,
+    19.5 bpm over) stays an F and still caps the overall.
+  - **`activity_hr_samples` is NOT an escape hatch for the exceedance**, even
+    though it is local once fetched. It holds 11 of 760 activities, so grading
+    off it "when present" would make the metric mean one thing on 1.4% of
+    history and another on the rest — the availability trap the splits rule
+    exists to prevent, and worse than the splits case it would improve on.
+    Split averages smooth real within-mile excursions; that is the accepted
+    cost of a metric that means the same thing on every row.
+  - **The HR row must state the axis that produced the letter** (0.40.1;
+    `hr_cap_axis` returns `"exceedance"` / `"average"` / `None` since 0.40.2).
+    When the split-derived exceedance is what graded, the row moves to it —
+    `actual_display`, `expected_display` and the Delta together, and the three
+    cells reconcile by arithmetic (`actual − expected = delta`, hence one
+    decimal on both). **Why:** taking the worse of two axes and then displaying
+    only the average printed, on the live 2026-08-02 card,
     `| Avg HR | 139 bpm | ≤ 140 bpm | -1% | F |` — three numbers all describing
-    the *compliant* average (which scored 0.0) beside an F earned entirely by
-    58% of the run sitting above the cap. A reader cannot reconstruct an F from
-    three passing numbers, so a correct grade read as a broken one. This is the
-    same contract the pace row already kept via `actual_display`: **the Delta
-    column may never compare two different quantities.** The numeric `actual`
-    /`expected` fields stay in bpm — storage, the note and the coach read are
-    unchanged; only the display moves.
+    the *compliant* average (which scored 0.0) beside an F. A reader cannot
+    reconstruct an F from three passing numbers. (That card turned out to be a
+    broken grade too — see the bpm bullet above — but the display contract
+    stands on its own.) Same contract the pace row already kept via
+    `actual_display`: **the Delta column may never compare two different
+    quantities.** The numeric `actual`/`expected` fields stay in bpm — storage,
+    the note and the coach read are unchanged; only the display moves. The note
+    must reconcile BOTH ways: a sub-noise breach states the time fraction *and*
+    the bpm ("58% … by 1.2 bpm on average — inside sensor noise"), because the
+    fraction alone beside an A+ reads as the card noticing a breach and
+    ignoring it.
   - **The card always names its yardstick.** Plan-prescribed (distance, pace,
     and HR when `target_hr_max` is set) or a 60-day rolling *median* of
     comparable activities. Median, not mean: the history carries real
@@ -718,9 +761,10 @@ These are settled — don't redesign without a reason.
     grade would be unavailable on ~87% of history and mean different things on
     different rows. **Every exception must handle absence explicitly**, and they
     do it differently on purpose: quality-day pace and `continuity` *abstain*
-    (n/a + a stated reason, weight redistributes), while the HR-cap time check
-    (`time_above_cap_fraction`, 0.40.0) *degrades* — with no splits the cap is
-    still graded on the average alone, so it adds no new availability cliff.
+    (n/a + a stated reason, weight redistributes), while the HR-cap exceedance
+    (`hr_exceedance_bpm`, 0.40.2 — was `time_above_cap_fraction` in 0.40.0)
+    *degrades* — with no splits the cap is still graded on the average alone, so
+    it adds no new availability cliff.
     `tests/test_report_card.py::test_only_the_documented_exceptions_read_splits`
     pins that distance, non-quality pace and uncapped HR stay byte-identical with
     and without splits. The first exception is

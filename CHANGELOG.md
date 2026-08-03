@@ -6,6 +6,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.2] - 2026-08-02
+
+### Fixed
+- **A prescribed HR cap is graded on how far over it you went, not on how long.**
+  0.40.0 measured a cap breach as the *fraction of the run above the ceiling*,
+  subtracted a 5% grace and fed the result into `GRADE_BANDS` — a table
+  calibrated for relative magnitudes, where 0.53 means catastrophic. A time
+  fraction is not a relative magnitude, so this was a category error, and taking
+  `max()` of it against the average-over-cap compared two different units.
+
+  It counted a split as *entirely* above the cap whenever its average exceeded
+  the cap by any amount. On the live 2026-08-02 card — easy 5 mi, "keep HR under
+  140", executed at **139 average with a 148 peak and zero seconds in Garmin
+  zones 4-5** — three miles averaged 141, 143 and 142. One to three bpm over.
+  That produced 58% "in breach", a 0.53 deviation, and an **F**, which then
+  F-capped a 3.60 GPA down to an overall **C** beside A+ on distance, pace and
+  continuity.
+
+  Measured across all 19 completed capped days in the active plan, the time
+  axis had produced **only A+ or F — never a letter in between** — and it ranked
+  the mildest breach in the window (1% of it in zones 4-5) as the single worst
+  session of the nine it failed.
+
+  The graded quantity is now `hr_exceedance_bpm`: the time-weighted mean bpm
+  *above* the ceiling, put through the raw-excess-past-a-noise-floor treatment
+  `continuity_deviation` already uses (`HR_CAP_NOISE_BPM` 1.5,
+  `HR_CAP_BPM_SCALE` 28.0). Both cap axes now speak bpm-over-cap, so the `max()`
+  between them means something. Genuine breaches are untouched: 2026-07-22
+  (average 157, splits reaching 185, 48% in zones 4-5, 19.5 bpm over) stays an F
+  and still caps the overall. Six of the nine F's regrade — to A+, A+, C+, C, C-
+  and D — and the three that remain are exactly the three whose zone-4+5 share
+  reached 42%, a signal the grade does not read.
+- **The average-over-cap axis is no longer divided by the cap either.** Same
+  compression: HR's large non-zero offset put a run averaging 168 against a
+  prescribed 140 — 28 bpm over — at a **C**. It is an F.
+- The HR row's display contract from 0.40.1 carries onto the new axis, and the
+  three cells now reconcile by arithmetic (`actual - expected = delta`). A run
+  that drifted over the cap by less than the noise floor keeps its bpm display
+  and reads "in range", with a note that reconciles the passing grade against
+  the time fraction rather than stating the fraction alone beside an A+.
+
 ## [0.40.1] - 2026-08-02
 
 ### Fixed
