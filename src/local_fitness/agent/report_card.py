@@ -349,6 +349,9 @@ HR_CAP_BPM_SCALE = 28.0
 # the session is treated as having contained a break rather than a pace
 # variation. See continuity_deviation for the measurement behind 1.15.
 CONTINUITY_TOLERANCE = 1.15
+# Distance gap below which the Delta column says "on target" instead of a
+# number. ~32 m — GPS wobble and treadmill rounding, not a miss.
+_DISTANCE_ON_TARGET_MI = 0.02
 # Below this many full splits a slowest-vs-median ratio is noise, not a finding —
 # and it is what keeps manually-lapped interval sessions out (see
 # continuity_ratio).
@@ -520,6 +523,56 @@ def pace_deviation(
         slow = max(0.0, (actual_sec_per_km - expected_sec_per_km) / expected_sec_per_km)
         return max(slow, walked)
     return abs(actual_sec_per_km / expected_sec_per_km - 1.0)
+
+
+def pace_bound_kind(cls: str) -> str:
+    """Which side of the pace expectation ``pace_deviation`` actually penalizes:
+    ``"floor"``, ``"ceiling"`` or ``"point"``.
+
+    Exists so the Expected column can state the bound the grade was measured
+    against rather than a bare number. Before this, an easy day printed
+
+        | Pace | 9:44/mi | 9:39/mi | 5s/mi slower | A+ |
+
+    — a stated target, a stated 5s/mi miss, and an A+. Every number there is
+    correct and the row still reads as a broken grade, because 9:39 is not a
+    point target on an easy day: ``pace_deviation`` gates easy/long to the FAST
+    side only, so running slower than it is compliance, not a shortfall. That
+    display is the whole reason 91% of the A-band grades on real cards look
+    like a participation trophy (measured over 15 stored cards: 9 of 15 pace
+    deviations are exactly 0.0, which is mechanically an A+).
+
+    Mirrors ``pace_deviation``'s own branches, and
+    ``test_pace_bound_kind_matches_pace_deviation_gating`` re-derives it from
+    that function so the two cannot drift.
+
+    Note the bound described is the one relative to the TARGET. easy/long also
+    carry ``pace_deviation``'s absolute walk floor
+    (``RUN_PACE_CEILING_SEC_PER_MI``), which is an anti-abuse guard rather than
+    a prescription and is deliberately not printed here — a card that read
+    "9:39-13:00/mi" would imply the plan asked for a range it never asked for.
+    """
+    if cls in ("easy", "long"):
+        # Only too FAST costs, so the expectation is a floor on the pace value
+        # (sec/km — bigger is slower).
+        return "floor"
+    if cls == "quality":
+        return "ceiling"
+    return "point"
+
+
+def bounded_display(kind: str, text: str) -> str:
+    """A formatted expectation prefixed with the bound it represents.
+
+    Reuses the ``≤`` / ``≥`` idiom ``_fmt_hr_band`` already established, so a
+    one-sided pace or distance target reads the same way a one-sided HR band
+    does and the reader learns one convention instead of three.
+    """
+    if kind == "floor":
+        return f"≥ {text}"
+    if kind == "ceiling":
+        return f"≤ {text}"
+    return text
 
 
 def hr_band_bounds(
@@ -1234,6 +1287,14 @@ def build_card(
         distance = _metric(
             grade_from_deviation(d), activity.get("distance_meters"), expected or None,
             d, "rolling_60d", note=walk_note)
+        # `two_sided=False` above: going LONGER than your rolling norm is never
+        # a penalty, so this expectation is a floor and has to print as one.
+        # The plan branch stays a bare number because it genuinely is a point
+        # target — over-running a prescription costs you there.
+        if expected:
+            distance["bound"] = "floor"
+            distance["expected_display"] = bounded_display(
+                "floor", _fmt_distance(expected))
     else:
         distance = _metric(
             None, activity.get("distance_meters"), None, None, reference.get("mode"),
@@ -1306,6 +1367,12 @@ def build_card(
         expected_pace, d, pace_ref, note=pace_note)
     if pace_display:
         pace["actual_display"] = pace_display
+    # State the BOUND, not a bare number — see pace_bound_kind. Only when there
+    # is an expectation at all: a by-feel day has none, and "≥ —" is noise.
+    if expected_pace is not None:
+        pace["bound"] = pace_bound_kind(cls)
+        pace["expected_display"] = bounded_display(
+            pace["bound"], _fmt_pace(expected_pace))
 
     # -- HR: the plan's own ceiling when it states one (0.40.0), else rolling.
     med_hr = reference.get("median_hr") if has_rolling else None
@@ -1411,7 +1478,10 @@ def build_card(
         continuity["note"] = reason
     else:
         continuity["actual_display"] = f"{ratio:.2f}x median split"
-        continuity["expected_display"] = f"<= {CONTINUITY_TOLERANCE:.2f}x"
+        # Typographic ≤, matching _fmt_hr_band and bounded_display. This was
+        # the one bound on the card still written in ASCII, and the two forms
+        # rendered side by side in the same column.
+        continuity["expected_display"] = f"≤ {CONTINUITY_TOLERANCE:.2f}x"
         continuity["ratio"] = round(ratio, 3)
         if d and d > 0:
             slowest = max(
@@ -1568,7 +1638,23 @@ def actual_text(key: str, metric: dict) -> str:
 
 def _delta_text(key: str, metric: dict) -> str:
     """Signed, human delta between actual and expected — the granularity a
-    bare letter loses."""
+    bare letter loses.
+
+    ONE grammar: ``{magnitude in the row's own unit} {direction}``, or
+    ``"on target"`` inside rounding. The direction vocabulary is per-unit
+    ("slower" beats "over" for a pace) but the SHAPE never varies, and the rule
+    that makes it coherent is: **a delta is never a percentage.** A live card
+    printed four dialects in four rows — ``on target`` / ``5s/mi slower`` /
+    ``53% over`` / ``even`` — where the percentages were a percentage of a
+    distance, a percentage of a ratio, and a percentage of a percentage. Those
+    are three different quantities wearing one symbol, which is the same defect
+    the Delta column's "never compare two quantities" contract exists to
+    prevent, one level down in the units.
+
+    The two HR branches below are deliberately left on their own text: they
+    are correct under this grammar already, and they are being reworked
+    elsewhere.
+    """
     actual, expected = metric.get("actual"), metric.get("expected")
     if actual is None or expected is None or not isinstance(expected, (int, float)):
         return "—"
@@ -1583,12 +1669,29 @@ def _delta_text(key: str, metric: dict) -> str:
         if abs(diff) < 1:
             return "on target"
         return f"{abs(diff)}s/mi {'slower' if diff > 0 else 'faster'}"
+    if key == "distance":
+        # Was `+N%`. A percentage of a distance is the least useful form of a
+        # number a runner already thinks about in miles, and it was the only
+        # row on the card whose delta was not in its own unit.
+        diff_mi = (units.to_miles(actual) or 0) - (units.to_miles(expected) or 0)
+        if abs(diff_mi) < _DISTANCE_ON_TARGET_MI:
+            # Within rounding IS on target; say so. The predecessor of this
+            # branch printed "-0%" for a 4.00-of-4.00 mi run off by meters,
+            # which reads like a typo beside an A+. The threshold is a real
+            # tolerance rather than a display epsilon: 5.01 against a 5.00
+            # prescription is 16 m, which is treadmill rounding, and printing
+            # "0.01 mi long" for it invents a miss the grade did not find.
+            return "on target"
+        return f"{abs(diff_mi):.2f} mi {'long' if diff_mi > 0 else 'short'}"
     if key == "continuity":
         # A percentage against the tolerance would read as "+10%" for a run whose
         # worst mile was 27% off its median — the tolerance is not the quantity
-        # the reader cares about. State the excess in units of a median split.
+        # the reader cares about. State the gap in units of a median split,
+        # which is what both `actual` and `expected` are already measured in.
         excess = actual - expected
-        return "even" if excess <= 0 else f"{round(excess * 100)}% over"
+        if abs(excess) < 0.005:
+            return "on target"
+        return f"{abs(excess):.2f}x {'over' if excess > 0 else 'under'}"
     if key == "hr" and metric.get("in_band"):
         # Inside the band IS the A. A percentage against one edge would imply
         # a miss that did not happen.
@@ -1601,13 +1704,22 @@ def _delta_text(key: str, metric: dict) -> str:
         # shape continuity uses against its tolerance.
         excess = metric.get("exceedance_bpm", 0.0) - HR_CAP_NOISE_BPM
         return f"{excess:+.1f} bpm"
+    if key == "hr":
+        # The rolling-band case, reached only when the run sat OUTSIDE the band
+        # (in_band returns above). bpm, not a percentage: the Expected column
+        # beside it is already in bpm, and "+4%" next to "≤ 141 bpm" made the
+        # reader do the arithmetic to find out it meant 6 beats.
+        diff = round(actual) - round(expected)
+        if diff == 0:
+            return "on target"
+        return f"{abs(diff)} bpm {'over' if diff > 0 else 'under'}"
     if not expected:
         return "—"
+    # Anything with no unit of its own (today: nothing rendered — load is a
+    # stimulus metric and has no table row). Kept as a percentage rather than
+    # deleted so a future metric degrades to something readable.
     pct = (actual / expected - 1) * 100
     if round(pct) == 0:
-        # A sub-half-percent shortfall printed "-0%" on a live card (4.00 of
-        # 4.00 mi, off by meters) — negative zero reads like a typo beside an
-        # A+. Within rounding of zero IS on target; say so.
         return "on target"
     return f"{pct:+.0f}%"
 
@@ -1688,6 +1800,67 @@ def stimulus_notes(card: dict) -> list[str]:
         f"{intent_prose} correctly is supposed to bank less of it — it is "
         "reported here and cannot affect the grade above.")
     return notes
+
+
+def split_table(card: dict) -> tuple[list[str], list[list[str]]]:
+    """``(headers, rows)`` for the per-split breakdown, with dead columns gone.
+
+    Shared by the markdown card and the PDF for the same reason
+    ``stimulus_rows`` is: the two renderers had this table written out twice,
+    and a column dropped in one and kept in the other is precisely the
+    divergence ``render_report_card_pdf`` takes a pre-built card to avoid.
+
+    Elevation and heart rate are both frequently absent, and the table used to
+    print a full column of em-dashes for them regardless. Measured over the
+    live DB: **13 of 15 stored cards have an entirely empty Elev column**, and
+    362 of 428 ``activity_splits`` rows (85%) carry no elevation at all — a
+    treadmill run never has any. On a page whose density ladder was already
+    bottoming out, that is ~15% of the table's width spent on nothing.
+
+    A column survives if ANY row has a value for it. `vs run` additionally
+    needs the activity average to subtract from, and it is kept whenever it
+    has data — it is what makes a hot mile visible at a glance, which is not
+    something to make the reader do by hand.
+    """
+    splits = card.get("splits") or {}
+    rows = splits.get("rows") or []
+    unit = splits.get("unit", "Lap")
+    avg_hr = (card.get("activity") or {}).get("avg_hr")
+
+    has_pace = any(r.get("pace_min_per_mi") for r in rows)
+    has_hr = any(r.get("avg_hr") for r in rows)
+    has_elev = any(r.get("elevation_gain_meters") is not None for r in rows)
+    has_vs = has_hr and bool(avg_hr)
+
+    headers = [unit]
+    if has_pace:
+        headers.append("Pace")
+    if has_hr:
+        headers.append("Avg HR")
+    if has_vs:
+        headers.append("vs run")
+    if has_elev:
+        headers.append("Elev")
+
+    out = []
+    for r in rows:
+        # The label already carries the partial lap's distance, which is why
+        # there is no Distance column: for every full lap it would read
+        # "1.00 mi" beside a column literally headed "Mile".
+        cells = [f"{unit} {r['index']}" if not r.get("partial")
+                 else f"final {r['distance_mi']:.2f} mi"]
+        hr = r.get("avg_hr")
+        elev = r.get("elevation_gain_meters")
+        if has_pace:
+            cells.append(f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—")
+        if has_hr:
+            cells.append(f"{hr} bpm" if hr else "—")
+        if has_vs:
+            cells.append(f"{hr - avg_hr:+d}" if hr else "—")
+        if has_elev:
+            cells.append(f"{elev:.0f} m" if elev is not None else "—")
+        out.append(cells)
+    return headers, out
 
 
 def stimulus_heading(card: dict, *, markdown: bool = True) -> str:
@@ -1864,26 +2037,8 @@ def render_markdown(card: dict) -> str:
             "_No per-mile splits recorded for this activity. Splits are captured "
             "only by the daily sync path — backfilled activities have none._")
     else:
-        avg_hr = act.get("avg_hr")
-        split_rows = []
-        for r in card["splits"]["rows"]:
-            # The label already carries the partial lap's distance, which is
-            # why there is no Distance column: for every full lap it would
-            # read "1.00 mi" beside a column literally headed "Mile".
-            label = (f"{card['splits']['unit']} {r['index']}" if not r["partial"]
-                     else f"final {r['distance_mi']:.2f} mi")
-            hr = r.get("avg_hr")
-            elev = r.get("elevation_gain_meters")
-            split_rows.append([
-                label,
-                f"{r['pace_min_per_mi']}/mi" if r.get("pace_min_per_mi") else "—",
-                f"{hr} bpm" if hr else "—",
-                f"{hr - avg_hr:+d}" if hr and avg_hr else "—",
-                f"{elev:.0f} m" if elev is not None else "—",
-            ])
-        lines.append(render.render_table(
-            [card["splits"]["unit"], "Pace", "Avg HR", "vs run", "Elev"],
-            split_rows))
+        headers, split_rows = split_table(card)
+        lines.append(render.render_table(headers, split_rows))
         drift = card["splits"]["hr_drift_pct"]
         if drift is not None:
             lines += ["", f"_HR drift back-half vs front-half: {drift:+.1f}%_"]

@@ -6,6 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-08-02
+
+### Fixed
+- **The report card PDF was two pages.** `img.split-chart` was capped by WIDTH
+  only, so `chart_h_pt` — the knob the density ladder exists to turn — was
+  never read by the report-card stylesheet at all and no rung could buy
+  vertical room. Measured over the live DB, **3 of 15 stored cards rendered 2
+  pages**, with the HR chart landing alone on page 2 under nine inches of
+  white. `img.chart` (the brief's) has carried the height cap since
+  2026-07-22 and documents exactly this failure mode in a comment; the lesson
+  was never applied to the card. Now 15/15 fit one page.
+
+  The card also gets its own `CARD_DENSITY_PRESETS` — a tighter `dense` cap
+  (68pt, measured: 80pt still spilled, 78pt was the first value to fit, 68
+  leaves 10pt of margin) plus a 4th `ultra` rung. Both are kept OFF the
+  brief's ladder deliberately: the brief reads `page_count > 1` to decide
+  whether to drop a takeaway, so an extra rung there silently changes which
+  takeaways print. The 4th rung also fixes a 14-split half marathon that was
+  2 pages on dev for a second, never-diagnosed reason — row count, not chart
+  height.
+
+### Changed
+- **The Expected column states the bound the grade was measured against.**
+  Direction gating means a run on the free side of a one-sided expectation
+  scores an exact 0.0 deviation, which is mechanically an A+ — across the 15
+  stored cards, 9 of 15 pace deviations were exactly 0.0 and **A+ was 29 of the
+  32 A-band grades (91%)**. The grades are right; the display was not. An easy
+  day printed
+
+  | Metric | Actual | Expected | Delta | Grade |
+  |---|---|---|---|---|
+  | Pace | 9:44/mi | 9:39/mi | 5s/mi slower | A+ |
+
+  — a stated target, a stated 5s/mi miss, and an A+, which reads as a
+  participation trophy. `pace_deviation` gates easy/long to the FAST side only,
+  so 9:39 is a floor, not a point target. It now reads `≥ 9:39/mi` and the A+
+  is self-evident. Same for quality pace (`≤`) and rolling-reference distance
+  (`≥`). Two-sided expectations — a plan distance, a steady-day pace — keep a
+  bare number, because they genuinely are point targets.
+
+- **One Delta grammar: `{magnitude in the row's own unit} {direction}`, never a
+  percentage.** The card printed four dialects in four rows — `on target` /
+  `5s/mi slower` / `53% over` / `even` — where the percentages were a
+  percentage of a distance, of a ratio, and of a percentage. Three different
+  quantities wearing one symbol. Distance now reads `0.35 mi long`, HR
+  `8 bpm over`, continuity `0.15x over`; pace was already unit-native and is
+  unchanged. Continuity's expected bound also moves from ASCII `<=` to the
+  typographic `≤` that HR uses in the same column.
+
+- **Dead split-table columns are dropped.** 13 of 15 stored cards had an
+  entirely empty Elev column, and 362 of 428 `activity_splits` rows (85%) carry
+  no elevation — a treadmill run never has any. A column now renders only if
+  some row has a value for it, and `Avg HR`/`vs run` drop together when the
+  watch recorded no per-split HR. `vs run` is deliberately KEPT when it has
+  data. Headers and cells come from one shared `report_card.split_table`, so
+  the markdown card and the PDF cannot disagree about which columns exist —
+  the same reason `stimulus_rows` is shared.
+
 ## [0.40.2] - 2026-08-02
 
 ### Fixed

@@ -883,6 +883,36 @@ These are settled — don't redesign without a reason.
     the grade. HR is the one metric held to a *range*, so it carries
     `expected_display` (the band), `band`, and `in_band`; `expected_text()`
     prefers that display and everything else formats its number.
+  - **A one-sided expectation must PRINT as one-sided** (0.41.0). Direction
+    gating means a run on the free side scores an exact `0.0` deviation, which
+    is mechanically an A+ — measured over 15 stored cards, 9 of 15 pace
+    deviations were exactly 0.0 and **A+ was 29 of the 32 A-band grades**. The
+    grades are right; a bare number was making them read as a participation
+    trophy: an easy day printed `| Pace | 9:44/mi | 9:39/mi | 5s/mi slower |
+    A+ |` — a target, a stated miss, and an A+. `pace_deviation` gates
+    easy/long to the FAST side only, so 9:39 is a *floor*. `pace_bound_kind`
+    names the side and `bounded_display` prefixes `≥`/`≤` (the `_fmt_hr_band`
+    idiom). Two-sided expectations — a plan distance, a steady-day pace —
+    keep a bare number, because they really are point targets. Don't fix an
+    A+-inflation complaint by touching `GRADE_BANDS`, `_modifier` or
+    `PLAN_TIGHTEN`; it is a display problem.
+    `test_pace_bound_kind_matches_pace_deviation_gating` derives the bound
+    from `pace_deviation` itself so the two can't drift.
+  - **Every Delta is in its row's own unit — never a percentage** (0.41.0).
+    The card printed four dialects in four rows (`on target` / `5s/mi slower`
+    / `53% over` / `even`) where the percentages meant a percentage of a
+    distance, of a ratio, and of a percentage — three quantities wearing one
+    symbol, which is the "never compare two quantities" contract failing one
+    level down in the units. Distance reads `0.35 mi long`, HR `8 bpm over`,
+    continuity `0.15x over`. Bounds are the typographic `≤`/`≥` everywhere.
+  - **A split-table column renders only if some row has data** (0.41.0). 13 of
+    15 stored cards had an entirely empty `Elev` column and 85% of
+    `activity_splits` rows carry no elevation (a treadmill run never does).
+    `Avg HR` and `vs run` drop together; `vs run` is KEPT when it has data.
+    Both renderers take headers AND cells from `report_card.split_table` —
+    the table was written out twice and a column dropped in one but not the
+    other is the divergence the already-built-card contract exists to
+    prevent, same reason as `stimulus_rows`.
   - **Calibrate bands against real data, not intuition.** The original easy-HR
     ceiling (0.88x median) demanded a number that appeared in 1 of 13 runs in
     the window — the median is taken over ALL comparable activities, which for
@@ -998,8 +1028,24 @@ These are settled — don't redesign without a reason.
   lowest-priority takeaways and prints `N further signals omitted for space`.
   Never let either PDF spill silently, and never hide a takeaway silently.
   When adding page content, add a case to `test_brief_always_fits...` /
-  `test_generate_brief_report_is_always_exactly_one_page` rather than
-  eyeballing a render.
+  `test_generate_brief_report_is_always_exactly_one_page` /
+  `test_report_card_is_always_exactly_one_page` rather than eyeballing a
+  render. **Apply the height cap to EVERY chart element, not just the one you
+  fixed** (0.41.0): `img.split-chart` — the report card's chart — shipped with
+  a width-only cap for over a week, 490 lines below the `img.chart` comment
+  explaining why that doesn't work, so `chart_h_pt` was never read by the
+  report-card stylesheet at all and its ladder was decorative. Measured: 3 of
+  15 stored cards rendered 2 pages with the chart alone on page 2. A lesson
+  written into a comment protects the line it sits on and nothing else.
+  **The card has its own `CARD_DENSITY_PRESETS`** — a tighter `dense`
+  (`chart_h_pt` 68, measured: 80 spilled, 78 was the first fit) plus a 4th
+  `ultra` rung, because a card's overflow has TWO drivers and the chart cap
+  fixes only one; the other is split-row count (a 14-split half marathon was 2
+  pages on dev for that reason alone). Those rungs must **never** be merged
+  into `DENSITY_PRESETS`: the brief's ladder exhaustion is a *signal*
+  `generate_brief_report` reads to decide whether to drop a takeaway, so an
+  extra rung there silently changes what prints.
+  `test_the_card_ladder_never_changes_the_brief_ladder` is the guard.
 - **The brief PDF (`generate_brief_report`) has a 2-column signal-card grid
   and a Training Plan section** (2026-07-09 redesign). `visuals.py`'s
   signal cards (formerly one stacked column) reflow into a flexbox grid

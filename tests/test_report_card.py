@@ -801,7 +801,11 @@ def test_an_average_breach_keeps_the_row_in_bpm():
     assert hr["grade"] == "D+"
     assert rc.actual_text("hr", hr) == "148 bpm"
     assert rc.expected_text("hr", hr) == "≤ 140 bpm"
-    assert rc._delta_text("hr", hr) == "+6%"
+    # bpm, not a percentage — which is what this test's own name asks for and
+    # what it did NOT assert before 0.41.0. 148 against a 140 cap is 8 beats;
+    # "+6%" made the reader convert it themselves against an Expected column
+    # already written in bpm.
+    assert rc._delta_text("hr", hr) == "8 bpm over"
 
 
 def test_a_compliant_capped_run_names_no_axis_and_reads_in_range():
@@ -1208,9 +1212,12 @@ def test_render_markdown_tables_are_well_formed():
             blocks[-1].append(line)
         prev_was_row = is_row
     # compliance (Metric/Actual/Expected/Delta/Grade), stimulus (Signal/Value),
-    # splits (Mile/Pace/Avg HR/vs run/Elev — the Distance column was dropped as
-    # duplicative, the row label already IS the distance).
-    assert [b[0].count("|") for b in blocks] == [6, 3, 6]
+    # splits (Mile/Avg HR/vs run — the Distance column was dropped as
+    # duplicative, the row label already IS the distance, and 0.41.0 drops any
+    # column with no data in ANY row. This fixture's splits carry no pace and
+    # no elevation, so those two columns are correctly absent rather than
+    # rendering as a full column of em-dashes).
+    assert [b[0].count("|") for b in blocks] == [6, 3, 4]
     for block in blocks:
         assert len({ln.count("|") for ln in block}) == 1
     assert "Morning Run" in md
@@ -1659,7 +1666,8 @@ def test_hr_expected_is_the_bound_the_grade_was_measured_against():
     assert hr["expected"] == pytest.approx(ceiling)
     assert hr["expected"] != 146.0          # NOT the bare median
     # And the delta agrees with the grade's direction: over the ceiling.
-    assert rc._delta_text("hr", hr).startswith("+")
+    # Stated in bpm since 0.41.0 — 160 against a 141.62 ceiling is 18 beats.
+    assert rc._delta_text("hr", hr) == "18 bpm over"
 
 
 def test_hr_inside_the_band_reads_in_range_not_a_percentage():
@@ -1710,12 +1718,21 @@ def test_easy_hr_ceiling_is_actually_reachable():
 
 
 def test_expected_text_falls_back_to_the_numeric_formatter():
-    # Only HR carries a display string; every other metric formats its number.
-    card = card_for({"date": "2026-07-19", "distance_meters": 10000,
-                     "duration_seconds": 3000, "avg_pace_sec_per_km": 300,
-                     "avg_hr": 150, "training_load": 100})
-    assert rc.expected_text("distance", card["metrics"]["distance"]) == "6.21 mi"
+    """A metric with no `expected_display` formats its raw number.
+
+    Rewritten in 0.41.0: this used to assert the fallback via a card's DISTANCE
+    metric on the claim that "only HR carries a display string". That stopped
+    being true — a rolling-reference distance is one-sided and now prints
+    "≥ 6.21 mi" — so the test is pointed at the fallback itself with a
+    hand-built dict, which is the behavior it was always about.
+    """
+    assert rc.expected_text("distance", {"expected": 10000.0}) == "6.21 mi"
+    assert rc.expected_text("pace", {"expected": 300.0}) == "8:03/mi"
     assert rc.expected_text("load", {"expected": None}) == "—"
+    # A display string, when present, always wins over the formatter.
+    assert rc.expected_text(
+        "distance", {"expected": 10000.0, "expected_display": "≥ 6.21 mi"}
+    ) == "≥ 6.21 mi"
 
 
 # --- a plan target is an instruction, a median is a reference --------------
@@ -2385,10 +2402,234 @@ def test_report_card_imports_without_workout_coach():
 
 def test_delta_text_never_prints_negative_zero_percent():
     """A live card printed 'Distance ... -0%' for 4.00-of-4.00 miles (short
-    by meters): within rounding of zero IS on target — say so."""
+    by meters): within rounding of zero IS on target — say so.
+
+    Since 0.41.0 there is no percentage on this row at all: a real gap reads in
+    miles. The negative-zero case is still the point of the test.
+    """
     just_under = {"actual": 6432.0, "expected": 6437.376, "grade": "A+"}
     assert rc._delta_text("distance", just_under) == "on target"
     just_over = {"actual": 6440.0, "expected": 6437.376, "grade": "A+"}
     assert rc._delta_text("distance", just_over) == "on target"
     real_gap = {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
-    assert rc._delta_text("distance", real_gap) == "+9%"
+    assert rc._delta_text("distance", real_gap) == "0.35 mi long"
+    short = {"actual": 5000.0, "expected": 6437.376, "grade": "D"}
+    assert rc._delta_text("distance", short) == "0.89 mi short"
+
+
+# --- 0.41.0: the card states the bound it graded against -------------------
+# The display half of the A+ problem. Direction gating means a run on the free
+# side of a one-sided expectation scores an exact 0.0 deviation, which is
+# mechanically an A+ — measured over the 15 stored cards at the time, 9 of 15
+# pace deviations were exactly 0.0 and A+ was 29 of the 32 A-band grades. The
+# grades are right; a bare "9:39/mi" in the Expected column beside a stated
+# "5s/mi slower" and an A+ is what made them read as a participation trophy.
+
+def test_pace_bound_kind_matches_pace_deviation_gating():
+    """`pace_bound_kind` is a claim ABOUT `pace_deviation`, so derive the truth
+    from `pace_deviation` itself rather than restating the branches.
+
+    A "floor" means running slower than the expectation is free; a "ceiling"
+    means running faster is free; a "point" means neither is. If the two ever
+    disagree the card prints a bound the grade did not use, which is the exact
+    class of bug this whole change is fixing.
+    """
+    target = 360.0  # 6:00/km
+    for cls in ("easy", "long", "quality", "steady"):
+        slower = rc.pace_deviation(target * 1.10, target, cls)
+        faster = rc.pace_deviation(target * 0.90, target, cls)
+        kind = rc.pace_bound_kind(cls)
+        if kind == "floor":
+            assert slower == 0.0, cls    # slow side free
+            assert faster > 0.0, cls
+        elif kind == "ceiling":
+            assert faster == 0.0, cls    # fast side free
+            assert slower > 0.0, cls
+        else:
+            assert slower > 0.0 and faster > 0.0, cls
+
+
+def test_easy_pace_expected_prints_as_a_floor_not_a_point_target():
+    """The headline case. A prescribed easy day run 5s/mi SLOWER is compliance,
+    and the row has to say so — before this it printed a bare target beside a
+    stated miss and an A+."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8047, "duration_seconds": 2923,
+         "avg_pace_sec_per_km": 363, "avg_hr": 130, "training_load": 52},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "seq": 1},
+    )
+    pace = card["metrics"]["pace"]
+    assert card["intent_class"] == "easy"
+    assert pace["deviation"] == 0.0                 # slower is free
+    assert pace["grade"].startswith("A")
+    assert pace["bound"] == "floor"
+    assert rc.expected_text("pace", pace).startswith("≥ ")
+    assert rc._delta_text("pace", pace).endswith("slower")
+
+
+def test_quality_pace_expected_prints_as_a_ceiling():
+    """The mirror: a rep target is a speed the run must MEET, so beating it is
+    free and the bound points the other way."""
+    assert rc.pace_bound_kind("quality") == "ceiling"
+    assert rc.bounded_display("ceiling", "6:58/mi") == "≤ 6:58/mi"
+
+
+def test_two_sided_expectations_keep_a_bare_number():
+    """A plan DISTANCE is a genuine point target — over-running a prescription
+    costs you — so it must NOT grow a bound prefix. Only the one-sided
+    expectations do."""
+    card = card_for(
+        {"date": "2026-08-02", "distance_meters": 8047, "duration_seconds": 2923,
+         "avg_pace_sec_per_km": 363, "avg_hr": 130, "training_load": 52},
+        plan={"type": "easy", "target_distance_m": 8047,
+              "target_pace_sec_per_km": 360, "seq": 1},
+    )
+    distance = card["metrics"]["distance"]
+    assert distance["reference"] == "plan"
+    assert "bound" not in distance
+    assert rc.expected_text("distance", distance) == "5.00 mi"
+    assert rc.pace_bound_kind("steady") == "point"
+    assert rc.bounded_display("point", "5.00 mi") == "5.00 mi"
+
+
+def test_rolling_distance_expected_prints_as_a_floor():
+    """`distance_deviation(two_sided=False)` against the rolling median: going
+    LONGER than your norm is never a penalty, so the expectation is a floor."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100})
+    distance = card["metrics"]["distance"]
+    assert distance["reference"] == "rolling_60d"
+    assert distance["bound"] == "floor"
+    assert rc.expected_text("distance", distance).startswith("≥ ")
+
+
+# --- 0.41.0: one Delta grammar, never a percentage -------------------------
+
+def test_every_delta_is_in_the_rows_own_unit():
+    """A live card printed four dialects in four rows — `on target` /
+    `5s/mi slower` / `53% over` / `even` — where the percentages meant a
+    percentage of a distance, of a ratio, and of a percentage. Three different
+    quantities wearing one symbol.
+
+    The rule: a delta is stated in the unit its own row is measured in.
+    """
+    assert rc._delta_text(
+        "distance", {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
+    ) == "0.35 mi long"
+    assert rc._delta_text(
+        "pace", {"actual": 375.0, "expected": 360.0, "grade": "B"}
+    ) == "24s/mi slower"
+    assert rc._delta_text(
+        "hr", {"actual": 148.0, "expected": 140.0, "grade": "C"}
+    ) == "8 bpm over"
+    assert rc._delta_text(
+        "continuity", {"actual": 1.30, "expected": 1.15, "grade": "D"}
+    ) == "0.15x over"
+    # None of them may carry a percent sign.
+    for key, metric in (
+        ("distance", {"actual": 7000.0, "expected": 6437.376, "grade": "B"}),
+        ("pace", {"actual": 375.0, "expected": 360.0, "grade": "B"}),
+        ("hr", {"actual": 148.0, "expected": 140.0, "grade": "C"}),
+        ("continuity", {"actual": 1.30, "expected": 1.15, "grade": "D"}),
+    ):
+        assert "%" not in rc._delta_text(key, metric), key
+
+
+def test_continuity_delta_states_the_gap_in_median_splits_both_ways():
+    """`even` lost the magnitude on the compliant side, and `N% over` was a
+    percentage of a ratio on the other. Both are now a gap in the unit
+    `actual` and `expected` are already in."""
+    compliant = {"actual": 1.07, "expected": 1.15, "grade": "A+"}
+    assert rc._delta_text("continuity", compliant) == "0.08x under"
+    assert rc._delta_text(
+        "continuity", {"actual": 1.15, "expected": 1.15, "grade": "A"}
+    ) == "on target"
+
+
+def test_continuity_expected_uses_the_typographic_bound():
+    """The card printed `<= 1.15x` beside `≤ 140 bpm` in the same column."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=MILE_SPLITS)
+    continuity = card["metrics"]["continuity"]
+    if continuity.get("expected_display"):
+        assert continuity["expected_display"].startswith("≤ ")
+        assert "<=" not in continuity["expected_display"]
+
+
+# --- 0.41.0: dead split columns are dropped --------------------------------
+
+def test_split_table_drops_columns_with_no_data_and_keeps_the_rest():
+    """13 of 15 stored cards had an entirely empty Elev column and 85% of
+    `activity_splits` rows carry no elevation — a treadmill run never has any.
+    A full column of em-dashes is ~15% of the table's width spent on nothing,
+    on a page whose density ladder was already bottoming out.
+
+    `vs run` is deliberately KEPT when it has data: it is what makes a hot mile
+    visible at a glance.
+    """
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 600 + i, "avg_hr": 140 + i,
+                 "avg_pace_sec_per_km": 373.0} for i in range(4)])
+    headers, rows = rc.split_table(card)
+    assert "Elev" not in headers            # no elevation anywhere
+    assert "Avg HR" in headers
+    assert "vs run" in headers              # has data — kept
+    assert "Pace" in headers
+    assert all(len(r) == len(headers) for r in rows)
+    assert not any("—" == c for r in rows for c in r)
+
+    # ...and a column WITH data survives.
+    with_elev = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 600 + i, "avg_hr": 140 + i,
+                 "avg_pace_sec_per_km": 373.0,
+                 "elevation_gain_meters": 12.0} for i in range(4)])
+    assert "Elev" in rc.split_table(with_elev)[0]
+
+
+def test_split_table_drops_hr_columns_together_when_the_watch_recorded_none():
+    """No per-split HR means `Avg HR` and `vs run` are both dead. Dropping one
+    and keeping the other would leave a column of dashes headed by a
+    comparison against a number that isn't shown."""
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "training_load": 100},
+        splits=[{"split_index": i, "distance_meters": 1609.34,
+                 "duration_seconds": 600, "avg_pace_sec_per_km": 373.0}
+                for i in range(4)])
+    headers, _rows = rc.split_table(card)
+    assert "Avg HR" not in headers
+    assert "vs run" not in headers
+    assert headers[0] == "Mile"
+
+
+def test_split_table_is_the_single_source_for_both_renderers():
+    """The markdown card and the PDF had this table written out twice, and a
+    column dropped in one and kept in the other is precisely the divergence
+    `render_report_card_pdf`'s already-built-card contract exists to prevent —
+    the same reason `stimulus_rows` is shared."""
+    from local_fitness.agent import visuals
+
+    card = card_for(
+        {"date": "2026-07-19", "distance_meters": 10000, "duration_seconds": 3000,
+         "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100},
+        splits=MILE_SPLITS)
+    headers, rows = rc.split_table(card)
+    md = rc.render_markdown(card)
+    html_doc = visuals._render_splits_html(card, None)
+    for h in headers:
+        assert f"| {h} " in md or f"|{h}|" in md.replace(" ", "")
+        assert f"<th>{h}</th>" in html_doc
+    assert "<th>Elev</th>" not in html_doc
+    assert html_doc.count("<th>") == len(headers)
+    for cell in rows[0]:
+        assert f"<td>{cell}</td>" in html_doc
