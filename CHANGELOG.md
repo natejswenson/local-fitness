@@ -6,7 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.43.1] - 2026-08-03
+## [0.44.0] - 2026-08-03
+
+### Added
+- **`get_training_plan_status` now reports `pending_draft`.** A proposed plan
+  that was never committed governs nothing and was invisible on every path an
+  agent had reason to call: `get_training_plan_status` and
+  `get_training_plan_progress` both read the ACTIVE plan only, and the one
+  tool that could see a draft — `get_training_plan_draft` — was never called
+  once across every recorded session. Since `plans.insert_draft` archives any
+  existing draft, an unsurfaced draft is destroyed by the next proposal
+  without a word.
+
+  Measured on the live DB: a 59-workout draft ("10K sub-48:30 — walk-supported
+  rebuild") sat unnoticed for 12 days from 2026-07-22 while the active plan
+  was hand-patched one day at a time — 39 single-day `update_plan_workout`
+  calls, 52 fitness tool calls in one day.
+
+  `plans.draft_summary()` is pure and returns
+  `{plan_id, title, created_at, workout_count, first_date, last_date}` or
+  `None`. A **summary, not the plan** — this tool's contract is "slim by
+  design" and the full draft has its own tool.
+
+  Resolved BEFORE the no-active-plan early return, so the key is present on
+  both branches: "nothing active, a draft waiting" is exactly the state worth
+  reporting, and a bare `{"active": false}` hid it. Read on the connection the
+  handler already holds (`plans.get_draft_plan` gains the `conn=` parameter
+  `get_active_plan` has had), so this costs **no extra `db.connect()`** — the
+  tool is on the perf gate's hot path. Measured A/B over 300 iterations
+  against the synthetic fixture: **0.650 ms with vs 0.642 ms without, +1.2%**,
+  against a 15%-of-min floor.
+
+### Changed
+- `docs/mcp/get_training_plan_status.md` said "Drafts are invisible here" in
+  four places. All four now describe the draft as a loose end to close, and
+  name the silent-archive consequence of leaving one open.
 
 ### Security
 - **A crafted `Host` header could skip the bearer gate entirely.** The auth

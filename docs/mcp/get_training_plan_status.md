@@ -13,8 +13,9 @@ rollups, the projected finish, the goal gap, or a day-by-day list, switch to
 `get_training_plan_progress` — this tool computes none of those (there is no Riegel projection on
 this path).
 
-Read-only. It never writes and never touches drafts: a draft plan is invisible here, and
-`{"active": false}` means "no active plan", not "no plan exists".
+Read-only. It never writes and it never grades a draft — but since 0.44.0 it does *report* one:
+`pending_draft` summarises a proposed-but-uncommitted plan (or is `null`). `{"active": false}`
+still means "no active plan", not "no plan exists".
 
 ```
   [ DRAFT ] ──commit──► [ ACTIVE ] ──abandon──► [ ARCHIVED ]
@@ -32,7 +33,23 @@ Takes no parameters.
 When no plan is active — the whole payload:
 
 ```json
-{"active": false}
+{"active": false, "pending_draft": null}
+```
+
+…or, when a draft is waiting to be committed:
+
+```json
+{
+  "active": false,
+  "pending_draft": {
+    "plan_id": 5,
+    "title": "10K sub-48:30 — walk-supported rebuild",
+    "created_at": "2026-07-22T08:05",
+    "workout_count": 59,
+    "first_date": "2026-07-23",
+    "last_date": "2026-09-19"
+  }
+}
 ```
 
 When a plan is active:
@@ -75,7 +92,8 @@ When a plan is active:
 
 | Key | Meaning |
 |---|---|
-| `active` | `false` ⇒ every other key is absent. Always branch on this first. |
+| `active` | `false` ⇒ every other key is absent **except `pending_draft`**, which is always present. Always branch on this first. |
+| `pending_draft` | A proposed plan that was never committed, so it governs nothing — `{plan_id, title, created_at, workout_count, first_date, last_date}`, or `null`. A summary, not the plan; read it with [`get_training_plan_draft`](./get_training_plan_draft.md). |
 | `goal_type` / `race_date` / `target_time_seconds` | The plan's goal, as stored. `target_time_seconds` is `null` on a "just finish" plan. |
 | `target_time_formatted` | `target_time_seconds` rendered `H:MM:SS`; `null` when the goal time is. |
 | `days_to_race` | `race_date − date.today()`. Negative once the race is past. `null` if either date fails to parse. |
@@ -141,13 +159,19 @@ Answer with the prescription and one line of coach read — don't narrate the lo
   "missed" that could be yesterday or three weeks ago, and the two are coached very differently.
 - **No `predicted_finish` / `goal_gap` / `this_week` here** — those live only on
   `get_training_plan_progress`.
-- **Drafts are invisible here.** `{"active": false}` while a draft is sitting unopened is
-  expected — use `get_training_plan_draft` to see it.
+- **A pending draft is a loose end, not a plan.** It governs nothing until
+  [`commit_training_plan`](./commit_training_plan.md) runs. Surface it, then commit it or
+  [`discard_training_plan_draft`](./discard_training_plan_draft.md) — **`propose_training_plan`
+  archives the existing draft**, so leaving one open means the next proposal destroys it
+  silently. Before 0.44.0 drafts were invisible on this path, and a 59-workout draft went
+  unnoticed for 12 days on the live DB while the active plan was patched a day at a time.
+- **`pending_draft` is a summary, deliberately.** This tool is slim by design; the full draft
+  has its own tool. Don't infer prescriptions from `workout_count` and the date span.
 
 ## See also
 
 - [`get_training_plan_progress`](./get_training_plan_progress.md) — day-by-day, rollups, projection
-- [`get_training_plan_draft`](./get_training_plan_draft.md) — the draft this tool never shows
+- [`get_training_plan_draft`](./get_training_plan_draft.md) — the full draft this tool only summarises
 - [`update_plan_workout`](./update_plan_workout.md) — change today's prescription
 - [`commit_training_plan`](./commit_training_plan.md) — what made this plan active
 - [`abandon_active_plan`](./abandon_active_plan.md) — what makes this return `{"active": false}`

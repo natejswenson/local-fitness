@@ -2715,6 +2715,116 @@ def plan_seeded(tmp_path, monkeypatch):
 
 # --- 2a: weekly_rollup — direct import from tools, pure, no DB ---------------
 
+# --- pending_draft: a proposed-but-uncommitted plan must never be invisible --
+# plans.insert_draft archives any prior draft, so a draft nobody surfaces can
+# be destroyed by the next proposal without a word. Measured on the live DB: a
+# 59-workout draft sat unnoticed for 12 days while the active plan was patched
+# one day at a time.
+
+
+def test_draft_summary_is_none_without_a_draft():
+    assert plans.draft_summary(None) is None
+
+
+def test_draft_summary_reports_the_countable_facts():
+    """Pins the actual values, not just the keys — a summary that returned the
+    wrong count or spanned the wrong dates would still have the right shape."""
+    draft = {
+        "plan_id": 7, "title": "10K rebuild", "created_at": "2026-07-22T08:05",
+        "workouts": [
+            {"date": "2026-07-30", "seq": 1},
+            {"date": "2026-07-24", "seq": 1},
+            {"date": "2026-07-28", "seq": 1},
+        ],
+    }
+    assert plans.draft_summary(draft) == {
+        "plan_id": 7,
+        "title": "10K rebuild",
+        "created_at": "2026-07-22T08:05",
+        "workout_count": 3,
+        "first_date": "2026-07-24",   # min, not list order
+        "last_date": "2026-07-30",
+    }
+
+
+def test_draft_summary_handles_a_draft_with_no_workouts():
+    summary = plans.draft_summary(
+        {"plan_id": 2, "title": "empty", "created_at": "t", "workouts": []})
+    assert summary["workout_count"] == 0
+    assert summary["first_date"] is None and summary["last_date"] is None
+
+
+def test_plan_status_reports_a_pending_draft_alongside_the_active_plan(plan_seeded):
+    """The active plan governs; the draft is a loose end reported beside it.
+    Both must be present — an earlier shape returned one OR the other."""
+    plan_id = plans.insert_draft(
+        {"goal_type": "10k", "race_date": "2026-12-01",
+         "target_time_seconds": 2900, "created_at": "2026-07-22T08:05"},
+        [{"date": "2026-11-01", "seq": 1, "week_index": 1, "type": "easy",
+          "target_distance_m": 5000.0, "description": ""},
+         {"date": "2026-11-02", "seq": 1, "week_index": 1, "type": "long",
+          "target_distance_m": 9000.0, "description": ""}],
+        db_path=plan_seeded,
+    )
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert payload["active"] is True, "the active plan must still be reported"
+    assert payload["pending_draft"] == {
+        "plan_id": plan_id,
+        "title": None,
+        "created_at": "2026-07-22T08:05",
+        "workout_count": 2,
+        "first_date": "2026-11-01",
+        "last_date": "2026-11-02",
+    }
+
+
+def test_plan_status_reports_a_pending_draft_when_there_is_no_active_plan(
+        tmp_path, monkeypatch):
+    """The case that matters most: nothing active, a draft waiting. A bare
+    {active: false} used to hide it completely."""
+    p = tmp_path / "f.db"
+    db.init_schema(p)
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    plan_id = plans.insert_draft(
+        {"goal_type": "10k", "race_date": "2026-12-01",
+         "target_time_seconds": 2900, "created_at": "2026-07-22T08:05"},
+        [{"date": "2026-11-01", "seq": 1, "week_index": 1, "type": "easy",
+          "target_distance_m": 5000.0, "description": ""}],
+        db_path=p,
+    )
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert payload["active"] is False
+    assert payload["pending_draft"]["plan_id"] == plan_id
+    assert payload["pending_draft"]["workout_count"] == 1
+
+
+def test_plan_status_pending_draft_is_none_when_none_exists(plan_seeded):
+    """No draft → the key is present and null, so the agent can tell 'no draft'
+    apart from 'this tool does not report drafts'."""
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert "pending_draft" in payload
+    assert payload["pending_draft"] is None
+
+
+def test_plan_status_still_opens_exactly_one_connection(plan_seeded, monkeypatch):
+    """The draft read rides the connection already held. This tool is on the
+    perf gate's hot path; a second open would be a real regression."""
+    opens = []
+    real_connect = db.connect
+
+    def counting_connect(*a, **kw):
+        opens.append(1)
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(db, "connect", counting_connect)
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert len(opens) == 1, f"expected 1 db.connect(), got {len(opens)}"
+
+
 def test_weekly_rollup_empty_workouts_yields_zero_totals():
     rollup = tools.weekly_rollup([], "2026-07-12")
     assert rollup == {

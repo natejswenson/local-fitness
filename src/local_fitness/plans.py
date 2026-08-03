@@ -992,8 +992,13 @@ def best_recent_effort(
     return select_best_effort(rows)
 
 
-def get_draft_plan(db_path: Path | None = None) -> dict | None:
-    return _get_by_status("draft", db_path)
+def get_draft_plan(
+    db_path: Path | None = None, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    """Accepts an already-open ``conn`` for the same reason ``get_active_plan``
+    does — ``get_training_plan_status`` reads the draft on the connection it
+    already holds, so surfacing a pending draft costs no extra open."""
+    return _get_by_status("draft", db_path, conn=conn)
 
 
 # --- assembly for the tab + brief -----------------------------------------
@@ -1147,6 +1152,36 @@ def _slim_workout(workout: dict | None) -> dict | None:
         "target_hr_max": workout.get("target_hr_max"),
         "description": desc,
         "verdict": workout.get("verdict"),
+    }
+
+
+def draft_summary(draft: dict | None) -> dict | None:
+    """A one-line description of a pending draft, or None when there isn't one.
+
+    Pure — takes the plan dict a caller already read. Deliberately a SUMMARY
+    and not the draft itself: this rides along on ``get_training_plan_status``,
+    whose whole contract is "slim by design", and the full draft already has
+    its own tool (``get_training_plan_draft``).
+
+    Exists because a draft was otherwise invisible. ``get_training_plan_status``
+    and ``get_training_plan_progress`` both read the ACTIVE plan only, so an
+    agent had no way to learn a draft was waiting without calling a tool it had
+    no reason to call — and ``insert_draft`` archives any prior draft, so
+    proposing a second one silently destroys the first. Measured on the live
+    DB: a 59-workout draft sat unnoticed for 12 days while the active plan was
+    hand-patched one day at a time.
+    """
+    if draft is None:
+        return None
+    workouts = draft.get("workouts") or []
+    dates = sorted(w["date"] for w in workouts if w.get("date"))
+    return {
+        "plan_id": draft.get("plan_id"),
+        "title": draft.get("title"),
+        "created_at": draft.get("created_at"),
+        "workout_count": len(workouts),
+        "first_date": dates[0] if dates else None,
+        "last_date": dates[-1] if dates else None,
     }
 
 

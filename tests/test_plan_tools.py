@@ -161,8 +161,13 @@ def test_new_plan_lifecycle_tools_not_read_only():
 
 
 def test_status_inactive(seeded):
+    """Exact equality on purpose — this pins the WHOLE inactive payload, so a
+    key added here has to be a deliberate contract change. `pending_draft` is
+    present-and-null rather than absent (0.44.0): the agent must be able to
+    tell "no draft" from "this tool doesn't report drafts", and no-active-plan
+    is exactly the branch where a waiting draft matters most."""
     body, _ = call(tools.get_training_plan_status, {})
-    assert body == {"active": False}
+    assert body == {"active": False, "pending_draft": None}
 
 
 def test_status_active(seeded):
