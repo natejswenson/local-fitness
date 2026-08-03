@@ -29,11 +29,12 @@ shape one `update_plan_workout` call at a time.
 
 ## The write boundary
 
-`plans.update_active_workout` whitelists exactly five columns:
+`plans.update_active_workout` whitelists exactly six columns:
 
 ```python
 _EDITABLE_WORKOUT_COLS = frozenset(
-    {"type", "target_distance_m", "target_pace_sec_per_km", "target_duration_sec", "description"}
+    {"type", "target_distance_m", "target_pace_sec_per_km", "target_duration_sec",
+     "target_hr_max", "description"}
 )
 ```
 
@@ -57,17 +58,23 @@ between "adjust today's run" and "silently rewrite the plan's structure".
 | `distance_mi` | number | no | unchanged | Miles. Converted to metres (`units.from_miles`, `× 1609.344`). |
 | `pace_min_per_mi` | string \| number | no | unchanged | **`"M:SS"` preferred** — `"9:39"`. A bare number is *decimal minutes*: `9.65` is 9:39/mi. Bounded to 3:00–30:00/mi. See the trap below. |
 | `duration_min` | number | no | unchanged | Minutes. Converted to seconds and rounded. The **graded** field for `tempo`/`interval`. |
-| `hr_max` | number | no | unchanged | Prescribed heart-rate **ceiling** in bpm. Bounded to 90–210. Pass it whenever the day has a cap: [`workout_report_card`](workout_report_card.md) grades average HR **and** time-above-cap against this column, and a cap written only into `description` is invisible to the grader (0.40.0). |
+| `hr_max` | number | no | unchanged | Prescribed heart-rate **ceiling** in bpm. Bounded to 90–210. Pass it whenever the day has a cap: [`workout_report_card`](workout_report_card.md) grades the run's average HR **and** how far above the ceiling it ran (in bpm, `hr_exceedance_bpm` — 0.40.2 replaced the earlier time-above-cap fraction, which was a different unit fed into bands calibrated for relative magnitudes) against this column. A cap written only into `description` is invisible to the grader (0.40.0). |
 | `description` | string | no | unchanged | Prose prescription. |
 | `seq` | integer | no | `1` | Intra-day session: 1 = first/AM, 2 = second/PM. Must be a positive int. |
 
 At least one of `type` / `distance_mi` / `pace_min_per_mi` / `duration_min` / `hr_max` / `description` is
 required — a call with only `date` errors with `nothing to update`.
 
-**`type: "rest"` is special:** it clears `target_distance_m`, `target_pace_sec_per_km`, and
-`target_duration_sec`, and defaults `description` to `"Rest day"` unless you pass one. Without that,
-a day flipped to rest would keep its old hard-run prose, which surfaces in every plan payload and
-in the brief PDF.
+**`type: "rest"` is special:** it clears `target_distance_m`, `target_pace_sec_per_km`,
+`target_duration_sec` **and `target_hr_max`**, and defaults `description` to `"Rest day"` unless you
+pass one. Without that, a day flipped to rest would keep its old hard-run prose (which surfaces in
+every plan payload and in the brief PDF) and a stale HR ceiling prescribing a session that no longer
+exists.
+
+Since 0.46.0 that clearing lives in `plans.apply_rest_semantics`, at the **write boundary** rather
+than in this tool — so [`update_plan_workouts`](update_plan_workouts.md) and any future write path
+inherit it. It was tool-side while this was the only caller, which was correct right up until it
+wasn't.
 
 ### Pace: send `"9:39"`, not `9.39`
 

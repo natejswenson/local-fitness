@@ -2633,3 +2633,71 @@ def test_split_table_is_the_single_source_for_both_renderers():
     assert html_doc.count("<th>") == len(headers)
     for cell in rows[0]:
         assert f"<td>{cell}</td>" in html_doc
+
+
+# --- metric_table: one definition, two renderers ----------------------------
+# The cells were already single-sourced (both renderers call actual_text /
+# expected_text / _delta_text), but the HEADER ROW and the column set were
+# written out twice — the same divergence split_table and stimulus_rows exist
+# to prevent, one level up. Extracted in 0.48.0.
+
+
+def _graded_card_for_table():
+    return {
+        "metrics": {
+            "distance": {"actual": 8046.72, "expected": 8046.72, "grade": "A",
+                         "deviation": 0.0, "unit": "m", "reference": "plan"},
+            "pace": {"actual": 360.0, "expected": 355.0, "grade": "B+",
+                     "deviation": 0.014, "unit": "sec_per_km", "reference": "plan",
+                     "note": "a shade slow"},
+            "hr": {"actual": 139.0, "expected": 140.0, "grade": "A+",
+                   "deviation": 0.0, "unit": "bpm", "reference": "plan"},
+            "continuity": {"actual": 1.05, "expected": 1.15, "grade": "A",
+                           "deviation": 0.0, "unit": "ratio", "reference": "self"},
+        },
+    }
+
+
+def test_metric_table_headers_and_row_order_are_one_definition():
+    headers, rows = rc.metric_table(_graded_card_for_table())
+    assert headers == ["Metric", "Actual", "Expected", "Delta", "Grade"]
+    assert [r[0] for r in rows] == [label for _k, label in rc._METRIC_LABELS]
+    assert all(len(r) == len(headers) for r in rows)
+
+
+def test_metric_table_puts_the_grade_last():
+    """The PDF colours the final cell by grade band, so the grade's POSITION is
+    part of the contract, not an accident of ordering."""
+    _headers, rows = rc.metric_table(_graded_card_for_table())
+    assert [r[-1] for r in rows] == ["A", "B+", "A+", "A"]
+
+
+def test_both_renderers_take_the_metric_table_from_one_source():
+    """The guard that makes the extraction worth anything: add a column to
+    metric_table and BOTH the markdown card and the PDF must show it. Before
+    0.48.0 each built its own header row, so one could gain a column the other
+    never rendered."""
+    from local_fitness.agent import render, visuals
+
+    card = _graded_card_for_table()
+    headers, rows = rc.metric_table(card)
+
+    md = render.render_table(headers, rows)
+    html_out = visuals._render_metric_table_html(card)
+
+    for h in headers:
+        assert h in md, f"markdown lost header {h}"
+        assert f"<th>{h}</th>" in html_out, f"PDF lost header {h}"
+    for row in rows:
+        for cell in row:
+            assert cell in md, f"markdown lost cell {cell}"
+            assert cell in html_out, f"PDF lost cell {cell}"
+
+
+def test_metric_notes_are_shared_and_table_ordered():
+    card = _graded_card_for_table()
+    card["metrics"]["distance"]["note"] = "spot on"
+    assert rc.metric_notes(card) == [("Distance", "spot on"), ("Pace", "a shade slow")]
+    # A metric with no note contributes nothing.
+    assert all(label not in ("Avg HR", "Continuity")
+               for label, _n in rc.metric_notes(card))

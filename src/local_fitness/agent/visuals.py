@@ -23,6 +23,8 @@ import asyncio
 import base64
 import html
 import io
+import json
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,6 +39,8 @@ if TYPE_CHECKING:
 # chart stylesheet in render_chart_png — the ASCII chart tool keeps its own
 # emoji heat ramp (PRESS is the *print* brand).
 from . import branding
+
+LOG = logging.getLogger(__name__)
 
 _VERDICT_LABEL = {
     "done": "done",
@@ -113,8 +117,74 @@ CARD_DENSITY_PRESETS: tuple[dict, ...] = (
 )
 
 
+#: Where the per-document winning-rung hints live — next to the SQLite DB, in
+#: the already-gitignored `data/` dir, exactly like the two coach caches.
+#: Deliberately NOT in the DB: it is a disposable performance hint, and losing
+#: it costs one slower render, not correctness.
+_LADDER_HINT_FILE = "density_ladder_hints.json"
+
+
+def _ladder_hint_path() -> Path:
+    from .. import db
+
+    return db.DEFAULT_DB_PATH.parent / _LADDER_HINT_FILE
+
+
+def read_ladder_hint(kind: str) -> int:
+    """The rung that last won for ``kind``, or 0 when unknown.
+
+    Best-effort by contract: a missing, unreadable or corrupt hint file returns
+    0, which is exactly the pre-0.48.0 behaviour. A performance hint must never
+    be able to break a render.
+    """
+    try:
+        raw = json.loads(_ladder_hint_path().read_text(encoding="utf-8"))
+        value = raw.get(kind)
+        return int(value) if isinstance(value, int) and value >= 0 else 0
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def write_ladder_hint(kind: str, index: int) -> None:
+    """Record the winning rung. Never raises."""
+    try:
+        path = _ladder_hint_path()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raw = {}
+        except (OSError, ValueError):
+            raw = {}
+        if raw.get(kind) == index:
+            return  # no write when nothing moved
+        raw[kind] = int(index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(raw), encoding="utf-8")
+    except (OSError, ValueError, TypeError):
+        LOG.debug("density-ladder hint write failed (ignored)", exc_info=True)
+
+
+def _fit_with_hint(
+    build_html: Callable[[dict], str], presets: Sequence[dict], kind: str
+) -> tuple[bytes, int]:
+    """``fit_one_page`` with the winning rung remembered across renders.
+
+    One rung of headroom (``hint - 1``) so a document that shrank can climb
+    back to a roomier layout; see ``fit_one_page``'s ``start_index`` note for
+    why that converges rather than ratcheting dense.
+    """
+    hint = read_ladder_hint(kind)
+    pdf, pages, index = fit_one_page(
+        build_html, presets, start_index=max(0, hint - 1))
+    write_ladder_hint(kind, index)
+    return pdf, pages
+
+
 def fit_one_page(
-    build_html: Callable[[dict], str], presets: Sequence[dict] = DENSITY_PRESETS
+    build_html: Callable[[dict], str],
+    presets: Sequence[dict] = DENSITY_PRESETS,
+    *,
+    start_index: int = 0,
 ) -> tuple[bytes, int, int]:
     """Lay `build_html(preset)` out at each density until it fits one page.
 
@@ -150,11 +220,28 @@ def fit_one_page(
     if not presets:
         raise ValueError("presets must not be empty")
 
+    # `start_index` skips rungs a previous render already proved too roomy.
+    # Measured over the live corpus: the card ladder's roomiest rung won 0 of
+    # 15 times and 65% of all layout time went on discarded passes (57% for
+    # briefs). Callers pass `last_winner - 1`, keeping one rung of headroom so
+    # a document that got SHORTER can still climb back — each render moves the
+    # hint at most one rung roomier, so it converges on the true optimum
+    # instead of ratcheting dense.
+    #
+    # The trade, stated plainly: a render can land one rung tighter than
+    # strictly necessary until it converges. That is deliberate (0.48.0) and
+    # is the whole point — this is NOT a pure win, it buys ~200ms with a
+    # bounded, self-correcting density cost.
+    #
+    # Clamped, never trusted: a stale or corrupt hint must not skip the ladder
+    # entirely or index out of range.
+    first = min(max(0, start_index), len(presets) - 1)
+
     font_config = FontConfiguration()
     image_cache: dict = {}
     doc = None
-    index = 0
-    for index, preset in enumerate(presets):  # noqa: B007 — index is read AFTER the loop (returned rung)
+    index = first
+    for index, preset in enumerate(presets[first:], start=first):  # noqa: B007 — index is read AFTER the loop (returned rung)
         doc = weasyprint.HTML(
             string=build_html(preset), url_fetcher=_report_url_fetcher()
         ).render(font_config=font_config, cache=image_cache)
@@ -883,10 +970,14 @@ def render_brief_pdf(
     (see `generate_brief_report`), because nothing this function can do to
     type size will fit what it was handed.
     """
-    return fit_one_page(
+    return _fit_with_hint(
         lambda preset: _build_html(brief, charts, plan_section, preset, omitted),
         presets,
-    )[:2]
+        # Keyed by the ladder actually in use: generate_brief_report passes a
+        # TRUNCATED presets tuple when it retries after dropping a takeaway, and
+        # a hint learned from a 1-rung ladder must not steer a full-ladder run.
+        "brief" if presets is DENSITY_PRESETS else f"brief:{len(presets)}",
+    )
 
 
 # --- workout report card ---------------------------------------------------
@@ -1246,21 +1337,21 @@ def ref_mode_is_running(card: dict) -> bool:
 def _render_metric_table_html(card: dict) -> str:
     from . import report_card as rc
 
+    # Headers AND cells come from report_card.metric_table — the table was
+    # written out twice before 0.48.0, which is the same divergence split_table
+    # and stimulus_rows exist to prevent. The cells already deferred to the
+    # card's own display strings (HR is held to a band, quality pace grades the
+    # fastest split); now the column set does too.
+    headers, body_rows = rc.metric_table(card)
     rows = ""
-    for key, label in rc._METRIC_LABELS:
-        m = card["metrics"][key]
-        # Both columns defer to the card's own display strings: HR is held to a
-        # band rather than a point, and quality pace is graded on the fastest
-        # split rather than the run average. See rc.expected_text / rc.actual_text.
-        expected = rc.expected_text(key, m)
-        actual = rc.actual_text(key, m)
-        grade = m.get("grade") or "n/a"
+    for cells in body_rows:
+        *lead, grade = cells
+        label, rest = lead[0], lead[1:]
+        tds = "".join(f"<td>{html.escape(c)}</td>" for c in rest)
         rows += f"""
         <tr>
           <td class="metric-name">{html.escape(label)}</td>
-          <td>{html.escape(actual)}</td>
-          <td>{html.escape(expected)}</td>
-          <td>{html.escape(rc._delta_text(key, m))}</td>
+          {tds}
           <td class="metric-grade {_grade_class(grade)}">{html.escape(grade)}</td>
         </tr>
         """
@@ -1271,7 +1362,7 @@ def _render_metric_table_html(card: dict) -> str:
         <col style="width:22%"><col style="width:12%">
       </colgroup>
       <thead><tr>
-        <th>Metric</th><th>Actual</th><th>Expected</th><th>Delta</th><th>Grade</th>
+        {"".join(f"<th>{html.escape(h)}</th>" for h in headers)}
       </tr></thead>
       <tbody>{rows}</tbody>
     </table>
@@ -1433,8 +1524,7 @@ def _build_report_card_html(
         f"{card.get('intent')} ({graded_by})"
     )
 
-    notes = [f"{label}: {card['metrics'][key]['note']}"
-             for key, label in rc._METRIC_LABELS if card["metrics"][key].get("note")]
+    notes = [f"{label}: {note}" for label, note in rc.metric_notes(card)]
     # The load spike note lives in the Stimulus section now (0.40.0) — it is a
     # statement about stimulus, not about compliance with the prescription.
     if overall.get("capped_by") == "F":
@@ -1518,7 +1608,8 @@ def render_report_card_pdf(
     it is surfaced to the caller (which logs it) rather than being discarded,
     because CLAUDE.md's contract is that a PDF never spills silently.
     """
-    return fit_one_page(
+    return _fit_with_hint(
         lambda preset: _build_report_card_html(card, split_chart, preset),
         CARD_DENSITY_PRESETS,
-    )[:2]
+        "card",
+    )

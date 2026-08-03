@@ -58,7 +58,6 @@ Three tools overlap here; the distinction is on each page.
 | Tool | Use it for |
 |---|---|
 | [`daily_snapshot`](daily_snapshot.md) | One-call "how am I doing today" |
-| [`get_today_status`](get_today_status.md) | Today's metrics vs baseline + training load, no plan/trend data |
 | [`get_brief_context`](get_brief_context.md) | The deterministic planner's full typed output — candidate takeaways, plan status, anomalies, continuity |
 | [`save_brief`](save_brief.md) | ✍️ Persist today's composed brief |
 
@@ -102,13 +101,13 @@ The first three attach **deterministic interpretation** — see
 
 ### Training plans
 
-The full lifecycle. These nine are a state machine — every page carries the
+The full lifecycle. These ten are a state machine — every page carries the
 diagram.
 
 ```
 propose_training_plan ──> DRAFT ──> commit_training_plan ──> ACTIVE
                             │  ▲                                │
-              revise_training_plan                   update_plan_workout
+              revise_training_plan                   update_plan_workout(s)
                             │                                   │
                 discard_training_plan_draft         abandon_active_plan (no undo)
 ```
@@ -117,10 +116,11 @@ propose_training_plan ──> DRAFT ──> commit_training_plan ──> ACTIVE
 |---|---|
 | [`propose_training_plan`](propose_training_plan.md) | ✍️ Draft a new plan toward a goal |
 | [`revise_training_plan`](revise_training_plan.md) | ✍️ Restructure the draft |
-| [`get_training_plan_draft`](get_training_plan_draft.md) | The only way to see a pending draft — read it before committing or discarding |
+| [`get_training_plan_draft`](get_training_plan_draft.md) | Read the full pending draft before committing or discarding it (`get_training_plan_status` reports that one exists) |
 | [`commit_training_plan`](commit_training_plan.md) | ✍️ Activate the draft |
 | [`discard_training_plan_draft`](discard_training_plan_draft.md) | ✍️ Throw the draft away |
 | [`update_plan_workout`](update_plan_workout.md) | ✍️ Re-prescribe **one day** on the active plan |
+| [`update_plan_workouts`](update_plan_workouts.md) | ✍️ Re-prescribe **many days** atomically — reshaping a week or a block |
 | [`abandon_active_plan`](abandon_active_plan.md) | ✍️ Stop following the active plan — **no undo** |
 | [`get_training_plan_status`](get_training_plan_status.md) | Is there a plan, and what's today? |
 | [`get_training_plan_progress`](get_training_plan_progress.md) | Day-by-day grading + adherence rollups |

@@ -102,12 +102,11 @@ def seeded(tmp_path, monkeypatch):
     return p
 
 
-def test_get_today_status(seeded):
-    # Fix B (2026-07-10 doc): get_today_status now delegates to
-    # status.assemble_status() — the old {today, recent_days,
-    # current_baseline} raw shape is gone, replaced by assemble_status()'s
-    # richer payload (metrics with baseline deltas, training_load, etc).
-    payload, err = call(tools.get_today_status, {})
+def test_daily_snapshot_payload_shape(seeded):
+    """Inherited from the removed get_today_status: the old raw
+    {today, recent_days, current_baseline} shape is gone, replaced by
+    assemble_status()'s richer payload."""
+    payload, err = call(tools.daily_snapshot, {})
     assert not err
     assert "recent_days" not in payload
     assert "current_baseline" not in payload
@@ -116,24 +115,32 @@ def test_get_today_status(seeded):
     assert payload["date"] == date.today().isoformat()
 
 
-def test_get_today_status_matches_daily_snapshot(seeded):
-    # Fix B's convergence invariant: identical payload for identical DB state.
-    today_payload, err1 = call(tools.get_today_status, {})
-    snapshot_payload, err2 = call(tools.daily_snapshot, {})
-    assert not err1 and not err2
-    assert today_payload == snapshot_payload
+def test_get_today_status_is_gone(seeded):
+    """0.48.0 removed it — byte-identical body to daily_snapshot, sharing one
+    description constant, so the model coin-flipped between two names for one
+    tool (16/5 across recorded sessions). Pinned so it can't drift back in."""
+    assert not hasattr(tools, "get_today_status")
+    assert "get_today_status" not in {t.name for t in tools.ALL_TOOLS}
 
 
-def test_get_today_status_description_mirrors_daily_snapshot():
-    today_tool = next(t for t in tools.ALL_TOOLS if t.name == "get_today_status")
-    snapshot_tool = next(t for t in tools.ALL_TOOLS if t.name == "daily_snapshot")
-    # Must no longer be the stale raw-shape description.
-    assert today_tool.description != (
-        "Today's metrics + last 7 days alongside the latest 60-day baselines. "
-        "Call this first when assessing recovery or making 'should I train "
-        "hard' decisions."
-    )
-    assert today_tool.description == snapshot_tool.description
+def test_the_v1_brief_grant_still_matches_its_prompt(seeded):
+    """The removal moved the V1 read-only grant from get_today_status to
+    daily_snapshot. briefing_prompt names it as step 1, and a prompt that
+    instructs a tool the loop was never granted fails SILENTLY — that exact
+    mismatch went unnoticed for three weeks in 2026 (see _READ_ONLY_TOOL_NAMES).
+    """
+    from local_fitness.agent import prompts
+
+    granted = set(tools.read_only_tool_names())
+    assert "mcp__fitness__daily_snapshot" in granted
+    assert "mcp__fitness__get_today_status" not in granted
+    # Every tool the V1 prompt tells the loop to call must actually be granted.
+    body = prompts.briefing_prompt("Nate")
+    for name in ("daily_snapshot", "get_training_plan_status",
+                 "training_load_status", "query_workouts", "get_metric_trend"):
+        assert name in body, f"V1 prompt no longer names {name}"
+        assert f"mcp__fitness__{name}" in granted, (
+            f"V1 prompt instructs {name} but the loop is not granted it")
 
 
 def test_get_metric_valid(seeded):
@@ -188,13 +195,18 @@ def test_get_metric_trend(seeded):
 
 
 def test_get_metric_trend_unknown(seeded):
-    _payload, err = call(tools.get_metric_trend, {"metric": "nope", "days": 14})
+    payload, err = call(tools.get_metric_trend, {"metric": "nope", "days": 14})
     assert err
+    assert "unknown metric 'nope'" in payload["error"]
 
 
 def test_get_metric_trend_no_data(seeded):
-    _payload, err = call(tools.get_metric_trend, {"metric": "vo2_max", "days": 14})
-    assert err  # vo2_max never seeded → no rows in window
+    payload, err = call(tools.get_metric_trend, {"metric": "vo2_max", "days": 14})
+    assert err
+    # vo2_max is a REAL metric with no rows in the window — the message must
+    # say "no data", not "unknown metric", or the two failures are the same
+    # to a caller trying to work out what went wrong.
+    assert payload["error"] == "no data in window"
 
 
 # --------------------------------------------------------------------------- #
@@ -388,7 +400,8 @@ def test_chart_unknown_style(seeded):
 
 def test_chart_no_data(seeded):
     payload, err = call(tools.chart, {"metric": "vo2_max", "days": 14})
-    assert err  # vo2_max never seeded → no rows in window
+    assert err
+    assert payload["error"] == "no data in window"   # not "unknown metric"
 
 
 def test_chart_value_fmt_vo2_max_keeps_a_decimal():
@@ -443,8 +456,9 @@ def test_get_workout_detail_found(seeded):
 
 
 def test_get_workout_detail_missing(seeded):
-    _payload, err = call(tools.get_workout_detail, {"activity_id": 999})
+    payload, err = call(tools.get_workout_detail, {"activity_id": 999})
     assert err
+    assert payload["error"] == "activity not found"
 
 
 # --------------------------------------------------------------------------- #
@@ -558,12 +572,13 @@ def test_compare_periods_training_load(seeded):
 
 
 def test_compare_periods_unknown(seeded):
-    _payload, err = call(
+    payload, err = call(
         tools.compare_periods,
         {"metric": "xyz", "period_a_start": "2026-01-01", "period_a_end": "2026-01-02",
          "period_b_start": "2026-01-03", "period_b_end": "2026-01-04"},
     )
     assert err
+    assert "unknown metric 'xyz'" in payload["error"]
 
 
 def test_find_anomalies(seeded):
@@ -574,8 +589,11 @@ def test_find_anomalies(seeded):
 
 
 def test_find_anomalies_unsupported_metric(seeded):
-    _payload, err = call(tools.find_anomalies, {"metric": "steps"})
+    payload, err = call(tools.find_anomalies, {"metric": "steps"})
     assert err
+    # steps is a REAL metric that simply isn't baseline-tracked — the message
+    # must say that, not "unknown metric".
+    assert "only baseline-tracked metrics supported" in payload["error"]
 
 
 def test_training_load_status(seeded):
@@ -588,8 +606,12 @@ def test_training_load_status_empty(tmp_path, monkeypatch):
     p = tmp_path / "fitness.db"
     monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
     db.init_schema(p)
-    _payload, err = call(tools.training_load_status, {})
+    payload, err = call(tools.training_load_status, {})
     assert err
+    # An EMPTY db, not a broken one — the message has to send the user to the
+    # fix (sync) rather than read as a generic failure.
+    assert "no training-load data yet" in payload["error"]
+    assert "sync_garmin_data" in payload["error"]
 
 
 # --------------------------------------------------------------------------- #
@@ -695,13 +717,15 @@ def test_correlate_with_lag(seeded):
 
 
 def test_correlate_bad_metric(seeded):
-    _payload, err = call(tools.correlate, {"metric_a": "foo", "metric_b": "rhr", "days": 30})
+    payload, err = call(tools.correlate, {"metric_a": "foo", "metric_b": "rhr", "days": 30})
     assert err
+    assert "metrics must be daily numeric" in payload["error"]
 
 
 def test_correlate_insufficient(seeded):
-    _payload, err = call(tools.correlate, {"metric_a": "sleep_seconds", "metric_b": "rhr", "days": 2})
-    assert err  # < 5 paired points
+    payload, err = call(tools.correlate, {"metric_a": "sleep_seconds", "metric_b": "rhr", "days": 2})
+    assert err
+    assert "insufficient paired data" in payload["error"]  # NOT 'metrics must be daily numeric' — both metrics are valid
 
 
 def test_recovery_pattern(seeded):
@@ -1135,19 +1159,41 @@ def test_run_sql_select(seeded):
     assert payload["count"] == 1
 
 
+# These three guard the SQL boundary, and each must fail for its OWN reason.
+# They asserted only `assert err` until 0.47.0 — so a run_sql that rejected
+# EVERY query, including valid SELECTs, would have passed all three. Pinning
+# the error text is what makes them distinguish "rejected correctly" from
+# "rejected for the wrong reason" (and from "rejected everything").
+
+
 def test_run_sql_rejects_non_select(seeded):
-    _payload, err = call(tools.run_sql, {"query": "DELETE FROM daily_metrics"})
+    payload, err = call(tools.run_sql, {"query": "DELETE FROM daily_metrics"})
     assert err
+    assert "only SELECT/WITH queries permitted" in payload["error"]
 
 
 def test_run_sql_rejects_forbidden_keyword(seeded):
-    _payload, err = call(tools.run_sql, {"query": "WITH x AS (SELECT 1) UPDATE settings SET value='x'"})
+    """A statement that STARTS with WITH clears the first gate, so the keyword
+    denylist is what has to catch it."""
+    payload, err = call(tools.run_sql,
+                        {"query": "WITH x AS (SELECT 1) UPDATE settings SET value='x'"})
     assert err
+    assert "forbidden keyword: update" in payload["error"]
 
 
 def test_run_sql_bad_query(seeded):
-    _payload, err = call(tools.run_sql, {"query": "SELECT * FROM does_not_exist"})
+    payload, err = call(tools.run_sql, {"query": "SELECT * FROM does_not_exist"})
     assert err
+    # Reached sqlite and failed there — NOT stopped by either guard above.
+    assert "no such table: does_not_exist" in payload["error"]
+
+
+def test_run_sql_accepts_a_valid_select(seeded):
+    """The other half of the boundary, and the one whose absence let the three
+    tests above pass a reject-everything implementation."""
+    payload, err = call(tools.run_sql, {"query": "SELECT 1 AS n"})
+    assert not err, payload
+    assert payload["rows"] == [{"n": 1}]
 
 
 def test_run_sql_bad_table_points_at_schema_resource(seeded):
@@ -1269,8 +1315,9 @@ def test_save_and_list_user_notes(seeded):
 
 
 def test_save_user_note_empty(seeded):
-    _payload, err = call(tools.save_user_note, {"note": "   "})
+    payload, err = call(tools.save_user_note, {"note": "   "})
     assert err
+    assert "note text is required" in payload["error"]
 
 
 def test_update_user_note(seeded):
@@ -1281,12 +1328,18 @@ def test_update_user_note(seeded):
 
 
 def test_update_user_note_bad_line(seeded):
-    _payload, err = call(tools.update_user_note, {"line": None, "note": "x"})
+    """Three DIFFERENT rejections. Asserting only `assert err` three times
+    could not tell them apart — nor tell any of them from an
+    update_user_note that refused everything."""
+    payload, err = call(tools.update_user_note, {"line": None, "note": "x"})
     assert err
-    _payload, err = call(tools.update_user_note, {"line": 0, "note": ""})
+    assert "line index is required" in payload["error"]
+    payload, err = call(tools.update_user_note, {"line": 0, "note": ""})
     assert err
-    _payload, err = call(tools.update_user_note, {"line": 99, "note": "x"})
-    assert err  # no note at that line
+    assert "new note text is required" in payload["error"]   # the TEXT, not the line
+    payload, err = call(tools.update_user_note, {"line": 99, "note": "x"})
+    assert err
+    assert "no note at line 99" in payload["error"]           # the LINE, not the text
 
 
 def test_delete_user_note(seeded):
@@ -1296,18 +1349,45 @@ def test_delete_user_note(seeded):
 
 
 def test_delete_user_note_bad_line(seeded):
-    _payload, err = call(tools.delete_user_note, {"line": None})
+    payload, err = call(tools.delete_user_note, {"line": None})
     assert err
-    _payload, err = call(tools.delete_user_note, {"line": 42})
+    assert "line index is required" in payload["error"]      # missing argument
+    payload, err = call(tools.delete_user_note, {"line": 42})
     assert err
+    assert "no note at line 42" in payload["error"]          # argument fine, row absent
 
 
 def test_server_and_tool_names():
     server = tools.make_server()
-    assert server is not None
+    # Pin what the server IS, not merely that one was returned — an
+    # `is not None` here would pass on any object at all.
+    assert server["name"] == tools.SERVER_NAME == "fitness"
     names = tools.allowed_tool_names()
     assert len(names) == len(tools.ALL_TOOLS)
     assert all(n.startswith("mcp__fitness__") for n in names)
+
+
+def test_server_version_tracks_pyproject():
+    """Every MCP client reads this in `serverInfo` — it is the version you look
+    at in Claude Desktop to decide whether a fix has shipped.
+
+    It was a hardcoded "0.6.0" from the server's first commit, so by 0.44.0 it
+    was 38 releases stale and silently wrong. Compare against pyproject.toml
+    rather than against `importlib.metadata` (which is what the code reads —
+    asserting one against itself would be a tautology that passes no matter
+    what either says)."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+
+    assert tools.server_version() == declared
+    assert tools.server_version() != "0.6.0", "the old hardcoded literal is back"
+    # The instance attribute is what the SDK actually puts in the `serverInfo`
+    # of the initialize response — `make_server()`'s dict has no version key,
+    # so asserting on the dict would have compared None to None-ish forever.
+    assert tools.make_server()["instance"].version == declared
 
 
 # --- W4-T2: observation + manual-workout round-trip -----------------------
@@ -1556,14 +1636,22 @@ def test_delete_manual_workout_recompute_failure_reports_deleted(seeded, monkeyp
 
 
 def test_delete_manual_workout_guardrails(seeded):
-    # Refuses non-negative ids (Garmin data protection).
-    _payload, err = call(tools.delete_manual_workout, {"activity_id": 1})
+    """The guardrail rejection and the not-found rejection are different
+    things, and this test could not distinguish them until 0.47.0 — so a
+    delete_manual_workout that had DROPPED the Garmin-data protection and
+    merely returned "not found" for everything would have passed.
+
+    Manual workouts carry negative ids; anything >= 0 came from Garmin and
+    must never be deletable through this tool."""
+    for garmin_id in (1, 0):
+        payload, err = call(tools.delete_manual_workout, {"activity_id": garmin_id})
+        assert err
+        assert "refusing to delete non-manual activity" in payload["error"], (
+            f"id {garmin_id} was not refused BY THE GUARDRAIL: {payload['error']}")
+    # A negative id clears the guardrail and fails for the other reason.
+    payload, err = call(tools.delete_manual_workout, {"activity_id": -99})
     assert err
-    _payload, err = call(tools.delete_manual_workout, {"activity_id": 0})
-    assert err
-    # Absent negative id → _err.
-    _payload, err = call(tools.delete_manual_workout, {"activity_id": -99})
-    assert err
+    assert payload["error"] == "no manual workout at id -99"
 
 
 def test_delete_manual_workout_detaches_observation(seeded):
@@ -1754,16 +1842,26 @@ def test_save_brief_schema_meets_the_sdk_passthrough_condition():
 
 def test_brief_loop_excludes_write_tools():
     """Contract invariant: the brief loop's allow-list (read_only_tool_names)
-    is a strict subset of all tools and never includes a write or the
-    snapshot/list-observations tools, so brief generation cannot mutate data."""
+    is a strict subset of all tools and includes no WRITE tool, so brief
+    generation cannot mutate data.
+
+    `daily_snapshot` used to be excluded here too, but never because it writes
+    — it doesn't. It was held out (0.47.0 and earlier) purely to keep the V1
+    tool set byte-identical while it and `get_today_status` both existed. With
+    the duplicate removed in 0.48.0 the V1 prompt names `daily_snapshot` as
+    step 1, so it has to be granted; see
+    test_the_v1_brief_grant_still_matches_its_prompt. `list_observations` stays
+    out — it is still not part of the V1 brief's read set."""
     ro = set(tools.read_only_tool_names())
     for w in (
         "log_manual_workout", "delete_manual_workout", "log_observation",
         "delete_observation", "save_user_note", "update_user_note",
-        "delete_user_note", "daily_snapshot", "list_observations",
-        "sync_garmin_data",
+        "delete_user_note", "list_observations", "sync_garmin_data",
+        "update_plan_workout", "update_plan_workouts", "propose_training_plan",
+        "commit_training_plan", "abandon_active_plan", "save_brief",
+        "save_coach_memory", "delete_coach_memory", "update_coach_personality",
     ):
-        assert f"mcp__{tools.SERVER_NAME}__{w}" not in ro
+        assert f"mcp__{tools.SERVER_NAME}__{w}" not in ro, f"{w} is a write"
     assert ro < set(tools.allowed_tool_names())
 
 
@@ -2714,6 +2812,116 @@ def plan_seeded(tmp_path, monkeypatch):
 # (docs/plans/2026-07-12-deterministic-intelligence-and-ux-design.md, WS2)
 
 # --- 2a: weekly_rollup — direct import from tools, pure, no DB ---------------
+
+# --- pending_draft: a proposed-but-uncommitted plan must never be invisible --
+# plans.insert_draft archives any prior draft, so a draft nobody surfaces can
+# be destroyed by the next proposal without a word. Measured on the live DB: a
+# 59-workout draft sat unnoticed for 12 days while the active plan was patched
+# one day at a time.
+
+
+def test_draft_summary_is_none_without_a_draft():
+    assert plans.draft_summary(None) is None
+
+
+def test_draft_summary_reports_the_countable_facts():
+    """Pins the actual values, not just the keys — a summary that returned the
+    wrong count or spanned the wrong dates would still have the right shape."""
+    draft = {
+        "plan_id": 7, "title": "10K rebuild", "created_at": "2026-07-22T08:05",
+        "workouts": [
+            {"date": "2026-07-30", "seq": 1},
+            {"date": "2026-07-24", "seq": 1},
+            {"date": "2026-07-28", "seq": 1},
+        ],
+    }
+    assert plans.draft_summary(draft) == {
+        "plan_id": 7,
+        "title": "10K rebuild",
+        "created_at": "2026-07-22T08:05",
+        "workout_count": 3,
+        "first_date": "2026-07-24",   # min, not list order
+        "last_date": "2026-07-30",
+    }
+
+
+def test_draft_summary_handles_a_draft_with_no_workouts():
+    summary = plans.draft_summary(
+        {"plan_id": 2, "title": "empty", "created_at": "t", "workouts": []})
+    assert summary["workout_count"] == 0
+    assert summary["first_date"] is None and summary["last_date"] is None
+
+
+def test_plan_status_reports_a_pending_draft_alongside_the_active_plan(plan_seeded):
+    """The active plan governs; the draft is a loose end reported beside it.
+    Both must be present — an earlier shape returned one OR the other."""
+    plan_id = plans.insert_draft(
+        {"goal_type": "10k", "race_date": "2026-12-01",
+         "target_time_seconds": 2900, "created_at": "2026-07-22T08:05"},
+        [{"date": "2026-11-01", "seq": 1, "week_index": 1, "type": "easy",
+          "target_distance_m": 5000.0, "description": ""},
+         {"date": "2026-11-02", "seq": 1, "week_index": 1, "type": "long",
+          "target_distance_m": 9000.0, "description": ""}],
+        db_path=plan_seeded,
+    )
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert payload["active"] is True, "the active plan must still be reported"
+    assert payload["pending_draft"] == {
+        "plan_id": plan_id,
+        "title": None,
+        "created_at": "2026-07-22T08:05",
+        "workout_count": 2,
+        "first_date": "2026-11-01",
+        "last_date": "2026-11-02",
+    }
+
+
+def test_plan_status_reports_a_pending_draft_when_there_is_no_active_plan(
+        tmp_path, monkeypatch):
+    """The case that matters most: nothing active, a draft waiting. A bare
+    {active: false} used to hide it completely."""
+    p = tmp_path / "f.db"
+    db.init_schema(p)
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
+    plan_id = plans.insert_draft(
+        {"goal_type": "10k", "race_date": "2026-12-01",
+         "target_time_seconds": 2900, "created_at": "2026-07-22T08:05"},
+        [{"date": "2026-11-01", "seq": 1, "week_index": 1, "type": "easy",
+          "target_distance_m": 5000.0, "description": ""}],
+        db_path=p,
+    )
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert payload["active"] is False
+    assert payload["pending_draft"]["plan_id"] == plan_id
+    assert payload["pending_draft"]["workout_count"] == 1
+
+
+def test_plan_status_pending_draft_is_none_when_none_exists(plan_seeded):
+    """No draft → the key is present and null, so the agent can tell 'no draft'
+    apart from 'this tool does not report drafts'."""
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert "pending_draft" in payload
+    assert payload["pending_draft"] is None
+
+
+def test_plan_status_still_opens_exactly_one_connection(plan_seeded, monkeypatch):
+    """The draft read rides the connection already held. This tool is on the
+    perf gate's hot path; a second open would be a real regression."""
+    opens = []
+    real_connect = db.connect
+
+    def counting_connect(*a, **kw):
+        opens.append(1)
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(db, "connect", counting_connect)
+    payload, err = call(tools.get_training_plan_status, {})
+    assert not err
+    assert len(opens) == 1, f"expected 1 db.connect(), got {len(opens)}"
+
 
 def test_weekly_rollup_empty_workouts_yields_zero_totals():
     rollup = tools.weekly_rollup([], "2026-07-12")
@@ -4106,9 +4314,16 @@ def test_update_coach_personality_reset_returns_to_stock(seeded):
 
 
 def test_update_coach_personality_spec_size_cap(seeded):
+    payload, err = call(tools.update_coach_personality,
+                        {"identity": "x" * 4001})
+    assert err
+    # Names the cap and the overage — a bare `assert err` would pass on a
+    # tool that rejected every personality edit.
+    assert "identity too long (4001 chars, max 4000)" in payload["error"]
+    # One under the cap still writes, so the boundary is real, not a blanket no.
     _payload, err = call(tools.update_coach_personality,
-                         {"identity": "x" * 4001})
-    assert err  # identity over its own cap is rejected before storage
+                         {"identity": "y" * 4000})
+    assert not err
 
 
 # --- report-card persistence: fast path + query tools ------------------------

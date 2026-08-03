@@ -64,6 +64,35 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
 - **Every new endpoint that calls Claude is rate-limited.** The
   middleware matches by prefix in `RATE_LIMITED_PREFIXES`. Add new
   Claude-cost paths to that tuple — don't just hope they stay cheap.
+- **A path-based security decision reads `request.scope["path"]`, never
+  `request.url.path`** (0.43.1). `_request_path()` in `web/server.py` is the
+  single accessor and both middlewares use it. Starlette rebuilds
+  `request.url` from the **`Host` header** and re-parses it, so a `/` in that
+  attacker-controlled header relocates the path boundary — `POST /mcp/` with
+  `Host: fitness.home.local/health#` presented `url.path == "/health"`,
+  `_is_public_path` said public, and the bearer check never ran
+  (GHSA-86qp-5c8j-p5mr). `_is_public_path` itself was never wrong; the bug was
+  its *input*. What appeared to contain it was luck: the MCP transport's
+  DNS-rebinding guard matches the allowlist exactly and a poisoned Host can't
+  match — but its wildcard-port branch (`host:*`, a documented config) accepts
+  one, and the same unauthenticated request then completed a full MCP
+  `initialize`. The dependency is bumped too, but **the code fix is the
+  durable half** — a bump closes one CVE and leaves the class open. Anything
+  deriving a security decision from a URL gets the same treatment: use the
+  string the router dispatches on.
+- **One tool, one name — a duplicate is an ambiguity, not a convenience**
+  (0.48.0). `get_today_status` was removed: byte-identical body to
+  `daily_snapshot` and sharing the same description constant, so the model
+  coin-flipped 16/5 between two names for one job. Before adding an alias "for
+  compatibility", note that the 2026-07-10 design which converged these two
+  said the quiet part itself — "Two tools for one job is exactly the ambiguity
+  that causes an agent to pick the weaker one." **Removing a tool means moving
+  everything keyed to its NAME**: `ALL_TOOLS`, `_READ_ONLY_TOOL_NAMES` (the V1
+  brief grant), any prompt that names it, its `docs/mcp` page, and the README
+  tool counts. The V1 grant is the dangerous one — `briefing_prompt` names its
+  step-1 tool, and a prompt instructing a tool the loop isn't granted fails
+  SILENTLY (it did, for three weeks in 2026).
+  `test_the_v1_brief_grant_still_matches_its_prompt` cross-checks the pair.
 - **No SQL with user input via f-strings.** Whitelist column / table
   names against a frozen set, parameterize values via `?`. The
   pattern is locked in `agent/tools.py` and the existing route
@@ -167,9 +196,12 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   shows a double-digit margin. Confirm both, then recapture via the
   workflow dispatched on `main` (pre-PR code = the honest floor) and
   hand-promote the artifact to the committed `0001_*.json`.
-- **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
-  manual prefix today, `/devlog` skill (auto from git commits) going
-  forward.
+- **The PR body IS the writeup.** There is no in-repo `devlog/` (removed
+  2026-08-03 — 63 files nothing in the repo read, duplicating what the
+  `/devlog` skill publishes to natejswenson.com from git history). A
+  meaningful change explains itself in the CHANGELOG entry and the PR
+  description; the durable *rule* it teaches goes in this file. Don't
+  reintroduce a parallel notes directory.
 - **Commit messages explain why.** Short subject, body when motivation
   isn't obvious from the diff. Co-authored-by line stays.
 - **Work through `feature/* → dev → main`.** Normal changes land via a PR
@@ -270,6 +302,39 @@ today", "how's my training load", "what did I run last week"):
   is enforced in `plans.py` (`update_active_workout` whitelists prescription
   columns only — it can't re-key/re-status/restructure). Don't hand-write
   `UPDATE` SQL — the tool exists.
+- **Reshaping more than one day is `update_plan_workouts`, ONE atomic call**
+  (0.46.0) — never a loop of `update_plan_workout`. Same fields, same
+  whitelist, same keyed `UPDATE` (`date` is the key, not an editable column),
+  so a batch is many re-prescriptions and never a restructure; capped at
+  `plans.MAX_BATCH_UPDATES` (60) as a blast-radius bound. All-or-nothing:
+  entries are validated, deduped on `(date, seq)`, and every target checked to
+  exist BEFORE the first write, then applied in one transaction. **The
+  atomicity is the point, not the speed** — 20 sequential calls cost ~75 ms of
+  our time (~3.8 ms each) and the LLM turns dominate by three orders of
+  magnitude; what they also cost was 20 independent transactions, so the
+  two-call "move the long run" idiom could rest the old day, fail on the new
+  one, and delete the run with nothing to roll back. The two-call swap now goes
+  in one batch. **The rest-day clear lives at the write boundary**
+  (`plans.apply_rest_semantics`), not in the tool — it was tool-side while
+  `update_plan_workout` was the only caller, which is exactly the shape of bug
+  a second write path exposes: a caller that skipped it would leave a stale
+  `target_hr_max` on a rest day, and the report card grades that column.
+- **A pending draft is a loose end, and `get_training_plan_status` now names
+  it** (0.44.0, `pending_draft`). A draft governs nothing until
+  `commit_training_plan` runs, and `plans.insert_draft` **archives any existing
+  draft**, so an unsurfaced draft is destroyed by the next proposal with no
+  error. It used to be invisible on every path there was a reason to call:
+  both `get_training_plan_status` and `get_training_plan_progress` read the
+  ACTIVE plan only, and `get_training_plan_draft` was never called once in any
+  recorded session. Measured: a 59-workout draft sat unnoticed for 12 days
+  while the active plan was hand-patched 39 times one day at a time. When the
+  field is non-null, **close it** — commit or `discard_training_plan_draft` —
+  don't leave it open and don't infer prescriptions from the summary
+  (`plans.draft_summary` returns counts and a date span, never workouts; read
+  the plan with `get_training_plan_draft`). Resolved before the
+  no-active-plan early return on purpose, so `{active: false}` still carries
+  it, and read on the handler's existing connection — this tool is on the perf
+  gate, and the draft read must never add a `db.connect()`.
 - **Don't narrate the lookup.** The user wants the answer, not the mechanics.
   Lead with a one-line answer, then a clean table (at most ~4 columns, one-word
   headers, never a sentence in a cell) plus short coach text. Per-item detail
@@ -317,6 +382,30 @@ These are settled — don't redesign without a reason.
   V2** — the MCP `mcp__fitness__*` tools and the MCP `_brief_prompt` (chat /
   external-agent path) still use V1's tool-driven approach (a deliberate scope
   choice; `grounding.flag` is the reusable follow-up there).
+- **The persona's token budget is allocated against MEASURED tool usage, and
+  there is a size ceiling** (0.45.0). Audited across every recorded session
+  (247 real invocations), it was backwards: 532 tokens on "Managing preferences
+  conversationally" (`save`/`update`/`delete_user_note` — **0 calls ever**,
+  superseded by `update_coach_personality`, 25 calls) and 199 on "Writing your
+  journal" (`save_coach_memory` — 0 calls; all 18 `coach_journal` entries came
+  from auto-reflect, none from chat), while the **plan tools — 62 of 247 calls,
+  the largest cluster — had no section at all**. Both were compressed to their
+  decision rule (never deleted, every tool name kept) to pay for a
+  `# Managing the training plan` section. The persona SHRANK 14,920 → 12,016
+  chars in the process. Before adding to it, check what the new text orients
+  toward is actually called; `test_system_prompt_stays_under_its_size_ceiling`
+  (13,000 chars) is a deliberate ratchet — raising it is allowed, drifting past
+  it is not. **Compressing a section is not free**: `tests/test_prompts.py`
+  gates specific strings (`save_coach_memory`, `"session note"`, "Never say you
+  don't remember without searching", "never cite a memory the search didn't
+  return"), so run that file before assuming a cut is safe.
+- **`serverInfo.version` comes from package metadata, never a literal**
+  (0.45.0). `tools.server_version()` reads `importlib.metadata`; it was
+  hardcoded `"0.6.0"` from the first commit and every MCP client read a version
+  38 releases stale — the number you check in Claude Desktop to see whether a
+  fix shipped. Note `make_server()`'s returned dict has **no** `version` key;
+  the value that reaches the initialize response is `["instance"].version`, so
+  that is what a test must assert on.
 - **One coach voice, composed by every prompt surface** (0.28.0). The profile
   was already resolved everywhere, but what surrounded it had drifted:
   `plan_coach`/`workout_coach` carried `persona` + `dials_line` yet omitted the
@@ -494,7 +583,7 @@ These are settled — don't redesign without a reason.
     (silence no longer is the only signal) and exits non-zero.
   Either way the outcome is **no brief saves** (orphaned sync — pull ran,
   brief didn't). That state is now surfaced: `assemble_status()` (→
-  `get_today_status` / `daily_snapshot`) carries `latest_brief_date` +
+  `daily_snapshot`) carries `latest_brief_date` +
   `brief_stale_days`, and the `fitness://brief/latest` resource leads
   with a STALE banner when serving a brief older than today.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
@@ -953,7 +1042,7 @@ These are settled — don't redesign without a reason.
     changing ANY constant here — `GRADE_BANDS`, `HR_BANDS`, `HR_CAP_NOISE_BPM`,
     `HR_CAP_BPM_SCALE`, `CONTINUITY_TOLERANCE`, `PLAN_TIGHTEN`,
     `LOAD_SPIKE_FACTOR`, `*_FACTORS`, `MIN_REFERENCE_ACTIVITIES` — and paste the
-    output into the devlog entry. The two signatures are **deliberately
+    output into the CHANGELOG entry and the PR body. The two signatures are **deliberately
     asymmetric**: concentration in a *passing* grade is not evidence of anything
     (distance grades 79% A because the distances are being hit) and is reported,
     not gated. A symmetric rule was this check's own first draft and it flagged
@@ -1084,6 +1173,28 @@ These are settled — don't redesign without a reason.
   consumes the theme for BOTH the WeasyPrint report CSS (`_build_css`)
   and the matplotlib chart styles — the ASCII `chart` tool keeps its
   emoji heat ramp (PRESS is the *print* brand).
+- **The density ladder remembers its winning rung, and that is a TRADE**
+  (0.49.0). `visuals._fit_with_hint` starts a render at `last_winner - 1`
+  instead of rung 0, persisting the hint in `data/density_ladder_hints.json`
+  (disposable by contract — missing/corrupt/out-of-range/unwritable all
+  degrade to rung 0, the old behaviour; `fit_one_page` stays I/O-free and the
+  caller owns the file). **Measured across all 15 live cards with their real
+  reads: winners `{0:1, 1:13, 2:1}`, 342 ms of 3551 ms = 9.6%, 23 ms/card.**
+  An earlier estimate said ~65% by counting all discarded-layout time — that
+  is NOT recoverable, because the one-rung headroom is what lets a document
+  that got shorter climb back, and 13 of 15 cards win at rung 1 where
+  `hint - 1 = 0` skips nothing. Don't "finish the optimisation" by dropping
+  the headroom: density would ratchet permanently dense on a page that has to
+  stay readable. The cost of the hint is that a render can land one rung
+  tighter than optimal until it converges, one rung per render.
+- **After a release that touches `report_card.py` or `workout_coach.py`, warm
+  the stored cards** — `uv run python scripts/warm_report_cards.py` (free
+  survey) then `--yes`. The read cache key covers the whole prompt, so a rubric
+  or read-prompt change invalidates every stored card at once and the 14.5 s
+  miss lands on the next person to open one. Measured 2026-08-03: 15 of 15
+  stale after 0.41-0.45. The survey drives the REAL handler with the SDK call
+  and the write stubbed, so it re-derives no key of its own and cannot drift;
+  `--max-calls` refuses rather than warns.
 - **Both PDFs fit one page, and the fitting is measured, not tuned**
   (0.27.0). `visuals.fit_one_page(build_html, presets)` is renderer-agnostic:
   it takes a callable, renders at each `DENSITY_PRESETS` rung (roomy →
@@ -1179,4 +1290,3 @@ These are settled — don't redesign without a reason.
 - `src/local_fitness/db.py` — SQLite schema + connection helpers.
 - `tests/` — pytest. `test_security.py` is the audit-regression file.
 - `docs/deployment.md` — what the deploying side wires into compose.
-- `devlog/` — running notes per change.

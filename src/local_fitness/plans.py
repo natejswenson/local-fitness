@@ -112,6 +112,14 @@ _WALKING_SUBSTRINGS = ("walk", "hik")
 _DISTANCE_TYPES = frozenset({"easy", "long", "race"})
 _DURATION_TYPES = frozenset({"interval", "tempo"})
 
+#: Plausible bounds for a PRESCRIBED heart-rate ceiling (bpm). One definition
+#: shared by both write paths — `validate_plan_input` (plan creation) and
+#: `update_plan_workout` (a single-day edit). They disagreed until 0.47.0: the
+#: edit path bounded it and the create path did not, so the same nonsense value
+#: was rejected on an edit and accepted on a proposal.
+MIN_PRESCRIBED_HR = 90.0
+MAX_PRESCRIBED_HR = 210.0
+
 # numeric workout fields that, when present, must be finite and non-negative
 _NUMERIC_FIELDS = ("target_distance_m", "target_pace_sec_per_km",
                    "target_duration_sec", "target_hr_max", "week_index", "seq")
@@ -297,6 +305,22 @@ def validate_plan_input(
                 return f"workout {i}: {field} must be a number"
             if not math.isfinite(v) or v < 0:
                 return f"workout {i}: {field} must be finite and non-negative"
+
+        # A prescribed HR ceiling outside 90-210 bpm is a transposed or
+        # unit-confused argument, not a coaching decision. `update_plan_workout`
+        # has bounded it since 0.40.0 while this path — how a plan is CREATED —
+        # only checked finite-and-non-negative, so `hr_max: 14` was accepted on
+        # a proposal and rejected on an edit. The blast radius is the whole
+        # plan: the card grades HR against this column via
+        # `hr_cap_severity = (bpm_over - 1.5) / 28`, so a 14 bpm cap puts every
+        # capped day ~120 bpm over, F on HR, and the F-cap drops each of those
+        # days to C for the life of the plan, with no error anywhere.
+        # 90 is deliberately not tightened further — it is a plausible real
+        # recovery-run ceiling.
+        hr_max = w.get("target_hr_max")
+        if hr_max is not None and not (MIN_PRESCRIBED_HR <= hr_max <= MAX_PRESCRIBED_HR):
+            return (f"workout {i}: target_hr_max of {hr_max:.0f} bpm is outside "
+                    f"the plausible {MIN_PRESCRIBED_HR:.0f}-{MAX_PRESCRIBED_HR:.0f} bpm range")
 
         desc = w.get("description")
         # Reject a non-string description with a clean indexed error rather than
@@ -701,6 +725,42 @@ def revise_draft(
             _insert_workouts(conn, plan_id, workouts)
 
 
+#: Prescription columns a rest day must not carry. `target_hr_max` is in here
+#: for the same reason as the rest: a cap left behind on a rest day is a
+#: prescription for a session that no longer exists, and the report card grades
+#: against that column directly.
+_REST_CLEARED_COLS = (
+    "target_distance_m",
+    "target_pace_sec_per_km",
+    "target_duration_sec",
+    "target_hr_max",
+)
+
+
+def apply_rest_semantics(fields: dict) -> dict:
+    """Return ``fields`` with a rest day's prescription cleared. Pure.
+
+    Lives at the write boundary, not in the tool that happens to call it.
+    It was tool-side until 0.46.0, which was correct only because
+    ``update_plan_workout`` was the single caller — the moment a second write
+    path exists (the batch tool), a caller that skipped this would silently
+    leave a stale distance, pace or HR cap attached to a rest day. Putting it
+    here means every caller of ``update_active_workout(s)`` inherits it.
+
+    ``description`` is defaulted rather than overwritten: the column is NOT
+    NULL and surfaces in every plan payload and the PDF, so a rest-flip with no
+    new description must not leave the old hard-run prose on a rest day — but
+    an explicitly passed description always wins.
+    """
+    if fields.get("type") != "rest":
+        return fields
+    out = dict(fields)
+    for col in _REST_CLEARED_COLS:
+        out[col] = None
+    out.setdefault("description", "Rest day")
+    return out
+
+
 def update_active_workout(
     date: str,
     fields: dict,
@@ -723,6 +783,7 @@ def update_active_workout(
         raise ValueError("no fields to update")
     if "type" in fields and fields["type"] not in WORKOUT_TYPES:
         raise ValueError(f"unknown workout type '{fields['type']}'")
+    fields = apply_rest_semantics(fields)
 
     with db.connect(db_path) as conn:
         active = conn.execute(
@@ -744,6 +805,106 @@ def update_active_workout(
             (plan_id, date, seq),
         ).fetchone()
         return dict(row)
+
+
+#: Ceiling on one batch. A restructure is tens of days, not hundreds — this is
+#: a blast-radius bound, so one malformed call can't silently rewrite a whole
+#: plan (the live active plan is 75 workouts).
+MAX_BATCH_UPDATES = 60
+
+
+def update_active_workouts(
+    updates: list[tuple[str, int, dict]],
+    db_path: Path | None = None,
+) -> list[dict]:
+    """Re-prescribe MANY days on the ACTIVE plan atomically.
+
+    ``updates`` is ``[(date, seq, fields), ...]``. Returns the updated rows in
+    input order. All-or-nothing: ``db.connect()`` commits on clean exit and
+    rolls back on any exception, so a batch either lands whole or not at all.
+
+    Exists because restructuring was 20 sequential ``update_plan_workout``
+    calls — 20 model turns, and 20 INDEPENDENT transactions. Partial failure
+    was real: the documented "move Saturday's long run to Sunday" idiom is two
+    calls, so resting Saturday and then failing on Sunday deleted the long run
+    outright. Here, a bad entry aborts the whole batch instead.
+
+    Every date is verified to exist BEFORE anything is written, so a typo'd
+    date fails the batch rather than half-applying it and reporting an error
+    that arrives after 14 rows already changed.
+
+    The write boundary is identical to the single-day path — the same
+    ``_EDITABLE_WORKOUT_COLS`` whitelist, the same ``WORKOUT_TYPES`` check, the
+    same ``apply_rest_semantics``, and the same keyed ``UPDATE``. It cannot
+    insert a day, move one, or change a plan's status; ``date`` is the key, not
+    an editable column. Raises ``NoActivePlanError`` or ``ValueError`` (the
+    message names the offending index and date).
+    """
+    if not updates:
+        raise ValueError("no updates provided")
+    if len(updates) > MAX_BATCH_UPDATES:
+        raise ValueError(
+            f"batch of {len(updates)} exceeds the {MAX_BATCH_UPDATES}-update "
+            f"limit; split it or use propose_training_plan for a restructure"
+        )
+
+    # Validate every entry before opening a connection — a malformed batch
+    # never reaches the DB at all.
+    prepared: list[tuple[str, int, dict]] = []
+    seen: set[tuple[str, int]] = set()
+    for i, (date, seq, fields) in enumerate(updates):
+        bad = set(fields) - _EDITABLE_WORKOUT_COLS
+        if bad:
+            raise ValueError(
+                f"update {i} ({date}): non-editable workout field(s): {sorted(bad)}")
+        if not fields:
+            raise ValueError(f"update {i} ({date}): no fields to update")
+        if "type" in fields and fields["type"] not in WORKOUT_TYPES:
+            raise ValueError(
+                f"update {i} ({date}): unknown workout type '{fields['type']}'")
+        key = (date, seq)
+        if key in seen:
+            # Last-wins would be silent and order-dependent; a batch that
+            # prescribes the same day twice is a mistake worth naming.
+            raise ValueError(
+                f"update {i}: {date} (seq {seq}) appears twice in one batch")
+        seen.add(key)
+        prepared.append((date, seq, apply_rest_semantics(fields)))
+
+    with db.connect(db_path) as conn:
+        active = conn.execute(
+            "SELECT plan_id FROM training_plans WHERE status='active'"
+        ).fetchone()
+        if active is None:
+            raise NoActivePlanError("no active plan")
+        plan_id = active["plan_id"]
+
+        # Pre-flight: every target must exist. Checked up front so a missing
+        # date aborts before the first write rather than midway through.
+        for i, (date, seq, _fields) in enumerate(prepared):
+            hit = conn.execute(
+                "SELECT 1 FROM plan_workouts WHERE plan_id=? AND date=? AND seq=?",
+                (plan_id, date, seq),
+            ).fetchone()
+            if hit is None:
+                raise ValueError(
+                    f"update {i}: no workout on {date} (seq {seq}) in the active "
+                    f"plan — this tool re-prescribes existing days, it cannot add one"
+                )
+
+        rows = []
+        for date, seq, fields in prepared:
+            sets = ", ".join(f"{c}=:{c}" for c in fields)  # keys whitelisted above
+            conn.execute(
+                f"UPDATE plan_workouts SET {sets} "
+                "WHERE plan_id=:plan_id AND date=:date AND seq=:seq",
+                {**fields, "plan_id": plan_id, "date": date, "seq": seq},
+            )
+            rows.append(dict(conn.execute(
+                "SELECT * FROM plan_workouts WHERE plan_id=? AND date=? AND seq=?",
+                (plan_id, date, seq),
+            ).fetchone()))
+        return rows
 
 
 def commit_plan(plan_id: int, now: str, db_path: Path | None = None) -> None:
@@ -992,8 +1153,13 @@ def best_recent_effort(
     return select_best_effort(rows)
 
 
-def get_draft_plan(db_path: Path | None = None) -> dict | None:
-    return _get_by_status("draft", db_path)
+def get_draft_plan(
+    db_path: Path | None = None, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    """Accepts an already-open ``conn`` for the same reason ``get_active_plan``
+    does — ``get_training_plan_status`` reads the draft on the connection it
+    already holds, so surfacing a pending draft costs no extra open."""
+    return _get_by_status("draft", db_path, conn=conn)
 
 
 # --- assembly for the tab + brief -----------------------------------------
@@ -1147,6 +1313,36 @@ def _slim_workout(workout: dict | None) -> dict | None:
         "target_hr_max": workout.get("target_hr_max"),
         "description": desc,
         "verdict": workout.get("verdict"),
+    }
+
+
+def draft_summary(draft: dict | None) -> dict | None:
+    """A one-line description of a pending draft, or None when there isn't one.
+
+    Pure — takes the plan dict a caller already read. Deliberately a SUMMARY
+    and not the draft itself: this rides along on ``get_training_plan_status``,
+    whose whole contract is "slim by design", and the full draft already has
+    its own tool (``get_training_plan_draft``).
+
+    Exists because a draft was otherwise invisible. ``get_training_plan_status``
+    and ``get_training_plan_progress`` both read the ACTIVE plan only, so an
+    agent had no way to learn a draft was waiting without calling a tool it had
+    no reason to call — and ``insert_draft`` archives any prior draft, so
+    proposing a second one silently destroys the first. Measured on the live
+    DB: a 59-workout draft sat unnoticed for 12 days while the active plan was
+    hand-patched one day at a time.
+    """
+    if draft is None:
+        return None
+    workouts = draft.get("workouts") or []
+    dates = sorted(w["date"] for w in workouts if w.get("date"))
+    return {
+        "plan_id": draft.get("plan_id"),
+        "title": draft.get("title"),
+        "created_at": draft.get("created_at"),
+        "workout_count": len(workouts),
+        "first_date": dates[0] if dates else None,
+        "last_date": dates[-1] if dates else None,
     }
 
 

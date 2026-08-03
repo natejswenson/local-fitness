@@ -6,6 +6,323 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-08-03
+
+### Added
+- **`scripts/warm_report_cards.py`** — re-renders stored cards so their coach
+  reads are cached again. A stored card doubles as a per-activity read cache;
+  a MISS costs **14.5 s**, a HIT **0.003 s**. The key covers the whole prompt,
+  so any release touching the rubric or the read prompt legitimately
+  invalidates every card at once — measured 2026-08-03, **15 of 15** were stale
+  (the 0.41–0.43 rubric work plus 0.45.0's persona edit). This pays that cost
+  once, deliberately, off the request path.
+
+  **A survey is free and is the default.** It drives the real
+  `workout_report_card` handler with the SDK call and the row write stubbed
+  out, so it reports exactly which cards would regenerate without spending
+  anything or touching a row — and it cannot drift from the path it measures,
+  because it re-derives no cache key of its own. Nothing is spent without
+  `--yes`, and `--max-calls` REFUSES (exit 2) rather than warning.
+
+  Its own test suite pins the two safety properties — no SDK call escapes a
+  survey, no row is mutated — because a script that decides whether to spend
+  needs one, the same precedent `calibrate_report_card.py` set.
+
+### Changed
+- **The PDF density ladder remembers its winning rung.** Renders start one
+  rung roomier than last time instead of always at the top.
+
+  **Measured, and smaller than projected.** Across all 15 live cards with their
+  real coach reads: winners `{0:1, 1:13, 2:1}`, **342 ms saved of 3551 ms =
+  9.6%, 23 ms/card.** An earlier estimate of ~65% counted all time spent on
+  discarded layouts, which is *not* recoverable: the one-rung headroom is what
+  lets a document that got shorter climb back to a roomier layout, and 13 of 15
+  cards win at rung 1, where `hint − 1 = 0` skips nothing. Dropping the
+  headroom would buy the rest and let density ratchet permanently dense — not
+  a trade worth making for a card that has to stay readable.
+
+  The hint lives in `data/density_ladder_hints.json` (gitignored, beside the
+  coach caches) and is disposable by contract: missing, corrupt, out-of-range
+  or unwritable all degrade to "start at rung 0", i.e. exactly the pre-0.48.0
+  behaviour. `fit_one_page` stays I/O-free — the caller reads and writes the
+  hint.
+
+### Fixed
+- `report_card.metric_table()` / `metric_notes()` index `card["metrics"]` with
+  `.get`, not `[key]`. A card stored before a metric existed has no entry for
+  it (`continuity` landed in 0.40.0) and `get_report_card` hands those rows
+  straight back; the pre-extraction inline code had the same latent
+  `KeyError`. Found by rendering real stored cards while measuring the ladder.
+
+## [0.48.0] - 2026-08-03
+
+### Removed
+- **`get_today_status`** — a byte-identical duplicate of `daily_snapshot`.
+  Same body (`return _text(assemble_status())`), sharing the *same description
+  constant*, so the model was choosing between two names for one tool and
+  coin-flipped 16/5 across recorded sessions. The 2026-07-10 design that
+  converged their behaviour said it itself: "Two tools for one job is exactly
+  the ambiguity that causes an agent to pick the weaker one." The compat window
+  is closed. **46 tools over stdio, 44 over HTTP.**
+
+  The removal moved the V1 brief loop's read-only grant from `get_today_status`
+  to `daily_snapshot`, which had been excluded from that allow-list *only* to
+  keep the V1 tool set byte-identical while both names existed. `briefing_prompt`
+  names it as step 1, and a prompt instructing a tool the loop was never granted
+  fails **silently** — the exact bug that went unnoticed for three weeks in 2026
+  and is documented on `_READ_ONLY_TOOL_NAMES`.
+  `test_the_v1_brief_grant_still_matches_its_prompt` now cross-checks every tool
+  the V1 prompt names against the grant, so the pair cannot drift again.
+
+- **`devlog/`** — 63 markdown files at the repo root that nothing in the repo
+  read, duplicating what the `/devlog` skill publishes to natejswenson.com from
+  git history. The question ("why is the devlog folder located in this repo?")
+  was asked 2026-07-22 and never answered; the answer is that it shouldn't be.
+  CLAUDE.md's workflow rule now says the CHANGELOG entry and the PR body are
+  the writeup, and the durable *rule* a change teaches goes in CLAUDE.md.
+  References in `docs/plans/` are left alone — those are dated historical
+  design records, not live guidance.
+
+### Changed
+- **The report card's metric table is one definition again.**
+  `report_card.metric_table()` / `metric_notes()` now feed both the markdown
+  card and the PDF. The *cells* were already single-sourced (both renderers
+  called `actual_text` / `expected_text` / `_delta_text`), but the header row,
+  the column set and the row-assembly loop were written out twice — precisely
+  the divergence `split_table` and `stimulus_rows` exist to prevent, one level
+  up in the same table. `test_both_renderers_take_the_metric_table_from_one_source`
+  asserts every header and cell reaches both.
+
+## [0.47.0] - 2026-08-03
+
+### Fixed
+- **The `/coach` prompt leaked raw float64 that every tool payload rounds
+  away.** `_round_floats` describes itself as "the ONE choke point every tool
+  payload flows through", but it only ran inside `_text`/`_err` —
+  `mcp_server._render_status` formats `assemble_status()` straight to markdown
+  and bypassed it. The same data reached the model two ways, live:
+
+  ```
+  /coach prompt:       CTL 58.957722002523454 · TSB -0.077230305434135
+                       avg_stress ↓ -14.6% vs baseline 31.616666666666667
+  daily_snapshot tool: ctl 58.96, tsb -0.08, baseline 31.62
+  ```
+
+  Now routed through the same helper. Raw float64 in a prompt is noise the
+  model must re-round before it can speak, and it invites a spurious-precision
+  read-back.
+
+- **A prescribed HR cap was bounded on edit but not on create.**
+  `update_plan_workout` has rejected anything outside 90–210 bpm since 0.40.0;
+  `plans.validate_plan_input` — how a plan is *created* — only checked
+  finite-and-non-negative, so `target_hr_max: 14` was rejected on an edit and
+  accepted on a proposal. The blast radius is the whole plan, silently: the
+  report card grades HR via `hr_cap_severity = (bpm_over − 1.5) / 28`, so a
+  14 bpm cap puts every capped day ~120 bpm over the ceiling → F on HR → the
+  F-cap drops each of those days to C for the life of the plan, with no error
+  anywhere. The bounds now live once in `plans.MIN_PRESCRIBED_HR` /
+  `MAX_PRESCRIBED_HR` and both write paths read them. 90 is deliberately not
+  tightened further — it is a plausible real recovery-run ceiling.
+
+### Tests
+- **The three `run_sql` boundary tests would have passed a `run_sql` that
+  rejected every query, valid ones included.** Each asserted only `assert err`,
+  so none could tell "rejected correctly" from "rejected for the wrong reason".
+  They now pin the distinguishing message — `only SELECT/WITH queries
+  permitted`, `forbidden keyword: update`, `no such table: does_not_exist` —
+  and a fourth test asserts a valid `SELECT` still *succeeds*, which is the
+  half whose absence made the reject-everything implementation pass.
+
+## [0.46.0] - 2026-08-03
+
+### Added
+- **`update_plan_workouts` — re-prescribe many days on the active plan in ONE
+  atomic call.** Measured across recorded sessions: 39 `update_plan_workout`
+  calls, ~20 of them a single restructure, and 52 fitness tool calls in one
+  day. Two costs, and the second is the real one:
+
+  - 20 model turns, each carrying the full tool schemas and persona.
+  - **20 independent transactions.** The documented "move Saturday's long run
+    to Sunday" idiom is *two* calls — rest the old day, prescribe the new one.
+    If the second failed, the long run was simply gone, with nothing to roll
+    back.
+
+  One batch is one transaction. Validation runs in three passes before any row
+  changes: per-entry shape through the same `_prescription_fields` the
+  single-day tool uses, then the `_EDITABLE_WORKOUT_COLS` whitelist plus a
+  duplicate-`(date, seq)` check, then an existence pre-flight `SELECT` for
+  every target. A typo'd date aborts before the first write rather than
+  half-applying, and every error names the offending entry by index and date.
+
+  **Not a latency fix.** 20 sequential calls cost ~75 ms of our time end to end
+  (~3.8 ms each); the LLM turns dominate by three orders of magnitude. The win
+  is turns, tokens and atomicity — the docs say so explicitly so nobody
+  justifies it on database performance later.
+
+  The write boundary is unchanged: same whitelist, same keyed `UPDATE`, `date`
+  is still the key and not an editable column. A batch is many
+  re-prescriptions, never a restructure. Capped at 60 entries as a blast-radius
+  bound (the live active plan is 75 workouts).
+
+### Changed
+- **The rest-day clear moved from the tool to the write boundary**
+  (`plans.apply_rest_semantics`). It cleared distance/pace/duration/`hr_max`
+  inside `update_plan_workout`, which was correct only because that tool was
+  the sole caller — the moment a second write path existed, a caller that
+  skipped it would leave a stale HR cap on a rest day, prescribing a session
+  that no longer exists and that the report card grades against directly. Now
+  every caller of `update_active_workout(s)` inherits it. Single-day behaviour
+  is byte-identical, pinned by a regression test.
+- The persona's plan section gains the batch tool ("Never loop
+  `update_plan_workout` over a list of days"). Persona is 12,303 chars, still
+  under the 13,000 ceiling.
+
+### Fixed
+- `update_plan_workout`'s `hr_max` description and `docs/mcp/update_plan_workout.md`
+  both said the report card grades "time-above-cap" against the column. 0.40.2
+  replaced that axis with `hr_exceedance_bpm` precisely because a time fraction
+  fed into bands calibrated for relative magnitudes was a category error; the
+  fraction survives as reporting only. The docs page also listed
+  `_EDITABLE_WORKOUT_COLS` as five columns, omitting `target_hr_max` — added in
+  0.40.0. `test_docs_drift.py` checks page existence and availability claims,
+  never body accuracy, so this class of drift is unguarded.
+- `docs/mcp/README.md` described `get_training_plan_draft` as "the only way to
+  see a pending draft"; 0.44.0 made `get_training_plan_status` report one.
+
+## [0.45.0] - 2026-08-03
+
+### Changed
+- **The coach persona now has a training-plan section, paid for by two that
+  pointed at tools nobody calls.** Measured across every recorded session (247
+  real tool invocations), the persona's token budget was allocated backwards:
+
+  | persona section | tokens | tools it orients toward | real calls |
+  |---|---|---|---|
+  | Managing preferences conversationally | 532 | `save`/`update`/`delete_user_note` | 0 |
+  | Writing your journal | 199 | `save_coach_memory` | 0 |
+  | — no section existed — | 0 | every plan tool | **62 of 247** |
+
+  Both cut sections are superseded rather than merely unlucky:
+  `data/user_notes.md` was last written 2026-06-18 (preferences migrated to
+  `update_coach_personality`, 25 calls), and 0 of 18 `coach_journal` entries
+  came from chat — 14 `report_card`, 4 `brief`, all auto-reflect. Neither was
+  deleted; both were compressed to the decision rule, keeping every tool name.
+
+  The new section carries the four constraints an agent cannot recover from
+  the tool descriptions alone, because each spans two tools: `update_plan_workout`
+  edits ONE existing day so a swap is two calls; pass `hr_max` because a cap
+  written only in prose is invisible to the grader; restructuring goes through
+  a draft, never day-by-day patching; and a non-null `pending_draft` must be
+  closed because the next proposal silently archives it.
+
+  Net effect: the persona **shrank** 14,920 → 12,016 chars (~726 tokens saved)
+  while gaining the guidance for its largest usage cluster. It is delivered on
+  every `/coach` invocation, so this is a per-session saving.
+  `test_system_prompt_stays_under_its_size_ceiling` is a ratchet against
+  quietly growing it back.
+
+### Fixed
+- **The MCP server reported itself as `fitness v0.6.0`.** `make_server()` had
+  the version hardcoded as a literal since the server's first commit, so by
+  0.44.0 every client — Claude Desktop, opencode, a phone over `/mcp/` — read
+  a `serverInfo` 38 releases stale. That is the number you check to decide
+  whether a fix has shipped. `tools.server_version()` now reads installed
+  package metadata, falling back to `"0.0.0"` when the package isn't installed
+  (a version string must never stop a server from starting).
+  `test_server_version_tracks_pyproject` compares against `pyproject.toml`
+  parsed directly — asserting against `importlib.metadata`, which is what the
+  code itself reads, would be a tautology that passes whatever either says.
+
+### Tests
+- `test_server_and_tool_names` asserted `server is not None`, which passes for
+  any object at all. It now pins `server["name"] == SERVER_NAME == "fitness"`.
+
+## [0.44.0] - 2026-08-03
+
+### Added
+- **`get_training_plan_status` now reports `pending_draft`.** A proposed plan
+  that was never committed governs nothing and was invisible on every path an
+  agent had reason to call: `get_training_plan_status` and
+  `get_training_plan_progress` both read the ACTIVE plan only, and the one
+  tool that could see a draft — `get_training_plan_draft` — was never called
+  once across every recorded session. Since `plans.insert_draft` archives any
+  existing draft, an unsurfaced draft is destroyed by the next proposal
+  without a word.
+
+  Measured on the live DB: a 59-workout draft ("10K sub-48:30 — walk-supported
+  rebuild") sat unnoticed for 12 days from 2026-07-22 while the active plan
+  was hand-patched one day at a time — 39 single-day `update_plan_workout`
+  calls, 52 fitness tool calls in one day.
+
+  `plans.draft_summary()` is pure and returns
+  `{plan_id, title, created_at, workout_count, first_date, last_date}` or
+  `None`. A **summary, not the plan** — this tool's contract is "slim by
+  design" and the full draft has its own tool.
+
+  Resolved BEFORE the no-active-plan early return, so the key is present on
+  both branches: "nothing active, a draft waiting" is exactly the state worth
+  reporting, and a bare `{"active": false}` hid it. Read on the connection the
+  handler already holds (`plans.get_draft_plan` gains the `conn=` parameter
+  `get_active_plan` has had), so this costs **no extra `db.connect()`** — the
+  tool is on the perf gate's hot path. Measured A/B over 300 iterations
+  against the synthetic fixture: **0.650 ms with vs 0.642 ms without, +1.2%**,
+  against a 15%-of-min floor.
+
+### Changed
+- `docs/mcp/get_training_plan_status.md` said "Drafts are invisible here" in
+  four places. All four now describe the draft as a loose end to close, and
+  name the silent-archive consequence of leaving one open.
+
+### Security
+- **A crafted `Host` header could skip the bearer gate entirely.** The auth
+  middleware decided public-vs-private from `request.url.path`. Starlette
+  rebuilds `request.url` out of the `Host` header
+  (`f"{scheme}://{host}{path}"`) and re-parses it, so a `/` in that header
+  moves the path boundary: a `POST /mcp/` sent with
+  `Host: fitness.home.local/health#` presented a `url.path` of `/health`,
+  `_is_public_path` returned True, and `require_api_token` returned before
+  checking the token (starlette <1.0.1, GHSA-86qp-5c8j-p5mr).
+
+  `_is_public_path` was never wrong — the bug was what got *passed* to it.
+  Both middlewares now read `_request_path(request)` → `request.scope["path"]`,
+  the string the ASGI server parsed from the request line and the one the
+  router actually dispatches on. No header can influence it, so the gate and
+  the router cannot disagree.
+
+  **What was containing it, and why that wasn't good enough.** The request
+  still died at 421 in the MCP transport's own DNS-rebinding guard, which
+  compares the Host against its allowlist *exactly* — and a poisoned Host,
+  containing a `/`, can never match. That is an accident of the attack's
+  shape, not a control. Under the supported wildcard-port form
+  (`LOCAL_FITNESS_MCP_ALLOWED_HOSTS='fitness.home.local:*'`) the guard's
+  `startswith` branch accepts it and the identical unauthenticated request
+  completed a full MCP `initialize` — and from there `tools/list` and every
+  read and write tool. Traefik filters the proxied path but not traffic
+  reaching the container directly on the Docker network.
+
+  Fixed in two independent layers: the `scope["path"]` change (holds
+  regardless of dependency version) and the starlette bump below (closes
+  today's CVE). The code change is the durable one — bumping alone would fix
+  this instance and leave the class open.
+
+- **Dependency bumps for 6 HIGH advisories.** `starlette` 1.0.0 → 1.3.1
+  (the above, plus the HIGH form-limit DoS GHSA-82w8-qh3p-5jfq),
+  `python-multipart` 0.0.26 → 0.0.32 (quadratic-querystring DoS, unbounded
+  multipart headers), `pydantic-settings` 2.14.0 → 2.14.2.
+
+### Tests
+- Three cases in `tests/test_security.py`. `test_poisoned_host_header_cannot
+  _bypass_the_bearer_gate` fails on the pre-fix middleware by raising
+  `RuntimeError: Task group is not initialized` from inside the mounted MCP
+  app — reaching the mount at all is the proof the gate was skipped.
+  `test_request_path_is_invariant_under_any_host_header` pins the invariant
+  across five hostile Host forms and is deliberately version-independent: an
+  earlier draft asserted that `url.path` *does* relocate, which the starlette
+  bump immediately falsified, turning the test into a CVE detector that
+  silently passes once the library is patched.
+  `test_health_stays_public_with_an_ordinary_host_header` guards the
+  over-correction — the container's liveness probe must stay unauthenticated.
+
 ## [0.43.0] - 2026-08-02
 
 ### Added

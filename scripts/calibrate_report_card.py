@@ -43,7 +43,8 @@ quietly become constants" failure.
 NOT wired into CI, and cannot be: it needs a populated ``data/fitness.db`` that
 CI does not have, and fabricating one would just be asking the fixture whether
 the fixture agrees with itself. It is a MANUAL gate — run it before changing any
-constant in ``report_card.py`` and paste the output into the devlog entry.
+constant in ``report_card.py``; paste the output into the CHANGELOG entry
+and the PR body.
 
 Strictly READ-ONLY: the database is opened ``mode=ro`` through a URI, so a write
 is refused by SQLite rather than merely avoided by convention.

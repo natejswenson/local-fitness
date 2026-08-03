@@ -386,6 +386,93 @@ def test_is_public_path_deny_by_default():
     assert srv._is_public_path("/assets/index.js") is False
 
 
+# --- Host-header path poisoning cannot reach the auth gate -------------------
+# _is_public_path was never wrong; the bug was what got PASSED to it.
+# starlette <1.0.1 rebuilds request.url from the Host header and re-parses it
+# (GHSA-86qp-5c8j-p5mr), so a `/` in that header moves the path boundary and a
+# POST to /mcp/ presents a url.path of /health. These pin the middleware on
+# scope["path"] instead — which no header can influence — so the fix survives
+# both a starlette downgrade and a future reintroduction of the same class.
+
+
+def test_request_path_is_invariant_under_any_host_header():
+    """The unit-level invariant: the path used for security decisions comes
+    from the ASGI scope, so NO Host header can move it.
+
+    Deliberately version-independent. starlette 1.3.1 patched
+    GHSA-86qp-5c8j-p5mr, so ``request.url.path`` no longer relocates on this
+    pin — asserting that it does would make this test a CVE detector that
+    silently passes once the library is fixed, which is backwards. What must
+    hold forever is that our gate reads the router's own path, so a
+    downgrade, a transitive re-pin, or a new variant of the same class cannot
+    reach ``_is_public_path``."""
+    from starlette.requests import Request
+
+    from local_fitness.web import server as srv
+
+    def _scope(host: bytes) -> dict:
+        return {
+            "type": "http", "method": "POST", "path": "/mcp/",
+            "headers": [(b"host", host)],
+            "query_string": b"", "scheme": "http",
+            "server": ("fitness.home.local", 80), "client": ("10.0.0.9", 5555),
+        }
+
+    for host in (
+        b"fitness.home.local",
+        b"fitness.home.local/health#",
+        b"fitness.home.local/health?",
+        b"fitness.home.local:8765/health#",
+        b"/health#",
+    ):
+        request = Request(_scope(host))
+        assert srv._request_path(request) == "/mcp/", f"Host={host!r} moved the path"
+        assert srv._is_public_path(srv._request_path(request)) is False
+
+
+@pytest.mark.anyio
+async def test_poisoned_host_header_cannot_bypass_the_bearer_gate(app_with_token):
+    """End-to-end: an unauthenticated POST to /mcp/ carrying a Host header
+    crafted to read as /health must still 401.
+
+    Reverting the middleware to ``request.url.path`` fails this test by
+    raising ``RuntimeError: Task group is not initialized`` from inside the
+    mounted MCP app — which is itself the proof, since reaching the mount at
+    all means the bearer gate was skipped.
+
+    Against a live server the same request stops at 421, but only because the
+    MCP transport's DNS-rebinding guard matches its allowlist exactly and a
+    poisoned Host cannot. That containment is accidental: under a documented
+    wildcard-port allowlist (``host:*``) the identical request completes a
+    full unauthenticated MCP initialize. A 401 here proves the AUTH layer
+    stopped it rather than a downstream accident."""
+    transport = httpx.ASGITransport(app=app_with_token.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        for hostile in (
+            "fitness.home.local/health#",
+            "fitness.home.local/health?",
+            "t/health#",
+        ):
+            r = await c.post(
+                "/mcp/",
+                headers={"Host": hostile},
+                json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            )
+            assert r.status_code == 401, (
+                f"Host={hostile!r} bypassed the bearer gate: {r.status_code}"
+            )
+
+
+@pytest.mark.anyio
+async def test_health_stays_public_with_an_ordinary_host_header(app_with_token):
+    """The fix must not over-correct: /health is still reachable unauthenticated,
+    otherwise the container's liveness probe breaks."""
+    transport = httpx.ASGITransport(app=app_with_token.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.get("/health", headers={"Host": "fitness.home.local"})
+        assert r.status_code == 200
+
+
 # --- coach-journal tools store hostile text inertly (0.30.0) -----------------
 # The journal's `text` reaches (a) an INSERT and (b) every future prompt.
 # (a) must be parameterized-only; this pins that a classic injection string is
