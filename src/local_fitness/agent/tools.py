@@ -2874,14 +2874,24 @@ def _augment_plan_workout(w: dict) -> dict:
     "overall adherence. Returns {active: false} when there is no active plan. "
     "Call this first in a brief to decide whether to fold the plan in. Slim "
     "by design — for week rollups, goal gap, or projected finish, use "
-    "get_training_plan_progress instead.",
+    "get_training_plan_progress instead. "
+    "ALSO reports `pending_draft` (null when there is none): a proposed plan "
+    "that has never been committed, so it governs nothing. It is a loose end "
+    "— surface it, then either commit_training_plan or "
+    "discard_training_plan_draft. Proposing another plan silently archives "
+    "it. Use get_training_plan_draft to read the whole thing.",
     {},
 )
 async def get_training_plan_status(_args: dict) -> dict:
     with db.connect() as conn:
         active = plans.get_active_plan(conn=conn)
+        # Read on the connection we already hold — no extra open. Resolved
+        # BEFORE the no-active-plan early return on purpose: "no active plan
+        # but a draft waiting to be committed" is precisely the state that
+        # needs reporting, and a bare {active: false} hides it.
+        pending_draft = plans.draft_summary(plans.get_draft_plan(conn=conn))
         if active is None:
-            return _text({"active": False})
+            return _text({"active": False, "pending_draft": pending_draft})
         frontier = db.last_known_daily_date(conn=conn)
         today = date.today().isoformat()
         dates = [w["date"] for w in active["workouts"]] or [today]
@@ -2890,6 +2900,7 @@ async def get_training_plan_status(_args: dict) -> dict:
         activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
         cfg = plans.resolve_grading_config(conn=conn)
     status = plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
+    status["pending_draft"] = pending_draft
 
     # 2d: pure formatting of data already in hand. (plans.py does import
     # agent.units since 0.35.0 — a pure stdlib leaf, no cycle — so display

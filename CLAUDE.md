@@ -286,6 +286,22 @@ today", "how's my training load", "what did I run last week"):
   is enforced in `plans.py` (`update_active_workout` whitelists prescription
   columns only — it can't re-key/re-status/restructure). Don't hand-write
   `UPDATE` SQL — the tool exists.
+- **A pending draft is a loose end, and `get_training_plan_status` now names
+  it** (0.44.0, `pending_draft`). A draft governs nothing until
+  `commit_training_plan` runs, and `plans.insert_draft` **archives any existing
+  draft**, so an unsurfaced draft is destroyed by the next proposal with no
+  error. It used to be invisible on every path there was a reason to call:
+  both `get_training_plan_status` and `get_training_plan_progress` read the
+  ACTIVE plan only, and `get_training_plan_draft` was never called once in any
+  recorded session. Measured: a 59-workout draft sat unnoticed for 12 days
+  while the active plan was hand-patched 39 times one day at a time. When the
+  field is non-null, **close it** — commit or `discard_training_plan_draft` —
+  don't leave it open and don't infer prescriptions from the summary
+  (`plans.draft_summary` returns counts and a date span, never workouts; read
+  the plan with `get_training_plan_draft`). Resolved before the
+  no-active-plan early return on purpose, so `{active: false}` still carries
+  it, and read on the handler's existing connection — this tool is on the perf
+  gate, and the draft read must never add a `db.connect()`.
 - **Don't narrate the lookup.** The user wants the answer, not the mechanics.
   Lead with a one-line answer, then a clean table (at most ~4 columns, one-word
   headers, never a sentence in a cell) plus short coach text. Per-item detail
