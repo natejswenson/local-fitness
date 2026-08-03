@@ -434,6 +434,47 @@ def test_system_prompt_carries_report_card_directives(no_saved_notes):
     assert "NEVER state a letter grade or GPA that did not come from" in normalized
 
 
+def test_system_prompt_orients_toward_the_plan_write_path(no_saved_notes):
+    """The persona had NO plan section while plan tools were the single largest
+    usage cluster — 62 of 247 recorded tool calls — and 880 tokens went to
+    sections pointing at tools called zero times. These are the four facts an
+    agent cannot recover from the tool descriptions alone, because each is a
+    constraint that spans two tools."""
+    text = prompts.system_prompt("Alex", coach.resolve_coach_profile())
+    normalized = " ".join(text.split())
+    # The one-day editor, and the cap that is invisible to the grader in prose.
+    assert "update_plan_workout" in text
+    assert "hr_max" in text
+    # It cannot move or add a day, so a swap is two calls.
+    assert "cannot add a day or move one" in normalized
+    # Restructuring goes through a draft, never day-by-day patching.
+    assert "propose_training_plan" in text
+    assert "commit_training_plan" in text
+    assert "Never walk an active plan into a new shape one day at a time" in normalized
+    # A draft left open is destroyed by the next proposal.
+    assert "pending_draft" in text
+    assert "discard_training_plan_draft" in text
+    assert "silently archives it" in normalized
+    # plan_chart is THE planned-vs-actual view; it had 0 recorded calls.
+    assert "plan_chart" in text
+
+
+def test_system_prompt_stays_under_its_size_ceiling(no_saved_notes):
+    """The persona is delivered on every /coach invocation (and again via the
+    MCP instructions payload), so its length is a real per-session cost.
+
+    0.45.0 compressed two sections whose tools had never been called and spent
+    part of the saving on the plan section above, taking it 14,920 -> ~12,000
+    chars. This ceiling is a ratchet against silently growing it back: raising
+    it is allowed, but it should be a deliberate edit with a reason, not a
+    side effect."""
+    text = prompts.system_prompt("Alex", coach.resolve_coach_profile())
+    assert len(text) < 13_000, (
+        f"system prompt grew to {len(text)} chars; compress or raise the "
+        f"ceiling deliberately"
+    )
+
+
 # --- source guard: no personal name in executable prompt text ---------------
 
 _PROMPT_MODULES = (

@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-03
+
+### Changed
+- **The coach persona now has a training-plan section, paid for by two that
+  pointed at tools nobody calls.** Measured across every recorded session (247
+  real tool invocations), the persona's token budget was allocated backwards:
+
+  | persona section | tokens | tools it orients toward | real calls |
+  |---|---|---|---|
+  | Managing preferences conversationally | 532 | `save`/`update`/`delete_user_note` | 0 |
+  | Writing your journal | 199 | `save_coach_memory` | 0 |
+  | — no section existed — | 0 | every plan tool | **62 of 247** |
+
+  Both cut sections are superseded rather than merely unlucky:
+  `data/user_notes.md` was last written 2026-06-18 (preferences migrated to
+  `update_coach_personality`, 25 calls), and 0 of 18 `coach_journal` entries
+  came from chat — 14 `report_card`, 4 `brief`, all auto-reflect. Neither was
+  deleted; both were compressed to the decision rule, keeping every tool name.
+
+  The new section carries the four constraints an agent cannot recover from
+  the tool descriptions alone, because each spans two tools: `update_plan_workout`
+  edits ONE existing day so a swap is two calls; pass `hr_max` because a cap
+  written only in prose is invisible to the grader; restructuring goes through
+  a draft, never day-by-day patching; and a non-null `pending_draft` must be
+  closed because the next proposal silently archives it.
+
+  Net effect: the persona **shrank** 14,920 → 12,016 chars (~726 tokens saved)
+  while gaining the guidance for its largest usage cluster. It is delivered on
+  every `/coach` invocation, so this is a per-session saving.
+  `test_system_prompt_stays_under_its_size_ceiling` is a ratchet against
+  quietly growing it back.
+
+### Fixed
+- **The MCP server reported itself as `fitness v0.6.0`.** `make_server()` had
+  the version hardcoded as a literal since the server's first commit, so by
+  0.44.0 every client — Claude Desktop, opencode, a phone over `/mcp/` — read
+  a `serverInfo` 38 releases stale. That is the number you check to decide
+  whether a fix has shipped. `tools.server_version()` now reads installed
+  package metadata, falling back to `"0.0.0"` when the package isn't installed
+  (a version string must never stop a server from starting).
+  `test_server_version_tracks_pyproject` compares against `pyproject.toml`
+  parsed directly — asserting against `importlib.metadata`, which is what the
+  code itself reads, would be a tautology that passes whatever either says.
+
+### Tests
+- `test_server_and_tool_names` asserted `server is not None`, which passes for
+  any object at all. It now pins `server["name"] == SERVER_NAME == "fitness"`.
+
 ## [0.44.0] - 2026-08-03
 
 ### Added

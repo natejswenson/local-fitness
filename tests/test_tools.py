@@ -1304,10 +1304,35 @@ def test_delete_user_note_bad_line(seeded):
 
 def test_server_and_tool_names():
     server = tools.make_server()
-    assert server is not None
+    # Pin what the server IS, not merely that one was returned — an
+    # `is not None` here would pass on any object at all.
+    assert server["name"] == tools.SERVER_NAME == "fitness"
     names = tools.allowed_tool_names()
     assert len(names) == len(tools.ALL_TOOLS)
     assert all(n.startswith("mcp__fitness__") for n in names)
+
+
+def test_server_version_tracks_pyproject():
+    """Every MCP client reads this in `serverInfo` — it is the version you look
+    at in Claude Desktop to decide whether a fix has shipped.
+
+    It was a hardcoded "0.6.0" from the server's first commit, so by 0.44.0 it
+    was 38 releases stale and silently wrong. Compare against pyproject.toml
+    rather than against `importlib.metadata` (which is what the code reads —
+    asserting one against itself would be a tautology that passes no matter
+    what either says)."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+
+    assert tools.server_version() == declared
+    assert tools.server_version() != "0.6.0", "the old hardcoded literal is back"
+    # The instance attribute is what the SDK actually puts in the `serverInfo`
+    # of the initialize response — `make_server()`'s dict has no version key,
+    # so asserting on the dict would have compared None to None-ish forever.
+    assert tools.make_server()["instance"].version == declared
 
 
 # --- W4-T2: observation + manual-workout round-trip -----------------------

@@ -349,6 +349,30 @@ These are settled — don't redesign without a reason.
   V2** — the MCP `mcp__fitness__*` tools and the MCP `_brief_prompt` (chat /
   external-agent path) still use V1's tool-driven approach (a deliberate scope
   choice; `grounding.flag` is the reusable follow-up there).
+- **The persona's token budget is allocated against MEASURED tool usage, and
+  there is a size ceiling** (0.45.0). Audited across every recorded session
+  (247 real invocations), it was backwards: 532 tokens on "Managing preferences
+  conversationally" (`save`/`update`/`delete_user_note` — **0 calls ever**,
+  superseded by `update_coach_personality`, 25 calls) and 199 on "Writing your
+  journal" (`save_coach_memory` — 0 calls; all 18 `coach_journal` entries came
+  from auto-reflect, none from chat), while the **plan tools — 62 of 247 calls,
+  the largest cluster — had no section at all**. Both were compressed to their
+  decision rule (never deleted, every tool name kept) to pay for a
+  `# Managing the training plan` section. The persona SHRANK 14,920 → 12,016
+  chars in the process. Before adding to it, check what the new text orients
+  toward is actually called; `test_system_prompt_stays_under_its_size_ceiling`
+  (13,000 chars) is a deliberate ratchet — raising it is allowed, drifting past
+  it is not. **Compressing a section is not free**: `tests/test_prompts.py`
+  gates specific strings (`save_coach_memory`, `"session note"`, "Never say you
+  don't remember without searching", "never cite a memory the search didn't
+  return"), so run that file before assuming a cut is safe.
+- **`serverInfo.version` comes from package metadata, never a literal**
+  (0.45.0). `tools.server_version()` reads `importlib.metadata`; it was
+  hardcoded `"0.6.0"` from the first commit and every MCP client read a version
+  38 releases stale — the number you check in Claude Desktop to see whether a
+  fix shipped. Note `make_server()`'s returned dict has **no** `version` key;
+  the value that reaches the initialize response is `["instance"].version`, so
+  that is what a test must assert on.
 - **One coach voice, composed by every prompt surface** (0.28.0). The profile
   was already resolved everywhere, but what surrounded it had drifted:
   `plan_coach`/`workout_coach` carried `persona` + `dials_line` yet omitted the
