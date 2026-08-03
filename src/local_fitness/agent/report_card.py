@@ -1802,6 +1802,44 @@ def stimulus_notes(card: dict) -> list[str]:
     return notes
 
 
+METRIC_TABLE_HEADERS = ["Metric", "Actual", "Expected", "Delta", "Grade"]
+
+
+def metric_table(card: dict) -> tuple[list[str], list[list[str]]]:
+    """``(headers, rows)`` for the graded-compliance table.
+
+    Shared by the markdown card and the PDF for the same reason ``split_table``
+    and ``stimulus_rows`` are. The *cells* were already single-sourced — both
+    renderers called ``actual_text`` / ``expected_text`` / ``_delta_text`` — but
+    the header row, the column set and the row-assembly loop were written out
+    twice, which is exactly the shape of the ``split_table`` divergence: a
+    column added or dropped in one renderer and not the other.
+
+    Rows are ordered by ``_METRIC_LABELS``, and the grade is always the LAST
+    cell — the PDF colours that column by grade band, so its position is part
+    of the contract rather than an accident of ordering.
+    """
+    rows = []
+    for key, label in _METRIC_LABELS:
+        m = card["metrics"][key]
+        rows.append([
+            label,
+            actual_text(key, m),
+            expected_text(key, m),
+            _delta_text(key, m),
+            m.get("grade") or "n/a",
+        ])
+    return list(METRIC_TABLE_HEADERS), rows
+
+
+def metric_notes(card: dict) -> list[tuple[str, str]]:
+    """``(label, note)`` for every graded metric carrying a note, in table
+    order. Both renderers built this list inline from ``_METRIC_LABELS``."""
+    return [(label, card["metrics"][key]["note"])
+            for key, label in _METRIC_LABELS
+            if card["metrics"][key].get("note")]
+
+
 def split_table(card: dict) -> tuple[list[str], list[list[str]]]:
     """``(headers, rows)`` for the per-split breakdown, with dead columns gone.
 
@@ -1997,21 +2035,10 @@ def render_markdown(card: dict) -> str:
             if read.get(key):
                 lines += [f"**{label.title()}** — {read[key]}", ""]
 
-    rows = []
-    for key, label in _METRIC_LABELS:
-        m = card["metrics"][key]
-        rows.append([
-            label,
-            actual_text(key, m),
-            expected_text(key, m),
-            _delta_text(key, m),
-            m.get("grade") or "n/a",
-        ])
-    lines.append(render.render_table(
-        ["Metric", "Actual", "Expected", "Delta", "Grade"], rows))
+    headers, rows = metric_table(card)
+    lines.append(render.render_table(headers, rows))
 
-    notes = [f"- {label}: {card['metrics'][key]['note']}"
-             for key, label in _METRIC_LABELS if card["metrics"][key].get("note")]
+    notes = [f"- {label}: {note}" for label, note in metric_notes(card)]
     # The load spike note moved to the Stimulus section in 0.40.0 — it is a
     # statement about stimulus, and leaving it under the graded table was half
     # the reason a low-load easy day read as a failure.

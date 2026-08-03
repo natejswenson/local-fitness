@@ -80,6 +80,19 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   durable half** — a bump closes one CVE and leaves the class open. Anything
   deriving a security decision from a URL gets the same treatment: use the
   string the router dispatches on.
+- **One tool, one name — a duplicate is an ambiguity, not a convenience**
+  (0.48.0). `get_today_status` was removed: byte-identical body to
+  `daily_snapshot` and sharing the same description constant, so the model
+  coin-flipped 16/5 between two names for one job. Before adding an alias "for
+  compatibility", note that the 2026-07-10 design which converged these two
+  said the quiet part itself — "Two tools for one job is exactly the ambiguity
+  that causes an agent to pick the weaker one." **Removing a tool means moving
+  everything keyed to its NAME**: `ALL_TOOLS`, `_READ_ONLY_TOOL_NAMES` (the V1
+  brief grant), any prompt that names it, its `docs/mcp` page, and the README
+  tool counts. The V1 grant is the dangerous one — `briefing_prompt` names its
+  step-1 tool, and a prompt instructing a tool the loop isn't granted fails
+  SILENTLY (it did, for three weeks in 2026).
+  `test_the_v1_brief_grant_still_matches_its_prompt` cross-checks the pair.
 - **No SQL with user input via f-strings.** Whitelist column / table
   names against a frozen set, parameterize values via `?`. The
   pattern is locked in `agent/tools.py` and the existing route
@@ -183,9 +196,12 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   shows a double-digit margin. Confirm both, then recapture via the
   workflow dispatched on `main` (pre-PR code = the honest floor) and
   hand-promote the artifact to the committed `0001_*.json`.
-- **Devlog the change.** Each meaningful PR gets a `devlog/` entry —
-  manual prefix today, `/devlog` skill (auto from git commits) going
-  forward.
+- **The PR body IS the writeup.** There is no in-repo `devlog/` (removed
+  2026-08-03 — 63 files nothing in the repo read, duplicating what the
+  `/devlog` skill publishes to natejswenson.com from git history). A
+  meaningful change explains itself in the CHANGELOG entry and the PR
+  description; the durable *rule* it teaches goes in this file. Don't
+  reintroduce a parallel notes directory.
 - **Commit messages explain why.** Short subject, body when motivation
   isn't obvious from the diff. Co-authored-by line stays.
 - **Work through `feature/* → dev → main`.** Normal changes land via a PR
@@ -567,7 +583,7 @@ These are settled — don't redesign without a reason.
     (silence no longer is the only signal) and exits non-zero.
   Either way the outcome is **no brief saves** (orphaned sync — pull ran,
   brief didn't). That state is now surfaced: `assemble_status()` (→
-  `get_today_status` / `daily_snapshot`) carries `latest_brief_date` +
+  `daily_snapshot`) carries `latest_brief_date` +
   `brief_stale_days`, and the `fitness://brief/latest` resource leads
   with a STALE banner when serving a brief older than today.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
@@ -1026,7 +1042,7 @@ These are settled — don't redesign without a reason.
     changing ANY constant here — `GRADE_BANDS`, `HR_BANDS`, `HR_CAP_NOISE_BPM`,
     `HR_CAP_BPM_SCALE`, `CONTINUITY_TOLERANCE`, `PLAN_TIGHTEN`,
     `LOAD_SPIKE_FACTOR`, `*_FACTORS`, `MIN_REFERENCE_ACTIVITIES` — and paste the
-    output into the devlog entry. The two signatures are **deliberately
+    output into the CHANGELOG entry and the PR body. The two signatures are **deliberately
     asymmetric**: concentration in a *passing* grade is not evidence of anything
     (distance grades 79% A because the distances are being hit) and is reported,
     not gated. A symmetric rule was this check's own first draft and it flagged
@@ -1252,4 +1268,3 @@ These are settled — don't redesign without a reason.
 - `src/local_fitness/db.py` — SQLite schema + connection helpers.
 - `tests/` — pytest. `test_security.py` is the audit-regression file.
 - `docs/deployment.md` — what the deploying side wires into compose.
-- `devlog/` — running notes per change.

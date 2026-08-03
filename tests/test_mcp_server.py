@@ -439,14 +439,14 @@ def test_tool_call_returns_unwrapped_content():
     handler = server.request_handlers[types.CallToolRequest]
     req = types.CallToolRequest(
         method="tools/call",
-        params=types.CallToolRequestParams(name="get_today_status", arguments={}),
+        params=types.CallToolRequestParams(name="daily_snapshot", arguments={}),
     )
     res = asyncio.run(handler(req))
     result = res.root  # CallToolResult
     assert result.isError is not True
     assert result.content and result.content[0].type == "text"
     payload = json.loads(result.content[0].text)
-    # Fix B (2026-07-10 doc): get_today_status now delegates to
+    # daily_snapshot delegates to
     # status.assemble_status(); "recent_days" doesn't exist on that shape
     # anymore. "training_load" is a key assemble_status() always guarantees
     # (present even on an empty DB — see status.assemble_status's docstring).

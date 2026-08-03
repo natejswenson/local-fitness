@@ -14,9 +14,6 @@ Which one do I call?
 
 - **`daily_snapshot`** — you want today's numbers, the recent workouts, and the
   user notes. This is the everyday snapshot.
-- **[`get_today_status`](get_today_status.md)** — a byte-identical alias of this
-  tool. Same handler, same payload. Prefer `daily_snapshot`; `get_today_status`
-  exists because the V1 brief loop's read-only allow-list names it.
 - **[`get_brief_context`](get_brief_context.md)** — you want the *brief's* read:
   fired triggers, priority-ordered candidate takeaways, the 14-day workout list,
   RHR anomalies, and active-plan status. Bigger, and it carries no user notes.
@@ -141,13 +138,14 @@ follow-ups needed.
 - **`distance_mi` is suppressed entirely** when `LOCAL_FITNESS_DISPLAY_UNITS`
   isn't `miles`; `pace_min_per_mi` / `duration_formatted` are omitted per-workout
   when the underlying value is null or zero.
-- **This tool is not in the V1 brief loop's read-only allow-list** —
-  `get_today_status` is, deliberately, so the brief's tool set didn't change when
-  `daily_snapshot` landed.
+- **This tool IS the V1 brief loop's daily snapshot** (0.48.0). The allow-list
+  used to name `get_today_status` — a byte-identical alias removed as a
+  duplicate — so the grant moved here with it. The V1 prompt names this tool as
+  step 1, and the two must always agree: a prompt instructing a tool the loop
+  isn't granted fails silently, which is what happened for three weeks in 2026.
 
 ## See also
 
-- [`get_today_status`](get_today_status.md) — the identical alias.
 - [`get_brief_context`](get_brief_context.md) — the full brief read.
 - [`training_load_status`](training_load_status.md) — CTL/ATL/TSB with history.
 - [`get_metric_trend`](get_metric_trend.md) — a real slope over any window.

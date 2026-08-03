@@ -57,7 +57,10 @@ def test_tool_schemas_well_formed():
     # update_plan_workout — a restructure was ~20 sequential calls and, worse,
     # 20 independent transactions, so a failed second call could delete a long
     # run with nothing to roll back)
-    assert len(agent_tools.ALL_TOOLS) == 45
+    # -get_today_status (0.48.0: byte-identical body to daily_snapshot, sharing
+    # one description constant — two names for one tool, so the model
+    # coin-flipped 16/5 between them)
+    assert len(agent_tools.ALL_TOOLS) == 44
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

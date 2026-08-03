@@ -223,7 +223,7 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **47 tools over stdio** (45 over HTTP — two are
+Once connected you get **46 tools over stdio** (44 over HTTP — two are
 local-only, see below), **2 prompts**, and **2 resources**.
 
 📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool
@@ -237,7 +237,7 @@ is a map; that directory is the documentation.
     follow-ups. This is the everyday "talk to my coach" entry point.
   - **`brief`** — composes a fresh structured daily brief from the same
     snapshot and persists it via `save_brief`.
-- **Status** — `daily_snapshot` (one-call "how am I doing"), `get_today_status`,
+- **Status** — `daily_snapshot` (one-call "how am I doing"),
   `get_brief_context` (the deterministic planner's full typed output).
 - **Metrics & analysis** — `get_metric` / `get_metric_trend`,
   `training_load_status`, `compare_periods`, `correlate`, `find_anomalies`,
@@ -380,7 +380,6 @@ src/local_fitness/
 ops/                       # macOS launchd plist + installer for the scheduled brief
 scripts/score_prompt.py    # eval that scores agent/prompts.py (gates CI)
 tests/                     # pytest suite (run: uv run pytest)
-devlog/                    # running notes, one entry per meaningful change
 docs/mcp/                  # per-tool MCP reference (one page per tool)
 docs/deployment.md         # container / reverse-proxy deployment
 ```

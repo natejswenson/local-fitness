@@ -102,12 +102,11 @@ def seeded(tmp_path, monkeypatch):
     return p
 
 
-def test_get_today_status(seeded):
-    # Fix B (2026-07-10 doc): get_today_status now delegates to
-    # status.assemble_status() — the old {today, recent_days,
-    # current_baseline} raw shape is gone, replaced by assemble_status()'s
-    # richer payload (metrics with baseline deltas, training_load, etc).
-    payload, err = call(tools.get_today_status, {})
+def test_daily_snapshot_payload_shape(seeded):
+    """Inherited from the removed get_today_status: the old raw
+    {today, recent_days, current_baseline} shape is gone, replaced by
+    assemble_status()'s richer payload."""
+    payload, err = call(tools.daily_snapshot, {})
     assert not err
     assert "recent_days" not in payload
     assert "current_baseline" not in payload
@@ -116,24 +115,32 @@ def test_get_today_status(seeded):
     assert payload["date"] == date.today().isoformat()
 
 
-def test_get_today_status_matches_daily_snapshot(seeded):
-    # Fix B's convergence invariant: identical payload for identical DB state.
-    today_payload, err1 = call(tools.get_today_status, {})
-    snapshot_payload, err2 = call(tools.daily_snapshot, {})
-    assert not err1 and not err2
-    assert today_payload == snapshot_payload
+def test_get_today_status_is_gone(seeded):
+    """0.48.0 removed it — byte-identical body to daily_snapshot, sharing one
+    description constant, so the model coin-flipped between two names for one
+    tool (16/5 across recorded sessions). Pinned so it can't drift back in."""
+    assert not hasattr(tools, "get_today_status")
+    assert "get_today_status" not in {t.name for t in tools.ALL_TOOLS}
 
 
-def test_get_today_status_description_mirrors_daily_snapshot():
-    today_tool = next(t for t in tools.ALL_TOOLS if t.name == "get_today_status")
-    snapshot_tool = next(t for t in tools.ALL_TOOLS if t.name == "daily_snapshot")
-    # Must no longer be the stale raw-shape description.
-    assert today_tool.description != (
-        "Today's metrics + last 7 days alongside the latest 60-day baselines. "
-        "Call this first when assessing recovery or making 'should I train "
-        "hard' decisions."
-    )
-    assert today_tool.description == snapshot_tool.description
+def test_the_v1_brief_grant_still_matches_its_prompt(seeded):
+    """The removal moved the V1 read-only grant from get_today_status to
+    daily_snapshot. briefing_prompt names it as step 1, and a prompt that
+    instructs a tool the loop was never granted fails SILENTLY — that exact
+    mismatch went unnoticed for three weeks in 2026 (see _READ_ONLY_TOOL_NAMES).
+    """
+    from local_fitness.agent import prompts
+
+    granted = set(tools.read_only_tool_names())
+    assert "mcp__fitness__daily_snapshot" in granted
+    assert "mcp__fitness__get_today_status" not in granted
+    # Every tool the V1 prompt tells the loop to call must actually be granted.
+    body = prompts.briefing_prompt("Nate")
+    for name in ("daily_snapshot", "get_training_plan_status",
+                 "training_load_status", "query_workouts", "get_metric_trend"):
+        assert name in body, f"V1 prompt no longer names {name}"
+        assert f"mcp__fitness__{name}" in granted, (
+            f"V1 prompt instructs {name} but the loop is not granted it")
 
 
 def test_get_metric_valid(seeded):
@@ -1835,16 +1842,26 @@ def test_save_brief_schema_meets_the_sdk_passthrough_condition():
 
 def test_brief_loop_excludes_write_tools():
     """Contract invariant: the brief loop's allow-list (read_only_tool_names)
-    is a strict subset of all tools and never includes a write or the
-    snapshot/list-observations tools, so brief generation cannot mutate data."""
+    is a strict subset of all tools and includes no WRITE tool, so brief
+    generation cannot mutate data.
+
+    `daily_snapshot` used to be excluded here too, but never because it writes
+    — it doesn't. It was held out (0.47.0 and earlier) purely to keep the V1
+    tool set byte-identical while it and `get_today_status` both existed. With
+    the duplicate removed in 0.48.0 the V1 prompt names `daily_snapshot` as
+    step 1, so it has to be granted; see
+    test_the_v1_brief_grant_still_matches_its_prompt. `list_observations` stays
+    out — it is still not part of the V1 brief's read set."""
     ro = set(tools.read_only_tool_names())
     for w in (
         "log_manual_workout", "delete_manual_workout", "log_observation",
         "delete_observation", "save_user_note", "update_user_note",
-        "delete_user_note", "daily_snapshot", "list_observations",
-        "sync_garmin_data",
+        "delete_user_note", "list_observations", "sync_garmin_data",
+        "update_plan_workout", "update_plan_workouts", "propose_training_plan",
+        "commit_training_plan", "abandon_active_plan", "save_brief",
+        "save_coach_memory", "delete_coach_memory", "update_coach_personality",
     ):
-        assert f"mcp__{tools.SERVER_NAME}__{w}" not in ro
+        assert f"mcp__{tools.SERVER_NAME}__{w}" not in ro, f"{w} is a write"
     assert ro < set(tools.allowed_tool_names())
 
 

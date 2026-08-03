@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-08-03
+
+### Removed
+- **`get_today_status`** — a byte-identical duplicate of `daily_snapshot`.
+  Same body (`return _text(assemble_status())`), sharing the *same description
+  constant*, so the model was choosing between two names for one tool and
+  coin-flipped 16/5 across recorded sessions. The 2026-07-10 design that
+  converged their behaviour said it itself: "Two tools for one job is exactly
+  the ambiguity that causes an agent to pick the weaker one." The compat window
+  is closed. **46 tools over stdio, 44 over HTTP.**
+
+  The removal moved the V1 brief loop's read-only grant from `get_today_status`
+  to `daily_snapshot`, which had been excluded from that allow-list *only* to
+  keep the V1 tool set byte-identical while both names existed. `briefing_prompt`
+  names it as step 1, and a prompt instructing a tool the loop was never granted
+  fails **silently** — the exact bug that went unnoticed for three weeks in 2026
+  and is documented on `_READ_ONLY_TOOL_NAMES`.
+  `test_the_v1_brief_grant_still_matches_its_prompt` now cross-checks every tool
+  the V1 prompt names against the grant, so the pair cannot drift again.
+
+- **`devlog/`** — 63 markdown files at the repo root that nothing in the repo
+  read, duplicating what the `/devlog` skill publishes to natejswenson.com from
+  git history. The question ("why is the devlog folder located in this repo?")
+  was asked 2026-07-22 and never answered; the answer is that it shouldn't be.
+  CLAUDE.md's workflow rule now says the CHANGELOG entry and the PR body are
+  the writeup, and the durable *rule* a change teaches goes in CLAUDE.md.
+  References in `docs/plans/` are left alone — those are dated historical
+  design records, not live guidance.
+
+### Changed
+- **The report card's metric table is one definition again.**
+  `report_card.metric_table()` / `metric_notes()` now feed both the markdown
+  card and the PDF. The *cells* were already single-sourced (both renderers
+  called `actual_text` / `expected_text` / `_delta_text`), but the header row,
+  the column set and the row-assembly loop were written out twice — precisely
+  the divergence `split_table` and `stimulus_rows` exist to prevent, one level
+  up in the same table. `test_both_renderers_take_the_metric_table_from_one_source`
+  asserts every header and cell reaches both.
+
 ## [0.47.0] - 2026-08-03
 
 ### Fixed

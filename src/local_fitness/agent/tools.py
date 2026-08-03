@@ -290,9 +290,12 @@ def _augment_workout(w: dict) -> dict:
     return w
 
 
-# Shared verbatim between get_today_status and daily_snapshot (Fix B,
-# 2026-07-10 doc): both tools now call status.assemble_status() and return
-# an identical payload, so one description string, not two that drift.
+# 0.48.0: `get_today_status` is GONE. It and `daily_snapshot` had byte-identical
+# bodies and shared this very description constant — two names for one tool, so
+# the model coin-flipped between them (16/5 across recorded sessions). The
+# 2026-07-10 design that converged them said so itself: "Two tools for one job
+# is exactly the ambiguity that causes an agent to pick the weaker one." The
+# compat window is closed; `daily_snapshot` is the one name.
 _DAILY_SNAPSHOT_DESCRIPTION = (
     "The full daily snapshot — today's metrics with baseline deltas / trend "
     "arrows, current CTL/ATL/TSB, recent workouts (with mile + formatted "
@@ -302,21 +305,6 @@ _DAILY_SNAPSHOT_DESCRIPTION = (
     "No plan/anomalies/candidates in this payload — "
     "use get_brief_context for the full read or anything plan-/trend-related."
 )
-
-
-@tool(
-    "get_today_status",
-    _DAILY_SNAPSHOT_DESCRIPTION,
-    {},
-)
-async def get_today_status(_args: dict) -> dict:
-    # Fix B (2026-07-10 doc): converges with daily_snapshot — same
-    # status.assemble_status() body, same richer payload, instead of an
-    # independent raw baseline-row query. Lazy import: status.py imports
-    # DAILY_NUMERIC_METRICS from this module, so a top-level import here
-    # would be circular (same pattern as daily_snapshot below).
-    from .status import assemble_status
-    return _text(assemble_status())
 
 
 @tool(
@@ -2481,7 +2469,7 @@ _EDITABLE_TOOL_FIELDS = ("goal_type", "race_date", "target_time_seconds", "goal_
 @tool(
     "propose_training_plan",
     "Create a DRAFT training plan from a goal + a full workout schedule you "
-    "generated. Ground it first: call training_load_status, get_today_status, "
+    "generated. Ground it first: call training_load_status, daily_snapshot, "
     "and query_workouts to read the athlete's real fitness before proposing. "
     "Archives any prior draft. Does NOT activate the plan — call "
     "commit_training_plan to activate it, or discard_training_plan_draft to "
@@ -4253,7 +4241,6 @@ async def get_report_card(args: dict) -> dict:
 
 
 ALL_TOOLS = [
-    get_today_status,
     get_brief_context,
     get_metric,
     get_metric_trend,
@@ -4357,12 +4344,19 @@ def allowed_tool_names() -> list[str]:
 # tools, and (deliberately) daily_snapshot + list_observations so the brief's
 # tool set is identical to before this issue.
 _READ_ONLY_TOOL_NAMES = (
-    "get_today_status",
     # briefing_prompt (V1) instructs "call get_training_plan_status FIRST" —
     # this entry keeps the rollback path's tool grant matching its prompt.
     # Missing here 2026-06-27→2026-07-19: a V1 rollback silently lost
     # plan-aware briefs (round-2 facet review, prompts finding 1).
     "get_training_plan_status",
+    # 0.48.0: was "get_today_status" until that tool was removed as a duplicate
+    # of daily_snapshot. briefing_prompt (V1) lists it as step 1, so the grant
+    # has to move with the prompt — the note above is this exact bug, and it
+    # went unnoticed for three weeks the last time. daily_snapshot was
+    # previously excluded here ONLY to keep the V1 tool set byte-identical
+    # while both names existed; with one name left, excluding it would strip
+    # the daily snapshot from the rollback path entirely.
+    "daily_snapshot",
     "get_metric",
     "get_metric_trend",
     "query_workouts",
