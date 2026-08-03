@@ -6,6 +6,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-08-02
+
+### Added
+- **`scripts/calibrate_report_card.py` — the check that would have caught the
+  0.40.0 HR-cap defect.** CLAUDE.md has said "calibrate bands against real data,
+  not intuition" since 0.26.0 and nothing executed it, which is why every
+  grading defect in this module's history was found by a human reading a
+  rendered card. The script recomputes every graded metric across a trailing
+  window through the real production path
+  (`load_report_card_inputs` → `build_card`, never a reimplementation), prints a
+  per-metric letter histogram, and exits non-zero on either degeneracy
+  signature: **punitive skew** (>60% of runs graded D/F) or **dead bands** (≥2
+  letters never used).
+
+  Verified against the defect it was designed for. On `23ee63a` — the commit
+  where a human investigation looked at this exact card and concluded "the grade
+  was fine" — it reports `hr (prescribed cap)  1 0 0 0 9  FAIL — 90% of runs
+  graded D/F`. On the corrected rubric the same line reads `3 0 3 1 3  ok — 4/5
+  bands used`, and the F-cap rate over the window falls 21% → 12%.
+
+  The asymmetry between the two signatures is deliberate and was the correction
+  to this check's own first draft, which failed any letter above a flat 60%
+  share: distance grades 79% A because the distances are being hit. A rubric
+  measures compliance with a prescription the athlete is *trying* to follow, so
+  concentration in a passing grade is evidence of nothing and is reported rather
+  than gated.
+
+  Strictly read-only (`mode=ro` URI — SQLite refuses the write rather than the
+  script merely avoiding it), and deliberately **not** in CI: it needs a
+  populated database CI does not have, and a fabricated one would only ask the
+  fixture whether it agrees with itself. `test_the_gate_is_not_wired_into_ci`
+  fails if someone adds it to a workflow.
+
+- **`tests/evals/report_cards.py` + `tests/evals/test_report_card_verdicts.py` —
+  verdict evals for the report card.** The report card had 141 unit tests and no
+  evals. Those tests assert that the rubric computes what it says it computes —
+  a deviation float, a band boundary, a display string — and not one of them
+  could fail when the rubric's *answer* was wrong. These assert the **overall
+  letter a run deserves**, through a fabricated SQLite database and the full
+  `load_report_card_inputs` → `build_card` path, so the reference-pool filter is
+  inside what they grade.
+
+  Five scenarios, each a failure that reached a rendered card:
+  `obedient_easy_clean`, `obedient_easy_straddling` (the 2026-08-02 shape —
+  average obeys a 140 ceiling while 60% of the run sits 1–3 bpm over),
+  `cap_blown_hard`, `interval_manual_laps`, `walk_mislabelled`. Expected
+  verdicts are declared as BOUNDS in `EXPECTED_VERDICTS`, with a stated reason;
+  a scenario without an entry fails `test_every_scenario_declares_a_verdict`.
+
+  Verified against `23ee63a`: three tests fail there, including
+  `test_the_three_cap_scenarios_are_strictly_ordered` with `assert 2.0 > 2.0` —
+  straddling a cap by a beat and blowing it by 15 bpm both graded C, which is
+  the collapse the ordering test exists to name.
+
+### Fixed
+- **`tests/conftest.py` puts `tests/evals/` on `sys.path`** alongside `scripts/`,
+  so a test outside that directory can import the fixture builders. This is what
+  lets `tests/test_calibrate_report_card.py` reuse the report-card scenarios
+  instead of fabricating a second corpus that could drift from them.
+
 ## [0.42.0] - 2026-08-02
 
 ### Fixed

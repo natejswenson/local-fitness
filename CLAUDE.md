@@ -939,12 +939,45 @@ These are settled — don't redesign without a reason.
     the table was written out twice and a column dropped in one but not the
     other is the divergence the already-built-card contract exists to
     prevent, same reason as `stimulus_rows`.
-  - **Calibrate bands against real data, not intuition.** The original easy-HR
-    ceiling (0.88x median) demanded a number that appeared in 1 of 13 runs in
-    the window — the median is taken over ALL comparable activities, which for
-    a mostly-easy runner already sits near easy HR. That made HR a standing
-    penalty rather than a judgment. Before changing `HR_BANDS`, check the
-    proposed bound against the actual distribution.
+  - **Calibrate bands against real data, not intuition — and the check is now
+    executable** (0.43.0). The original easy-HR ceiling (0.88x median) demanded
+    a number that appeared in 1 of 13 runs in the window — the median is taken
+    over ALL comparable activities, which for a mostly-easy runner already sits
+    near easy HR. That made HR a standing penalty rather than a judgment. This
+    rule was advisory for four releases and nothing ran it, which is how the
+    0.40.0 HR-cap axis shipped emitting 32 F / 7 A / 4 D over 90 days with B and
+    C empty. **`scripts/calibrate_report_card.py` is the gate**: it regrades a
+    trailing window through the production path (`load_report_card_inputs` ->
+    `build_card`, never a reimplementation) and exits non-zero on *punitive
+    skew* (>60% of runs D/F) or *dead bands* (>=2 letters unused). Run it before
+    changing ANY constant here — `GRADE_BANDS`, `HR_BANDS`, `HR_CAP_NOISE_BPM`,
+    `HR_CAP_BPM_SCALE`, `CONTINUITY_TOLERANCE`, `PLAN_TIGHTEN`,
+    `LOAD_SPIKE_FACTOR`, `*_FACTORS`, `MIN_REFERENCE_ACTIVITIES` — and paste the
+    output into the devlog entry. The two signatures are **deliberately
+    asymmetric**: concentration in a *passing* grade is not evidence of anything
+    (distance grades 79% A because the distances are being hit) and is reported,
+    not gated. A symmetric rule was this check's own first draft and it flagged
+    three of five healthy metrics. **Strictly read-only** (`mode=ro` URI — SQLite
+    refuses the write) and **deliberately not in CI**: it needs a populated
+    `data/fitness.db`, and a fabricated one would only ask the fixture whether it
+    agrees with itself. `test_the_gate_is_not_wired_into_ci` fails if someone
+    wires it up.
+  - **A grade change needs a VERDICT eval, not just a unit test** (0.43.0).
+    `tests/test_report_card.py`'s ~141 tests assert that the rubric computes what
+    it says it computes — a deviation float, a band boundary, a display string —
+    and not one of them can fail when the rubric's *answer* is wrong. That is why
+    every grading defect in this module's history was caught by a human reading a
+    rendered card, never by the suite. `tests/evals/report_cards.py` +
+    `tests/evals/test_report_card_verdicts.py` are the other half: fabricated
+    scenarios asserting **the overall letter a run deserves**, driven through a
+    real SQLite DB so the reference-pool filter is inside what they grade.
+    Expected verdicts are BOUNDS in `EXPECTED_VERDICTS` (a bound is the actual
+    contract and survives ordinary recalibration; an exact letter would fight
+    it), each with a stated reason — and a scenario with no entry fails
+    `test_every_scenario_declares_a_verdict`. **When a user reports a wrong
+    grade, the permanent fix is a new scenario here**, not only a unit test; and
+    never pin the disputed grade as a regression assertion (0.40.1 added
+    `assert hr["grade"] == "F"` for the card under dispute).
   - **A plan target is an instruction; a rolling median is a reference.**
     Plan-referenced distance and pace are graded on bands tightened by
     `PLAN_TIGHTEN` (0.6). Without it both were held to the same tolerance and
