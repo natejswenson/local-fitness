@@ -396,7 +396,7 @@ an embedded chart.
 Call (in any sensible order):
 0. get_training_plan_status — call this FIRST. It decides whether today's
    workout takeaway is plan-driven (see "Active training plan" below).
-1. get_today_status
+1. daily_snapshot
 2. training_load_status
 3. query_workouts(days=14)  — 14 days, not 7. Conditioning trend
    needs the longer window (run frequency, TE trajectory, distance

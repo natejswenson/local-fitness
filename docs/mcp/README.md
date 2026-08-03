@@ -16,13 +16,13 @@ worked examples, and gotchas.
 
 ## Connecting
 
-**Local, over stdio** — all 47 tools, no token:
+**Local, over stdio** — all 46 tools, no token:
 
 ```bash
 claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
 ```
 
-**Over the running server** — 45 tools, bearer-gated:
+**Over the running server** — 44 tools, bearer-gated:
 
 ```bash
 claude mcp add --transport http fitness \
@@ -39,7 +39,7 @@ unreachable over the networked `/mcp/` transport:
 
 | | stdio (`fitness mcp-stdio`) | HTTP (`/mcp/`) |
 |---|---|---|
-| Tool count | **47** | **45** |
+| Tool count | **46** | **44** |
 | [`generate_brief_report`](generate_brief_report.md) | ✅ | ❌ |
 | [`workout_report_card`](workout_report_card.md) | ✅ | ❌ |
 
@@ -58,7 +58,6 @@ Three tools overlap here; the distinction is on each page.
 | Tool | Use it for |
 |---|---|
 | [`daily_snapshot`](daily_snapshot.md) | One-call "how am I doing today" |
-| [`get_today_status`](get_today_status.md) | Today's metrics vs baseline + training load, no plan/trend data |
 | [`get_brief_context`](get_brief_context.md) | The deterministic planner's full typed output — candidate takeaways, plan status, anomalies, continuity |
 | [`save_brief`](save_brief.md) | ✍️ Persist today's composed brief |
 

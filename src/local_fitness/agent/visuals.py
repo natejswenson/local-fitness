@@ -1246,21 +1246,21 @@ def ref_mode_is_running(card: dict) -> bool:
 def _render_metric_table_html(card: dict) -> str:
     from . import report_card as rc
 
+    # Headers AND cells come from report_card.metric_table — the table was
+    # written out twice before 0.48.0, which is the same divergence split_table
+    # and stimulus_rows exist to prevent. The cells already deferred to the
+    # card's own display strings (HR is held to a band, quality pace grades the
+    # fastest split); now the column set does too.
+    headers, body_rows = rc.metric_table(card)
     rows = ""
-    for key, label in rc._METRIC_LABELS:
-        m = card["metrics"][key]
-        # Both columns defer to the card's own display strings: HR is held to a
-        # band rather than a point, and quality pace is graded on the fastest
-        # split rather than the run average. See rc.expected_text / rc.actual_text.
-        expected = rc.expected_text(key, m)
-        actual = rc.actual_text(key, m)
-        grade = m.get("grade") or "n/a"
+    for cells in body_rows:
+        *lead, grade = cells
+        label, rest = lead[0], lead[1:]
+        tds = "".join(f"<td>{html.escape(c)}</td>" for c in rest)
         rows += f"""
         <tr>
           <td class="metric-name">{html.escape(label)}</td>
-          <td>{html.escape(actual)}</td>
-          <td>{html.escape(expected)}</td>
-          <td>{html.escape(rc._delta_text(key, m))}</td>
+          {tds}
           <td class="metric-grade {_grade_class(grade)}">{html.escape(grade)}</td>
         </tr>
         """
@@ -1271,7 +1271,7 @@ def _render_metric_table_html(card: dict) -> str:
         <col style="width:22%"><col style="width:12%">
       </colgroup>
       <thead><tr>
-        <th>Metric</th><th>Actual</th><th>Expected</th><th>Delta</th><th>Grade</th>
+        {"".join(f"<th>{html.escape(h)}</th>" for h in headers)}
       </tr></thead>
       <tbody>{rows}</tbody>
     </table>
@@ -1433,8 +1433,7 @@ def _build_report_card_html(
         f"{card.get('intent')} ({graded_by})"
     )
 
-    notes = [f"{label}: {card['metrics'][key]['note']}"
-             for key, label in rc._METRIC_LABELS if card["metrics"][key].get("note")]
+    notes = [f"{label}: {note}" for label, note in rc.metric_notes(card)]
     # The load spike note lives in the Stimulus section now (0.40.0) — it is a
     # statement about stimulus, not about compliance with the prescription.
     if overall.get("capped_by") == "F":
