@@ -64,6 +64,22 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
 - **Every new endpoint that calls Claude is rate-limited.** The
   middleware matches by prefix in `RATE_LIMITED_PREFIXES`. Add new
   Claude-cost paths to that tuple — don't just hope they stay cheap.
+- **A path-based security decision reads `request.scope["path"]`, never
+  `request.url.path`** (0.43.1). `_request_path()` in `web/server.py` is the
+  single accessor and both middlewares use it. Starlette rebuilds
+  `request.url` from the **`Host` header** and re-parses it, so a `/` in that
+  attacker-controlled header relocates the path boundary — `POST /mcp/` with
+  `Host: fitness.home.local/health#` presented `url.path == "/health"`,
+  `_is_public_path` said public, and the bearer check never ran
+  (GHSA-86qp-5c8j-p5mr). `_is_public_path` itself was never wrong; the bug was
+  its *input*. What appeared to contain it was luck: the MCP transport's
+  DNS-rebinding guard matches the allowlist exactly and a poisoned Host can't
+  match — but its wildcard-port branch (`host:*`, a documented config) accepts
+  one, and the same unauthenticated request then completed a full MCP
+  `initialize`. The dependency is bumped too, but **the code fix is the
+  durable half** — a bump closes one CVE and leaves the class open. Anything
+  deriving a security decision from a URL gets the same treatment: use the
+  string the router dispatches on.
 - **No SQL with user input via f-strings.** Whitelist column / table
   names against a frozen set, parameterize values via `?`. The
   pattern is locked in `agent/tools.py` and the existing route
