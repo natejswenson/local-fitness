@@ -3891,9 +3891,13 @@ _REPORT_CARD_SCHEMA = {
 
 @tool(
     "workout_report_card",
-    "Graded report card for ONE workout — distance, pace, HR (broken down by "
-    "mile) and training load, each given a letter grade, plus an overall "
-    "grade. Defaults to the most recent logged activity; pass activity_id or "
+    "Rated report card for ONE workout — distance, pace, HR (broken down by "
+    "mile) and continuity, each given a 1-5 star score with fractional "
+    "precision, plus an intent-weighted overall. 5 stars means the day was "
+    "executed as prescribed: it is a COMPLIANCE score, not a verdict on how "
+    "good the run was, so a correctly-run easy day rates 5. Training load is "
+    "reported alongside but never rated. Defaults to the most recent logged "
+    "activity; pass activity_id or "
     "date to grade a specific one. Grades against the active training plan's "
     "prescribed workout when one exists for that date, otherwise against a "
     "60-day rolling median of comparable activities — the card always says "
@@ -4037,7 +4041,14 @@ async def workout_report_card(args: dict) -> dict:
         "activity_id": inputs["activity"]["activity_id"],
         "date": inputs["activity"].get("date"),
         "overall": card["overall"],
-        "grades": {k: v.get("grade") for k, v in card["metrics"].items()},
+        "stars": {k: v.get("stars") for k, v in card["metrics"].items()},
+        # The rendered rating strings, so an agent reading this card aloud
+        # renders them verbatim instead of re-deriving a star string of its own
+        # — the same single-source discipline metric_table keeps.
+        "ratings": {k: report_card.star_display(v.get("stars"))
+                    for k, v in card["metrics"].items()},
+        "overall_rating": report_card.star_display(card["overall"].get("stars")),
+        "scale_note": _STAR_SCALE_NOTE,
         "reference": card["reference"].get("mode"),
         "intent": card["intent"],
         "intent_source": card["intent_source"],
@@ -4116,11 +4127,19 @@ async def workout_report_card(args: dict) -> dict:
 # dated snapshot, and the honest labeling of what graded_at does (and does
 # not) promise is the load-bearing part — see the 2026-07-23 design doc.
 _CARD_SNAPSHOT_NOTE = (
-    "This is the stored snapshot as graded on graded_at — the most recent "
+    "This is the stored snapshot as rated on graded_at — the most recent "
     "render whose read differed (a distinct prompt-key render), so graded_at "
-    "can lag more recent renders whose inputs hashed identically. Grades "
-    "reflect the plan active at that render, not a retroactive regrade, and "
-    "a fresh live render may show a slightly different grade."
+    "can lag more recent renders whose inputs hashed identically. Ratings "
+    "reflect the plan active at that render, not a retroactive re-rating, and "
+    "a fresh live render may show a slightly different score."
+)
+
+#: What a 5 means, carried in the payload so an agent summarising a card aloud
+#: cannot drop the claim the card makes about itself. See visuals for why the
+#: review-score connotation has to be corrected explicitly rather than trusted.
+_STAR_SCALE_NOTE = (
+    "5 stars = the day was executed as prescribed. A compliance score, not a "
+    "verdict on how good the run was."
 )
 
 
@@ -4128,8 +4147,9 @@ _CARD_SNAPSHOT_NOTE = (
     "list_report_cards",
     "Past workout report cards (stored snapshots), newest run first. One call "
     "answers 'how have my quality days trended' — each row carries the "
-    "overall grade, GPA and the four metric grades without re-grading "
-    "anything. Filter by date range and/or intent_class "
+    "overall 1-5 star score and the four metric scores without re-rating "
+    "anything. Rows stored before 0.50.0 carry the retired letter grade "
+    "instead and have null stars. Filter by date range and/or intent_class "
     "(easy|long|quality|steady). Use get_report_card for one card's full "
     "detail and the coach's read. History accumulates as cards are rendered "
     "(no backfill), so older activities may have no row. "
@@ -4185,16 +4205,17 @@ async def list_report_cards(args: dict) -> dict:
             "graded_at": r["graded_at"],
             "intent": r["intent"],
             "intent_class": r["intent_class"],
-            "overall": r["overall_grade"],
-            "gpa": r["gpa"],
-            "capped_by": r["capped_by"],
-            "grades": {
-                "distance": r["distance_grade"],
-                "pace": r["pace_grade"],
-                "hr": r["hr_grade"],
-                "continuity": r["continuity_grade"],
-                "load": r["load_grade"],
+            "overall": r["overall_stars"],
+            "mean_stars": r["mean_stars"],
+            "capped_by": r["capped_by_metric"],
+            "stars": {
+                "distance": r["distance_stars"],
+                "pace": r["pace_stars"],
+                "hr": r["hr_stars"],
+                "continuity": r["continuity_stars"],
             },
+            # Pre-0.50.0 rows only; null on everything rated since.
+            "legacy_grade": r["overall_grade"],
         }
         for r in rows
     ]

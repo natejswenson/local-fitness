@@ -12,7 +12,7 @@ import io
 import pdfplumber
 import pytest
 
-from local_fitness.agent import visuals
+from local_fitness.agent import branding, report_card, visuals
 from local_fitness.agent.schemas import Brief, Takeaway, TakeawayMetric
 
 _SERIES = [
@@ -717,6 +717,98 @@ def test_report_card_is_always_exactly_one_page(n_splits):
     assert pages == 1
     with pdfplumber.open(io.BytesIO(pdf)) as doc:
         assert len(doc.pages) == 1
+
+
+def test_the_widest_possible_rating_column_still_fits_one_page():
+    """The 0.50.0 worst case, which is NOT in the stored corpus.
+
+    A star row is ~7.8x the ink of a letter, and it is WIDEST when every metric
+    scores a full 5.00 — five filled stars plus a four-character numeral on
+    every row, with nothing abstaining to shorten one. Pair that with the
+    14-split half marathon and a read at the full word budget and this is the
+    largest card the ladder can be asked to fit.
+
+    Measured across the 16 stored cards the change moved exactly one rung on
+    one card; this asserts the ladder still has room past that.
+    """
+    card = _report_card_with_splits(14)
+    for metric in card["metrics"].values():
+        if metric.get("stars") is not None:
+            metric["stars"] = 5.0
+    card["overall"] = {"stars": 5.0, "mean_stars": 5.0, "capped": False,
+                       "capped_by": None, "graded_metrics": 4}
+    card["coach_read"] = {
+        key: ("Forty-five words is the budget and this paragraph spends every "
+              "one of them, because the read is the swing factor in which rung "
+              "of the density ladder a card lands on and a short one would not "
+              "test the thing this case exists to test at all here.")
+        for key, _label in report_card.READ_SECTIONS
+    }
+    pdf, pages = visuals.render_report_card_pdf(
+        card, visuals.render_split_hr_png(card))
+    assert pages == 1
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        assert len(doc.pages) == 1
+
+
+def test_a_partial_star_is_drawn_with_the_area_linearised_cut():
+    """Star ink is not uniform in x: clipping the fill at 75% of the bounding
+    box leaves 89.6% of the ink, which made a 4.75 indistinguishable from a
+    5.00 in the first prototype. The cut table is what fixes it, and a
+    "simplification" to 20*f would silently undo the fix.
+    """
+    svg = visuals.star_row(4.75, uid="t", ink="#181510", em=1.0)
+    assert f'width="{visuals._STAR_CUTS[0.75]}"' in svg
+    # ...and that is materially left of the naive 75%-of-20 cut.
+    assert visuals._STAR_CUTS[0.75] < 0.75 * visuals._STAR_BOX
+    # Four full stars carry no clipPath at all; only the partial one does.
+    assert svg.count("clipPath") == 2          # the <clipPath> open + close tag
+    assert svg.count('clip-path="url(') == 1
+
+
+def test_every_star_is_outlined_so_an_unearned_star_is_still_a_rule():
+    """PRESS: the empty portion of the row is an ink rule, never a tint or a
+    grey track. Five outlines always, however low the score."""
+    svg = visuals.star_row(1.0, uid="t", ink="#181510", em=1.0)
+    assert svg.count('fill="none" stroke="#181510"') == 5
+    assert svg.count('fill="#181510"/>') == 1      # exactly one filled star
+
+
+def test_a_row_at_or_under_the_critical_score_takes_the_accent():
+    """The accent's whole job on this card. Zero orange on a good day is
+    on-brand, so this must fire ONLY at the bottom of the scale."""
+    theme = branding.load_theme()
+    accent = theme["colors"]["accent"]
+    bad = visuals.star_cell(1.5, uid="a", theme=theme, em=1.0)
+    good = visuals.star_cell(4.0, uid="b", theme=theme, em=1.0)
+    assert accent in bad and "star-num crit" in bad
+    assert accent not in good
+    # The boundary itself is critical; a hair above it is not.
+    assert accent in visuals.star_cell(
+        visuals.STAR_CRITICAL, uid="c", theme=theme, em=1.0)
+    assert accent not in visuals.star_cell(
+        visuals.STAR_CRITICAL + 0.01, uid="d", theme=theme, em=1.0)
+
+
+def test_an_unrated_metric_never_draws_an_empty_star_row():
+    """n/a is on MOST cards — continuity abstains on 83% of history — and five
+    empty stars would read as a score of zero, the loudest possible statement
+    of failure on a row where nothing was measured."""
+    theme = branding.load_theme()
+    cell = visuals.star_cell(None, uid="x", theme=theme, em=1.0)
+    assert "stars-na" in cell and "n/a" in cell
+    assert "<svg" not in cell
+    assert theme["colors"]["accent"] not in cell
+
+
+def test_star_row_ids_are_namespaced_per_row():
+    """WeasyPrint resolves url(#id) in DOCUMENT scope, so colliding clipPath
+    ids would let one row clip another."""
+    a = visuals.star_row(4.5, uid="mdistance_", ink="#000", em=1.0)
+    b = visuals.star_row(4.5, uid="mpace_", ink="#000", em=1.0)
+    assert 'id="mdistance_4"' in a
+    assert 'id="mpace_4"' in b
+    assert "mdistance_" not in b
 
 
 def test_split_chart_is_capped_by_height_not_only_width():

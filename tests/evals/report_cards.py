@@ -64,22 +64,28 @@ SCENARIOS = (
 
 
 #: The verdict each scenario must produce, as a BOUND rather than an exact
-#: letter. A bound is what the contract actually is — "a run that obeyed its
+#: score. A bound is what the contract actually is — "a run that obeyed its
 #: prescription must not be marked down" — and it survives the ordinary
-#: recalibration that an exact letter would fight. Grades compare by
-#: ``GRADE_POINTS`` on the base letter.
+#: recalibration that an exact value would fight.
+#:
+#: Restated in stars at 0.50.0. The bounds are the SAME contract at the same
+#: strength: the old letters mapped to the star scale through
+#: ``STAR_VERDICT_CUTS``, so "at least a B" became "at least 3.50" and "at most
+#: a C" became "at most 3.49" — a max is the top of the band it named, minus a
+#: hair, because a bound that admitted the whole B band would be looser than the
+#: letter it replaced.
 #:
 #: Adding a scenario without an entry here fails
 #: ``test_every_scenario_declares_a_verdict``, which is what keeps this table
 #: the single place a report card's expected behavior is written down.
 EXPECTED_VERDICTS: dict[str, dict] = {
     "obedient_easy_clean": {
-        "min": "A",
+        "min_stars": 4.25,
         "why": "Distance, pace and HR all on prescription, never near the cap. "
                "There is no defensible reading in which this is not an A.",
     },
     "obedient_easy_straddling": {
-        "min": "B",
+        "min_stars": 3.50,
         "why": "THE 2026-08-02 guard. The average obeyed a stated 140 ceiling "
                "and the run sat 1-3 bpm over it for 60% of its duration. That "
                "is compliance with noise on top, not disobedience. 0.40.0 "
@@ -87,20 +93,20 @@ EXPECTED_VERDICTS: dict[str, dict] = {
                "looked straight at it and changed only the row's wording.",
     },
     "cap_blown_hard": {
-        "max": "C",
+        "max_stars": 3.49,
         "why": "15 bpm over a stated ceiling, sustained, peaking 25 over. The "
                "cap has to bite here or the straddling fix has simply "
                "disabled the metric.",
     },
     "interval_manual_laps": {
-        "min": "B",
+        "min_stars": 3.50,
         "why": "Reps hit at the prescribed pace. The run AVERAGE is 2:19/mi "
                "slower than rep pace by construction (warmup + cooldown are "
                "in it), so grading the average guarantees an F on a session "
                "that was executed correctly.",
     },
     "walk_mislabelled": {
-        "min": "B",
+        "min_stars": 3.50,
         "why": "An ordinary easy run whose 60-day pool is 30 walking-desk "
                "sessions to 16 runs, all labelled `treadmill_running`. If the "
                "walks reach the median the yardstick becomes a 15:00/mi walk "

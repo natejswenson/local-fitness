@@ -200,21 +200,21 @@ def test_notables_quality_done_and_overachieve_boundary():
 # callback that contradicts its own report-card memory (0.38.2 fix).
 
 
-def test_notables_suppresses_quality_done_when_same_date_card_grades_d():
+def test_notables_suppresses_quality_done_when_same_date_card_rates_badly():
     graded = [_w("2026-07-21", "done", "interval")]
-    cards = [_card("2026-07-21", 1.05, "D")]
+    cards = [_card("2026-07-21", 1.8)]
     assert ledger.notable_results(graded, TODAY, cards=cards) == []
 
 
-def test_notables_suppresses_quality_done_for_an_f_card_too():
+def test_notables_suppresses_quality_done_for_a_floored_card_too():
     graded = [_w("2026-07-21", "done", "tempo")]
-    cards = [_card("2026-07-21", 0.7, "F")]
+    cards = [_card("2026-07-21", 1.0)]
     assert ledger.notable_results(graded, TODAY, cards=cards) == []
 
 
-def test_notables_keeps_quality_done_when_same_date_card_grades_a():
+def test_notables_keeps_quality_done_when_same_date_card_rates_well():
     graded = [_w("2026-07-21", "done", "interval")]
-    cards = [_card("2026-07-21", 4.0, "A")]
+    cards = [_card("2026-07-21", 4.6)]
     assert ledger.notable_results(graded, TODAY, cards=cards) == [
         {"date": "2026-07-21", "type": "interval", "kind": "quality_done"},
     ]
@@ -223,7 +223,7 @@ def test_notables_keeps_quality_done_when_same_date_card_grades_a():
 def test_notables_keeps_quality_done_when_no_card_for_that_date():
     graded = [_w("2026-07-21", "done", "interval")]
     # A card exists, but for a different date — must not suppress.
-    cards = [_card("2026-07-20", 1.0, "D")]
+    cards = [_card("2026-07-20", 1.5)]
     assert ledger.notable_results(graded, TODAY, cards=cards) == [
         {"date": "2026-07-21", "type": "interval", "kind": "quality_done"},
     ]
@@ -283,7 +283,7 @@ def test_notables_suppression_is_scoped_to_quality_done_not_overachieved():
     """An overachieved easy day isn't the receipt this suppresses — it isn't
     claiming 'done as prescribed' the way a quality day's callback does."""
     graded = [_w("2026-07-20", "done", "easy", target_m=5000, actual_m=5500)]
-    cards = [_card("2026-07-20", 1.0, "D")]
+    cards = [_card("2026-07-20", 1.5)]
     assert ledger.notable_results(graded, TODAY, cards=cards) == [
         {"date": "2026-07-20", "type": "easy", "kind": "overachieved"},
     ]
@@ -372,14 +372,14 @@ def test_compute_relationship_ledger_from_a_seeded_db(tmp_path, monkeypatch):
 # --- report_card_facts -------------------------------------------------------
 
 
-def _card(day: str, gpa: float | None, grade: str | None) -> dict:
-    return {"activity_date": day, "gpa": gpa, "overall_grade": grade}
+def _card(day: str, stars: float | None) -> dict:
+    return {"activity_date": day, "overall_stars": stars}
 
 
 def test_card_facts_empty_is_zeroed():
     facts = ledger.report_card_facts([], TODAY)
     assert facts == {
-        "count": 0, "mean_gpa": None, "grade_counts": {},
+        "count": 0, "mean_stars": None, "verdict_counts": {},
         "trend": "no data", "window_days": ledger._CARD_WINDOW_DAYS,
     }
     led = ledger.compute_ledger(
@@ -391,14 +391,14 @@ def test_card_facts_empty_is_zeroed():
 
 def test_card_facts_excludes_today_and_future():
     cards = [
-        _card(TODAY, 4.0, "A"),                                    # today: out
-        _card("2026-07-24", 4.0, "A"),                              # tomorrow: out
-        _card("2026-07-22", 3.0, "B"),                              # yesterday: in
-        _card("2026-07-21", 2.0, "C"),                              # 2 days back: in
+        _card(TODAY, 5.0),                     # today: out
+        _card("2026-07-24", 5.0),              # tomorrow: out
+        _card("2026-07-22", 4.0),              # yesterday: in
+        _card("2026-07-21", 3.0),              # 2 days back: in
     ]
     facts = ledger.report_card_facts(cards, TODAY)
     assert facts["count"] == 2
-    assert facts["mean_gpa"] == 2.5
+    assert facts["mean_stars"] == 3.5
 
 
 def test_card_facts_window_edge_day21_in_day22_out():
@@ -406,55 +406,72 @@ def test_card_facts_window_edge_day21_in_day22_out():
     edge_in = (t - timedelta(days=ledger._CARD_WINDOW_DAYS)).isoformat()
     edge_out = (t - timedelta(days=ledger._CARD_WINDOW_DAYS + 1)).isoformat()
     facts = ledger.report_card_facts(
-        [_card(edge_in, 3.0, "B"), _card(edge_out, 4.0, "A")], TODAY)
+        [_card(edge_in, 4.0), _card(edge_out, 5.0)], TODAY)
     assert facts["count"] == 1
-    assert facts["mean_gpa"] == 3.0
+    assert facts["mean_stars"] == 4.0
 
 
-def test_card_facts_mean_gpa_and_base_letter_counts():
+def test_card_facts_mean_stars_and_verdict_counts():
     cards = [
-        _card("2026-07-22", 3.3, "B+"),
-        _card("2026-07-21", 2.7, "B-"),
-        _card("2026-07-20", None, "C"),   # no gpa: skipped entirely
-        _card("2026-07-19", 1.0, None),   # no grade: skipped entirely
-        _card("2026-07-18", 4.0, "A"),
+        _card("2026-07-22", 4.4),
+        _card("2026-07-21", 3.8),
+        _card("2026-07-20", None),        # no score: skipped entirely
+        _card("2026-07-18", 4.95),
     ]
     facts = ledger.report_card_facts(cards, TODAY)
     assert facts["count"] == 3
-    assert facts["mean_gpa"] == round((3.3 + 2.7 + 4.0) / 3, 2)
-    assert facts["grade_counts"] == {"B": 2, "A": 1}
+    assert facts["mean_stars"] == round((4.4 + 3.8 + 4.95) / 3, 2)
+    # Bucketed by VERDICT WORD, not by quarter star: this line is read aloud.
+    assert facts["verdict_counts"] == {
+        "on target": 1, "slightly off target": 1, "dead on": 1}
+
+
+def test_a_pre_star_card_is_skipped_not_synthesized():
+    """The 0.50.0 cutover, handled by the existing skip rather than a migration.
+
+    A card stored under the letter rubric has overall_stars NULL. Inventing a
+    star score from its stored letter would mix two scales inside one mean —
+    the exact category error this module keeps getting burned by — so it drops
+    out until the card is re-rendered.
+    """
+    legacy = {"activity_date": "2026-07-22", "gpa": 4.0, "overall_grade": "A",
+              "overall_stars": None}
+    assert ledger.report_card_facts([legacy], TODAY)["count"] == 0
+    assert ledger.report_card_facts(
+        [legacy, _card("2026-07-21", 3.0)], TODAY)["mean_stars"] == 3.0
 
 
 def test_card_facts_trend_halves_and_min_count():
     # Recent half (days 1-10 back) averages well above earlier (11-21 back).
-    recent = [_card(f"2026-07-{22 - i:02d}", 3.8, "A") for i in range(3)]
-    earlier = [_card(f"2026-07-{10 - i:02d}", 2.0, "C") for i in range(3)]
+    recent = [_card(f"2026-07-{22 - i:02d}", 4.8) for i in range(3)]
+    earlier = [_card(f"2026-07-{10 - i:02d}", 3.0) for i in range(3)]
     facts = ledger.report_card_facts(recent + earlier, TODAY)
     assert facts["trend"] == "rising"
 
-    flat = ([_card("2026-07-22", 3.0, "B")] * 2
-            + [_card("2026-07-10", 3.0, "B")] * 2)
+    flat = ([_card("2026-07-22", 4.0)] * 2
+            + [_card("2026-07-10", 4.0)] * 2)
     assert ledger.report_card_facts(flat, TODAY)["trend"] == "flat"
 
     # Only 1 card in the earlier half: under-populated, no trend claimed.
-    under = [_card("2026-07-22", 3.0, "B"), _card("2026-07-21", 3.5, "B"),
-              _card("2026-07-10", 2.0, "C")]
+    under = [_card("2026-07-22", 4.0), _card("2026-07-21", 4.5),
+              _card("2026-07-10", 3.0)]
     assert ledger.report_card_facts(under, TODAY)["trend"] == "no data"
 
 
 def test_render_ledger_pins_the_card_line():
-    facts = {"count": 5, "mean_gpa": 3.12,
-              "grade_counts": {"A": 2, "B": 2, "F": 1},
+    facts = {"count": 5, "mean_stars": 4.12,
+              "verdict_counts": {"on target": 2, "slightly off target": 2,
+                                 "missed badly": 1},
               "trend": "rising", "window_days": 21}
     led = {"as_of": TODAY, "plan": {}, "steps": {}, "patterns": [],
            "notables": [], "cards": facts}
     block = ledger.render_ledger_block(led, "Alex")
-    assert ("- Report cards: 5 workouts graded in the last 3 weeks "
-            "(through yesterday) — avg GPA 3.12 (A:2 B:2 F:1); grades "
-            "rising.") in block
+    assert ("- Report cards: 5 workouts rated in the last 3 weeks "
+            "(through yesterday) — avg 4.12 of 5 (2 on target, 2 slightly off "
+            "target, 1 missed badly); ratings rising.") in block
 
     # Below the render floor: no line at all.
-    one = {"count": 1, "mean_gpa": 4.0, "grade_counts": {"A": 1},
+    one = {"count": 1, "mean_stars": 5.0, "verdict_counts": {"dead on": 1},
            "trend": "no data", "window_days": 21}
     led_one = {"as_of": TODAY, "plan": {}, "steps": {}, "patterns": [],
                "notables": [], "cards": one}
@@ -467,29 +484,29 @@ def test_compute_relationship_ledger_reads_report_cards_table(tmp_path, monkeypa
     db.init_schema(p)
     today = date.today()
 
-    def _insert(conn, back, gpa, grade):
+    def _insert(conn, back, stars):
         d = (today - timedelta(days=back)).isoformat()
         conn.execute(
             "INSERT INTO report_cards (activity_id, activity_date, graded_at, "
-            "overall_grade, gpa, card_json) VALUES (?, ?, ?, ?, ?, '{}')",
-            (1000 + back, d, "2026-07-01T00:00:00", grade, gpa),
+            "overall_stars, card_json) VALUES (?, ?, ?, ?, '{}')",
+            (1000 + back, d, "2026-07-01T00:00:00", stars),
         )
 
     with db.connect(p) as conn:
-        _insert(conn, 0, 4.0, "A")   # today: must be excluded
-        _insert(conn, 1, 3.0, "B")
-        _insert(conn, 2, 3.5, "A")
-        _insert(conn, 3, 2.0, "C")
+        _insert(conn, 0, 5.0)        # today: must be excluded
+        _insert(conn, 1, 4.0)
+        _insert(conn, 2, 4.5)
+        _insert(conn, 3, 3.0)
 
     led = ledger.compute_relationship_ledger(db_path=p)
     assert led["cards"]["count"] == 3
-    assert "Report cards: 3 workouts graded" in ledger.render_ledger_block(led, "Alex")
+    assert "Report cards: 3 workouts rated" in ledger.render_ledger_block(led, "Alex")
 
 
 def test_compute_relationship_ledger_wires_cards_into_notables(tmp_path, monkeypatch):
     """Integration: the divider passes the already-loaded report_cards rows
-    into notable_results (no second DB round trip), so a same-date D card
-    suppresses the false 'done as prescribed' receipt end-to-end."""
+    into notable_results (no second DB round trip), so a same-date badly-rated
+    card suppresses the false 'done as prescribed' receipt end-to-end."""
     from local_fitness import plans as plans_mod
 
     p = tmp_path / "fitness.db"
@@ -510,8 +527,8 @@ def test_compute_relationship_ledger_wires_cards_into_notables(tmp_path, monkeyp
     with db.connect(p) as conn:
         conn.execute(
             "INSERT INTO report_cards (activity_id, activity_date, graded_at, "
-            "overall_grade, gpa, card_json) VALUES (?, ?, ?, ?, ?, '{}')",
-            (5001, workout_date, "2026-07-01T00:00:00", "D", 1.1),
+            "overall_stars, card_json) VALUES (?, ?, ?, ?, '{}')",
+            (5001, workout_date, "2026-07-01T00:00:00", ledger.BAD_CARD_MAX_STARS),
         )
 
     led = ledger.compute_relationship_ledger(db_path=p)
