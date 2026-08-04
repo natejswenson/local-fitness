@@ -3810,7 +3810,7 @@ def test_report_card_without_splits_still_grades_and_still_renders(rc_seeded, re
     payload, err = call(tools.workout_report_card, {})
     assert not err
     assert payload["splits_available"] is False
-    assert payload["overall"]["grade"] != "n/a"      # grades are unaffected
+    assert payload["overall"]["stars"] is not None   # ratings are unaffected
     assert Path(payload["path"]).read_bytes()[:5] == b"%PDF-"
     assert "No per-mile splits recorded" in payload["markdown"]
 
@@ -3820,8 +3820,11 @@ def test_report_card_insufficient_history_grades_nothing(seeded, reports_tmp):
     payload, err = call(tools.workout_report_card, {"format": "table"})
     assert not err
     assert payload["reference"] == "insufficient_data"
-    assert payload["overall"]["grade"] == "n/a"
-    assert set(payload["grades"].values()) == {None}
+    assert payload["overall"]["stars"] is None
+    assert set(payload["stars"].values()) == {None}
+    # ...and the rendered strings say so rather than drawing an empty row.
+    assert set(payload["ratings"].values()) == {"n/a"}
+    assert payload["overall_rating"] == "n/a"
 
 
 def test_report_card_reports_a_double_day(rc_seeded, reports_tmp):
@@ -3948,11 +3951,15 @@ def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monke
     for para in ("You covered the ground.", "Too quick.", "Stayed low.",
                  "Banked what it should."):
         assert para in text
-    # They sit under the GPA/distance/pace line inside the hero, in table order.
-    assert text.index("4.00 GPA") < text.index("You covered the ground.")
+    # They sit under the hero band — score, meta line, scale note — in table
+    # order. The score is the first thing on the page after the run's name.
+    assert text.index("/ 5") < text.index("You covered the ground.")
     assert text.index("You covered the ground.") < text.index("Too quick.")
-    # The GPA explainer was removed — the number stands on its own.
-    assert "weighted 4.0 scale" not in text
+    # The card states what a 5 means, on the page and not only in the payload.
+    assert "compliance score" in text
+    assert text.index("compliance score") < text.index("You covered the ground.")
+    # No letter rubric survives on the page.
+    assert "GPA" not in text
 
 
 def test_report_card_pdf_splits_table_has_no_distance_column(rc_seeded, reports_tmp):
@@ -4378,8 +4385,8 @@ def test_report_card_render_persists_a_real_read_snapshot(
     row = _rc_raw_row(1)
     assert row is not None
     assert row["read_cache_key"] is not None
-    assert row["overall_grade"] == payload["overall"]["grade"]
-    assert row["distance_grade"] == payload["grades"]["distance"]
+    assert row["overall_stars"] == payload["overall"]["stars"]
+    assert row["distance_stars"] == payload["stars"]["distance"]
     stored = json.loads(row["card_json"])
     assert stored["coach_read"]["distance"] == "covered the ground today."
 
@@ -4493,11 +4500,12 @@ def test_list_report_cards_payload_filters_and_order(rc_cards, reports_tmp, monk
     # activity 103 is 3 days ago, 105 is 5 days ago — newest run first.
     assert [c["activity_id"] for c in payload["cards"]] == [103, 105]
     top = payload["cards"][0]
-    assert set(top["grades"]) == {"distance", "pace", "hr", "continuity", "load"}
-    # `load` is present as a key but is always NULL from 0.40.0 — it is a
-    # stimulus metric now. Every other key is a real compliance grade.
-    assert top["grades"]["load"] is None
+    # Four compliance metrics. `load` is absent entirely — it carries no score
+    # (0.40.0), and a key that is always null invites a reader to look for one.
+    assert set(top["stars"]) == {"distance", "pace", "hr", "continuity"}
     assert top["overall"] is not None and top["graded_at"]
+    # A card rated under the star rubric has no legacy letter.
+    assert top["legacy_grade"] is None
     # The date filter pins actual rows, not just a count.
     cutoff = (date.today() - timedelta(days=4)).isoformat()
     payload, err = call(tools.list_report_cards, {"start_date": cutoff})
@@ -4524,7 +4532,7 @@ def test_get_report_card_returns_the_stored_snapshot_verbatim(
     assert payload["graded_at"]
     assert payload["markdown"].startswith("# Report Card")
     assert payload["coach_read"]["distance"] == "covered the ground today."
-    assert payload["card"]["overall"]["grade"] == rendered["overall"]["grade"]
+    assert payload["card"]["overall"]["stars"] == rendered["overall"]["stars"]
 
 
 def test_card_query_tools_are_shared_not_local_only():

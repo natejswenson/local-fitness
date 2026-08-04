@@ -65,27 +65,40 @@ _STRIPPED_KEYS = ("hr_trace", "recent_activities", "upcoming_workouts")
 
 INTENT_CLASSES = ("easy", "long", "quality", "steady")
 
+#: The pre-0.50.0 letter columns are still selected. They are the only record
+#: of what a card stored under the letter rubric actually said, and a card is a
+#: historical snapshot with no backfill path by design.
 _LIST_COLUMNS = (
     "activity_id, activity_date, graded_at, intent, intent_class, "
-    "intent_source, overall_grade, gpa, capped_by, distance_grade, "
+    "intent_source, overall_stars, mean_stars, capped_by_metric, "
+    "distance_stars, pace_stars, hr_stars, continuity_stars, "
+    "overall_grade, gpa, capped_by, distance_grade, "
     "pace_grade, hr_grade, continuity_grade, load_grade"
 )
 
 # The branch rules live entirely in this WHERE guard — no SELECT precedes the
 # write, so there is no read-modify-write window inside save_card. Walking it:
 # equal non-NULL keys satisfy neither disjunct (keyed no-op); a differing or
-# first real key satisfies the first (full overwrite, words+grades from ONE
+# first real key satisfies the first (full overwrite, words+ratings from ONE
 # render); a NULL key over a real row satisfies neither (a fallback can never
 # null a real key); NULL over NULL satisfies the second (an all-fallback row
-# refreshes its grades). With no existing row the INSERT simply proceeds.
+# refreshes its ratings). With no existing row the INSERT simply proceeds.
+#
+# The letter columns are written as NULL from 0.50.0 on. A row re-rendered
+# under the star rubric therefore loses its stored letters — correct, because
+# that row IS the new render; only rows never re-rendered keep theirs.
 _UPSERT_SQL = """
 INSERT INTO report_cards
     (activity_id, activity_date, graded_at, intent, intent_class,
-     intent_source, overall_grade, gpa, capped_by, distance_grade,
+     intent_source, overall_stars, mean_stars, capped_by_metric,
+     distance_stars, pace_stars, hr_stars, continuity_stars,
+     overall_grade, gpa, capped_by, distance_grade,
      pace_grade, hr_grade, continuity_grade, load_grade, read_cache_key,
      card_json)
 VALUES (:activity_id, :activity_date, :graded_at, :intent, :intent_class,
-     :intent_source, :overall_grade, :gpa, :capped_by, :distance_grade,
+     :intent_source, :overall_stars, :mean_stars, :capped_by_metric,
+     :distance_stars, :pace_stars, :hr_stars, :continuity_stars,
+     :overall_grade, :gpa, :capped_by, :distance_grade,
      :pace_grade, :hr_grade, :continuity_grade, :load_grade, :read_cache_key,
      :card_json)
 ON CONFLICT(activity_id) DO UPDATE SET
@@ -94,6 +107,13 @@ ON CONFLICT(activity_id) DO UPDATE SET
     intent         = excluded.intent,
     intent_class   = excluded.intent_class,
     intent_source  = excluded.intent_source,
+    overall_stars  = excluded.overall_stars,
+    mean_stars     = excluded.mean_stars,
+    capped_by_metric = excluded.capped_by_metric,
+    distance_stars = excluded.distance_stars,
+    pace_stars     = excluded.pace_stars,
+    hr_stars       = excluded.hr_stars,
+    continuity_stars = excluded.continuity_stars,
     overall_grade  = excluded.overall_grade,
     gpa            = excluded.gpa,
     capped_by      = excluded.capped_by,
@@ -123,9 +143,10 @@ def card_row(card: dict, *, read_cache_key: str | None) -> dict:
     overall = card.get("overall") or {}
     metrics = card.get("metrics") or {}
 
-    def _grade(key: str) -> str | None:
-        return (metrics.get(key) or {}).get("grade")
+    def _stars(key: str) -> float | None:
+        return (metrics.get(key) or {}).get("stars")
 
+    capped_by = overall.get("capped_by")
     stored = {k: v for k, v in card.items() if k not in _STRIPPED_KEYS}
     return {
         "activity_id": activity.get("activity_id"),
@@ -133,18 +154,30 @@ def card_row(card: dict, *, read_cache_key: str | None) -> dict:
         "intent": card.get("intent"),
         "intent_class": card.get("intent_class"),
         "intent_source": card.get("intent_source"),
-        "overall_grade": overall.get("grade"),
-        "gpa": overall.get("gpa"),
-        "capped_by": overall.get("capped_by"),
-        "distance_grade": _grade("distance"),
-        "pace_grade": _grade("pace"),
-        "hr_grade": _grade("hr"),
-        "continuity_grade": _grade("continuity"),
-        # Always NULL from 0.40.0 on — load is a stimulus metric and carries no
-        # grade. The column is retained rather than dropped because rows graded
-        # before the split hold real letters, and a SQLite column drop is a table
-        # rebuild for no gain.
-        "load_grade": _grade("load"),
+        "overall_stars": overall.get("stars"),
+        "mean_stars": overall.get("mean_stars"),
+        # The metric NAME that pulled the overall down, or NULL. The old
+        # `capped_by` held the literal "F"; naming the metric says which row to
+        # look at, which is the only reason a reader wants the field.
+        "capped_by_metric": (capped_by or {}).get("metric")
+        if isinstance(capped_by, dict) else None,
+        "distance_stars": _stars("distance"),
+        "pace_stars": _stars("pace"),
+        "hr_stars": _stars("hr"),
+        "continuity_stars": _stars("continuity"),
+        # The letter columns stop being written at 0.50.0. Retained rather than
+        # dropped because rows stored under the letter rubric hold real letters
+        # and are the only record of them, and a SQLite column drop is a table
+        # rebuild for no gain — the same reasoning that kept `load_grade` when
+        # load stopped being graded in 0.40.0.
+        "overall_grade": None,
+        "gpa": None,
+        "capped_by": None,
+        "distance_grade": None,
+        "pace_grade": None,
+        "hr_grade": None,
+        "continuity_grade": None,
+        "load_grade": None,
         "read_cache_key": read_cache_key,
         "card_json": json.dumps(stored, default=str),
     }

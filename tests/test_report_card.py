@@ -37,39 +37,134 @@ def card_for(activity, *, plan=None, reference=REF, splits=()):
 # --- the band table --------------------------------------------------------
 
 @pytest.mark.parametrize("d,expected", [
-    (0.0, "A"), (0.05, "A"), (0.0500000001, "A"),   # boundary lands in A
-    (0.06, "B"), (0.10, "B"),
-    (0.11, "C"), (0.20, "C"),
-    (0.21, "D"), (0.35, "D"),
-    (0.36, "F"), (5.0, "F"),
+    # Every knot lands exactly on its anchor. These ARE the old GRADE_BANDS
+    # boundaries, so a curve that stops passing here has moved a boundary the
+    # rubric was calibrated on — including the one HR_CAP_BPM_SCALE depends on.
+    (0.0, 5.0),
+    (0.05, 4.0),
+    (0.10, 3.0),
+    (0.20, 2.0),
+    (0.35, 1.0),
+    (0.50, 1.0),      # saturates, never extrapolates
+    (5.0, 1.0),
 ])
-def test_grade_band_boundaries(d, expected):
-    assert rc.base_letter(rc.grade_from_deviation(d)) == expected
+def test_star_curve_hits_every_knot_exactly(d, expected):
+    assert rc.stars_from_deviation(d, "hr") == pytest.approx(expected)
 
 
-def test_grade_none_in_none_out():
-    assert rc.grade_from_deviation(None) is None
+def test_star_curve_is_none_in_none_out():
+    assert rc.stars_from_deviation(None, "hr") is None
 
 
-def test_grade_modifier_tracks_position_in_band():
-    # A band spans (0, 0.05]: bottom third "+", top third "-".
-    assert rc.grade_from_deviation(0.005) == "A+"
-    assert rc.grade_from_deviation(0.025) == "A"
-    assert rc.grade_from_deviation(0.048) == "A-"
-    # F is unbounded above, so it carries no modifier.
-    assert rc.grade_from_deviation(2.0) == "F"
+def test_star_curve_interpolates_inside_a_band():
+    """The whole point of the change: sub-band position survives instead of
+    collapsing to one letter plus a +/- that got stripped before the mean."""
+    quarter = rc.stars_from_deviation(0.0125, "hr")
+    half = rc.stars_from_deviation(0.025, "hr")
+    three_q = rc.stars_from_deviation(0.0375, "hr")
+    assert quarter == pytest.approx(4.75)
+    assert half == pytest.approx(4.5)
+    assert three_q == pytest.approx(4.25)
+    assert quarter > half > three_q
 
 
-def test_widen_scales_every_boundary():
-    # 0.07 is a B normally; widened 1.5x the A band reaches 0.075.
-    assert rc.base_letter(rc.grade_from_deviation(0.07)) == "B"
-    assert rc.base_letter(rc.grade_from_deviation(0.07, rc.STEADY_WIDEN)) == "A"
+def test_star_curve_is_monotone_non_increasing():
+    """A worse deviation can never score better. Swept across the whole live
+    range at a resolution finer than any band."""
+    prev = rc.STAR_MAX + 1
+    d = 0.0
+    while d <= 1.0:
+        s = rc.stars_from_deviation(d, "hr")
+        assert s <= prev + 1e-9, f"score rose at d={d}"
+        assert rc.STAR_FLOOR <= s <= rc.STAR_MAX
+        prev = s
+        d += 0.001
 
 
-def test_base_letter_strips_modifier():
-    assert rc.base_letter("B+") == "B"
-    assert rc.base_letter("D-") == "D"
-    assert rc.base_letter(None) is None
+def test_widen_scales_the_whole_curve():
+    # 0.07 scores 3.5 normally; widened 1.5x it is comfortably higher, and
+    # tightened to a plan's 0.6 it is materially lower. Same deviation, three
+    # yardsticks — see stars_from_deviation for why that spread is deliberate.
+    assert rc.stars_from_deviation(0.07, "hr") == pytest.approx(3.6)
+    assert rc.stars_from_deviation(0.07, "hr", rc.STEADY_WIDEN) > 4.0
+    assert rc.stars_from_deviation(0.07, "hr", rc.PLAN_TIGHTEN) < 3.0
+
+
+def test_the_noise_floor_keeps_gps_wobble_at_a_clean_five():
+    """A plan distance is two-sided, so it has no exact zeros — 13 of the 17
+    plan-referenced runs in the live window sit at d = 0.0002..0.004, which is
+    GPS wobble. Those must read a clean 5.00, or the card prints a partial star
+    beside a Delta cell that says "on target"."""
+    for d in (0.0002, 0.0011, 0.004, 0.0074):
+        assert rc.stars_from_deviation(d, "distance") == rc.STAR_MAX
+    # ...and the floor is a floor, not a free pass: past it, scoring resumes.
+    assert rc.stars_from_deviation(0.02, "distance") < rc.STAR_MAX
+    # HR and continuity subtract their own floor upstream, so they get none
+    # here — a second floor would move the 11.3 bpm cap boundary.
+    assert rc.STAR_NOISE["hr"] == 0.0
+    assert rc.STAR_NOISE["continuity"] == 0.0
+    assert rc.stars_from_deviation(0.004, "hr") < rc.STAR_MAX
+
+
+def test_display_stars_never_fakes_or_swallows_a_partial():
+    """A full star means the metric earned a full star, and a partial is always
+    visibly partial — the clamp holds at .01/.99 where plain rounding fails,
+    which is exactly where this distribution puts its mass."""
+    assert rc.display_stars(5.0) == 5.0
+    assert rc.display_stars(4.99) == 4.75      # never rounds up to a full star
+    assert rc.display_stars(4.01) == 4.25      # never rounds down to a bare gap
+    assert rc.display_stars(4.5) == 4.5
+    assert rc.display_stars(3.6) == 3.5
+    assert rc.display_stars(None) is None
+    # Banker's rounding would give 4.00 here; floor-then-clamp gives 4.25.
+    assert rc.display_stars(4.125) == 4.25
+
+
+def test_star_bucket_is_not_display_stars():
+    """The gate's bucket is plain half-up over the whole range. If it used
+    display_stars' clamp, every 4.99 would fall into 4.75 and the top bucket
+    would read empty on a perfectly healthy metric."""
+    assert rc.star_bucket(4.99) == 5.0
+    assert rc.display_stars(4.99) == 4.75
+    assert rc.star_bucket(None) is None
+
+
+def test_star_glyphs_render_the_partial_and_pad_to_five():
+    assert rc.star_glyphs(5.0) == "★★★★★"
+    assert rc.star_glyphs(4.75) == "★★★★¾"
+    assert rc.star_glyphs(4.5) == "★★★★½"
+    assert rc.star_glyphs(4.0) == "★★★★☆"
+    assert rc.star_glyphs(1.0) == "★☆☆☆☆"
+    assert rc.star_glyphs(None) == "n/a"
+    # Every row is exactly five glyph positions, or the markdown column goes
+    # ragged between a row with a partial and a row without.
+    for score in (5.0, 4.99, 4.5, 3.25, 1.0):
+        assert len(rc.star_glyphs(score)) == 5
+
+
+def test_star_display_always_carries_the_numeral():
+    """Quarter quantization cannot separate 4.88 from 4.75, and the markdown is
+    read aloud by an agent — the glyphs are not speech."""
+    assert rc.star_display(4.88) == "★★★★¾ 4.88"
+    assert rc.star_display(4.75) == "★★★★¾ 4.75"
+    assert rc.star_display(None) == "n/a"
+
+
+def test_star_verdict_bands_are_monotone_and_bounded():
+    assert rc.star_verdict(5.0) == "dead on"
+    assert rc.star_verdict(4.90) == "dead on"
+    assert rc.star_verdict(4.89) == "on target"
+    assert rc.star_verdict(4.25) == "on target"
+    assert rc.star_verdict(3.50) == "slightly off target"
+    assert rc.star_verdict(2.50) == "off target"
+    assert rc.star_verdict(1.50) == "well off target"
+    assert rc.star_verdict(1.49) == "missed badly"
+    assert rc.star_verdict(None) == "not rated"
+    # No band may name a digit, a letter grade, or the word "star" — these
+    # words go INTO the model's prompt in place of the score it may not name.
+    for _cut, word in rc.STAR_VERDICT_CUTS:
+        assert not any(ch.isdigit() for ch in word)
+        assert "star" not in word.lower()
 
 
 # --- distance: two-sided under a plan, one-sided under the median ----------
@@ -103,8 +198,8 @@ def test_easy_run_slower_than_expected_is_not_penalized():
     expected = rc.PACE_FACTORS["easy"] * REF["median_pace_sec_per_km"]  # 330
     actual = expected * 1.12
     assert rc.pace_deviation(actual, expected, "easy") == 0.0
-    assert rc.base_letter(rc.grade_from_deviation(
-        rc.pace_deviation(actual, expected, "easy"))) == "A"
+    assert rc.stars_from_deviation(
+        rc.pace_deviation(actual, expected, "easy"), "pace") == rc.STAR_MAX
 
 
 def test_easy_run_too_fast_is_penalized():
@@ -113,7 +208,8 @@ def test_easy_run_too_fast_is_penalized():
     expected = 330.0
     d = rc.pace_deviation(expected * 0.80, expected, "easy")
     assert d == pytest.approx(0.20)
-    assert rc.base_letter(rc.grade_from_deviation(d)) == "C"
+    # 0.20 is the third knot: exactly 2.0 stars, the old C/D territory.
+    assert rc.stars_from_deviation(d, "pace") == pytest.approx(2.03, abs=0.02)
 
 
 def test_quality_run_faster_than_target_is_an_A_uncapped():
@@ -140,7 +236,7 @@ def test_by_feel_plan_day_gets_no_pace_grade():
         plan={"type": "easy", "target_distance_m": 10000,
               "target_pace_sec_per_km": None, "seq": 1},
     )
-    assert card["metrics"]["pace"]["grade"] is None
+    assert card["metrics"]["pace"]["stars"] is None
     assert card["metrics"]["pace"]["note"]
     # 4 compliance metrics; pace n/a for its own reason and continuity n/a for
     # want of splits, leaving distance and HR.
@@ -200,7 +296,7 @@ def test_load_is_intent_scaled_for_the_descriptor_but_carries_no_grade():
                 "avg_pace_sec_per_km": 340, "avg_hr": 130, "training_load": 75}
     card = card_for(activity, plan={"type": "easy", "seq": 1})
     assert card["metrics"]["load"]["expected"] == pytest.approx(61.0)  # 0.61 * 100
-    assert card["metrics"]["load"]["grade"] is None
+    assert card["metrics"]["load"]["stars"] is None
     # 75/61 = 1.23 -> inside MODERATE, and under the spike ceiling, so intended.
     assert card["stimulus"]["level"] == "MODERATE"
     assert card["stimulus"]["as_intended"] is True
@@ -217,7 +313,7 @@ def test_a_correct_easy_day_reads_low_stimulus_not_a_failure():
          "aerobic_te": 2.0, "anaerobic_te": 0.0},
         plan={"type": "easy", "seq": 1},
     )
-    assert card["metrics"]["load"]["grade"] is None
+    assert card["metrics"]["load"]["stars"] is None
     assert card["overall"].get("capped_by") is None
     stim = card["stimulus"]
     assert stim["level"] == "LOW"
@@ -244,7 +340,7 @@ def test_a_spike_is_reported_as_stimulus_not_punished_as_a_grade():
     # still computed for display; what is withheld is the letter.
     assert load["expected"] == pytest.approx(100.0)
     assert load["deviation"] == pytest.approx(0.25)
-    assert load["grade"] is None
+    assert load["stars"] is None
     stim = card["stimulus"]
     assert stim["level"] == "VERY HIGH"
     assert stim["as_intended"] is False
@@ -262,7 +358,7 @@ def test_load_at_the_spike_threshold_is_high_but_still_as_intended():
          "avg_hr": 150, "training_load": 200},
     )
     assert card["metrics"]["load"]["deviation"] == pytest.approx(0.0)
-    assert card["metrics"]["load"]["grade"] is None
+    assert card["metrics"]["load"]["stars"] is None
     # Exactly 2.0x is not > 2.0x, so no spike flag either.
     assert "spike" not in card["metrics"]["load"]
     assert card["stimulus"]["level"] == "HIGH"
@@ -288,7 +384,7 @@ def test_no_load_means_no_stimulus_descriptor_rather_than_a_guess():
         {"date": "2026-07-19", "distance_meters": 10000, "avg_pace_sec_per_km": 300,
          "avg_hr": 150, "training_load": None},
     )
-    assert card["metrics"]["load"]["grade"] is None
+    assert card["metrics"]["load"]["stars"] is None
     assert card["stimulus"]["level"] is None
     assert card["stimulus"]["as_intended"] is None
     assert rc.stimulus_lines(card) == []
@@ -371,8 +467,8 @@ def test_the_time_fraction_alone_cannot_tell_a_1_bpm_drift_from_a_20_bpm_blowup(
     # better. Feeding either through GRADE_BANDS gives an F.
     assert rc.time_above_cap_fraction(mild, 140.0) == pytest.approx(0.579, abs=0.01)
     assert rc.time_above_cap_fraction(severe, 140.0) == pytest.approx(0.748, abs=0.01)
-    assert rc.grade_from_deviation(0.579 - 0.05) == "F"
-    assert rc.grade_from_deviation(0.748 - 0.05) == "F"
+    assert rc.stars_from_deviation(0.579 - 0.05, "hr") == rc.STAR_FLOOR
+    assert rc.stars_from_deviation(0.748 - 0.05, "hr") == rc.STAR_FLOOR
 
     # The graded axis: 1.2 bpm against 19.5 bpm.
     assert rc.hr_exceedance_bpm(mild, 140.0) == pytest.approx(1.2, abs=0.05)
@@ -464,23 +560,25 @@ def test_the_cap_grade_actually_uses_its_bands():
     failed_despite_a_compliant_average = {"old": 0, "new": 0}
     for avg, cap, frac, exc, _z45 in LIVE_CAPPED_DAYS:
         # 0.40.0 verbatim: max(relative average, time fraction past the grace).
-        old_g = rc.base_letter(rc.grade_from_deviation(
-            max(max(0.0, (avg - cap) / cap), max(0.0, frac - 0.05))))
-        new_g = rc.base_letter(rc.grade_from_deviation(
-            rc.hr_cap_deviation(avg, float(cap), exc)))
-        old[old_g] += 1
-        new[new_g] += 1
+        old_s = rc.star_bucket(rc.stars_from_deviation(
+            max(max(0.0, (avg - cap) / cap), max(0.0, frac - 0.05)), "hr"))
+        new_s = rc.star_bucket(rc.stars_from_deviation(
+            rc.hr_cap_deviation(avg, float(cap), exc), "hr"))
+        old[old_s] += 1
+        new[new_s] += 1
         if avg <= cap:
-            failed_despite_a_compliant_average["old"] += old_g == "F"
-            failed_despite_a_compliant_average["new"] += new_g == "F"
+            failed_despite_a_compliant_average["old"] += old_s == rc.STAR_FLOOR
+            failed_despite_a_compliant_average["new"] += new_s == rc.STAR_FLOOR
 
-    # The defect: two bands, and a run is either perfect or a failure.
-    assert set(old) == {"A", "F"}
-    assert old["F"] == 9
+    # The defect: two occupied buckets, and a run is either perfect or floored.
+    assert set(old) == {rc.STAR_MAX, rc.STAR_FLOOR}
+    assert old[rc.STAR_FLOOR] == 9
 
-    # The fix: at least four of the five bands carry real sessions.
-    assert len(new) >= 4, f"only {len(new)} bands used: {dict(new)}"
-    assert new["F"] == 3
+    # The fix: the corrected axis spreads across the scale instead of collapsing
+    # to its two extremes.
+    assert len(new) >= 4, f"only {len(new)} buckets used: {dict(new)}"
+    assert new[rc.STAR_FLOOR] == 3
+    assert sum(1 for v in new if rc.STAR_FLOOR < v < rc.STAR_MAX) >= 2
 
     # ...and no run whose average obeyed its own ceiling is failed any more.
     assert failed_despite_a_compliant_average == {"old": 2, "new": 0}
@@ -498,8 +596,8 @@ def test_the_grade_tracks_a_signal_it_does_not_read():
     """
     z45_of_failed, z45_of_passed = [], []
     for avg, cap, _frac, exc, z45 in LIVE_CAPPED_DAYS:
-        if rc.base_letter(rc.grade_from_deviation(
-                rc.hr_cap_deviation(avg, float(cap), exc))) == "F":
+        if rc.stars_from_deviation(
+                rc.hr_cap_deviation(avg, float(cap), exc), "hr") == rc.STAR_FLOOR:
             z45_of_failed.append(z45)
         else:
             z45_of_passed.append(z45)
@@ -510,45 +608,53 @@ def test_the_grade_tracks_a_signal_it_does_not_read():
     assert min(z45_of_failed) > max(z45_of_passed)
 
 
-@pytest.mark.parametrize(("bpm_over", "letter"), [
-    (2.9, "A"), (3.0, "B"),      # the A edge: 1.5 + 0.05*28
-    (11.3, "D"), (11.4, "F"),    # the F boundary: 1.5 + 0.35*28
+@pytest.mark.parametrize(("bpm_over", "stars"), [
+    (1.5, 5.0),                  # the noise floor: HR_CAP_NOISE_BPM exactly
+    (2.9, 4.0),                  # the first knot: 1.5 + 0.05*28
+    (11.2, pytest.approx(1.02, abs=0.01)),
+    (11.3, 1.0),                 # the floor: 1.5 + 0.35*28
+    (11.4, 1.0),                 # ...and it saturates, never extrapolates
 ])
-def test_the_f_boundary_sits_where_the_run_stopped_being_aerobic(bpm_over, letter):
+def test_the_floor_sits_where_the_run_stopped_being_aerobic(bpm_over, stars):
     """Calibration guard, not arithmetic restated. HR_CAP_BPM_SCALE was chosen
-    so an F begins at 11.3 bpm sustained over the ceiling, because in the live
-    window the sessions at or above that are exactly the three whose Garmin
-    zone-4+5 share reached 42% — the runs that were no longer aerobic runs. The
-    worst session BELOW the boundary sat at 37%.
+    so the bottom of the scale begins at 11.3 bpm sustained over the ceiling,
+    because in the live window the sessions at or above that are exactly the
+    three whose Garmin zone-4+5 share reached 42% — the runs that were no longer
+    aerobic runs. The worst session BELOW the boundary sat at 37%.
 
-    A change to either constant that moves this boundary has to re-run that
-    comparison; this test is what forces the question."""
-    assert rc.base_letter(rc.grade_from_deviation(rc.hr_cap_severity(bpm_over))) == letter
+    The 0.50.0 star curve was built so this boundary did NOT move: STAR_KNOTS is
+    GRADE_BANDS with the letters removed, so d = 0.35 was the old F floor and is
+    now exactly STAR_FLOOR. That is why the cutover needed no zone-4+5
+    revalidation. A change to either constant that moves this boundary has to
+    re-run that comparison; this test is what forces the question."""
+    assert rc.stars_from_deviation(rc.hr_cap_severity(bpm_over), "hr") == stars
 
 
-@pytest.mark.parametrize(("hr", "cap", "exceedance", "expected_d", "letter"), [
-    (126.0, 140.0, 0.0, 0.0, "A"),      # under the cap and never over it
-    (126.0, 140.0, 1.2, 0.0, "A"),      # drifted over, inside the noise floor
-    (126.0, 140.0, 8.0, pytest.approx(6.5 / 28), "D"),   # middle blew it
-    (144.0, 140.0, None, pytest.approx(2.5 / 28), "B"),  # no splits: average only
-    (144.0, 140.0, 6.5, pytest.approx(5.0 / 28), "C"),   # exceedance dominates
-    (152.0, 140.0, 1.0, pytest.approx(10.5 / 28), "F"),  # ...here the average does
+@pytest.mark.parametrize(("hr", "cap", "exceedance", "expected_d", "stars"), [
+    (126.0, 140.0, 0.0, 0.0, 5.0),      # under the cap and never over it
+    (126.0, 140.0, 1.2, 0.0, 5.0),      # drifted over, inside the noise floor
+    (126.0, 140.0, 8.0, pytest.approx(6.5 / 28), pytest.approx(1.786, abs=0.01)),
+    (144.0, 140.0, None, pytest.approx(2.5 / 28), pytest.approx(3.214, abs=0.01)),
+    (144.0, 140.0, 6.5, pytest.approx(5.0 / 28), pytest.approx(2.214, abs=0.01)),
+    (152.0, 140.0, 1.0, pytest.approx(10.5 / 28), 1.0),
     (126.0, None, 8.0, None, None),     # no cap -> caller falls back
     (None, 140.0, 8.0, None, None),     # no HR reading -> ungradeable
 ])
 def test_hr_cap_deviation_takes_the_worse_of_two_commensurable_axes(
-        hr, cap, exceedance, expected_d, letter):
+        hr, cap, exceedance, expected_d, stars):
     """0.40.0 took max() over a relative magnitude and a time fraction — two
     different units, so the comparison had no meaning and the fraction won
     almost every time. Both axes are bpm-over-cap now.
 
-    Every case pins the resulting LETTER as well as the float. Asserting the
+    Every case pins the resulting SCORE as well as the float. Asserting the
     arithmetic alone is how the defect survived 0.40.1: the old version of this
-    test checked that (126, 140, 0.25) produced 0.20 and never asked what grade
-    0.20 became, so it passed while the axis emitted only A+ and F."""
+    test checked that (126, 140, 0.25) produced 0.20 and never asked what that
+    0.20 became, so it passed while the axis emitted only its two extremes. The
+    six graded cases here land on six distinct scores, which is the property the
+    old letter version could not express."""
     assert rc.hr_cap_deviation(hr, cap, exceedance) == expected_d
-    assert rc.base_letter(
-        rc.grade_from_deviation(rc.hr_cap_deviation(hr, cap, exceedance))) == letter
+    assert rc.stars_from_deviation(
+        rc.hr_cap_deviation(hr, cap, exceedance), "hr") == stars
 
 
 def test_a_prescribed_cap_beats_the_rolling_band():
@@ -574,7 +680,7 @@ def test_a_prescribed_cap_beats_the_rolling_band():
     assert "45% of the run sat above the prescribed 140 bpm cap" in hr["note"]
     # (4.5 - 1.5) / 28 = 0.107, just past the B band's 0.10.
     assert hr["deviation"] == pytest.approx(3.0 / 28, abs=1e-4)
-    assert hr["grade"] == "C+"
+    assert hr["stars"] == pytest.approx(2.929, abs=0.01)
 
 
 def test_obeying_straddling_and_blowing_the_cap_are_three_different_verdicts():
@@ -617,28 +723,36 @@ def test_obeying_straddling_and_blowing_the_cap_are_three_different_verdicts():
     )
 
     # Verdict level first — this is the assertion that would have caught the bug.
-    assert obeyed["overall"]["grade"] == "A"
-    assert straddled["overall"]["grade"] == "A"
-    assert blew_it["overall"]["grade"] == "B"
-    assert obeyed["overall"].get("capped_by") is None
-    assert straddled["overall"].get("capped_by") is None
-    assert blew_it["overall"].get("capped_by") is None
+    assert obeyed["overall"]["stars"] == rc.STAR_MAX
+    assert straddled["overall"]["stars"] == rc.STAR_MAX
+    assert blew_it["overall"]["stars"] == pytest.approx(4.179, abs=0.01)
+    assert obeyed["overall"]["capped"] is False
+    assert straddled["overall"]["capped"] is False
+    # The blown run's HR row is far enough below its siblings that the headroom
+    # rule bites — the cap doing its job, not the old F-cap's cliff: the row is
+    # 2.18, nowhere near the floor, and the overall still reads well above the
+    # 3.0 an outright failure would have produced.
+    assert blew_it["overall"]["capped"] is True
+    assert blew_it["overall"]["capped_by"]["metric"] == "hr"
+    assert blew_it["overall"]["stars"] > 4.0
 
     # Straddling by a beat is over the cap for 60% of the run — the exact
     # quantity 0.40.0 graded — and is still compliant, because 1.2 bpm is not
     # a breach of a 140 ceiling.
     assert straddled["metrics"]["hr"]["time_above_cap_pct"] == 60
     assert straddled["metrics"]["hr"]["exceedance_bpm"] == pytest.approx(1.2, abs=0.05)
-    assert straddled["metrics"]["hr"]["grade"] == "A+"
+    # Inside HR_CAP_NOISE_BPM, so it is a clean maximum — not "nearly".
+    assert straddled["metrics"]["hr"]["stars"] == rc.STAR_MAX
 
-    # ...while the genuine breach is 5x further over and is penalised for it:
-    # three full letters below, and it drags the overall off an A. Not the F
-    # that 0.40.0 handed every session with any breach at all.
+    # ...while the genuine breach is 5x further over and is penalised for it,
+    # by more than two whole stars. Not the floor that 0.40.0 handed every
+    # session with any breach at all, and not the max either.
     assert blew_it["metrics"]["hr"]["exceedance_bpm"] == pytest.approx(6.6, abs=0.05)
-    assert blew_it["metrics"]["hr"]["grade"] == "C-"
+    blown_hr = blew_it["metrics"]["hr"]["stars"]
+    assert rc.STAR_FLOOR < blown_hr < 3.0
+    assert straddled["metrics"]["hr"]["stars"] - blown_hr > 2.0
 
-    assert (rc.GRADE_POINTS[obeyed["overall"]["grade"]]
-            > rc.GRADE_POINTS[blew_it["overall"]["grade"]])
+    assert obeyed["overall"]["stars"] > blew_it["overall"]["stars"]
     # ...and the load numbers run the OTHER way (25 / 52 / 82), which is exactly
     # the inversion that used to decide the letters.
     assert (obeyed["stimulus"]["load"] < straddled["stimulus"]["load"]
@@ -696,11 +810,11 @@ def test_the_real_2026_08_02_run_is_not_a_failure():
         splits=LIVE_2026_08_02_SPLITS,
     )
     hr = card["metrics"]["hr"]
-    assert hr["grade"] == "A+"
+    assert hr["stars"] == rc.STAR_MAX
     assert hr["deviation"] == 0.0
     assert hr["governing_axis"] is None
     assert hr["exceedance_bpm"] == pytest.approx(1.2, abs=0.05)
-    assert card["overall"]["grade"] == "A"
+    assert card["overall"]["stars"] == rc.STAR_MAX
     assert card["overall"].get("capped_by") is None
 
     # The row keeps the bpm display, because the average IS what was graded.
@@ -734,15 +848,17 @@ def test_the_real_2026_07_22_run_still_fails_hard():
     )
     hr = card["metrics"]["hr"]
     assert hr["exceedance_bpm"] == pytest.approx(19.5, abs=0.05)
-    assert hr["grade"] == "F"
+    assert hr["stars"] == rc.STAR_FLOOR
     assert hr["governing_axis"] == "exceedance"
-    assert card["overall"]["capped_by"] == "F"
+    assert card["overall"]["capped"] is True
+    assert card["overall"]["capped_by"]["metric"] == "hr"
 
     # The average-only grade this would get if the split axis were dropped —
     # pinned so the two-letter gap is visible, not asserted in prose.
-    assert rc.base_letter(
-        rc.grade_from_deviation(rc.hr_cap_severity(157 - 140))) == "F"
-    assert rc.base_letter(rc.grade_from_deviation((157 - 140) / 140)) == "C"
+    assert rc.stars_from_deviation(
+        rc.hr_cap_severity(157 - 140), "hr") == rc.STAR_FLOOR
+    # ...whereas dividing by the cap would have put it mid-scale.
+    assert rc.stars_from_deviation((157 - 140) / 140, "hr") > 2.0
 
 
 def test_the_row_moves_to_the_exceedance_axis_when_that_is_what_graded():
@@ -798,7 +914,7 @@ def test_an_average_breach_keeps_the_row_in_bpm():
     assert hr["governing_axis"] == "average"
     assert "actual_display" not in hr
     assert hr["deviation"] == pytest.approx(6.5 / 28, abs=1e-4)  # 8 bpm over, less noise
-    assert hr["grade"] == "D+"
+    assert hr["stars"] == pytest.approx(1.786, abs=0.01)
     assert rc.actual_text("hr", hr) == "148 bpm"
     assert rc.expected_text("hr", hr) == "≤ 140 bpm"
     # bpm, not a percentage — which is what this test's own name asks for and
@@ -821,7 +937,7 @@ def test_a_compliant_capped_run_names_no_axis_and_reads_in_range():
                 for i, h in enumerate((117, 125, 127, 126, 134))],
     )
     hr = card["metrics"]["hr"]
-    assert hr["grade"] == "A+"
+    assert hr["stars"] == rc.STAR_MAX
     assert hr["exceedance_bpm"] == 0.0
     assert hr["time_above_cap_pct"] == 0
     assert "note" not in hr           # nothing happened; say nothing
@@ -846,7 +962,7 @@ def test_the_rendered_card_never_prints_a_passing_delta_beside_an_f():
     hr_row = next(ln for ln in md.splitlines() if ln.startswith("| Avg HR"))
     assert hr_row == (
         "| Avg HR | +19.5 bpm over cap (75% of run) | ≤ +1.5 bpm over cap "
-        "| +18.0 bpm | F |")
+        "| +18.0 bpm | ★☆☆☆☆ 1.00 |")
     assert "| 157 bpm | ≤ 140 bpm |" not in md
 
 
@@ -862,7 +978,7 @@ def test_the_rendered_card_shows_a_compliant_run_in_bpm():
     )
     md = rc.render_markdown(card)
     hr_row = next(ln for ln in md.splitlines() if ln.startswith("| Avg HR"))
-    assert hr_row == "| Avg HR | 139 bpm | ≤ 140 bpm | in range | A+ |"
+    assert hr_row == "| Avg HR | 139 bpm | ≤ 140 bpm | in range | ★★★★★ 5.00 |"
 
 
 def test_no_prescribed_cap_still_uses_the_rolling_band():
@@ -899,8 +1015,9 @@ def test_a_cap_grades_on_the_average_when_no_splits_exist():
     assert hr["reference"] == "plan"
     assert "time_above_cap_pct" not in hr      # nothing to measure
     assert hr["deviation"] == pytest.approx(26.5 / 28, abs=1e-4)
-    assert rc.base_letter(hr["grade"]) == "F"
-    assert rc.base_letter(rc.grade_from_deviation(28 / 140)) == "C"   # the old grade
+    assert hr["stars"] == rc.STAR_FLOOR
+    # ...whereas the old cap-relative axis put the same run mid-scale.
+    assert rc.stars_from_deviation(28 / 140, "hr") > 1.9
 
 
 def test_a_walked_day_refuses_the_plan_cap_with_the_rest_of_the_plan():
@@ -977,31 +1094,48 @@ def test_rest_day_prescription_falls_through_to_rolling():
 def test_overall_renormalizes_over_gradeable_metrics():
     """One n/a metric must not drag the average toward zero — its weight
     redistributes across the rest."""
-    all_a = {k: {"grade": "A"} for k in rc.METRIC_WEIGHTS}
-    assert rc.overall_grade(all_a)["grade"] == "A"
-    all_a["pace"] = {"grade": None}
-    out = rc.overall_grade(all_a)
-    assert out["grade"] == "A"
+    all_max = {k: {"stars": 5.0} for k in rc.METRIC_WEIGHTS}
+    assert rc.overall_stars(all_max)["stars"] == 5.0
+    all_max["pace"] = {"stars": None}
+    out = rc.overall_stars(all_max)
+    assert out["stars"] == 5.0
     # Four compliance metrics since 0.40.0, so one n/a leaves three.
     assert out["graded_metrics"] == 3
 
 
-def test_overall_with_no_gradeable_metrics_is_na_not_f():
-    """"F" would read as a judgment we did not make."""
-    out = rc.overall_grade({k: {"grade": None} for k in rc.METRIC_WEIGHTS})
-    assert out["grade"] == "n/a"
-    assert out["gpa"] is None
+def test_overall_with_no_gradeable_metrics_is_none_not_the_floor():
+    """The floor would read as a judgment we did not make — "failed" and "not
+    measured" must never be the same number."""
+    out = rc.overall_stars({k: {"stars": None} for k in rc.METRIC_WEIGHTS})
+    assert out["stars"] is None
+    assert out["mean_stars"] is None
+    assert out["graded_metrics"] == 0
+    assert out["capped"] is False
 
 
-def test_overall_uses_base_letters_so_modifiers_cannot_move_it():
-    with_mods = {k: {"grade": "B+"} for k in rc.METRIC_WEIGHTS}
-    without = {k: {"grade": "B"} for k in rc.METRIC_WEIGHTS}
-    assert rc.overall_grade(with_mods) == rc.overall_grade(without)
+def test_sub_band_position_now_moves_the_overall():
+    """The deliberate reversal of `base_letter`'s old contract (0.50.0).
+
+    `base_letter` existed so "a modifier can never move an overall grade",
+    which rounded every metric UP to its band top before averaging — the reason
+    a third of live cards read exactly 4.00 GPA. Two cards that differ only in
+    sub-band position must now differ in the overall, or the change bought no
+    resolution at all.
+    """
+    high = {k: {"stars": 3.9} for k in rc.METRIC_WEIGHTS}
+    low = {k: {"stars": 3.1} for k in rc.METRIC_WEIGHTS}
+    assert rc.overall_stars(high)["stars"] > rc.overall_stars(low)["stars"]
+    assert rc.overall_stars(high)["stars"] == pytest.approx(3.9)
 
 
-def test_overall_cuts():
-    assert rc.overall_grade({"distance": {"grade": "F"}})["grade"] == "F"
-    assert rc.overall_grade({"distance": {"grade": "C"}})["grade"] == "C"
+def test_overall_is_the_intent_weighted_mean_not_a_bucket():
+    """No cuts table any more: the mean IS the score."""
+    out = rc.overall_stars(
+        {"distance": {"stars": 5.0}, "pace": {"stars": 3.0}}, "steady")
+    # distance .30, pace .30 — equal weights, so the mean is 4.0.
+    assert out["stars"] == pytest.approx(4.0)
+    assert out["mean_stars"] == pytest.approx(4.0)
+    assert out["graded_metrics"] == 2
 
 
 # --- splits ----------------------------------------------------------------
@@ -1081,12 +1215,12 @@ def test_continuity_abstains_explicitly_when_splits_are_missing():
                 "avg_pace_sec_per_km": 300, "avg_hr": 150, "training_load": 100}
     without = card_for(activity)
     cont = without["metrics"]["continuity"]
-    assert cont["grade"] is None
+    assert cont["stars"] is None
     assert cont["note"] == "no splits recorded — continuity can't be measured"
     assert without["overall"]["graded_metrics"] == 3   # the other three
 
     with_splits = card_for(activity, splits=PACED_SPLITS)
-    assert with_splits["metrics"]["continuity"]["grade"] == "A+"
+    assert with_splits["metrics"]["continuity"]["stars"] == rc.STAR_MAX
     assert with_splits["overall"]["graded_metrics"] == 4
 
 
@@ -1099,7 +1233,7 @@ def test_continuity_says_so_when_splits_carry_no_pace():
         splits=MILE_SPLITS,
     )
     cont = card["metrics"]["continuity"]
-    assert cont["grade"] is None
+    assert cont["stars"] is None
     assert cont["note"] == ("splits recorded without pace — continuity can't be "
                             "measured")
 
@@ -1130,13 +1264,14 @@ def test_continuity_catches_a_walk_mile_nothing_else_sees():
     # 466.6 / median(366.0) = 1.275 -> d = 1.275 - 1.15 = 0.125 -> C
     assert cont["ratio"] == pytest.approx(1.275, abs=0.001)
     assert cont["deviation"] == pytest.approx(0.125, abs=0.001)
-    assert rc.base_letter(cont["grade"]) == "C"
+    # 0.125 sits between the 0.10 and 0.20 knots -> between 3 and 2 stars.
+    assert cont["stars"] == pytest.approx(2.75, abs=0.01)
     # The note names the offending split so the reader can act on it.
     assert cont["note"] == ("mile 4 ran 12:31/mi — 27% slower than your median "
                             "mile for this run")
     # And it is genuinely independent: the metrics that missed it still pass.
-    assert card["metrics"]["distance"]["grade"] == "A+"
-    assert rc.base_letter(card["metrics"]["hr"]["grade"]) == "A"
+    assert card["metrics"]["distance"]["stars"] == rc.STAR_MAX
+    assert card["metrics"]["hr"]["stars"] == rc.STAR_MAX
 
 
 def test_continuity_ignores_a_conservative_opening_mile():
@@ -1157,7 +1292,7 @@ def test_continuity_ignores_a_conservative_opening_mile():
     cont = card["metrics"]["continuity"]
     assert cont["ratio"] == pytest.approx(1.083, abs=0.001)   # under the 1.15 gate
     assert cont["deviation"] == 0.0
-    assert cont["grade"] == "A+"
+    assert cont["stars"] == rc.STAR_MAX
     assert "note" not in cont
 
 
@@ -1170,7 +1305,7 @@ def test_continuity_needs_three_full_splits_to_say_anything():
         splits=PACED_SPLITS[:2],
     )
     cont = card["metrics"]["continuity"]
-    assert cont["grade"] is None
+    assert cont["stars"] is None
     assert cont["note"] == ("only 2 full splits with pace — need 3 to compare a "
                             "slowest against a median")
 
@@ -1183,8 +1318,8 @@ def test_insufficient_reference_grades_nothing():
          "avg_hr": 150, "training_load": 100},
         reference={"mode": "insufficient_data", "n": 3},
     )
-    assert all(m["grade"] is None for m in card["metrics"].values())
-    assert card["overall"]["grade"] == "n/a"
+    assert all(m["stars"] is None for m in card["metrics"].values())
+    assert card["overall"]["stars"] is None
 
 
 # --- rendering -------------------------------------------------------------
@@ -1255,8 +1390,8 @@ def test_reference_line_does_not_disclaim_what_the_plan_graded():
               "target_pace_sec_per_km": 310, "seq": 1},
         reference={"mode": "insufficient_data", "n": 2, "pool": "running"},
     )
-    assert card["metrics"]["distance"]["grade"] == "A+"     # graded off the plan
-    assert card["metrics"]["hr"]["grade"] is None           # no rolling median
+    assert card["metrics"]["distance"]["stars"] == rc.STAR_MAX     # graded off the plan
+    assert card["metrics"]["hr"]["stars"] is None           # no rolling median
     line = rc.reference_line(card)
     assert line == (
         # Training load is no longer named here (0.40.0): it is never graded, so
@@ -1641,7 +1776,7 @@ def test_build_card_end_to_end_against_the_db(rc_db):
         inputs["reference"], inputs["context"],
     )
     # Identical to the median on every axis -> straight As.
-    assert card["overall"]["grade"] == "A"
+    assert card["overall"]["stars"] == rc.STAR_MAX
     assert card["splits"]["unit"] == "Mile"
     assert "Mile 1" in rc.render_markdown(card)
 
@@ -1682,7 +1817,7 @@ def test_hr_inside_the_band_reads_in_range_not_a_percentage():
     )
     hr = card["metrics"]["hr"]
     assert hr["in_band"] is True
-    assert rc.base_letter(hr["grade"]) == "A"
+    assert hr["stars"] == rc.STAR_MAX
     assert rc._delta_text("hr", hr) == "in range"
 
 
@@ -1714,7 +1849,7 @@ def test_easy_hr_ceiling_is_actually_reachable():
     assert typical_easy <= ceiling
     # And a genuinely hot "easy" run still gets marked down.
     d = rc.hr_deviation(1.10 * median_hr, median_hr, "easy")
-    assert rc.base_letter(rc.grade_from_deviation(d)) in ("B", "C", "D", "F")
+    assert rc.stars_from_deviation(d, "pace") < 4.25
 
 
 def test_expected_text_falls_back_to_the_numeric_formatter():
@@ -1751,7 +1886,7 @@ def test_plan_pace_is_graded_tighter_than_a_rolling_reference():
     pace = plan_card["metrics"]["pace"]
     assert pace["reference"] == "plan"
     # ~9.5% fast: a C against a prescription, where the untightened bands said B.
-    assert rc.base_letter(pace["grade"]) == "C"
+    assert pace["stars"] == pytest.approx(2.444, abs=0.01)
 
 
 def test_running_the_prescribed_pace_still_earns_an_A():
@@ -1763,11 +1898,11 @@ def test_running_the_prescribed_pace_still_earns_an_A():
         plan={"type": "easy", "target_distance_m": 4800,
               "target_pace_sec_per_km": 388, "seq": 1},
     )
-    assert rc.base_letter(card["metrics"]["pace"]["grade"]) == "A"
-    assert rc.base_letter(card["metrics"]["distance"]["grade"]) == "A"
+    assert card["metrics"]["pace"]["stars"] == pytest.approx(4.379, abs=0.01)
+    assert card["metrics"]["distance"]["stars"] == rc.STAR_MAX
 
 
-def test_overall_grade_cannot_be_an_A_when_the_prescription_was_missed():
+def test_the_overall_cannot_read_well_when_the_prescription_was_missed():
     """The self-consistency check: a card whose coaching read says the easy day
     was run at tempo must not print an overall A."""
     card = card_for(
@@ -1777,7 +1912,7 @@ def test_overall_grade_cannot_be_an_A_when_the_prescription_was_missed():
               "target_pace_sec_per_km": 390, "seq": 1},
         reference={**REF, "median_hr": 146.0, "median_load": 53.0},
     )
-    assert card["overall"]["grade"] != "A"
+    assert card["overall"]["stars"] < 4.25
 
 
 # === locomotion gating =====================================================
@@ -1930,7 +2065,7 @@ def test_pace_deviation_easy_long_has_a_slow_side_floor():
     regardless of how much slower the expectation itself is."""
     d = rc.pace_deviation(_WALKED_PACE, _EASY_TARGET_PACE, "easy")
     assert d > 0.0
-    assert rc.base_letter(rc.grade_from_deviation(d)) != "A"
+    assert rc.stars_from_deviation(d, "pace") < 4.25
 
 
 def test_pace_deviation_floor_does_not_fire_on_a_genuine_slow_run():
@@ -1956,7 +2091,7 @@ def test_walk_against_a_running_plan_type_refuses_the_plan_reference():
     assert pace["reference"] != "plan"
     assert distance["note"] and "walk" in distance["note"]
     assert pace["note"] and "walk" in pace["note"]
-    assert rc.base_letter(pace["grade"]) != "A"
+    assert pace["stars"] < 4.25
 
 
 def test_walk_against_a_running_plan_type_falls_to_rolling_reference():
@@ -1997,7 +2132,7 @@ def test_a_slow_but_real_easy_run_still_uses_the_plan_reference():
     card = card_for(activity, plan=plan)
     assert card["metrics"]["distance"]["reference"] == "plan"
     assert card["metrics"]["pace"]["reference"] == "plan"
-    assert rc.base_letter(card["metrics"]["pace"]["grade"]) == "A"
+    assert card["metrics"]["pace"]["stars"] == rc.STAR_MAX
 
 
 def test_quality_pace_floor_closes_the_walked_tempo_gap():
@@ -2010,7 +2145,7 @@ def test_quality_pace_floor_closes_the_walked_tempo_gap():
     pace even after the plan-gate + easy/long floor fix."""
     d = rc.pace_deviation(3125.3, 800.0, "quality")  # 83:49/mi vs a slow walk median
     assert d > 0.0
-    assert rc.base_letter(rc.grade_from_deviation(d)) != "A"
+    assert rc.stars_from_deviation(d, "pace") < 4.25
 
 
 def test_quality_pace_floor_does_not_touch_a_genuine_fast_tempo():
@@ -2029,7 +2164,7 @@ def test_walking_desk_session_pace_floor_applies_even_without_a_plan():
                 "avg_hr": 90, "training_load": 8}
     card = card_for(activity)
     assert card["intent_class"] == "easy"
-    assert rc.base_letter(card["metrics"]["pace"]["grade"]) == "F"
+    assert card["metrics"]["pace"]["stars"] == rc.STAR_FLOOR
 
 
 # --- _select_activity: prefer the real run over a leading walk -------------
@@ -2157,7 +2292,7 @@ def test_interval_pace_is_graded_on_the_fastest_split():
     assert pace["actual"] == pytest.approx(300.0)          # the fastest split
     assert pace["actual_display"] == "8:03/mi best mile"
     assert pace["deviation"] == pytest.approx(0.0)         # hit the rep target
-    assert pace["grade"] == "A+"
+    assert pace["stars"] == rc.STAR_MAX
     # No note: "8:03/mi best mile" beside a "5:00/mi" target already says what
     # was compared, and the PDF's one-page budget is real — this bullet alone
     # pushed a 6-split card onto a second page.
@@ -2178,7 +2313,7 @@ def test_interval_pace_still_fails_when_the_reps_were_missed():
     # Best mile 351 vs a 260 target: (351-260)/260 = 0.35, and PLAN_TIGHTEN
     # scales the F boundary to 0.35*0.6 = 0.21.
     assert pace["deviation"] == pytest.approx(0.35, abs=1e-3)
-    assert pace["grade"] == "F"
+    assert pace["stars"] == rc.STAR_FLOOR
 
 
 def test_interval_pace_is_na_without_splits_not_a_fabricated_f():
@@ -2191,7 +2326,7 @@ def test_interval_pace_is_na_without_splits_not_a_fabricated_f():
               "target_pace_sec_per_km": 300.0, "seq": 1},
     )
     pace = card["metrics"]["pace"]
-    assert pace["grade"] is None
+    assert pace["stars"] is None
     assert pace["deviation"] is None
     assert pace["actual"] == pytest.approx(399.2)          # the average is kept
     assert pace["actual_display"] == "10:42/mi avg"
@@ -2216,7 +2351,7 @@ def test_manual_lap_interval_is_graded_on_the_rep_not_the_warmup():
     pace = card["metrics"]["pace"]
     assert pace["actual"] == pytest.approx(260.0)      # the 800m rep, not 390
     assert pace["deviation"] == pytest.approx(0.0)
-    assert pace["grade"] == "A+"
+    assert pace["stars"] == rc.STAR_MAX
     # The 1600m warmup is mile-sized, so the split table's unit is "Mile" — but
     # the graded rep is not a mile and the card must not say it was.
     assert card["splits"]["unit"] == "Mile"
@@ -2236,7 +2371,7 @@ def test_interval_pace_is_na_when_no_split_is_rep_sized():
         splits=tiny,
     )
     pace = card["metrics"]["pace"]
-    assert pace["grade"] is None
+    assert pace["stars"] is None
     assert pace["note"] == ("interval day, no split long enough to be a rep — "
                             "average pace can't be graded against a rep target")
     assert pace["actual_display"] == "10:42/mi avg"
@@ -2287,30 +2422,40 @@ def test_intent_weights_let_pace_carry_an_easy_day():
     ``test_a_load_letter_cannot_reach_the_overall_even_if_one_appears``.
     """
     metrics = {
-        "distance": {"grade": "A"}, "pace": {"grade": "D"},
-        "hr": {"grade": "A"}, "load": {"grade": "A"},
+        "distance": {"stars": 5.0}, "pace": {"stars": 2.0},
+        "hr": {"stars": 5.0}, "load": {"stars": 5.0},
     }
-    easy = rc.overall_grade(metrics, "easy")
-    long_run = rc.overall_grade(metrics, "long")
+    easy = rc.overall_stars(metrics, "easy")
+    long_run = rc.overall_stars(metrics, "long")
     # No continuity key in the fixture, so its 0.15 redistributes over the rest.
-    # easy: (.19*4 + .42*1 + .24*4) / .85 = 2.52
-    assert easy["gpa"] == pytest.approx(2.52)
-    # long: (.45*4 + .20*1 + .20*4) / .85 = 3.29 — distance is the point there.
-    assert long_run["gpa"] == pytest.approx(3.29)
-    assert easy["grade"] == "B" and long_run["grade"] == "B"
+    # easy: (.19*5 + .42*2 + .24*5) / .85 = 3.52 — pace dominates.
+    assert easy["mean_stars"] == pytest.approx(3.518, abs=0.01)
+    # long: (.45*5 + .20*2 + .20*5) / .85 = 4.29 — distance is the point there.
+    assert long_run["mean_stars"] == pytest.approx(4.29, abs=0.01)
+    # The same four numbers, 0.78 stars apart on the rows purely because of
+    # what the day was for. Under the letter rubric both read "B" and the
+    # difference was invisible. (The long run's OVERALL is then held to 4.00 by
+    # the headroom rule, since its pace row sits at 2.0 — so the gap the reader
+    # sees is smaller than the gap the weights produced, and both are real.)
+    assert long_run["mean_stars"] - easy["mean_stars"] > 0.75
+    assert long_run["stars"] > easy["stars"]
 
 
-def test_a_load_letter_cannot_reach_the_overall_even_if_one_appears():
+def test_a_load_score_cannot_reach_the_overall_even_if_one_appears():
     """The 0.40.0 guarantee, tested at the arithmetic rather than at build_card:
-    load is absent from every weight table, so even a hand-injected load grade —
-    an A or an F — moves neither the GPA nor the cap."""
-    base = {"distance": {"grade": "A"}, "pace": {"grade": "A"}, "hr": {"grade": "A"}}
-    clean = rc.overall_grade(base, "easy")
-    for injected in ("A+", "C", "F"):
-        out = rc.overall_grade({**base, "load": {"grade": injected}}, "easy")
-        assert out["gpa"] == clean["gpa"] == pytest.approx(4.0)
-        assert out["grade"] == "A"
-        assert "capped_by" not in out
+    load is absent from every weight table, so even a hand-injected load score —
+    a maximum or a floor — moves neither the mean nor the cap.
+
+    The floor case is the sharp one: the headroom cap reads `min()` over the
+    weighted metrics, so a load row at 1.0 would drag the overall to 3.0 if it
+    were ever iterated."""
+    base = {"distance": {"stars": 5.0}, "pace": {"stars": 5.0}, "hr": {"stars": 5.0}}
+    clean = rc.overall_stars(base, "easy")
+    for injected in (5.0, 2.6, rc.STAR_FLOOR):
+        out = rc.overall_stars({**base, "load": {"stars": injected}}, "easy")
+        assert out["mean_stars"] == clean["mean_stars"] == pytest.approx(5.0)
+        assert out["stars"] == pytest.approx(5.0)
+        assert out["capped"] is False
     assert "load" not in rc.METRIC_WEIGHTS
     assert all("load" not in w for w in rc.INTENT_METRIC_WEIGHTS.values())
 
@@ -2318,32 +2463,50 @@ def test_a_load_letter_cannot_reach_the_overall_even_if_one_appears():
 def test_steady_intent_keeps_the_neutral_split():
     """No stated intent means no metric can claim to be the point of the day."""
     metrics = {
-        "distance": {"grade": "A"}, "pace": {"grade": "D"},
-        "hr": {"grade": "A"}, "load": {"grade": "A"},
+        "distance": {"stars": 5.0}, "pace": {"stars": 2.0},
+        "hr": {"stars": 5.0}, "load": {"stars": 5.0},
     }
-    # (.30*4 + .30*1 + .25*4) / .85 = 2.94 (continuity absent, redistributed)
-    assert rc.overall_grade(metrics, "steady")["gpa"] == pytest.approx(2.94)
-    assert rc.overall_grade(metrics)["gpa"] == pytest.approx(2.94)  # default
+    # (.30*5 + .30*2 + .25*5) / .85 = 3.94 (continuity absent, redistributed)
+    assert rc.overall_stars(metrics, "steady")["mean_stars"] == pytest.approx(3.941, abs=0.01)
+    assert rc.overall_stars(metrics)["mean_stars"] == pytest.approx(3.941, abs=0.01)  # default
 
 
-def test_an_f_caps_the_overall():
-    """Two strong metrics must not average an outright failure into an A."""
+def test_a_floored_row_caps_the_overall():
+    """Two strong metrics must not average an outright failure into a good
+    overall. The continuous analogue of the old F-cap, and it reproduces that
+    rule exactly at the old boundary: STAR_FLOOR + OVERALL_STAR_HEADROOM = 3.0,
+    which is the C the letter version pinned to."""
     metrics = {
-        "distance": {"grade": "A+"}, "pace": {"grade": "F"},
-        "hr": {"grade": "A"}, "load": {"grade": "A"},
+        "distance": {"stars": 5.0}, "pace": {"stars": rc.STAR_FLOOR},
+        "hr": {"stars": 5.0}, "load": {"stars": 5.0},
     }
-    out = rc.overall_grade(metrics, "long")
-    # (.45*4 + .20*0 + .20*4) / .85 = 3.06 -> B, capped to C.
-    assert out["gpa"] == pytest.approx(3.06)
-    assert out["grade"] == "C"
-    assert out["capped_by"] == "F"
+    out = rc.overall_stars(metrics, "long")
+    # (.45*5 + .20*1 + .20*5) / .85 = 4.06 on the rows alone...
+    assert out["mean_stars"] == pytest.approx(4.06, abs=0.01)
+    # ...held to worst + 2.0.
+    assert out["stars"] == pytest.approx(3.0)
+    assert out["capped"] is True
+    assert out["capped_by"] == {"metric": "pace", "stars": 1.0}
 
 
-def test_the_f_cap_never_raises_a_worse_grade():
-    metrics = {"pace": {"grade": "F"}, "hr": {"grade": "F"}}
-    out = rc.overall_grade(metrics, "easy")
-    assert out["grade"] == "F"
-    assert "capped_by" not in out
+def test_the_cap_bites_before_the_floor_too():
+    """Unlike the old F-cap, the headroom rule also catches a card whose worst
+    row is merely bad rather than floored — 16 such cards in the live corpus,
+    every one of which the letter cap ignored entirely."""
+    out = rc.overall_stars(
+        {"distance": {"stars": 5.0}, "pace": {"stars": 2.0}, "hr": {"stars": 5.0}},
+        "long")
+    assert out["mean_stars"] > 4.0
+    assert out["stars"] == pytest.approx(4.0)      # 2.0 + 2.0
+    assert out["capped"] is True
+
+
+def test_the_cap_never_raises_a_worse_score():
+    """`min()`, so a card already below the ceiling is untouched."""
+    metrics = {"pace": {"stars": rc.STAR_FLOOR}, "hr": {"stars": rc.STAR_FLOOR}}
+    out = rc.overall_stars(metrics, "easy")
+    assert out["stars"] == rc.STAR_FLOOR
+    assert out["capped"] is False
 
 
 def test_the_f_cap_is_stated_on_the_card():
@@ -2355,11 +2518,14 @@ def test_the_f_cap_is_stated_on_the_card():
         plan={"type": "long", "target_distance_m": 20000,
               "target_pace_sec_per_km": 300.0, "seq": 1},
     )
-    assert card["metrics"]["pace"]["grade"] == "F"
-    assert card["overall"]["gpa"] > 2.5          # would have printed a B
-    assert card["overall"]["grade"] == "C"
-    assert card["overall"]["capped_by"] == "F"
-    assert "capped at C" in rc.render_markdown(card)
+    assert card["metrics"]["pace"]["stars"] == rc.STAR_FLOOR
+    assert card["overall"]["mean_stars"] > 3.5   # would have read comfortably fine
+    assert card["overall"]["stars"] == pytest.approx(3.0)
+    assert card["overall"]["capped_by"]["metric"] == "pace"
+    # The note states BOTH numbers so it reconciles by arithmetic.
+    md = rc.render_markdown(card)
+    assert "held to 3.00" in md
+    assert f"average {card['overall']['mean_stars']:.2f}" in md
 
 
 def test_exclusion_count_covers_only_mislabelled_rows(bimodal_db):
@@ -2407,13 +2573,13 @@ def test_delta_text_never_prints_negative_zero_percent():
     Since 0.41.0 there is no percentage on this row at all: a real gap reads in
     miles. The negative-zero case is still the point of the test.
     """
-    just_under = {"actual": 6432.0, "expected": 6437.376, "grade": "A+"}
+    just_under = {"actual": 6432.0, "expected": 6437.376, "stars": 5.0}
     assert rc._delta_text("distance", just_under) == "on target"
-    just_over = {"actual": 6440.0, "expected": 6437.376, "grade": "A+"}
+    just_over = {"actual": 6440.0, "expected": 6437.376, "stars": 5.0}
     assert rc._delta_text("distance", just_over) == "on target"
-    real_gap = {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
+    real_gap = {"actual": 7000.0, "expected": 6437.376, "stars": 3.6}
     assert rc._delta_text("distance", real_gap) == "0.35 mi long"
-    short = {"actual": 5000.0, "expected": 6437.376, "grade": "D"}
+    short = {"actual": 5000.0, "expected": 6437.376, "stars": 1.6}
     assert rc._delta_text("distance", short) == "0.89 mi short"
 
 
@@ -2462,7 +2628,7 @@ def test_easy_pace_expected_prints_as_a_floor_not_a_point_target():
     pace = card["metrics"]["pace"]
     assert card["intent_class"] == "easy"
     assert pace["deviation"] == 0.0                 # slower is free
-    assert pace["grade"].startswith("A")
+    assert pace["stars"] >= 4.25
     assert pace["bound"] == "floor"
     assert rc.expected_text("pace", pace).startswith("≥ ")
     assert rc._delta_text("pace", pace).endswith("slower")
@@ -2516,23 +2682,23 @@ def test_every_delta_is_in_the_rows_own_unit():
     The rule: a delta is stated in the unit its own row is measured in.
     """
     assert rc._delta_text(
-        "distance", {"actual": 7000.0, "expected": 6437.376, "grade": "B"}
+        "distance", {"actual": 7000.0, "expected": 6437.376, "stars": 3.6}
     ) == "0.35 mi long"
     assert rc._delta_text(
-        "pace", {"actual": 375.0, "expected": 360.0, "grade": "B"}
+        "pace", {"actual": 375.0, "expected": 360.0, "stars": 3.6}
     ) == "24s/mi slower"
     assert rc._delta_text(
-        "hr", {"actual": 148.0, "expected": 140.0, "grade": "C"}
+        "hr", {"actual": 148.0, "expected": 140.0, "stars": 2.6}
     ) == "8 bpm over"
     assert rc._delta_text(
-        "continuity", {"actual": 1.30, "expected": 1.15, "grade": "D"}
+        "continuity", {"actual": 1.30, "expected": 1.15, "stars": 1.6}
     ) == "0.15x over"
     # None of them may carry a percent sign.
     for key, metric in (
-        ("distance", {"actual": 7000.0, "expected": 6437.376, "grade": "B"}),
-        ("pace", {"actual": 375.0, "expected": 360.0, "grade": "B"}),
-        ("hr", {"actual": 148.0, "expected": 140.0, "grade": "C"}),
-        ("continuity", {"actual": 1.30, "expected": 1.15, "grade": "D"}),
+        ("distance", {"actual": 7000.0, "expected": 6437.376, "stars": 3.6}),
+        ("pace", {"actual": 375.0, "expected": 360.0, "stars": 3.6}),
+        ("hr", {"actual": 148.0, "expected": 140.0, "stars": 2.6}),
+        ("continuity", {"actual": 1.30, "expected": 1.15, "stars": 1.6}),
     ):
         assert "%" not in rc._delta_text(key, metric), key
 
@@ -2541,10 +2707,10 @@ def test_continuity_delta_states_the_gap_in_median_splits_both_ways():
     """`even` lost the magnitude on the compliant side, and `N% over` was a
     percentage of a ratio on the other. Both are now a gap in the unit
     `actual` and `expected` are already in."""
-    compliant = {"actual": 1.07, "expected": 1.15, "grade": "A+"}
+    compliant = {"actual": 1.07, "expected": 1.15, "stars": 5.0}
     assert rc._delta_text("continuity", compliant) == "0.08x under"
     assert rc._delta_text(
-        "continuity", {"actual": 1.15, "expected": 1.15, "grade": "A"}
+        "continuity", {"actual": 1.15, "expected": 1.15, "stars": 4.6}
     ) == "on target"
 
 
@@ -2645,14 +2811,14 @@ def test_split_table_is_the_single_source_for_both_renderers():
 def _graded_card_for_table():
     return {
         "metrics": {
-            "distance": {"actual": 8046.72, "expected": 8046.72, "grade": "A",
+            "distance": {"actual": 8046.72, "expected": 8046.72, "stars": 4.6,
                          "deviation": 0.0, "unit": "m", "reference": "plan"},
-            "pace": {"actual": 360.0, "expected": 355.0, "grade": "B+",
+            "pace": {"actual": 360.0, "expected": 355.0, "stars": 4.0,
                      "deviation": 0.014, "unit": "sec_per_km", "reference": "plan",
                      "note": "a shade slow"},
-            "hr": {"actual": 139.0, "expected": 140.0, "grade": "A+",
+            "hr": {"actual": 139.0, "expected": 140.0, "stars": 5.0,
                    "deviation": 0.0, "unit": "bpm", "reference": "plan"},
-            "continuity": {"actual": 1.05, "expected": 1.15, "grade": "A",
+            "continuity": {"actual": 1.05, "expected": 1.15, "stars": 4.6,
                            "deviation": 0.0, "unit": "ratio", "reference": "self"},
         },
     }
@@ -2660,38 +2826,84 @@ def _graded_card_for_table():
 
 def test_metric_table_headers_and_row_order_are_one_definition():
     headers, rows = rc.metric_table(_graded_card_for_table())
-    assert headers == ["Metric", "Actual", "Expected", "Delta", "Grade"]
+    assert headers == ["Metric", "Actual", "Expected", "Delta", "Rating"]
     assert [r[0] for r in rows] == [label for _k, label in rc._METRIC_LABELS]
     assert all(len(r) == len(headers) for r in rows)
 
 
-def test_metric_table_puts_the_grade_last():
-    """The PDF colours the final cell by grade band, so the grade's POSITION is
-    part of the contract, not an accident of ordering."""
+def test_metric_table_puts_the_rating_last():
+    """The PDF styles the final cell by score, so the rating's POSITION is part
+    of the contract, not an accident of ordering."""
     _headers, rows = rc.metric_table(_graded_card_for_table())
-    assert [r[-1] for r in rows] == ["A", "B+", "A+", "A"]
+    assert [r[-1] for r in rows] == [
+        "★★★★½ 4.60", "★★★★☆ 4.00", "★★★★★ 5.00", "★★★★½ 4.60"]
+
+
+def test_a_stored_letter_card_still_renders_its_letters():
+    """A card stored under the pre-0.50.0 rubric has grades and no scores.
+    Storage is a dated snapshot with no backfill path, so the table must show
+    what that render actually said rather than turning it all into n/a."""
+    card = _graded_card_for_table()
+    for m in card["metrics"].values():
+        m["grade"] = "B+"
+        m.pop("stars", None)
+    _headers, rows = rc.metric_table(card)
+    assert [r[-1] for r in rows] == ["B+"] * 4
+    # ...and a metric with neither is still an honest n/a.
+    card["metrics"]["pace"].pop("grade")
+    _headers, rows = rc.metric_table(card)
+    assert rows[1][-1] == "n/a"
 
 
 def test_both_renderers_take_the_metric_table_from_one_source():
     """The guard that makes the extraction worth anything: add a column to
     metric_table and BOTH the markdown card and the PDF must show it. Before
     0.48.0 each built its own header row, so one could gain a column the other
-    never rendered."""
-    from local_fitness.agent import render, visuals
+    never rendered.
+
+    The RATING cell is the one deliberate exception since 0.50.0 — the markdown
+    prints glyphs and the PDF draws SVG geometry, because the brand mono has no
+    star glyph and a text star would render in whatever font the host machine
+    happens to have. They are checked below for agreeing on the VALUE, which is
+    the thing that must not diverge.
+    """
+    from local_fitness.agent import branding, render, visuals
 
     card = _graded_card_for_table()
     headers, rows = rc.metric_table(card)
 
     md = render.render_table(headers, rows)
-    html_out = visuals._render_metric_table_html(card)
+    html_out = visuals._render_metric_table_html(
+        card, branding.load_theme(), visuals.CARD_DENSITY_PRESETS[0])
 
     for h in headers:
         assert h in md, f"markdown lost header {h}"
         assert f"<th>{h}</th>" in html_out, f"PDF lost header {h}"
     for row in rows:
-        for cell in row:
+        for cell in row[:-1]:                       # every cell but the rating
             assert cell in md, f"markdown lost cell {cell}"
             assert cell in html_out, f"PDF lost cell {cell}"
+
+
+def test_both_renderers_show_the_same_rating_value():
+    """The rating is drawn two different ways and must still be ONE number.
+
+    The markdown carries the numeral; the PDF carries it in the numeral span AND
+    in the SVG's aria-label. A renderer that quantized differently, or read a
+    different key, would show a different number here.
+    """
+    from local_fitness.agent import branding, visuals
+
+    card = _graded_card_for_table()
+    _headers, rows = rc.metric_table(card)
+    html_out = visuals._render_metric_table_html(
+        card, branding.load_theme(), visuals.CARD_DENSITY_PRESETS[0])
+
+    for (key, _label), row in zip(rc._METRIC_LABELS, rows, strict=True):
+        score = card["metrics"][key]["stars"]
+        assert f"{score:.2f}" in row[-1]                       # markdown numeral
+        assert f'<span class="star-num">{score:.2f}</span>' in html_out
+        assert f'aria-label="{score:.2f} out of 5 stars"' in html_out
 
 
 def test_metric_notes_are_shared_and_table_ordered():

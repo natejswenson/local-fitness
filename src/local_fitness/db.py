@@ -257,6 +257,15 @@ CREATE TABLE IF NOT EXISTS report_cards (
     intent          TEXT,
     intent_class    TEXT,                  -- easy | long | quality | steady
     intent_source   TEXT,                  -- 'plan' | 'inferred'
+    overall_stars   REAL,          -- 1-5, the intent-weighted mean (capped)
+    mean_stars      REAL,          -- the same mean BEFORE the headroom cap
+    capped_by_metric TEXT,         -- which metric pulled it down, or NULL
+    distance_stars  REAL,
+    pace_stars      REAL,
+    hr_stars        REAL,
+    continuity_stars REAL,
+    -- Pre-0.50.0 letter rubric. Written NULL from 0.50.0 on; kept because
+    -- rows stored under it are the only record of what it said.
     overall_grade   TEXT,
     gpa             REAL,
     capped_by       TEXT,
@@ -370,6 +379,26 @@ def init_schema(db_path: Path | None = None) -> None:
             "PRAGMA table_info(report_cards)")}
         if rc_cols and "continuity_grade" not in rc_cols:
             conn.execute("ALTER TABLE report_cards ADD COLUMN continuity_grade TEXT")
+        # Same guard, same reason: 0.50.0 replaced letter grades with a
+        # continuous 1-5 star score. The letter columns are KEPT and stop being
+        # written — a stored card is what was actually shown on the day, and
+        # those columns are the only record of what the letter rubric said.
+        # Rows stored before this keep NULL stars and are skipped by every
+        # aggregate that reads them (see ledger.report_card_facts), which is
+        # also the whole migration: `scripts/warm_report_cards.py` re-renders
+        # them under the star rubric, and until it does they render their
+        # stored letters unchanged.
+        # Interpolated, never parameterized — SQLite takes no bind parameter in
+        # DDL. `_col` comes from this frozen literal tuple and nowhere else,
+        # which is the whitelist the no-f-string-SQL rule asks for.
+        for _col in ("overall_stars", "mean_stars", "distance_stars",
+                     "pace_stars", "hr_stars", "continuity_stars"):
+            if rc_cols and _col not in rc_cols:
+                conn.execute(
+                    f"ALTER TABLE report_cards ADD COLUMN {_col} REAL")
+        if rc_cols and "capped_by_metric" not in rc_cols:
+            conn.execute(
+                "ALTER TABLE report_cards ADD COLUMN capped_by_metric TEXT")
         # Same guard, same reason: `plan_workouts.target_hr_max` landed in
         # 0.40.0 so the report card can grade HR against the cap the plan
         # actually prescribed. Before it, "Keep HR under 140" lived only in the

@@ -64,10 +64,10 @@ def test_prompt_carries_the_computed_grades_and_forbids_re_grading():
     assert PROFILE.dials_line in system
     # The verdicts are stated as decided, and the model is told not to revise.
     assert "not yours to revise" in system
-    # SEVERITY, not the letter — the prompt must not hand the model the token
+    # SEVERITY, not the score — the prompt must not hand the model the value
     # it is forbidden to repeat. This is the invariant, not a style choice.
-    assert workout_coach.grade_severity(card["overall"]["grade"]) in user
-    assert f"Overall grade {card['overall']['grade']}" not in user
+    assert workout_coach.star_severity(card["overall"]["stars"]) in user
+    assert f"{card['overall']['stars']:.2f}" not in user
     for label in ("Distance", "Pace", "Avg HR"):
         assert label in user
     # Training load is NOT among the per-metric verdicts any more (0.40.0) — it
@@ -78,24 +78,37 @@ def test_prompt_carries_the_computed_grades_and_forbids_re_grading():
     assert "do not ask for more work" in user
 
 
-def test_the_user_prompt_never_contains_a_letter_grade():
+def test_the_user_prompt_never_contains_a_rating():
     """The root cause of the leak: the prompt used to print every letter
     ("Distance: D- — actual 5.95 mi…") in the same context that forbade
-    repeating them, and a leaked read regenerated to the SAME letter."""
+    repeating them, and a leaked read regenerated to the SAME letter. The star
+    rubric must not reintroduce the same shape with numbers."""
     for card in (a_card(), _card_with_ungraded_pace()):
         _system, user = workout_coach.build_prompt(PROFILE, card)
         assert workout_coach.find_grade_leak({"user": user}) is None, user
 
 
-def test_grade_severity_keys_on_the_base_letter():
-    assert workout_coach.grade_severity("D-") == workout_coach.grade_severity("D+")
-    assert workout_coach.grade_severity("A") == "on target"
-    assert workout_coach.grade_severity("F") == "missed badly"
+@pytest.mark.parametrize(("score", "word"), [
+    (5.0, "dead on"), (4.90, "dead on"), (4.89, "on target"),
+    (4.25, "on target"), (4.24, "slightly off target"),
+    (3.50, "slightly off target"), (3.49, "off target"),
+    (2.50, "off target"), (2.49, "well off target"),
+    (1.50, "well off target"), (1.49, "missed badly"), (1.0, "missed badly"),
+])
+def test_star_severity_band_boundaries(score, word):
+    assert workout_coach.star_severity(score) == word
 
 
-def test_grade_severity_handles_ungraded():
-    assert workout_coach.grade_severity(None) == "n/a"
-    assert workout_coach.grade_severity("n/a") == "n/a"
+def test_star_severity_handles_unrated():
+    assert workout_coach.star_severity(None) == "n/a"
+
+
+def test_star_severity_is_the_one_definition():
+    """The same vocabulary renders into the coach's MEMORY block via
+    ledger.report_card_facts. Two tables would drift, and the drift would be
+    invisible — the prompt and the memory would simply disagree about what a
+    given run was called."""
+    assert workout_coach.star_severity(4.5) == rc.star_verdict(4.5)
 
 
 def test_prompt_states_the_yardstick_without_markdown_emphasis():
@@ -399,10 +412,12 @@ def test_prompt_demands_four_labelled_sections_and_forbids_letter_grades():
     system, _ = workout_coach.build_prompt(PROFILE, a_card())
     for label in ("DISTANCE:", "PACE:", "HEART RATE:", "STIMULUS:"):
         assert label in system
-    assert "Do not name one" in system
+    assert "Do not name it, do not count it" in system
     assert "never about a score" in system
     # The ban must not demonstrate itself: spelling out "A", "B-", "C+" put
     # four grades into the context alongside the instruction not to say one.
+    # The star wording is held to the same rule — it names the concept once and
+    # never shows a value.
     assert workout_coach.find_grade_leak({"system": system}) is None
     assert "45 words per paragraph" in system
 
@@ -480,13 +495,16 @@ def test_markdown_card_renders_four_labelled_paragraphs():
     # reference pool started excluding rows: which median a run is measured
     # against is now a decision the reader cannot reconstruct from the numbers.
     assert "Graded against your **60-day rolling median**" in md
-    assert md.index("| Grade |") < md.index("Graded against your")
+    assert md.index("| Rating |") < md.index("Graded against your")
 
 
-def test_markdown_card_without_a_read_opens_on_the_grade():
+def test_markdown_card_without_a_read_opens_on_the_rating():
     md = rc.render_markdown(a_card())
     assert "## Overall:" in md
     assert "**Distance** —" not in md
+    # And it states what a 5 means — a star row reads as a review score
+    # otherwise, which is a different claim from the one this card makes.
+    assert "compliance score" in md
 
 
 # === the SDK call's shape ==================================================

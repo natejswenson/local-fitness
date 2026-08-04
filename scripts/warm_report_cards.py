@@ -117,6 +117,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No database at {db_path} — nothing to warm.")
         return 0
 
+    # Migrate before reading. This script is the FIRST thing a release runs
+    # (CLAUDE.md: "ship the warm WITH the release"), so it is also the first
+    # thing to meet a schema that moved — 0.50.0's `overall_stars` columns made
+    # that concrete, with `list_cards` raising OperationalError before a single
+    # card was surveyed. Every other entry point (`cli.py`, `web/server.py`)
+    # already inits; this one bypassed them. Idempotent, so it costs nothing
+    # when the schema is already current.
+    db.init_schema()
+
     from datetime import date, timedelta
     start = (date.today() - timedelta(days=args.days)).isoformat()
     cards = card_store.list_cards(start_date=start, limit=args.limit)

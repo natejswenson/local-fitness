@@ -1,6 +1,6 @@
 # `workout_report_card`
 
-> Graded report card for ONE workout — four compliance grades plus an overall, an ungraded training-stimulus report, a coach's read, and a PRESS-themed PDF. **Availability:** stdio only — local
+> Rated report card for ONE workout — four compliance star ratings plus an overall, an unrated training-stimulus report, a coach's read, and a PRESS-themed PDF. **Availability:** stdio only — local
 
 ## What it does
 
@@ -46,8 +46,13 @@ with distance and duration.
 
 | Surface | Metrics | Output |
 |---|---|---|
-| **Compliance** — "did you execute the prescription?" | distance, pace, HR, continuity | letter grades + the overall |
-| **Stimulus** — "what did this run do to your body?" | training load, aerobic/anaerobic TE, HR-zone share, drift | numbers + a `LOW`/`MODERATE`/`HIGH`/`VERY HIGH` descriptor, **never a letter** |
+| **Compliance** — "did you execute the prescription?" | distance, pace, HR, continuity | 1-5 star ratings + the overall |
+| **Stimulus** — "what did this run do to your body?" | training load, aerobic/anaerobic TE, HR-zone share, drift | numbers + a `LOW`/`MODERATE`/`HIGH`/`VERY HIGH` descriptor, **never a rating** |
+
+**5 stars means the day was executed as prescribed.** It is a COMPLIANCE score,
+not a verdict on how good the run was — a correctly-run easy day rates 5 and is
+by design a low-stimulus day. Those are different claims, and conflating them is
+exactly what inverted the rubric in 0.40.0 (below).
 
 Grading load *and* HR graded one variable twice with the sign reversed: Garmin's
 training load is essentially `duration x f(HR)`, so obeying an easy day's HR cap
@@ -59,22 +64,46 @@ load — while the one that blew the cap from mile 3 scored **A**, earning A+ on
 load for the extra work. The rubric was inverted, not merely blunt.
 
 Load is absent from every `INTENT_METRIC_WEIGHTS` table, so "load cannot lower
-your grade" is structural rather than a small weight a cap could bypass.
+your rating" is structural rather than a small weight a cap could bypass.
 
 **Each compliance metric reduces to a single non-negative relative deviation
-`d`**, and every `d` goes through the same `GRADE_BANDS`. Four small deviation
+`d`**, and every `d` goes through the same curve. Four small deviation
 functions, one grader — that is what keeps the rubric testable.
 
-| `d` ≤ | Grade |
-|---|---|
-| 0.05 | A |
-| 0.10 | B |
-| 0.20 | C |
-| 0.35 | D |
-| above | F |
+Since 0.50.0 that curve is continuous, mapping `d` to a score in **[1.00, 5.00]**
+with fractional precision, and it saturates at both ends rather than
+extrapolating:
 
-A `+` / `-` modifier marks position within the band (bottom third earns the
-`+`). Modifiers are cosmetic: GPA math runs on base letters only.
+| `d` | Stars |
+|---|---|
+| 0.00 | 5.00 |
+| 0.05 | 4.00 |
+| 0.10 | 3.00 |
+| 0.20 | 2.00 |
+| 0.35 and above | 1.00 |
+
+Between those knots the score interpolates linearly, so sub-band position is
+information rather than a cosmetic `+`/`-`.
+
+**Those knots ARE the old letter bands, deliberately.** `STAR_KNOTS` is the
+retired `GRADE_BANDS` with the letters removed, so every boundary the rubric was
+calibrated against still sits where it sat — in particular `d = 0.35` was the F
+floor and is now exactly `STAR_FLOOR`, which is what keeps `HR_CAP_BPM_SCALE`
+putting the bottom of the scale at 11.3 bpm sustained over a prescribed cap.
+
+Why the change: the letter rubric could only say which of five buckets a run
+fell in, and the buckets were badly unbalanced. Measured over 240 real cards,
+the `+`/`-` modifier was 545 of 749 graded rows (73%), A+ alone was 63% of
+distance rows and 90% of HR rows, and a quarter of all cards scored a perfect
+4.00 GPA. Continuous scoring took the overall from 4 occupied levels to 12 and
+halved the share of perfect scores.
+
+The glyphs quantize to a **quarter star** and the numeral always prints beside
+them. A quarter, not a tenth: one quarter star spans 0.063-0.19 mi on a 5-mile
+expectation against a 0.02 mi measurement floor, while a tenth would move a
+visible step for a difference the data cannot resolve. A partial star never
+rounds up to a full one and a full star is never faked, so `4.99` draws
+`★★★★¾ 4.99`.
 
 Two band-width multipliers exist:
 
@@ -136,28 +165,42 @@ Intent comes from the plan's prescribed `type` when there is one
 run at easy HR and mis-classing it "easy" would grade it against a 0.75× distance
 expectation and hand it an automatic A.
 
-### The overall grade
+### The overall rating
 
-Intent-weighted GPA over gradeable metrics only. Flat weights let the two
+Intent-weighted mean of the per-metric scores. Flat weights let the two
 lowest-information metrics outvote the point of the session — the same
 prescribed-10:28-run-at-9:28 scored an overall B because HR and load together
 carried 40% and both landed A.
 
-| Intent | distance | pace | hr | load |
+| Intent | distance | pace | hr | continuity |
 |---|---|---|---|---|
-| easy | 0.20 | **0.45** | 0.25 | 0.10 |
-| quality | 0.20 | **0.45** | 0.25 | 0.10 |
+| easy | 0.19 | **0.42** | 0.24 | 0.15 |
+| quality | 0.19 | **0.42** | 0.24 | 0.15 |
 | long | **0.45** | 0.20 | 0.20 | 0.15 |
 | steady | 0.30 | 0.30 | 0.25 | 0.15 |
 
 An `n/a` metric drops out and its weight redistributes proportionally. Zero
-gradeable metrics yields `"n/a"` — never `F`, which would read as a judgment
-that wasn't made. GPA cuts: ≥3.5 A, ≥2.5 B, ≥1.5 C, ≥0.5 D, else F.
+gradeable metrics yields `null` — never `1.00`, because "failed" and "not
+measured" must not be the same number.
 
-**The F floor.** An F on any single metric caps the overall at **C**, reported
-as `"capped_by": "F"` rather than silently rewritten — a card printing "Overall:
-A" above a row reading F is not reporting a grade, it is averaging away the
-finding.
+The mean consumes UNQUANTIZED scores; quantizing first would compound four
+rounding errors into the number the reader looks at first. Note this removes a
+double quantization the letter path had (`d` → letter → base letter → points →
+GPA → cut → letter), and with it `base_letter`'s old contract that a modifier
+could never move the overall — sub-band position now propagates, which is where
+most of the new resolution comes from.
+
+**The headroom cap.** The overall may never sit more than
+`OVERALL_STAR_HEADROOM` (**2.0**) above its worst rated row, reported as
+`capped: true` with `capped_by: {metric, stars}` and the uncapped `mean_stars`
+kept alongside. A card printing a fine overall above a row that failed is not
+reporting a score, it is averaging away the finding — the same rule the old
+F-cap enforced, now an invariant of the arithmetic rather than a threshold that
+has to fire. `STAR_FLOOR + 2.0 = 3.0` is exactly the C the letter version pinned
+to, so it reproduces that rule at the old boundary and degrades linearly on
+either side instead of stepping. Measured over 240 cards it fires on 12% and
+catches every card the F-cap caught, plus 16 more whose worst row was merely bad
+rather than floored — cases the letter cap ignored entirely.
 
 ## Returns
 
@@ -166,11 +209,17 @@ everything else is metadata for the caller's own logic.
 
 ```json
 {
-  "markdown": "# Report Card — Interval Session\n**2026-07-21** · 5.95 mi in 1:03:41 · 10:42/mi\n\n## Overall: D (1.05 GPA)\n…",
+  "markdown": "# Report Card — Interval Session\n**2026-07-21** · 5.95 mi in 1:03:41 · 10:42/mi\n\n## Overall: ★★☆☆☆ 1.85 / 5\n…",
   "activity_id": 23685126977,
   "date": "2026-07-21",
-  "overall": {"grade": "D", "gpa": 1.05, "graded_metrics": 4},
-  "grades": {"distance": "D-", "pace": "F", "hr": "B+", "load": "D+"},
+  "overall": {"stars": 1.85, "mean_stars": 1.85, "graded_metrics": 3,
+              "capped": false, "capped_by": null},
+  "stars": {"distance": 1.31, "pace": 1.0, "hr": 3.76, "continuity": null,
+            "load": null},
+  "ratings": {"distance": "★¼☆☆☆ 1.31", "pace": "★☆☆☆☆ 1.00",
+              "hr": "★★★¾☆ 3.76", "continuity": "n/a", "load": "n/a"},
+  "overall_rating": "★★☆☆☆ 1.85",
+  "scale_note": "5 stars = the day was executed as prescribed. A compliance score, not a verdict on how good the run was.",
   "reference": "rolling_60d",
   "intent": "interval",
   "intent_source": "plan",
@@ -182,8 +231,10 @@ everything else is metadata for the caller's own logic.
 | Field | Notes |
 |---|---|
 | `markdown` | The formatted card. **Render verbatim.** |
-| `overall` | `{grade, gpa, graded_metrics}`, plus `capped_by: "F"` when the F floor fired. `gpa` is `null` and `grade` is `"n/a"` when nothing was gradeable. |
-| `grades` | Per-metric letter, or `null` for an ungraded metric. |
+| `overall` | `{stars, mean_stars, graded_metrics, capped, capped_by}`. `stars` is the capped value the card shows; `mean_stars` is the uncapped weighted mean, kept so the two can be reconciled. `capped_by` is `{metric, stars}` naming the row that pulled it down. Both `stars` and `mean_stars` are `null` when nothing was rated. |
+| `stars` | Per-metric score in [1.00, 5.00], or `null` for an unrated metric. `load` is always `null` — it is a stimulus metric. |
+| `ratings` / `overall_rating` | The rendered strings. Prefer these over re-deriving a star row of your own, so every surface shows one rating. |
+| `scale_note` | What a 5 means. Carry it when summarising a card aloud. |
 | `reference` | The reference *mode* — `plan` never appears here; this is `rolling_60d` or `insufficient_data`, since the mode belongs to the rolling pool. Whether the plan supplied targets is visible in `markdown`'s reference line. |
 | `intent` / `intent_source` | e.g. `"interval"` / `"plan"`, or `"easy"` / `"inferred"`. |
 | `splits_available` | False for the ~88% of history that was backfilled. |
@@ -199,19 +250,21 @@ Errors: `no matching activity found` (with the `activity_id` / `date` echoed),
 # Report Card — Interval Session
 **2026-07-21** · 5.95 mi in 1:03:41 · 10:42/mi
 
-## Overall: D (1.05 GPA)
+## Overall: ★★☆☆☆ 1.85 / 5
+_5 stars = you did what the day prescribed — a compliance score, not a verdict
+on how good the run was._
 
 **Distance** — You went 5.95 against a prescribed 5. …
 **Pace** — Your best mile was 9:25 against a 6:58 rep target. …
 **Heart Rate** — 136 against a 145 floor for a quality day. …
-**Training Load** — 81 banked against an interval-day expectation of 105. …
+**Stimulus** — 81 banked against an interval-day expectation of 105. …
 
-| Metric | Actual | Expected | Delta | Grade |
+| Metric | Actual | Expected | Delta | Rating |
 | --- | --- | --- | --- | --- |
-| Distance | 5.95 mi | 5.00 mi | +19% | D- |
-| Pace | 9:25/mi best mile | 6:58/mi | 147s/mi slower | F |
-| Avg HR | 136 bpm | ≥ 145 bpm | -6% | B+ |
-| Training Load | 81 | 105 | -23% | D+ |
+| Distance | 5.95 mi | 5.00 mi | 0.95 mi long | ★¼☆☆☆ 1.31 |
+| Pace | 9:25/mi best mile | 6:58/mi | 147s/mi slower | ★☆☆☆☆ 1.00 |
+| Avg HR | 136 bpm | ≥ 145 bpm | 9 bpm under | ★★★¾☆ 3.76 |
+| Continuity | — | — | — | n/a |
 
 _Graded against your **training plan** for this date (intent: interval,
 prescribed by your plan). HR and training load have no plan target, so they use
@@ -227,10 +280,13 @@ otherwise._
 | …
 ```
 
-The four labelled paragraphs under the grade line are the coach's read
-(`agent/workout_coach.py`). They are told the grades are not theirs to revise,
-and are forbidden from naming a letter — the letters print in the table
-immediately below.
+The four labelled paragraphs under the rating line are the coach's read
+(`agent/workout_coach.py`). They are told the verdicts are not theirs to revise,
+and are forbidden from naming the rating — it prints in the table immediately
+below. The prompt is handed a severity WORD in place of every score
+(`STAR_VERDICT_CUTS`), so the value it may not repeat is never in its context to
+echo. `find_grade_leak` polices both a star rating and a letter grade (an
+invented scale is banned just as squarely).
 
 ## Example
 

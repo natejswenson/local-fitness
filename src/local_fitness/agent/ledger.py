@@ -29,7 +29,7 @@ import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
-from . import interpret
+from . import interpret, report_card
 
 #: Plan workout types that count as quality sessions for miss-tracking.
 QUALITY_TYPES = frozenset({"tempo", "interval", "race"})
@@ -64,6 +64,11 @@ _CARD_RECENT_HALF_DAYS = 10
 #: Render floor — one graded workout isn't a trend worth a receipt line.
 _CARD_MIN_COUNT = 2
 _CARD_TREND_MIN_PER_HALF = 2
+#: At or below this, a card's execution contradicts a "done" plan verdict and
+#: `notable_results` refuses to promote the day as a receipt. Deliberately the
+#: same boundary `scripts/calibrate_report_card.py` calls failing, so the two
+#: definitions of "this session went badly" cannot drift apart.
+BAD_CARD_MAX_STARS = 2.0
 
 
 def _iso(d: date) -> str:
@@ -262,13 +267,14 @@ def notable_results(graded_workouts: list[dict], today: str,
     Last 14 days, newest first.
 
     ``cards`` (the same ``report_cards`` rows ``report_card_facts`` reads —
-    ``activity_date``/``overall_grade``) lets a quality "done" verdict be
-    checked against how the session actually graded. Plan adherence is
+    ``activity_date``/``overall_stars``) lets a quality "done" verdict be
+    checked against how the session actually scored. Plan adherence is
     distance-based, so a quality day can legitimately verdict "done" (target
-    distance hit) while the graded card says D or F (pace/HR/load blown) —
-    promoting that as a receipt hands the coach a false "done as prescribed"
-    callback that directly contradicts its own report-card memory. A date
-    with no card is unaffected (today's behavior): the notable stands.
+    distance hit) while the graded card scored at or under
+    ``BAD_CARD_MAX_STARS`` (pace/HR blown) — promoting that as a receipt hands
+    the coach a false "done as prescribed" callback that directly contradicts
+    its own report-card memory. A date with no card is unaffected (today's
+    behavior): the notable stands.
 
     "Overachieved" is gated on ``actual_run_distance_m`` (measured RUN
     distance, pace-gated per the repo-wide run-vs-walk rule — see
@@ -284,10 +290,10 @@ def notable_results(graded_workouts: list[dict], today: str,
     t = _parse(today)
     if t is None:
         return []
-    bad_grade_dates = {
+    bad_card_dates = {
         c["activity_date"] for c in (cards or [])
-        if c.get("activity_date") and c.get("overall_grade")
-        and c["overall_grade"][0] in ("D", "F")
+        if c.get("activity_date") and c.get("overall_stars") is not None
+        and c["overall_stars"] <= BAD_CARD_MAX_STARS
     }
     out = []
     for w in graded_workouts:
@@ -304,10 +310,10 @@ def notable_results(graded_workouts: list[dict], today: str,
         overachieved = bool(
             target and run_m and run_m >= OVERACHIEVE_FRACTION * target)
         if wtype in QUALITY_TYPES:
-            if w["date"] in bad_grade_dates:
+            if w["date"] in bad_card_dates:
                 # The plan verdict is "done" but the graded card says the
-                # execution was a D/F — do not let the coach quote this as a
-                # receipt for what "done as prescribed" should look like.
+                # execution was well off target — do not let the coach quote
+                # this as a receipt for what "done as prescribed" looks like.
                 continue
             out.append({"date": w["date"], "type": wtype,
                         "kind": "quality_done"})
@@ -327,10 +333,19 @@ def report_card_facts(cards: list[dict], today: str) -> dict:
     independently of any SQL filter the caller applied, since this function
     is exercised directly on fabricated rows in tests.
 
-    ``cards`` rows carry ``activity_date``/``gpa``/``overall_grade`` (the
-    ``report_cards`` row shape). A row with no ``gpa`` or no
-    ``overall_grade`` graded nothing usable and is skipped entirely — it
-    never counts, never enters the mean.
+    ``cards`` rows carry ``activity_date``/``overall_stars`` (the
+    ``report_cards`` row shape). A row with no ``overall_stars`` graded nothing
+    usable and is skipped entirely — it never counts, never enters the mean.
+
+    That skip is also what handles the 0.50.0 cutover, deliberately and without
+    a migration: a card stored under the letter rubric has ``overall_stars``
+    NULL and drops out, exactly as a row with no ``gpa`` did before. **Do not
+    synthesize a star score from a stored letter** — mixing two scales inside
+    one mean is the precise category error this module keeps getting burned by
+    (see ``hr_exceedance_bpm``'s history), and a memory line that goes briefly
+    quiet is far cheaper than one that is confidently wrong. The window is 3
+    weeks, so the aggregate is fully star-based within 21 days — immediately if
+    the release warms the stored cards, which it should.
     """
     t = _parse(today)
     in_window = []
@@ -341,27 +356,31 @@ def report_card_facts(cards: list[dict], today: str) -> dict:
         age = (t - d).days
         if not (1 <= age <= _CARD_WINDOW_DAYS):
             continue
-        if row.get("gpa") is None or not row.get("overall_grade"):
+        if row.get("overall_stars") is None:
             continue
         in_window.append({**row, "_age": age})
 
     count = len(in_window)
     if count == 0:
         return {
-            "count": 0, "mean_gpa": None, "grade_counts": {},
+            "count": 0, "mean_stars": None, "verdict_counts": {},
             "trend": "no data", "window_days": _CARD_WINDOW_DAYS,
         }
 
-    mean_gpa = round(sum(r["gpa"] for r in in_window) / count, 2)
+    mean_stars = round(sum(r["overall_stars"] for r in in_window) / count, 2)
 
-    grade_counts: dict[str, int] = {}
+    # Bucketed by VERDICT WORD, not by quarter star. This renders into a prompt
+    # block the coach reads aloud, and "two at 4.25, one at 4.50" is noise in
+    # prose — the five bands say something a sentence can carry.
+    verdict_counts: dict[str, int] = {}
     for r in in_window:
-        letter = r["overall_grade"][0]
-        if letter in "ABCDF":
-            grade_counts[letter] = grade_counts.get(letter, 0) + 1
+        word = report_card.star_verdict(r["overall_stars"])
+        verdict_counts[word] = verdict_counts.get(word, 0) + 1
 
-    recent = [r["gpa"] for r in in_window if r["_age"] <= _CARD_RECENT_HALF_DAYS]
-    earlier = [r["gpa"] for r in in_window if r["_age"] > _CARD_RECENT_HALF_DAYS]
+    recent = [r["overall_stars"] for r in in_window
+              if r["_age"] <= _CARD_RECENT_HALF_DAYS]
+    earlier = [r["overall_stars"] for r in in_window
+               if r["_age"] > _CARD_RECENT_HALF_DAYS]
     if len(recent) >= _CARD_TREND_MIN_PER_HALF and len(earlier) >= _CARD_TREND_MIN_PER_HALF:
         trend = interpret.delta_direction(
             interpret.pct_change(sum(recent) / len(recent), sum(earlier) / len(earlier)))
@@ -369,7 +388,8 @@ def report_card_facts(cards: list[dict], today: str) -> dict:
         trend = "no data"
 
     return {
-        "count": count, "mean_gpa": mean_gpa, "grade_counts": grade_counts,
+        "count": count, "mean_stars": mean_stars,
+        "verdict_counts": verdict_counts,
         "trend": trend, "window_days": _CARD_WINDOW_DAYS,
     }
 
@@ -434,15 +454,17 @@ def render_ledger_block(ledger: dict, user_name: str) -> str:
         lines.append(line + ".")
 
     cards = ledger.get("cards") or {}
-    if cards.get("count", 0) >= _CARD_MIN_COUNT and cards.get("mean_gpa") is not None:
-        counts = cards.get("grade_counts") or {}
-        dist = " ".join(f"{g}:{counts[g]}" for g in "ABCDF" if counts.get(g))
-        line = (f"Report cards: {cards['count']} workouts graded in the last "
-                f"3 weeks (through yesterday) — avg GPA {cards['mean_gpa']:.2f}")
+    if cards.get("count", 0) >= _CARD_MIN_COUNT and cards.get("mean_stars") is not None:
+        counts = cards.get("verdict_counts") or {}
+        order = [w for _, w in report_card.STAR_VERDICT_CUTS] + ["missed badly"]
+        dist = ", ".join(f"{counts[w]} {w}" for w in order if counts.get(w))
+        line = (f"Report cards: {cards['count']} workouts rated in the last "
+                f"3 weeks (through yesterday) — avg "
+                f"{cards['mean_stars']:.2f} of 5")
         if dist:
             line += f" ({dist})"
         if cards.get("trend") in ("rising", "falling"):
-            line += f"; grades {cards['trend']}"
+            line += f"; ratings {cards['trend']}"
         lines.append(line + ".")
 
     _PATTERN_PHRASES = {
@@ -520,18 +542,20 @@ def load_ledger_inputs(conn: sqlite3.Connection, today: str,
     card_window_start = _iso(t - timedelta(days=_CARD_WINDOW_DAYS))
     try:
         card_rows = [
-            {"activity_date": r[0], "gpa": r[1], "overall_grade": r[2]}
+            {"activity_date": r[0], "overall_stars": r[1]}
             for r in conn.execute(
-                "SELECT activity_date, gpa, overall_grade FROM report_cards "
+                "SELECT activity_date, overall_stars FROM report_cards "
                 "WHERE activity_date >= ? AND activity_date < ? "
                 "ORDER BY activity_date",
                 (card_window_start, today),
             )
         ]
     except sqlite3.OperationalError:
-        # Pre-0.32.0 DB with no report_cards table: costs this one line,
-        # never the whole memory block (memory.py fails the whole render to
-        # "" on any exception, which is a much bigger loss).
+        # Pre-0.32.0 DB with no report_cards table (or pre-0.50.0 with no
+        # overall_stars column, on the one render between an upgrade and
+        # `init_schema`): costs this one line, never the whole memory block
+        # (memory.py fails the whole render to "" on any exception, which is a
+        # much bigger loss).
         card_rows = []
     return {
         "graded_workouts": graded,

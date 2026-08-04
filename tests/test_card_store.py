@@ -81,7 +81,7 @@ def clock(monkeypatch):
 # --- pure half ---------------------------------------------------------------
 
 
-def test_card_row_extracts_the_actual_grades():
+def test_card_row_extracts_the_actual_scores():
     card = a_card()
     row = card_store.card_row(card, read_cache_key="k1")
     assert row["activity_id"] == 1
@@ -89,18 +89,22 @@ def test_card_row_extracts_the_actual_grades():
     assert row["intent"] == card["intent"]
     assert row["intent_class"] == card["intent_class"]
     assert row["intent_source"] == "inferred"
-    assert row["overall_grade"] == card["overall"]["grade"]
-    assert row["gpa"] == card["overall"]["gpa"]
-    assert row["distance_grade"] == card["metrics"]["distance"]["grade"]
-    assert row["pace_grade"] == card["metrics"]["pace"]["grade"]
-    assert row["hr_grade"] == card["metrics"]["hr"]["grade"]
-    # Always NULL from 0.40.0 on — load is a stimulus metric and carries no
-    # grade. The column is kept (rows graded before the split hold real letters,
-    # and dropping a SQLite column is a table rebuild), so this asserts the
-    # value rather than the round-trip: `== card[...]["grade"]` would pass
-    # vacuously with both sides None and would not notice a letter reappearing.
-    assert row["load_grade"] is None
-    assert card["metrics"]["load"]["grade"] is None
+    assert row["overall_stars"] == card["overall"]["stars"]
+    assert row["mean_stars"] == card["overall"]["mean_stars"]
+    assert row["distance_stars"] == card["metrics"]["distance"]["stars"]
+    assert row["pace_stars"] == card["metrics"]["pace"]["stars"]
+    assert row["hr_stars"] == card["metrics"]["hr"]["stars"]
+    # An uncapped card names no metric.
+    assert row["capped_by_metric"] is None
+    # Load carries no score at all (0.40.0) — asserted as a VALUE, not a
+    # round-trip: `== card[...]["stars"]` would pass vacuously with both sides
+    # None and would not notice a score reappearing.
+    assert card["metrics"]["load"]["stars"] is None
+    # The letter columns stop being written at 0.50.0. Same reasoning as
+    # load_grade: kept for rows stored under the old rubric, never written now.
+    for legacy in ("overall_grade", "gpa", "capped_by", "distance_grade",
+                   "pace_grade", "hr_grade", "continuity_grade", "load_grade"):
+        assert row[legacy] is None, legacy
     assert row["read_cache_key"] == "k1"
     # Pure: graded_at is save_card's concern, never card_row's.
     assert "graded_at" not in row
@@ -112,7 +116,7 @@ def test_card_row_strips_the_reproducible_keys_and_keeps_the_read():
     for key in ("hr_trace", "recent_activities", "upcoming_workouts"):
         assert key not in stored
     assert stored["coach_read"] == READ
-    assert stored["metrics"]["distance"]["grade"] is not None
+    assert stored["metrics"]["distance"]["stars"] is not None
 
 
 def test_read_is_complete_requires_all_four_nonempty_sections():
@@ -132,8 +136,8 @@ def test_save_load_round_trip_pins_columns_and_renders_markdown(cdb):
     card_store.save_card(card, read_cache_key="k1")
     loaded = card_store.load_card(1)
     assert loaded["activity_date"] == "2026-07-19"
-    assert loaded["overall_grade"] == card["overall"]["grade"]
-    assert loaded["distance_grade"] == card["metrics"]["distance"]["grade"]
+    assert loaded["overall_stars"] == card["overall"]["stars"]
+    assert loaded["distance_stars"] == card["metrics"]["distance"]["stars"]
     assert loaded["read_cache_key"] == "k1"
     # graded_at was stamped by save_card in journal.py's timestamp format.
     datetime.fromisoformat(loaded["graded_at"])
@@ -184,16 +188,16 @@ def test_differing_key_overwrites_the_whole_row(cdb, clock):
     after = raw_row()
     assert after["read_cache_key"] == "k2"
     assert after["graded_at"] != before["graded_at"]
-    # Words AND grades moved together — one render's whole row.
+    # Words AND scores moved together — one render's whole row.
     stored = json.loads(after["card_json"])
     assert stored["coach_read"]["distance"] == "a different verdict."
-    assert after["distance_grade"] == rc.build_card(
+    assert after["distance_stars"] == rc.build_card(
         {**ACTIVITY, "distance_meters": 12000}, [], None, REF, {}, None,
-        None, None)["metrics"]["distance"]["grade"]
+        None, None)["metrics"]["distance"]["stars"]
 
 
 def test_fallback_never_clobbers_a_real_read_row(cdb, clock):
-    """NULL over non-NULL → whole-row no-op: neither the words nor the grades
+    """NULL over non-NULL → whole-row no-op: neither the words nor the scores
     nor graded_at move, proving there is no field-level splice."""
     card_store.save_card(a_card(), read_cache_key="k1")
     before = raw_row()
@@ -440,8 +444,11 @@ def test_migration_does_not_disturb_the_snapshot(cdb, clock):
     assert after["graded_at"] == before["graded_at"]
     assert after["read_cache_key"] == before["read_cache_key"]
     for column in ("activity_date", "intent", "intent_class", "intent_source",
-                   "overall_grade", "gpa", "capped_by", "distance_grade",
-                   "pace_grade", "hr_grade", "continuity_grade", "load_grade"):
+                   "overall_stars", "mean_stars", "capped_by_metric",
+                   "distance_stars", "pace_stars", "hr_stars",
+                   "continuity_stars", "overall_grade", "gpa", "capped_by",
+                   "distance_grade", "pace_grade", "hr_grade",
+                   "continuity_grade", "load_grade"):
         assert after[column] == before[column], column
     # Inside card_json, only coach_read moves.
     b, a = json.loads(before["card_json"]), json.loads(after["card_json"])

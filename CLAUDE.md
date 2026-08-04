@@ -740,10 +740,72 @@ These are settled — don't redesign without a reason.
 - **Workout grading is deterministic Python, not model judgment** (0.25.0).
   `agent/report_card.py` backs the `workout_report_card` tool and follows the
   `interpret.py` rule: the LLM phrases a judgment, it never derives one code
-  can compute. **Compliance** metrics (distance, pace, HR) each reduce to ONE
-  non-negative relative deviation `d` fed through ONE shared `GRADE_BANDS`
-  table — three small deviation functions, one grader, so the rubric stays
+  can compute. **Compliance** metrics (distance, pace, HR, continuity) each
+  reduce to ONE non-negative relative deviation `d` fed through ONE shared
+  curve — four small deviation functions, one grader, so the rubric stays
   testable. Design constraints that are load-bearing, not incidental:
+  - **The score is a continuous 1-5 star rating, and `STAR_KNOTS` IS
+    `GRADE_BANDS` with the letters removed** (0.50.0). That identity is the
+    load-bearing property of the whole change and must survive any retune:
+    every knot is a boundary the rubric was already calibrated on, so
+    `d = 0.35` was the F floor and is now exactly `STAR_FLOOR`, which is what
+    keeps `HR_CAP_BPM_SCALE` putting the bottom of the scale at 11.3 bpm
+    sustained over a prescribed cap — **the cutover therefore needed no
+    zone-4+5 revalidation**. Reshaping the curve away from these knots
+    silently recalibrates that boundary and re-triggers the requirement.
+    **Why letters went:** they could only say which of five buckets a run fell
+    in, and the buckets were wildly unbalanced. Measured over 240 real cards
+    (730 days): the `+`/`-` modifier was 545 of 749 graded rows (**73%**), A+
+    alone was 63% of distance rows / 90% of HR / 76% of continuity, and a
+    quarter of all cards scored a perfect 4.00 GPA — the modifier was reporting
+    "this deviation was in the bottom third of a band whose bottom third holds
+    ~70% of all deviations". Measured result: the overall went from 4 occupied
+    levels to **12**, perfect scores halved (33% → 17%), and pace — 0.42 weight
+    on easy and quality days — went from 5 letters to **15** levels. A
+    percentile-derived per-metric `STAR_SCALE` (distance 0.55 / pace 0.28) was
+    simulated and **rejected**: +2 pace buckets, and it lost 2 of the 10 cards
+    the F-cap catches. Two quantizations disappeared with the letters
+    (`d` → letter → base letter → points → GPA → cut → letter), and with them
+    `base_letter`'s contract that a modifier could never move the overall —
+    sub-band position now propagates, which is where most of the resolution
+    comes from and why 5.6% of card pairs reorder against the old GPA.
+    `STAR_NOISE` is load-bearing on distance specifically: a plan target is
+    two-sided so it has NO exact zeros, and 13 of 17 live plan runs sit at
+    `d = 0.0002..0.004` (GPS wobble) which would otherwise print a partial star
+    beside a Delta cell reading "on target".
+  - **The F-cap became arithmetic:** `overall = min(weighted_mean,
+    worst_row + OVERALL_STAR_HEADROOM)` (2.0). "Never print an overall that
+    contradicts a row beside it" is now an invariant rather than a threshold
+    that has to fire. `STAR_FLOOR + 2.0 = 3.0` is exactly the C the letter cap
+    pinned to, so it reproduces the old rule at the old boundary and degrades
+    linearly either side instead of stepping. Measured: fires on 12% of cards,
+    catches **all 10** the F-cap caught, plus 16 more whose worst row was
+    merely bad (1.25-2.50) rather than floored — cases the letter cap ignored
+    entirely. Headroom 2.5 was tried and silently stopped capping 4 of those
+    10; 1.5 fired on 28% and piled 20 cards on exactly 2.50, becoming the
+    primary scoring rule rather than a rail. Both numbers are reported
+    (`stars` capped, `mean_stars` uncapped) so the card can say why they
+    disagree.
+  - **A free-side 0.0 earns exactly 5.00, and that is not negotiable.** 51% of
+    distance, 87% of HR and 71% of continuity deviations are exactly 0.0 — the
+    direction-gated free side. 0.41.0 settled that A+ inflation is a DISPLAY
+    problem ("Don't fix it by touching `GRADE_BANDS`, `_modifier` or
+    `PLAN_TIGHTEN`"), and rescaling the curve so a compliant easy run reads 4.3
+    would be doing exactly that one layer up. **Granularity on distance, HR and
+    continuity therefore comes only from the penalized side and from the
+    overall**; pace and the overall carry it, and that is the honest ceiling of
+    this change. The largest remaining gain is not a curve at all — it is an
+    `activity_splits` backfill, which would take continuity from 41 to ~236
+    rated rows.
+  - **`grade[0]` had FIVE independent re-implementations and four failed
+    silently** under a numeric score. Fixed at 0.50.0, but the shape recurs:
+    `ledger.report_card_facts` (distribution empties while the memory line
+    keeps printing), `ledger.notable_results` (D/F suppression stops firing —
+    undocumented before this), `visuals._grade_class` (accent lost, card still
+    renders), `calibrate_report_card.collect` (every line "skip", **exits 0** —
+    the mandatory pre-flight gate stops testing anything). Only
+    `prompts.py`'s pinned string failed loudly. Before changing the score's
+    type again, grep for `[0]` applied to it.
   - **Compliance is graded; stimulus is only reported** (0.40.0). Training
     load, aerobic/anaerobic TE, HR-zone distribution and drift live in a
     separate `stimulus` block with a `LOW|MODERATE|HIGH|VERY HIGH` descriptor
@@ -1038,15 +1100,23 @@ These are settled — don't redesign without a reason.
     C empty. **`scripts/calibrate_report_card.py` is the gate**: it regrades a
     trailing window through the production path (`load_report_card_inputs` ->
     `build_card`, never a reimplementation) and exits non-zero on *punitive
-    skew* (>60% of runs D/F) or *dead bands* (>=2 letters unused). Run it before
-    changing ANY constant here — `GRADE_BANDS`, `HR_BANDS`, `HR_CAP_NOISE_BPM`,
+    skew* (>60% of runs at or under 2.0 stars) or a *collapsed scale*. Run it
+    before changing ANY constant here — `STAR_KNOTS`, `STAR_SCALE`,
+    `STAR_NOISE`, `HR_BANDS`, `HR_CAP_NOISE_BPM`,
     `HR_CAP_BPM_SCALE`, `CONTINUITY_TOLERANCE`, `PLAN_TIGHTEN`,
     `LOAD_SPIKE_FACTOR`, `*_FACTORS`, `MIN_REFERENCE_ACTIVITIES` — and paste the
     output into the CHANGELOG entry and the PR body. The two signatures are **deliberately
-    asymmetric**: concentration in a *passing* grade is not evidence of anything
-    (distance grades 79% A because the distances are being hit) and is reported,
-    not gated. A symmetric rule was this check's own first draft and it flagged
-    three of five healthy metrics. **Strictly read-only** (`mode=ro` URI — SQLite
+    asymmetric**: concentration in a *high* score is not evidence of anything
+    (distance sits 74% at the top because the distances are being hit) and is
+    reported, not gated. A symmetric rule was this check's own first draft and
+    it flagged three of five healthy metrics. **"Dead bands" became "collapsed
+    scale" at 0.50.0 and is now a CONJUNCTION** — floor share >= 25% AND
+    interior share < 25% — because with 17 quarter-star buckets a healthy
+    small-n metric leaves several empty by construction, and the thing 0.40.0
+    actually broke was bimodality (mass at both extremes, nothing between). The
+    conjunction is what preserves the asymmetry: HR's rolling band is 77% at
+    the top with 23% interior and passes, because its floor share is 0%. An
+    interior-only rule was tried and false-failed it. **Strictly read-only** (`mode=ro` URI — SQLite
     refuses the write) and **deliberately not in CI**: it needs a populated
     `data/fitness.db`, and a fabricated one would only ask the fixture whether it
     agrees with itself. `test_the_gate_is_not_wired_into_ci` fails if someone
@@ -1058,14 +1128,15 @@ These are settled — don't redesign without a reason.
     every grading defect in this module's history was caught by a human reading a
     rendered card, never by the suite. `tests/evals/report_cards.py` +
     `tests/evals/test_report_card_verdicts.py` are the other half: fabricated
-    scenarios asserting **the overall letter a run deserves**, driven through a
+    scenarios asserting **the overall score a run deserves**, driven through a
     real SQLite DB so the reference-pool filter is inside what they grade.
-    Expected verdicts are BOUNDS in `EXPECTED_VERDICTS` (a bound is the actual
-    contract and survives ordinary recalibration; an exact letter would fight
-    it), each with a stated reason — and a scenario with no entry fails
+    Expected verdicts are BOUNDS in `EXPECTED_VERDICTS` (`min_stars` /
+    `max_stars` since 0.50.0 — a bound is the actual contract and survives
+    ordinary recalibration; an exact value would fight it), each with a stated
+    reason — and a scenario with no entry fails
     `test_every_scenario_declares_a_verdict`. **When a user reports a wrong
-    grade, the permanent fix is a new scenario here**, not only a unit test; and
-    never pin the disputed grade as a regression assertion (0.40.1 added
+    rating, the permanent fix is a new scenario here**, not only a unit test; and
+    never pin the disputed value as a regression assertion (0.40.1 added
     `assert hr["grade"] == "F"` for the card under dispute).
   - **A plan target is an instruction; a rolling median is a reference.**
     Plan-referenced distance and pace are graded on bands tightened by
@@ -1194,7 +1265,14 @@ These are settled — don't redesign without a reason.
   miss lands on the next person to open one. Measured 2026-08-03: 15 of 15
   stale after 0.41-0.45. The survey drives the REAL handler with the SDK call
   and the write stubbed, so it re-derives no key of its own and cannot drift;
-  `--max-calls` refuses rather than warns.
+  `--max-calls` refuses rather than warns. **At 0.50.0 the warm IS the
+  migration** — there is no backfill path for stored cards by design, so a card
+  stored under the letter rubric keeps its letters (and renders them unchanged)
+  until it is re-rendered, and `ledger.report_card_facts` skips it in the
+  meantime rather than synthesizing a star from a letter. Mixing two scales
+  inside one mean is the exact category error this module keeps getting burned
+  by; a memory line that goes briefly quiet is cheaper than one that is
+  confidently wrong. Ship the warm WITH the release, not after it.
 - **Both PDFs fit one page, and the fitting is measured, not tuned**
   (0.27.0). `visuals.fit_one_page(build_html, presets)` is renderer-agnostic:
   it takes a callable, renders at each `DENSITY_PRESETS` rung (roomy →
