@@ -6,6 +6,153 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-08-04
+
+### Changed
+- **The report card scores 1-5 stars with fractional precision instead of
+  letter grades.** Each compliance metric still reduces to one non-negative
+  relative deviation `d` through one shared grader; that grader now returns a
+  continuous score in `[1.00, 5.00]` rather than one of five letters plus a
+  `+`/`-`.
+
+  **Why.** The letter rubric could only say which of five buckets a run fell
+  in, and the buckets were badly unbalanced. Measured over **240 real cards
+  spanning 730 days**: the `+`/`-` modifier was **545 of 749 graded rows
+  (73%)**, A+ alone was **63%** of distance rows, **90%** of HR and **76%** of
+  continuity, and **a quarter of all cards scored a perfect 4.00 GPA**. The
+  modifier was reporting "this deviation was in the bottom third of a band
+  whose bottom third holds ~70% of all deviations" — decoration, not
+  information.
+
+  **`STAR_KNOTS` is `GRADE_BANDS` with the letters removed**, and that identity
+  is the load-bearing property of the change: every knot is a boundary the
+  rubric was already calibrated on, so `d = 0.35` was the F floor and is now
+  exactly `STAR_FLOOR`. `HR_CAP_BPM_SCALE` therefore still puts the bottom of
+  the scale at 11.3 bpm sustained over a prescribed cap — the boundary
+  validated against Garmin's zone-4+5 share — so **the cutover required no
+  zone-4+5 revalidation**. A percentile-derived per-metric `STAR_SCALE`
+  (distance 0.55 / pace 0.28) was simulated and rejected: it bought two
+  quarter-star buckets on pace and **lost 2 of the 10 cards the F-cap catches**.
+
+  **Measured result.** The overall went from 4 occupied levels to **12**,
+  perfect scores **halved (33% to 17%)**, and pace — which carries 0.42 weight
+  on easy and quality days — went from 5 letters to **15** levels. Rank
+  agreement with the old GPA is 0.944 across all 27,730 card pairs; the 5.6%
+  that reorder are cards where the modifier `base_letter` discarded was the
+  difference.
+
+  Distance and HR stay concentrated at the top and structurally must: 51% of
+  distance and 87% of HR deviations are exactly 0.0, the direction-gated free
+  side, and 0.41.0 settled that re-introducing a slow-side penalty is the wrong
+  fix. Granularity on those metrics comes from the penalized side and from the
+  overall.
+
+- **The F-cap became arithmetic:** `overall = min(weighted_mean, worst_row +
+  2.0)`. "Never print an overall that contradicts a row beside it" is now an
+  invariant rather than a threshold that has to fire. `STAR_FLOOR + 2.0 = 3.0`
+  is exactly the C the letter cap pinned to, so it reproduces the old rule at
+  the old boundary and degrades linearly either side instead of stepping. It
+  catches **all 10** cards the F-cap caught, plus **16 more** whose worst row
+  was merely bad (1.25-2.50) rather than floored — cases the letter cap ignored
+  entirely. Headroom 2.5 was tried and silently stopped capping 4 of those 10.
+  Both numbers are reported (`stars` capped, `mean_stars` uncapped) so the card
+  can state why they disagree.
+
+- **The card states what it means, on every surface**: *5 stars = you did what
+  the day prescribed — a compliance score, not a verdict on how good the run
+  was.* A star row carries an unavoidable review-score connotation, and for
+  this card that misleads: a correctly-run easy day rates 5 and is by design a
+  low-stimulus day. Conflating "followed the plan" with "was a great workout"
+  is what inverted the rubric in 0.40.0.
+
+- **Rendering.** The terminal prints quarter-star glyphs plus an exact numeral;
+  the PDF draws inline SVG, because the brand mono (IBM Plex Mono, 963
+  codepoints) carries **no star glyph at all** and a text star renders in
+  whatever font the host machine happens to have. Partial fill uses an
+  area-linearised cut table — clipping at 75% of the bounding box leaves
+  **89.6% of the ink**, which made the first 4.75 identical to a 5.00. The hero
+  is stacked so the coach read runs full width. Measured by re-rendering all 16
+  stored cards through the real ladder: **15 keep their density rung**, one
+  drops from `dense` to `ultra`, and every card stays exactly one page.
+
+### Fixed
+- **Four sites re-implemented `base_letter`'s `grade[0]` slice independently
+  and would have failed SILENTLY under a numeric score** — no exception, no
+  shape-level test failure:
+  - `ledger.report_card_facts` — the distribution would empty while the
+    coach-memory line kept printing, producing *wrong memory*.
+  - `ledger.notable_results` — the D/F suppression would stop firing, so a
+    quality day rated 1.5 would be promoted back into the coach's receipts as
+    "done as prescribed" (this one was undocumented).
+  - `visuals._grade_class` — class names matching no CSS rule; the card loses
+    its accent signal and still renders cleanly.
+  - `scripts/calibrate_report_card.py` — every metric skipped, all five lines
+    returning "skip", and the script **exiting 0**: the mandatory pre-flight
+    gate would have silently stopped testing anything.
+
+  `reflect.py`'s independent leak regexes and `prompts.py`'s pinned rubric
+  description were also updated; only the latter failed loudly.
+
+- **`workout_coach.find_grade_leak` now covers both scales.** A letter is an
+  *invented* scale under the star rubric, which `_GRADE_TONE` bans just as
+  squarely, so the letter pattern is kept and `_STAR_LEAK` added beside it. The
+  star pattern can afford to be much broader than the letter one ever could:
+  "A" is the English indefinite article, while "stars" is not a word a
+  paragraph about a run has reason to contain. It deliberately does **not**
+  catch a bare numeral — "4.75" is indistinguishable from a distance, and the
+  structural defence is that the score is never in the prompt to echo.
+
+### Added
+- **`scripts/calibrate_report_card.py`'s "dead bands" signature became
+  "collapsed scale"**, as a conjunction: floor share at or above 25% AND
+  interior share below 25%. With 17 quarter-star buckets a healthy small-n
+  metric leaves several empty by construction, so counting empty buckets would
+  false-fail; what 0.40.0 actually broke was bimodality. The conjunction
+  preserves the gate's deliberate asymmetry — HR's rolling band sits 77% at the
+  top with 23% interior and passes, because its floor share is 0%. An
+  interior-only rule was tried and false-failed it. Punitive skew is unchanged
+  in threshold and semantics (>60% of runs at or under 2.0 stars).
+- `docs/plans/2026-08-04-report-card-star-rating-design.md` — the full design
+  record: the scoring simulation over 240 cards, the render measurements over
+  all 16 stored cards, and the calibration output below.
+
+### Calibration gate at release
+
+```
+Report-card calibration — 42 running efforts, trailing 90 days
+
+occupancy strip: 17 quarter-star buckets, 1.00 (left) -> 5.00 (right)
+
+metric                 1.00 .. 5.00        mean    n  verdict
+-------------------------------------------------------------
+distance               ##.#...#..#.#.###   4.43   42  ok — 9 buckets used, top 74%, interior 24%, <=2.0* 12%
+pace                   #.#...##.##.#####   4.19   42  ok — 11 buckets used, top 45%, interior 52%, <=2.0* 5%
+hr (rolling band)      ....#......##.###   4.71   31  ok — 6 buckets used, top 77%, interior 23%, <=2.0* 6%
+hr (prescribed cap)    #.#..##.#.....#.#   2.88   11  ok — 7 buckets used, top 27%, interior 45%, <=2.0* 36%
+continuity             #.#...##....#..##   4.29   39  ok — 7 buckets used, top 74%, interior 18%, <=2.0* 13%
+
+overall (informational, not gated)
+  ...#....#########  mean 4.14, median 4.48
+  10/42 at 5.00 (24%)
+  cap fired on 12/42 cards (29%)
+
+OK — every rated metric still uses its scale.
+```
+
+### Migration
+- `report_cards` gains `overall_stars`, `mean_stars`, `capped_by_metric` and
+  four per-metric `*_stars` columns via the guarded-`ALTER` pattern. The letter
+  columns are **kept and stop being written** — a stored card is a dated
+  snapshot of what was actually shown, and those columns are the only record of
+  what the letter rubric said.
+- **The warm IS the migration.** There is no backfill by design: a card stored
+  under the letter rubric renders its letters unchanged until it is
+  re-rendered, and `ledger.report_card_facts` skips it rather than synthesizing
+  a star from a letter (mixing two scales inside one mean is the exact category
+  error this module keeps getting burned by). Run `uv run python
+  scripts/warm_report_cards.py` then `--yes` as part of this release.
+
+
 ## [0.49.0] - 2026-08-03
 
 ### Added

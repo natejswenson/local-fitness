@@ -75,17 +75,17 @@ Three tools overlap here; the distinction is on each page.
 |---|---|
 | [`query_workouts`](query_workouts.md) | List/filter sessions — returns `{workouts, count, truncated}` |
 | [`get_workout_detail`](get_workout_detail.md) | One session in full, including splits where they exist |
-| [`workout_report_card`](workout_report_card.md) | 📄 **Graded** report card for one session — letters, not adjectives |
+| [`workout_report_card`](workout_report_card.md) | 📄 **Rated** report card for one session — 1-5 stars, not adjectives |
 | [`log_manual_workout`](log_manual_workout.md) | ✍️ Record a non-Garmin session (feeds CTL/ATL/TSB) |
 | [`delete_manual_workout`](delete_manual_workout.md) | ✍️ Remove one |
 | [`list_report_cards`](list_report_cards.md) | Graded history — every card ever rendered, newest run first |
 | [`get_report_card`](get_report_card.md) | One stored card in full, with the coach's read and preformatted markdown |
 
-Stored cards are **dated snapshots**, graded against the plan active at that
+Stored cards are **dated snapshots**, rated against the plan active at that
 render, and there is no backfill — history starts when cards start rendering.
 The two query tools are pure JSON so they work over both transports, but
 `workout_report_card`, which creates the rows, is stdio-only: a remote client
-can read the graded history it cannot extend.
+can read the rated history it cannot extend.
 
 ### Analysis
 

@@ -1,18 +1,18 @@
 # `get_report_card`
 
-> One stored workout report card by `activity_id` — the full graded snapshot, the coach's verbal read from that render, and a preformatted markdown card. **Availability:** stdio + HTTP
+> One stored workout report card by `activity_id` — the full rated snapshot, the coach's verbal read from that render, and a preformatted markdown card. **Availability:** stdio + HTTP
 
 ## What it does
 
-Loads one row from `report_cards` and hands back the whole card: the four graded
-metrics with their references and expectations, the overall grade, the intent,
+Loads one row from `report_cards` and hands back the whole card: the four rated
+metrics with their references and expectations, the overall rating, the intent,
 the splits as rendered, and the four-paragraph coach's read from that render.
 
 **Render the `markdown` field to the user VERBATIM.** It is already the formatted
 card — the same rendering the PDF is built from. Re-summarizing it into your own
 verdict is exactly the failure this tool exists to prevent: the grades are
 deterministic Python and the read is the coach's phrasing of them, so a
-paraphrase can only drift out of agreement with the letters in the table.
+paraphrase can only drift out of agreement with the ratings in the table.
 
 Use [`list_report_cards`](list_report_cards.md) to find `activity_id`s. Use
 [`workout_report_card`](workout_report_card.md) (stdio-only) when you want a
@@ -39,12 +39,13 @@ Use [`list_report_cards`](list_report_cards.md) to find `activity_id`s. Use
     "reference": {"…": "…"},
     "plan_workout": {"…": "…"},
     "metrics": {
-      "distance": {"grade": "D-", "actual": 9.2, "expected": 5.95, "…": "…"},
-      "pace":     {"grade": "A",  "…": "…"},
-      "hr":       {"grade": "B+", "expected_display": "134–146", "band": [134, 146], "in_band": false},
-      "load":     {"grade": "A",  "spike": true}
+      "distance": {"stars": 1.31, "actual": 9.2, "expected": 5.95, "…": "…"},
+      "pace":     {"stars": 5.0,  "…": "…"},
+      "hr":       {"stars": 3.76, "expected_display": "134–146", "band": [134, 146], "in_band": false},
+      "load":     {"stars": null, "spike": true}
     },
-    "overall": {"grade": "B+", "gpa": 3.33, "graded_metrics": 4},
+    "overall": {"stars": 3.31, "mean_stars": 3.31, "graded_metrics": 3,
+                "capped": false, "capped_by": null},
     "splits": {"available": true, "unit": "Mile", "rows": ["…"], "hr_drift_pct": 4.1},
     "coach_read": {
       "distance": "…", "pace": "…", "hr": "…", "load": "…"
@@ -90,23 +91,23 @@ top of it rather than instead of it.
   data and the markdown is sugar, so the tool logs a warning and returns the
   card anyway. Fall back to reading `card` fields directly — never report the
   card as missing.
-- **This is a snapshot, not a live regrade.** The grades reflect the plan that
+- **This is a snapshot, not a live re-rating.** The ratings reflect the plan that
   was active at that render. If the plan has changed since, a fresh
   [`workout_report_card`](workout_report_card.md) can legitimately return a
-  different letter for the same run. Neither is wrong; they answer different
+  different score for the same run. Neither is wrong; they answer different
   questions. Say which one you're quoting.
 - **`graded_at` lags on purpose.** The save is one atomic guarded UPSERT keyed
   on the read's prompt key — an equal-key re-render is a byte-identical no-op,
   so re-viewing a card does not move `graded_at`. It only moves when the card's
   inputs actually changed.
-- **The card's words and grades always come from ONE render.** A
+- **The card's words and ratings always come from ONE render.** A
   template-fallback render (the deterministic read used when the SDK call fails)
   never overwrites a row that holds a real generated read, and no splicing path
-  exists. So `coach_read` can be trusted to describe the grades printed beside
+  exists. So `coach_read` can be trusted to describe the ratings printed beside
   it — which is why re-summarizing it is a downgrade.
 - **Three keys are stripped at save and re-defaulted to `[]` on load:**
   `hr_trace`, `recent_activities`, `upcoming_workouts`. They are
-  presentation/prompt-only (no grade reads them) and reproducible from the DB,
+  presentation/prompt-only (no rating reads them) and reproducible from the DB,
   so they are absent from a stored card by design — an empty `hr_trace` here
   does not mean the run had no HR data.
 - **A missing card means never rendered, not badly run.** There is no backfill;
@@ -116,10 +117,15 @@ top of it rather than instead of it.
 - **The stored read doubles as the render cache.** A re-render whose prompt key
   matches this row reuses the read with no SDK call — which is why the read here
   is usually identical to what a fresh local render would print.
+- **A card stored before 0.50.0 carries letter grades and null stars.** Storage
+  is a dated snapshot with no backfill path by design, so those rows render
+  their original letters unchanged rather than an n/a. Re-rendering one
+  (`workout_report_card`, or `scripts/warm_report_cards.py`) rewrites it under
+  the star rubric.
 
 ## See also
 
-- [`list_report_cards`](list_report_cards.md) — find `activity_id`s and trend the grades
+- [`list_report_cards`](list_report_cards.md) — find `activity_id`s and trend the ratings
 - [`workout_report_card`](workout_report_card.md) — render fresh (and store); stdio-only, returns a PDF path
 - [`get_workout_detail`](get_workout_detail.md) — the raw session; use the card when a graded one exists
 - [`list_coach_memories`](list_coach_memories.md) — the *other* durable record: the coach's journal
