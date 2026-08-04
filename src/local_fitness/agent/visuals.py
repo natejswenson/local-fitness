@@ -1004,27 +1004,49 @@ def _report_card_css(theme: dict, density: dict | None = None) -> str:
     dim, accent, rule = c["dim"], c["accent"], c["rule"]
     _, mono = _font_face_css(theme)
     return f"""
-table.grade-hero {{
-  width: 100%;
-  border-collapse: collapse;
-  table-layout: fixed;
-  margin: 0 0 1.1em 0;
+/* The hero is STACKED, not a two-column table (0.50.0). The old layout put a
+   1-2 character letter in a 22% cell beside the coach read; a five-star row is
+   ~5.8:1 and about 34% of the text width, so it overflowed straight through the
+   HEART RATE paragraph. Stacking it and letting the read run full width is not
+   a cosmetic preference — fewer line breaks per paragraph is what pays for the
+   star row's height, which is why the density ladder barely moves (measured:
+   15 of 16 live cards keep their rung). */
+div.star-hero {{ margin: 0 0 0.9em 0; }}
+div.star-hero .band {{
+  border-bottom: 2px solid {rule};
+  padding-bottom: 0.45em;
+  margin-bottom: 0.5em;
 }}
-table.grade-hero td {{ vertical-align: middle; padding: 0; }}
-td.grade-letter {{
-  font-size: {d["hero_em"]}em;
-  font-weight: 900;
-  letter-spacing: -0.05em;
-  line-height: 0.85;
-  width: 22%;
+/* The ink rule under the band replaces the visual mass the giant letter used
+   to supply. */
+span.hero-score {{
+  font-family: {mono};
+  font-size: {d["hero_em"] * 0.42 * 0.62}em;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-left: 0.5em;
+  vertical-align: 0.06em;
 }}
-td.grade-meta {{ width: 74%; padding-left: 0.6em; }}
-span.grade-gpa {{
+span.hero-outof {{
+  font-family: {mono};
+  font-size: {d["hero_em"] * 0.42 * 0.30}em;
+  color: {dim};
+  letter-spacing: 0.04em;
+}}
+span.hero-meta {{
   font-family: {mono};
   font-size: 0.78em;
   letter-spacing: 0.06em;
   color: {dim};
   display: block;
+  margin-top: 0.35em;
+}}
+p.hero-scale, p.hero-cap {{
+  font-family: {f["serif_stack"]};
+  font-style: italic;
+  color: {dim};
+  font-size: 0.8em;
+  margin: 0.15em 0 0 0;
 }}
 p.reference-line {{
   font-family: {f["serif_stack"]};
@@ -1065,13 +1087,24 @@ table.metric-table td, table.split-table td {{
   overflow-wrap: break-word;
 }}
 td.metric-name {{ font-family: {f["display_stack"]}; font-weight: 800; }}
-/* Left-aligned like every other column — the grade is the loudest cell on the
-   page by weight and size, and it does not also need a different alignment to
-   be found. */
-td.metric-grade {{ text-align: left; font-weight: 900; font-size: 1.15em; }}
-/* The accent's whole job: the grades that went wrong. */
-.grade-D, .grade-F {{ color: {accent}; }}
-.grade-na {{ color: {dim}; font-weight: 400; }}
+/* Left-aligned like every other column. The weight/size emphasis the letter
+   needed is gone: the stars carry their own visual weight as drawn geometry,
+   and bolding the numeral beside them just made the row noisy. */
+td.metric-grade {{ text-align: left; white-space: nowrap; }}
+svg.stars {{ vertical-align: -0.12em; }}
+span.star-num {{
+  font-family: {mono};
+  font-size: 0.95em;
+  color: {dim};
+  margin-left: 0.45em;
+  letter-spacing: 0.02em;
+}}
+/* The accent's whole job: the rows that went wrong. Scoped to STAR_CRITICAL
+   (the old D/F territory) so a good day still carries zero orange — measured
+   on the live 2026-08-02 card, whose four metrics all rate 5.00, the only
+   accent left on the page is the masthead stamp. */
+span.star-num.crit {{ color: {accent}; }}
+span.stars-na {{ color: {dim}; font-style: italic; }}
 tr.split-partial td {{ color: {dim}; font-style: italic; }}
 p.no-splits, p.drift-line, p.load-context {{
   font-family: {f["serif_stack"]};
@@ -1133,12 +1166,113 @@ span.coach-label {{
 """
 
 
-def _grade_class(grade: str | None) -> str:
-    """CSS class from a grade, keyed on the BASE letter so "D-" and "F" both
-    take the accent and "B+" does not."""
-    if not grade or grade == "n/a":
-        return "grade-na"
-    return f"grade-{grade[0]}"
+#: The card must state its own claim on every surface. A star row carries an
+#: unavoidable review-score connotation, and for this card that MISLEADS:
+#: Amazon and Yelp stars answer "how good was it", while this one answers "did
+#: you do what the day prescribed". The 0.40.0 compliance/stimulus split exists
+#: because conflating those two inverted the rubric outright, so a five-star
+#: easy day is BY DESIGN a low-stimulus day and can legitimately be a slow
+#: shuffle if slow was what was written.
+_STAR_SCALE_NOTE = ("5 stars = you did what the day prescribed. It is a "
+                    "compliance score, not a verdict on how good the run was.")
+
+#: At or below this a row draws in the accent. The old D/F territory, and the
+#: same boundary `ledger.BAD_CARD_MAX_STARS` and the calibration gate use.
+STAR_CRITICAL = 2.0
+
+#: A five-pointed star on a 20x20 box, drawn rather than typed. The brand mono
+#: (IBM Plex Mono) carries no star glyph at all — verified against its cmap — so
+#: a text star would render in whatever font the host machine happens to have.
+#: Pango does fall back per-glyph, so one appears, but at a non-monospace
+#: advance in a face that is not the brand's: an appearance that depends on the
+#: machine. Geometry does not.
+_STAR_PATH = ("M10 1.4 12.6 6.9 18.7 7.7 14.2 11.9 15.4 18 10 15.1 "
+              "4.6 18 5.8 11.9 1.3 7.7 7.4 6.9Z")
+#: Clip x for each eighth of fill, AREA-LINEARISED. Star ink is not uniform in
+#: x — clipping the fill at 75% of the bounding box leaves 89.6% of the ink,
+#: which is why the first 4.75 prototype was indistinguishable from a 5.00.
+#: These are solved so that a clip at CUT[f] leaves exactly f of the polygon's
+#: area. Precomputed on purpose: the renderer carries no geometry solver.
+#: Do NOT "simplify" this to 20*f.
+_STAR_CUTS = {0.125: 5.90, 0.25: 7.42, 0.375: 8.82, 0.5: 10.0,
+              0.625: 11.18, 0.75: 12.58, 0.875: 14.10}
+#: Sub-star resolution of the DRAWING. Finer than the quarter-star display
+#: quantum so `display_stars`' output always lands on an exact cut.
+_STAR_QUANTUM = 8
+_STAR_BOX = 20
+_STAR_GAP = 4
+
+
+def star_row(score: float | None, *, uid: str, ink: str, em: float,
+             max_stars: int = 5) -> str:
+    """One inline ``<svg>`` holding a whole star row.
+
+    ONE element with one id namespace, not five: WeasyPrint resolves
+    ``url(#id)`` in DOCUMENT scope, so colliding clipPath ids let one row clip
+    another. ``uid`` must be unique per row on the page.
+
+    Inline ``<svg>`` is the mechanism, and the alternatives were tested rather
+    than assumed: ``clipPath`` works in WeasyPrint 69 and renders an exact fill
+    ramp, while ``<img src="data:image/svg+xml;base64,...">`` renders nothing at
+    all — a blank cell.
+
+    Every star is always OUTLINED and only the fill is clipped, so an unearned
+    star reads as an ink rule rather than a tint. ``stroke-linejoin`` is a join,
+    not a corner radius (PRESS forbids the latter); without it the 36-degree
+    points spike at small sizes.
+    """
+    from . import report_card as rc
+
+    if score is None:
+        return f'<span class="stars-na">{html.escape(rc.STAR_NA_TEXT)}</span>'
+    shown = rc.display_stars(score)
+    width = max_stars * _STAR_BOX + (max_stars - 1) * _STAR_GAP
+    defs, parts = [], []
+    for i in range(max_stars):
+        fill = min(1.0, max(0.0, shown - i))
+        fill = round(fill * _STAR_QUANTUM) / _STAR_QUANTUM
+        g = [f'<g transform="translate({i * (_STAR_BOX + _STAR_GAP)},0)">',
+             f'<path d="{_STAR_PATH}" fill="none" stroke="{ink}" '
+             f'stroke-width="1.5" stroke-linejoin="round"/>']
+        if fill >= 1:
+            g.append(f'<path d="{_STAR_PATH}" fill="{ink}"/>')
+        elif fill > 0:
+            cid = f"{uid}{i}"
+            defs.append(f'<clipPath id="{cid}"><rect x="0" y="0" '
+                        f'width="{_STAR_CUTS[fill]}" height="{_STAR_BOX}"/>'
+                        f'</clipPath>')
+            g.append(f'<path d="{_STAR_PATH}" fill="{ink}" '
+                     f'clip-path="url(#{cid})"/>')
+        parts.append("".join(g) + "</g>")
+    defs_html = f"<defs>{''.join(defs)}</defs>" if defs else ""
+    # aria-label because the stars are drawn paths with no text layer — without
+    # it a PDF reader gets nothing at all from this cell.
+    return (f'<svg class="stars" viewBox="0 0 {width} {_STAR_BOX}" '
+            f'height="{em}em" width="{em * width / _STAR_BOX:.3f}em" '
+            f'xmlns="http://www.w3.org/2000/svg" role="img" '
+            f'aria-label="{score:.2f} out of {max_stars} stars">'
+            f'{defs_html}{"".join(parts)}</svg>')
+
+
+def star_cell(score: float | None, *, uid: str, theme: dict, em: float,
+              legacy: str | None = None) -> str:
+    """A rating cell: the star row plus its numeral.
+
+    ``legacy`` renders a stored pre-0.50.0 letter unchanged when there is no
+    score — a stored card is a historical record of what was actually shown and
+    there is no backfill path by design.
+    """
+    from . import report_card as rc
+
+    if score is None:
+        if legacy and legacy != rc.STAR_NA_TEXT:
+            return f'<span class="star-num">{html.escape(legacy)}</span>'
+        return f'<span class="stars-na">{html.escape(rc.STAR_NA_TEXT)}</span>'
+    crit = score <= STAR_CRITICAL
+    ink = theme["colors"]["accent"] if crit else theme["colors"]["ink"]
+    cls = " crit" if crit else ""
+    return (star_row(score, uid=uid, ink=ink, em=em)
+            + f'<span class="star-num{cls}">{score:.2f}</span>')
 
 
 def hr_chart_series(card: dict) -> dict | None:
@@ -1334,32 +1468,43 @@ def ref_mode_is_running(card: dict) -> bool:
     return (card.get("reference") or {}).get("mode_label") == "running"
 
 
-def _render_metric_table_html(card: dict) -> str:
+def _render_metric_table_html(card: dict, theme: dict, density: dict) -> str:
     from . import report_card as rc
 
-    # Headers AND cells come from report_card.metric_table — the table was
-    # written out twice before 0.48.0, which is the same divergence split_table
-    # and stimulus_rows exist to prevent. The cells already deferred to the
-    # card's own display strings (HR is held to a band, quality pace grades the
-    # fastest split); now the column set does too.
+    # Headers come from report_card.metric_table — the table was written out
+    # twice before 0.48.0, which is the same divergence split_table and
+    # stimulus_rows exist to prevent. The lead cells still come from there too;
+    # only the RATING cell is rendered here, because the PDF draws geometry
+    # where the markdown prints glyphs. Both read the same `stars` value and the
+    # same `display_stars` quantum, so they cannot disagree about the rating —
+    # only about how it is inked.
     headers, body_rows = rc.metric_table(card)
+    metrics = card.get("metrics") or {}
     rows = ""
-    for cells in body_rows:
-        *lead, grade = cells
+    for (key, _label), cells in zip(rc._METRIC_LABELS, body_rows, strict=True):
+        *lead, legacy = cells
         label, rest = lead[0], lead[1:]
         tds = "".join(f"<td>{html.escape(c)}</td>" for c in rest)
+        cell = star_cell(
+            (metrics.get(key) or {}).get("stars"),
+            uid=f"m{key}_", theme=theme, em=1.15, legacy=legacy)
         rows += f"""
         <tr>
           <td class="metric-name">{html.escape(label)}</td>
           {tds}
-          <td class="metric-grade {_grade_class(grade)}">{html.escape(grade)}</td>
+          <td class="metric-grade">{cell}</td>
         </tr>
         """
+    # Widened from 12% to 22% for the rating column, taken from Metric and
+    # Delta. A star row plus its numeral is ~9.4em against a letter's ~1.2em.
+    # Actual/Expected stay at 19%: they carry strings like "15:29/mi best mile"
+    # and already wrap. Three colgroups were swept and the ladder outcome was
+    # identical for all of them, so this is a legibility call, not a fit one.
     return f"""
     <table class="metric-table">
       <colgroup>
-        <col style="width:26%"><col style="width:19%"><col style="width:19%">
-        <col style="width:22%"><col style="width:12%">
+        <col style="width:23%"><col style="width:19%"><col style="width:19%">
+        <col style="width:17%"><col style="width:22%">
       </colgroup>
       <thead><tr>
         {"".join(f"<th>{html.escape(h)}</th>" for h in headers)}
@@ -1498,7 +1643,6 @@ def _build_report_card_html(
     act = card["activity"]
     name = act.get("activity_name") or act.get("activity_type") or "Workout"
     overall = card["overall"]
-    gpa = f"{overall['gpa']:.2f} GPA" if overall.get("gpa") is not None else "not graded"
     eyebrow = f"{ident['brand_line']} · REPORT CARD · {act.get('date')}"
 
     # The yardstick no longer gets its own sentence, but the card must still
@@ -1527,8 +1671,7 @@ def _build_report_card_html(
     notes = [f"{label}: {note}" for label, note in rc.metric_notes(card)]
     # The load spike note lives in the Stimulus section now (0.40.0) — it is a
     # statement about stimulus, not about compliance with the prescription.
-    if overall.get("capped_by") == "F":
-        notes.append(f"Overall: capped at {overall['grade']} — a metric graded F.")
+
     notes_html = (
         '<ul class="card-notes">'
         + "".join(f"<li>{html.escape(n)}</li>" for n in notes)
@@ -1542,10 +1685,12 @@ def _build_report_card_html(
         f'on this date.</p>'
     ) if ctx.get("ctl") is not None else ""
 
-    # Four short paragraphs in the hero's meta cell, one per graded area,
-    # directly under the GPA/distance/pace line. The masthead title names the
-    # run and carries nothing else. Omitted entirely when absent rather than
-    # left as an empty block.
+    # Four short paragraphs under the hero band, one per graded area. They run
+    # FULL WIDTH now (0.50.0) rather than sitting in a 74% cell beside the
+    # score — see the `div.star-hero` comment in the stylesheet for why that is
+    # load-bearing rather than cosmetic. The masthead title names the run and
+    # carries nothing else. Omitted entirely when absent rather than left as an
+    # empty block.
     from .report_card import READ_SECTIONS
 
     read = card.get("coach_read") or {}
@@ -1554,6 +1699,33 @@ def _build_report_card_html(
         f'{html.escape(label)}</span>{html.escape(read[key])}</p>'
         for key, label in READ_SECTIONS if read.get(key)
     )
+
+    hero_em = (density or CARD_DENSITY_PRESETS[0])["hero_em"] * 0.42
+    score = overall.get("stars")
+    if score is None and overall.get("grade"):
+        # A card stored under the letter rubric. Render what it actually said;
+        # see `report_card.metric_table` for why there is no backfill.
+        hero_stars = ""
+        hero_num = (f'<span class="hero-score">{html.escape(overall["grade"])}</span>')
+    elif score is None:
+        hero_stars = '<span class="stars-na">not rated</span>'
+        hero_num = ""
+    else:
+        ink = (theme["colors"]["accent"] if score <= STAR_CRITICAL
+               else theme["colors"]["ink"])
+        hero_stars = star_row(score, uid="hero_", ink=ink, em=hero_em)
+        hero_num = (f'<span class="hero-score" style="color:{ink}">'
+                    f'{score:.2f}</span><span class="hero-outof"> / 5</span>')
+    cap_html = ""
+    if overall.get("capped"):
+        cb = overall["capped_by"]
+        # BOTH numbers, so the line reconciles by arithmetic. A bare "capped"
+        # states a penalty without its cause, and the cause is the whole point.
+        cap_html = (
+            f'<p class="hero-cap">Held to {overall["stars"]:.2f} by '
+            f'{html.escape(rc._METRIC_PROSE.get(cb["metric"], cb["metric"]))} '
+            f'at {cb["stars"]:.2f} — the rows on their own average '
+            f'{overall["mean_stars"]:.2f}.</p>')
 
     return f"""<!doctype html>
 <html>
@@ -1567,17 +1739,19 @@ def _build_report_card_html(
     <h1>{html.escape(str(name))}</h1>
   </div>
 
-  <table class="grade-hero"><tr>
-    <td class="grade-letter {_grade_class(overall["grade"])}">{html.escape(overall["grade"])}</td>
-    <td class="grade-meta">
-      <span class="grade-gpa">{html.escape(gpa)} · {html.escape(subtitle)}</span>
-      {coach_html}
-    </td>
-  </tr></table>
+  <div class="star-hero">
+    <div class="band">
+      {hero_stars}{hero_num}
+      <span class="hero-meta">{html.escape(subtitle)}</span>
+      <p class="hero-scale">{html.escape(_STAR_SCALE_NOTE)}</p>
+      {cap_html}
+    </div>
+    {coach_html}
+  </div>
 
   <section>
     <h2 class="card-heading">Compliance</h2>
-    {_render_metric_table_html(card)}
+    {_render_metric_table_html(card, theme, density or CARD_DENSITY_PRESETS[0])}
     {notes_html}
     {ctx_html}
   </section>

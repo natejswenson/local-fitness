@@ -423,15 +423,23 @@ def test_system_prompt_carries_capture_and_recall_instructions(no_saved_notes):
 
 
 def test_system_prompt_carries_report_card_directives(no_saved_notes):
-    """The coach must reach for list_report_cards/get_report_card on grade
+    """The coach must reach for list_report_cards/get_report_card on rating
     or trend questions rather than guessing from prose memory — and never
-    state a grade/GPA that didn't come from a tool call or the memory
-    section's computed summary line."""
+    state a rating that didn't come from a tool call or the memory section's
+    computed summary line.
+
+    The scale note is pinned too: a star row reads as a review score unless the
+    prompt says otherwise, and "5 stars" meaning "you did what was prescribed"
+    rather than "this was a great run" is the distinction the whole
+    compliance/stimulus partition rests on.
+    """
     text = prompts.system_prompt("Alex", coach.resolve_coach_profile())
     normalized = " ".join(text.split())
     assert "list_report_cards" in text
     assert "get_report_card" in text
-    assert "NEVER state a letter grade or GPA that did not come from" in normalized
+    assert "NEVER state a rating that did not come from" in normalized
+    assert "compliance score" in normalized
+    assert "NOT a verdict on how good the run was" in normalized
 
 
 def test_system_prompt_orients_toward_the_plan_write_path(no_saved_notes):

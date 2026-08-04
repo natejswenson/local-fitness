@@ -144,7 +144,8 @@ def test_bench_report_card_inputs_and_build(benchmark, rc_db):
     assert card["reference"]["mode"] == "rolling_60d"
     assert card["reference"]["excluded_other_mode"] > 0    # the locomotion filter ran
     assert card["splits"]["available"] is True             # the split exceptions ran
-    assert card["metrics"]["continuity"]["grade"] is not None
+    assert card["metrics"]["continuity"]["stars"] is not None
+    assert card["overall"]["stars"] is not None
     assert card["overall"]["graded_metrics"] == 4
 
 

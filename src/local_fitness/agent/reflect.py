@@ -66,14 +66,14 @@ _TASK = (
     "- Never begin the line with a date — every entry is already shown with "
     "its own date attached when it's read back to you; start straight with "
     "the content.\n"
-    "- No letter grades, no CTL/ATL/TSB numbers.\n\n"
+    "- No star ratings, no letter grades, no CTL/ATL/TSB numbers.\n\n"
     "# Output format — follow exactly\n"
     "Either the single word NONE, or one line per memory:\n"
     "MEMORY: <the line>\n"
     "Nothing else — no preamble, no markdown, no explanation."
 )
 
-#: Journal entries must never carry a letter grade or a raw CTL/ATL/TSB
+#: Journal entries must never carry a rating or a raw CTL/ATL/TSB
 #: number — ``_TASK`` already asks the model not to, and it complies most of
 #: the time, but a live sample (2026-07-26) measured 6+ of 13 hot entries
 #: leaking one anyway: "hit distance/pace/HR (A/A+/A+) but load graded C-",
@@ -83,7 +83,13 @@ _TASK = (
 #: than scrubbed in place — cutting the offending token out of a coach-voice
 #: sentence usually leaves broken grammar, and the model reliably has
 #: another way to phrase the same fact without a grade.
-_GRADED_WORD_RE = re.compile(r"\bgraded\s+[A-DF][+-]?\b", re.IGNORECASE)
+#:
+#: ``workout_coach.find_grade_leak`` covers the star half since 0.50.0 (a count
+#: adjacent to "star", an "N/5", or a glyph), so the patterns below stay aimed
+#: at the shapes it structurally cannot see: a "/"-run never satisfies its
+#: leading-boundary lookbehind, and "graded C-" is a letter form.
+_GRADED_WORD_RE = re.compile(
+    r"\bgraded\s+(?:[A-DF][+-]?|\d(?:\.\d+)?)\b", re.IGNORECASE)
 _TRAINING_LOAD_RE = re.compile(r"\bCTL\b|\bATL\b|\bTSB\b", re.IGNORECASE)
 #: A run of 2+ slash-separated grade-like tokens, e.g. "A/A+/A+" or "B-/C".
 #: workout_coach's ``_GRADE_LEAK`` requires a preceding space/paren/start,
@@ -256,9 +262,15 @@ def _card_event(card: dict) -> dict:
         "date": act.get("date"),
         "activity": act.get("activity_name") or act.get("activity_type"),
         "intent": card.get("intent"),
-        "overall": (card.get("overall") or {}).get("grade"),
+        # Severity WORDS, never the scores — the same reasoning as
+        # `workout_coach.build_prompt`. A journal entry may not name a rating,
+        # and handing the model the numbers is precisely how it echoed them
+        # (measured 2026-07-26: 6+ of 13 hot entries carried a grade).
+        "overall": workout_coach.star_severity(
+            (card.get("overall") or {}).get("stars")),
         "grades": ", ".join(
-            f"{k}: {v.get('grade') or 'n/a'}" for k, v in metrics.items()),
+            f"{k}: {workout_coach.star_severity(v.get('stars'))}"
+            for k, v in metrics.items()),
         "coach_read": " ".join(str(v) for v in read.values()) if read else None,
     }
 

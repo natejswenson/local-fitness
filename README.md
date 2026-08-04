@@ -56,10 +56,12 @@ of metrics the agent reads when you ask it something or it writes a brief.
   resource, and `generate_brief_report` renders it to a polished PDF on
   demand. The composer is restricted to read-only tools, so an automated run
   can never mutate your data.
-- **Graded workout report cards.** `workout_report_card` *judges* one session
-  rather than describing it: distance, pace, HR and training load each reduce to
-  a single relative deviation passed through one shared band table, so the same
-  run always grades the same way. Graded against your training plan when one
+- **Star-rated workout report cards.** `workout_report_card` *judges* one
+  session rather than describing it: distance, pace, HR and continuity each
+  reduce to a single relative deviation passed through one shared curve into a
+  1-5 star score with fractional precision, so the same run always rates the
+  same way. Five stars means the day was executed as prescribed — a compliance
+  score, not a verdict on how good the run was. Rated against your training plan when one
   prescribes that day, otherwise a 60-day rolling median of comparable
   activities — and the card always says which. Renders as Markdown plus a
   PRESS-themed PDF with per-mile splits and an HR/pace chart.
@@ -245,10 +247,11 @@ is a map; that directory is the documentation.
   `trend_direction`, `effect_size`, …) computed in `agent/interpret.py`, rather
   than leaving the model to apply a legend by hand.
 - **Workouts** — `query_workouts`, `get_workout_detail`, and
-  `workout_report_card`, which *grades* one session — distance, pace, HR and
-  training load each get a letter from one shared band table, plus an overall.
-  Every render is stored, so `list_report_cards` / `get_report_card` read the
-  graded history back (JSON, so both transports) without re-grading anything.
+  `workout_report_card`, which *rates* one session — distance, pace, HR and
+  continuity each get a 1-5 star score from one shared curve, plus an
+  intent-weighted overall. Every render is stored, so `list_report_cards` /
+  `get_report_card` read the rated history back (JSON, so both transports)
+  without re-rating anything.
 - **Charts** — `chart` (inline ASCII/emoji), `generate_chart` (matplotlib PNG
   returned as an inline image block), `plan_chart` (**the** scheduled-vs-actual
   view — don't hand-roll it).

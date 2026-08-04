@@ -103,20 +103,25 @@ READ_SECTIONS = report_card.READ_SECTIONS
 _GRADE_TONE = (
     "The verdicts are already decided and are not yours to revise — do not "
     "argue with them, soften them, or re-grade the run.\n\n"
+    # Says "rating", never "star rating" — naming the scale IS naming the
+    # thing, and `_STAR_LEAK` (correctly) flags the phrase. This is the 0.28.1
+    # finding restated: the previous tone spelled out "A", "B-", "C+" in the
+    # same breath as the ban and leaked at 3.1%.
     "Write about the NUMBERS, never about a score. The report card prints a "
-    "letter grade for each area in the table directly below you, so a letter "
-    "in your paragraph is a word spent repeating what the reader can already "
-    "see. Do not name one, do not spell one out, and do not invent a grading "
-    "scale of your own. Make the reason obvious instead: what he was held to, "
-    "what he actually did, and whether that gap matters. A reader should look "
-    "at your paragraph, then at the table, and find the letter unsurprising.\n\n"
+    "rating for each area in the table directly below you, so restating it in "
+    "your paragraph is a word spent repeating what the reader can already "
+    "see. Do not name it, do not count it, do not restate it as a number or a "
+    "fraction, and do not invent a scale of your own. Make the reason obvious "
+    "instead: what he was held to, what he actually did, and whether that gap "
+    "matters. A reader should look at your paragraph, then at the table, and "
+    "find the rating unsurprising.\n\n"
     "Do NOT discuss CTL, ATL, TSB, fitness base, fatigue score or freshness. "
     "Those are printed elsewhere and are not what this card is about."
 )
 
 #: The STIMULUS paragraph is the one that is NOT about compliance, and the model
-#: has to be told so explicitly. Before 0.40.0 training load carried a letter,
-#: and on a correctly-run easy day that letter was an F — which the read then
+#: has to be told so explicitly. Before 0.40.0 training load carried a grade,
+#: and on a correctly-run easy day that grade was an F — which the read then
 #: dutifully explained as a failure of effort ("you banked distance and pace,
 #: then let the work evaporate. Show up loaded, not coasting." — a real card,
 #: 2026-07-29, written about a run that had followed its prescription exactly).
@@ -240,18 +245,18 @@ def build_prompt(
     lines = [
         f"Activity: {act.get('activity_name') or act.get('activity_type') or 'run'} "
         f"on {act.get('date')}.",
-        # Severity, not the letter, and no GPA — see _GRADE_SEVERITY. The read
-        # may not name either, and printing them here is what it echoed.
-        f"Overall, the session was {grade_severity(overall.get('grade'))}.",
+        # Severity, not the score — see star_severity. The read may not name
+        # the rating, and printing it here is what it echoed.
+        f"Overall, the session was {star_severity(overall.get('stars'))}.",
         f"Intent: {card.get('intent')} ({card.get('intent_source')}).",
         reference_summary(card),
         "",
         "Per-metric verdicts (already computed — phrase them, never re-derive "
-        "them, and never convert them back into a letter):",
+        "them, and never convert them back into a rating):",
     ]
     for key, label in report_card._METRIC_LABELS:
         m = (card.get("metrics") or {}).get(key) or {}
-        if not m.get("grade"):
+        if m.get("stars") is None:
             # Prefer the metric's own reason. "not enough to grade" is true of a
             # thin reference pool but wrong for an interval day with no splits,
             # and the model will happily invent the difference.
@@ -259,7 +264,8 @@ def build_prompt(
             continue
         # actual_text, not the raw number: quality pace is graded on the fastest
         # split, and a bare "9:25/mi" would read as the whole run's average.
-        line = f"  {label}: {grade_severity(m['grade'])} — actual {report_card.actual_text(key, m)}"
+        line = (f"  {label}: {star_severity(m['stars'])} — "
+                f"actual {report_card.actual_text(key, m)}")
         # expected_text, not the raw number: HR is held to a BAND, and handing
         # the model a bare midpoint is how it ends up explaining a heart-rate
         # verdict against a number the grade was never measured against.
@@ -365,11 +371,16 @@ def reference_summary(card: dict) -> str:
 
 
 #: A letter grade named in the prose. ``_GRADE_TONE`` forbids this outright —
-#: the letters are printed in the table directly below the read, so repeating
-#: one spends words the paragraph does not have on information already on the
-#: page. The model obeys most of the time and not always: measured 2026-07-22
-#: over 96 paragraphs on 3 real cards, **3 leaked** (3.1%) — "an F, no rounding
-#: it up", "F-grade pace", "the C+ says so".
+#: the rating is printed in the table directly below the read, so restating it
+#: spends words the paragraph does not have on information already on the page.
+#: The model obeys most of the time and not always: measured 2026-07-22 over 96
+#: paragraphs on 3 real cards, **3 leaked** (3.1%) — "an F, no rounding it up",
+#: "F-grade pace", "the C+ says so".
+#:
+#: KEPT after the 0.50.0 star cutover, not retired. A letter is now an invented
+#: scale rather than the card's own, which `_GRADE_TONE` bans just as squarely,
+#: and a model reaching for "an F" is exactly the reflex to catch. See
+#: ``_STAR_LEAK`` for the new half.
 #:
 #: Narrow by construction, because the FALSE POSITIVE is the expensive error: a
 #: bare "A" is nearly always the article ("A blown interval session…"), and
@@ -391,9 +402,40 @@ _GRADE_LEAK = re.compile(
 )
 
 
-#: Grade letter → the severity word the PROMPT carries in its place.
+#: A STAR rating named in the prose — the 0.50.0 half of the same rule.
 #:
-#: The read is forbidden from naming a letter, and the prompt used to hand it
+#: Deliberately much broader than ``_GRADE_LEAK`` can afford to be, because the
+#: false-positive risk that shaped that pattern does not exist here: "A" is the
+#: English indefinite article and the single most common word on the page, while
+#: "stars" is not a word a paragraph about a run has any reason to contain.
+#:
+#: Still narrowed rather than a bare ``\bstars?\b``, for one real lookalike:
+#: "you were seeing stars by mile six" is plausible coach prose. Requiring a
+#: count before the word, or ``rating``/``score`` after it, lets that through.
+#:
+#: Deliberately does NOT try to catch a bare numeral. "4.75" is indistinguishable
+#: from a distance or a training effect, and the read legitimately writes
+#: "5.01 vs 5.00 prescribed" and "TE 3.1/2.1" — a numeric rule would fire on
+#: correct prose constantly, and a false positive throws away a clean read and
+#: buys another generation. The structural defence is that the number is never
+#: in the prompt to echo in the first place (see ``star_severity``).
+_STAR_LEAK = re.compile(
+    r"(?:^|(?<=[\s(]))(?:"
+    r"[\u2605\u2606\u00bc\u00bd\u00be]"          # a glyph is never prose
+    r"|(?:\d(?:\.\d+)?|one|two|three|four|five|half)"
+    # The trailing `(?:a\s+)?` catches "half a star short" — a count, an
+    # article, then the noun. Without it the article breaks the adjacency.
+    r"\s*(?:and\s+(?:a\s+)?(?:half|quarter)\s+)?(?:a\s+)?stars?\b"
+    r"|stars?\s+(?:rating|score)\b"
+    r"|\d(?:\.\d+)?\s*(?:/|out\s+of)\s*(?:5|five)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+#: Star score → the severity word the PROMPT carries in its place.
+#:
+#: The read is forbidden from naming the rating, and the prompt used to hand it
 #: every letter anyway ("Distance: D- — actual 5.95 mi vs target 5.00 mi"). That
 #: is not a rule the model can follow reliably; it is a token sitting in its
 #: context next to the metric it is being asked to write about, and a leaked
@@ -401,37 +443,35 @@ _GRADE_LEAK = re.compile(
 #: retry saw the same prompt.
 #:
 #: The severity still has to be present, or the read drifts out of agreement
-#: with the table beside it: a +19% distance overshoot is a D- only because the
-#: intent scaling says an interval day is not the place for extra miles, and
+#: with the table beside it: a +19% distance overshoot rates badly only because
+#: the intent scaling says an interval day is not the place for extra miles, and
 #: that judgment is not recoverable from the raw numbers. So the band goes in
-#: and the letter stays out.
-_GRADE_SEVERITY = {
-    "A": "on target",
-    "B": "slightly off target",
-    "C": "off target",
-    "D": "well off target",
-    "F": "missed badly",
-}
+#: and the score stays out.
+#:
+#: The words and their cut points live in ``report_card.STAR_VERDICT_CUTS`` —
+#: ONE definition, because `ledger` renders the same vocabulary into the coach's
+#: memory block and two tables would drift.
 
 
-def grade_severity(grade: str | None) -> str:
-    """Severity word for a grade, keyed on the BASE letter so "D-" and "D+"
-    read the same. Unknown/ungraded → "n/a"."""
-    if not grade or grade == "n/a":
+def star_severity(score: float | None) -> str:
+    """Severity word for a star score. Ungraded → "n/a"."""
+    if score is None:
         return "n/a"
-    return _GRADE_SEVERITY.get(grade[0], "n/a")
+    return report_card.star_verdict(score)
 
 
 def find_grade_leak(sections: dict[str, str]) -> str | None:
-    """The first letter grade named in a parsed read, or ``None`` if clean.
+    """The first rating named in a parsed read, or ``None`` if clean.
 
-    Pure, so the decision to regenerate is testable without an SDK call. See
-    ``_GRADE_LEAK`` for why the pattern is deliberately narrow.
+    Covers BOTH patterns — a star rating (the card's own scale) and a letter
+    grade (an invented one). Pure, so the decision to regenerate is testable
+    without an SDK call.
     """
     for text in sections.values():
-        m = _GRADE_LEAK.search(text or "")
-        if m:
-            return m.group(0).strip()
+        for pattern in (_STAR_LEAK, _GRADE_LEAK):
+            m = pattern.search(text or "")
+            if m:
+                return m.group(0).strip()
     return None
 
 
@@ -720,13 +760,13 @@ def fallback_read(card: dict) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, _label in READ_SECTIONS:
         if key == "stimulus":
-            # Not in `metrics` and carries no grade by design — it reads off the
+            # Not in `metrics` and carries no rating by design — it reads off the
             # card's stimulus block instead of the metric machinery.
             out[key] = _fallback_stimulus_sentence(card)
             continue
         m = ((card.get("metrics") or {}).get(key)) or {}
         actual = report_card.actual_text(key, m)
-        if not m.get("grade"):
+        if m.get("stars") is None:
             reason = m.get("note") or "not enough comparable history to grade this"
             out[key] = f"{actual}. {reason[0].upper()}{reason[1:]}."
             continue
@@ -745,4 +785,5 @@ __all__ = [
     "build_prompt", "generate_read", "generate_read_cached", "fallback_read",
     "parse_read", "read_cache_key", "reference_summary", "READ_SECTIONS",
     "DEFAULT_MODEL", "DEFAULT_EFFORT", "DEFAULT_TIMEOUT_S",
+    "star_severity", "find_grade_leak",
 ]

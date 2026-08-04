@@ -71,32 +71,49 @@ SRC = REPO / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-# Every letter the rubric can emit, in order. A band table that never reaches
-# one of these over a whole season is not grading, it is thresholding.
-LETTERS = ("A", "B", "C", "D", "F")
-# Below this many graded runs a histogram is noise and the gate abstains rather
+# Below this many rated runs a histogram is noise and the gate abstains rather
 # than failing on thin data — the same reasoning as MIN_REFERENCE_ACTIVITIES.
 MIN_SAMPLE = 10
-# Share of graded runs in D or F above which the yardstick, not the athlete, is
-# the likelier explanation. Deliberately loose: the 0.40.0 axis sat at 84% and
-# the corrected one at 40%, so 0.60 separates them with room on both sides.
+# Share of rated runs at or under FAILING_MAX_STARS above which the yardstick,
+# not the athlete, is the likelier explanation. Deliberately loose: the 0.40.0
+# axis sat at 84% and the corrected one at 40%, so 0.60 separates them with room
+# on both sides. Unchanged across the 0.50.0 star cutover — the threshold and
+# its semantics are the same, only the definition of "failing" is restated.
 DEFAULT_MAX_FAIL_SHARE = 0.60
-# Unused letters at or above which the table is treated as not describing this
-# quantity. Two, because one empty band is ordinary (a compliant athlete
-# genuinely never earns an F) while two means the scale has collapsed.
-DEFAULT_MAX_EMPTY = 2
-# Letters that count as a failing outcome for the punitive-skew test.
-FAILING = ("D", "F")
+# A score at or under this is a failing outcome for the punitive-skew test:
+# 2.0 stars is exactly the old D/F territory (GRADE_POINTS <= 1 on the 0-4
+# scale). Same boundary `ledger.BAD_CARD_MAX_STARS` uses, so the two definitions
+# of "this session went badly" cannot drift.
+FAILING_MAX_STARS = 2.0
+# --- the collapsed-scale signature (0.50.0) --------------------------------
+# "Dead bands" had no honest continuous analogue. With 17 quarter-star buckets
+# and n=41, continuity would trivially "fail" on nine unused buckets while being
+# perfectly healthy — the letter version's two-empty-bands rule counted five
+# coarse buckets, not seventeen fine ones.
+#
+# What actually broke in 0.40.0 was BIMODALITY: the HR-cap time-fraction axis
+# emitted 32 F, 7 A and 4 D over 43 runs, with B and C empty — mass piled at
+# both extremes and nothing in between. So gate that directly, as a CONJUNCTION.
+#
+# The conjunction is what preserves the gate's deliberate asymmetry.
+# Concentration in a GOOD score is not evidence of anything and is reported,
+# never gated: HR's rolling band sits at 92% max with 8% interior and passes,
+# because its floor share is 0%. A metric fails only when it is punishing
+# heavily AND refusing to rate anything in between. An interior-only rule was
+# tried and would have false-failed that healthy line.
+DEFAULT_MIN_FLOOR_SHARE = 0.25
+DEFAULT_MIN_INTERIOR_SHARE = 0.25
 
 # Which constants govern which metric, so a failure names the thing to look at
 # instead of leaving the reader to grep. Keyed by the report line, not by the
 # metric dict key, because `hr` splits into two independently-tuned regimes.
+_CURVE = ("STAR_KNOTS", "STAR_SCALE", "STAR_NOISE")
 GOVERNING_CONSTANTS = {
-    "distance": ("GRADE_BANDS", "DISTANCE_FACTORS", "PLAN_TIGHTEN"),
-    "pace": ("GRADE_BANDS", "PACE_FACTORS", "PLAN_TIGHTEN", "STEADY_WIDEN"),
-    "hr (rolling band)": ("GRADE_BANDS", "HR_BANDS"),
-    "hr (prescribed cap)": ("GRADE_BANDS", "HR_CAP_NOISE_BPM", "HR_CAP_BPM_SCALE"),
-    "continuity": ("GRADE_BANDS", "CONTINUITY_TOLERANCE", "MIN_CONTINUITY_SPLITS"),
+    "distance": (*_CURVE, "DISTANCE_FACTORS", "PLAN_TIGHTEN"),
+    "pace": (*_CURVE, "PACE_FACTORS", "PLAN_TIGHTEN", "STEADY_WIDEN"),
+    "hr (rolling band)": (*_CURVE, "HR_BANDS"),
+    "hr (prescribed cap)": (*_CURVE, "HR_CAP_NOISE_BPM", "HR_CAP_BPM_SCALE"),
+    "continuity": (*_CURVE, "CONTINUITY_TOLERANCE", "MIN_CONTINUITY_SPLITS"),
 }
 
 
@@ -169,80 +186,133 @@ def _hr_line(metric: dict) -> str:
     return "hr (prescribed cap)" if metric.get("cap") else "hr (rolling band)"
 
 
-def collect(cards: list[dict]) -> dict[str, Counter]:
-    """Per-report-line base-letter counts across the graded cards."""
+def collect(cards: list[dict]) -> dict[str, list[float]]:
+    """Per-report-line star scores across the rated cards.
+
+    A list, not a Counter: the gate now measures the SHAPE of a continuous
+    distribution (floor share, interior share, spread), and bucketing before
+    that measurement would throw away the thing being measured. Buckets are
+    computed for display only, in `format_report`.
+    """
     from local_fitness.agent import report_card as rc
 
-    tally: dict[str, Counter] = {k: Counter() for k in GOVERNING_CONSTANTS}
+    tally: dict[str, list[float]] = {k: [] for k in GOVERNING_CONSTANTS}
     for card in cards:
         for name, metric in (card.get("metrics") or {}).items():
             if name not in rc.COMPLIANCE_METRICS:
                 continue
-            letter = rc.base_letter(metric.get("grade"))
-            if letter not in LETTERS:      # n/a — abstained, not graded
+            score = metric.get("stars")
+            if score is None:            # n/a — abstained, not rated
                 continue
             line = _hr_line(metric) if name == "hr" else name
-            tally[line][letter] += 1
+            tally[line].append(score)
     return tally
 
 
-def verdict(counts: Counter, *, max_fail_share: float, max_empty: int) -> tuple[str, str]:
-    """(status, reason) for one metric's letter distribution.
+def verdict(scores: list[float], *, max_fail_share: float,
+            min_floor_share: float, min_interior_share: float) -> tuple[str, str]:
+    """(status, reason) for one metric's star distribution.
 
-    ``skip`` under ``MIN_SAMPLE``; ``FAIL`` on punitive skew or dead bands;
-    ``ok`` otherwise. Concentration in a PASSING letter is never a failure —
+    ``skip`` under ``MIN_SAMPLE``; ``FAIL`` on punitive skew or a collapsed
+    scale; ``ok`` otherwise. Concentration in a HIGH score is never a failure —
     see the module docstring for why that asymmetry is the whole point.
+
+    All three shares are computed on the DISPLAY-quantized value, so the gate
+    judges the scale a reader actually sees rather than a float they never do.
     """
-    n = sum(counts.values())
+    from local_fitness.agent import report_card as rc
+
+    n = len(scores)
     if n < MIN_SAMPLE:
-        return "skip", f"only {n} graded run(s); need {MIN_SAMPLE}"
-    failing = sum(counts[x] for x in FAILING)
+        return "skip", f"only {n} rated run(s); need {MIN_SAMPLE}"
+    shown = [rc.star_bucket(s) for s in scores]
+    failing = sum(1 for s in shown if s <= FAILING_MAX_STARS)
     fail_share = failing / n
-    empty = [x for x in LETTERS if not counts[x]]
-    used = len(LETTERS) - len(empty)
+    floor_share = sum(1 for s in shown if s <= rc.STAR_FLOOR) / n
+    interior = sum(1 for s in shown if rc.STAR_FLOOR < s < rc.STAR_MAX)
+    interior_share = interior / n
+    buckets = len({s for s in shown})
+    top_share = max(Counter(shown).values()) / n
     if fail_share > max_fail_share:
-        return "FAIL", (f"{fail_share:.0%} of runs graded D/F "
+        return "FAIL", (f"{fail_share:.0%} of runs rated "
+                        f"{FAILING_MAX_STARS:.1f} stars or less "
                         f"(max {max_fail_share:.0%}) — punitive skew")
-    if len(empty) >= max_empty:
-        return "FAIL", f"dead bands — {', '.join(empty)} never used ({used}/5)"
-    top_letter, top = counts.most_common(1)[0]
-    return "ok", f"{used}/5 bands used, {top_letter} {top / n:.0%}, D/F {fail_share:.0%}"
+    if floor_share >= min_floor_share and interior_share < min_interior_share:
+        return "FAIL", (f"collapsed scale — {floor_share:.0%} on the floor with "
+                        f"only {interior_share:.0%} in between")
+    return "ok", (f"{buckets} buckets used, top {top_share:.0%}, "
+                  f"interior {interior_share:.0%}, "
+                  f"<={FAILING_MAX_STARS:.1f}* {fail_share:.0%}")
 
 
-def format_report(tally: dict[str, Counter], cards: list[dict], *,
-                  max_fail_share: float, max_empty: int, days: int) -> tuple[str, bool]:
+def _strip(scores: list[float]) -> str:
+    """A 17-cell occupancy strip over the quarter-star buckets, 1.00 -> 5.00.
+
+    Replaces the A/B/C/D/F histogram. Printing 17 counts would be unreadable at
+    a glance and the counts are not the question — occupancy is, since the
+    failure this gate exists to catch is a scale that only ever emits its
+    extremes. `#` marks an occupied bucket, `.` an empty one.
+    """
+    from local_fitness.agent import report_card as rc
+
+    shown = {rc.star_bucket(s) for s in scores}
+    steps = [rc.STAR_FLOOR + i * rc.STAR_DISPLAY_STEP
+             for i in range(int((rc.STAR_MAX - rc.STAR_FLOOR)
+                                / rc.STAR_DISPLAY_STEP) + 1)]
+    return "".join("#" if any(abs(b - s) < 1e-9 for b in shown) else "."
+                   for s in steps)
+
+
+def format_report(tally: dict[str, list[float]], cards: list[dict], *,
+                  max_fail_share: float, min_floor_share: float,
+                  min_interior_share: float, days: int) -> tuple[str, bool]:
     """Render the whole report; return (text, any_failure)."""
     from local_fitness.agent import report_card as rc
 
     out = [f"Report-card calibration — {len(cards)} running efforts, trailing {days} days",
+           "",
+           "occupancy strip: 17 quarter-star buckets, 1.00 (left) -> 5.00 (right)",
            ""]
-    header = f"{'metric':<22} {'A':>4}{'B':>4}{'C':>4}{'D':>4}{'F':>4}   {'n':>4}  verdict"
+    header = f"{'metric':<22} {'1.00 .. 5.00':<17}  {'mean':>5} {'n':>4}  verdict"
     out += [header, "-" * len(header)]
 
     failed = False
     for line in GOVERNING_CONSTANTS:
-        counts = tally[line]
-        n = sum(counts.values())
+        scores = tally[line]
+        n = len(scores)
         status, reason = verdict(
-            counts, max_fail_share=max_fail_share, max_empty=max_empty)
+            scores, max_fail_share=max_fail_share,
+            min_floor_share=min_floor_share,
+            min_interior_share=min_interior_share)
         failed = failed or status == "FAIL"
-        cells = "".join(f"{counts[x]:>4}" for x in LETTERS)
-        out.append(f"{line:<22} {cells}   {n:>4}  {status} — {reason}")
+        mean = f"{sum(scores) / n:.2f}" if n else "—"
+        out.append(f"{line:<22} {_strip(scores):<17}  {mean:>5} {n:>4}  "
+                   f"{status} — {reason}")
         if status == "FAIL":
             out.append(f"{'':<22} governed by: {', '.join(GOVERNING_CONSTANTS[line])}")
 
     # Informational: the card-level view. Not gated — `overall` is derived from
     # the rows above, so failing it too would report one defect twice. A high
-    # F-cap rate is the leading indicator that preceded BOTH the 0.40.0 load bug
+    # cap rate is the leading indicator that preceded BOTH the 0.40.0 load bug
     # and the 0.40.2 HR-cap bug, so it is worth printing even though it is not
     # the gate.
-    overall = Counter(rc.base_letter(c["overall"].get("grade")) for c in cards)
-    capped = sum(1 for c in cards if c["overall"].get("capped_by"))
+    #
+    # The collapsed-scale signature must stay OFF the overall permanently: a
+    # weighted mean of four metrics cannot reach the floor unless all four do,
+    # so the bottom buckets are structurally unreachable (measured minimum over
+    # 240 real cards: 1.72) and gating them would fail on healthy data forever.
+    scores = [c["overall"]["stars"] for c in cards
+              if (c.get("overall") or {}).get("stars") is not None]
+    capped = sum(1 for c in cards if (c.get("overall") or {}).get("capped"))
     out += ["", "overall (informational, not gated)"]
-    out.append("  letters: " + "  ".join(
-        f"{x}={overall.get(x, 0)}" for x in LETTERS))
+    if scores:
+        out.append(f"  {_strip(scores)}  mean {sum(scores) / len(scores):.2f}, "
+                   f"median {sorted(scores)[len(scores) // 2]:.2f}")
+        at_max = sum(1 for s in scores if rc.star_bucket(s) >= rc.STAR_MAX)
+        out.append(f"  {at_max}/{len(scores)} at 5.00 "
+                   f"({at_max / len(scores):.0%})")
     if cards:
-        out.append(f"  F-cap fired on {capped}/{len(cards)} cards "
+        out.append(f"  cap fired on {capped}/{len(cards)} cards "
                    f"({capped / len(cards):.0%})")
     return "\n".join(out), failed
 
@@ -254,9 +324,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db", type=Path, default=None,
                     help="database path (default: the app's resolved DB)")
     ap.add_argument("--max-fail-share", type=float, default=DEFAULT_MAX_FAIL_SHARE,
-                    help="fail above this share of D/F grades (default: 0.60)")
-    ap.add_argument("--max-empty", type=int, default=DEFAULT_MAX_EMPTY,
-                    help="fail at or above this many unused letters (default: 2)")
+                    help="fail above this share of runs rated <=2.0 stars "
+                         "(default: 0.60)")
+    ap.add_argument("--min-floor-share", type=float, default=DEFAULT_MIN_FLOOR_SHARE,
+                    help="collapsed-scale trigger: floor share at or above "
+                         "this, AND interior below --min-interior-share "
+                         "(default: 0.25)")
+    ap.add_argument("--min-interior-share", type=float,
+                    default=DEFAULT_MIN_INTERIOR_SHARE,
+                    help="collapsed-scale trigger: see --min-floor-share "
+                         "(default: 0.25)")
     ap.add_argument("--require-db", action="store_true",
                     help="treat a missing/empty database as a failure, not a skip")
     ap.add_argument("--verbose", action="store_true",
@@ -292,21 +369,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.verbose:
         for c in cards:
             metrics = "  ".join(
-                f"{k}={v.get('grade') or 'n/a'}" for k, v in c["metrics"].items())
-            print(f"{c['activity']['date']}  overall={c['overall'].get('grade')}  {metrics}")
+                f"{k}={'n/a' if v.get('stars') is None else format(v['stars'], '.2f')}"
+                for k, v in c["metrics"].items())
+            overall = c["overall"].get("stars")
+            shown = "n/a" if overall is None else f"{overall:.2f}"
+            print(f"{c['activity']['date']}  overall={shown}  {metrics}")
         print()
 
     text, failed = format_report(
         collect(cards), cards,
-        max_fail_share=args.max_fail_share, max_empty=args.max_empty,
+        max_fail_share=args.max_fail_share,
+        min_floor_share=args.min_floor_share,
+        min_interior_share=args.min_interior_share,
         days=args.days)
     print(text)
     if failed:
-        print("\nFAIL — at least one band table has stopped discriminating. "
+        print("\nFAIL — at least one metric has stopped discriminating. "
               "Recalibrate the named constants against this distribution "
               "before shipping.")
         return 1
-    print("\nOK — every graded metric still uses its bands.")
+    print("\nOK — every rated metric still uses its scale.")
     return 0
 
 

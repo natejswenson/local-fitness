@@ -20,9 +20,9 @@ PROFILE = coach.load_profile("hardass")
 CARD = {
     "activity": {"activity_id": 987, "date": "2026-07-22",
                  "activity_name": "Tempo Tuesday", "activity_type": "running"},
-    "overall": {"grade": "C"},
+    "overall": {"stars": 2.8},
     "intent": "tempo", "intent_source": "plan",
-    "metrics": {"distance": {"grade": "B"}, "pace": {"grade": "D"}},
+    "metrics": {"distance": {"stars": 4.0}, "pace": {"stars": 1.6}},
     "coach_read": {"distance": "held the distance", "pace": "way off the reps"},
 }
 
@@ -172,8 +172,11 @@ def test_event_payloads_summarize_brief_and_card():
     assert be["date"] == "2026-07-23"
     assert "[critical] You skipped the intervals again" in be["takeaways"]
     ce = reflect._card_event(CARD)
-    assert ce["overall"] == "C"
-    assert "pace: D" in ce["grades"]
+    # Severity WORDS, never the scores — the model may not name a rating, and
+    # handing it the numbers is exactly how it echoed them.
+    assert ce["overall"] == "off target"
+    assert "pace: well off target" in ce["grades"]
+    assert not any(ch.isdigit() for ch in ce["grades"])
     assert "way off the reps" in ce["coach_read"]
 
 

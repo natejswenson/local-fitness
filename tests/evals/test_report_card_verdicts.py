@@ -18,9 +18,13 @@ from local_fitness import db
 from local_fitness.agent import report_card as rc
 
 
-def _points(grade_str: str | None) -> float:
-    """Base-letter GPA points, for comparing verdicts as an ordering."""
-    return rc.GRADE_POINTS[rc.base_letter(grade_str)]
+def _score(card_dict: dict) -> float:
+    """The overall star score, for comparing verdicts as an ordering.
+
+    Replaces the old ``_points`` (base-letter GPA lookup): the score IS the
+    ordering now, so there is nothing to convert.
+    """
+    return card_dict["overall"]["stars"]
 
 
 @pytest.fixture
@@ -36,25 +40,32 @@ def test_every_scenario_declares_a_verdict():
     is what stops the suite drifting back into "asserts mechanics only"."""
     assert set(EXPECTED_VERDICTS) == set(SCENARIOS)
     for name, spec in EXPECTED_VERDICTS.items():
-        assert spec.get("min") or spec.get("max"), f"{name} bounds nothing"
+        assert ("min_stars" in spec) or ("max_stars" in spec), \
+            f"{name} bounds nothing"
+        for key in ("min_stars", "max_stars"):
+            if key in spec:
+                assert rc.STAR_FLOOR <= spec[key] <= rc.STAR_MAX, \
+                    f"{name}'s {key} is off the scale"
         assert len(spec.get("why", "")) > 40, f"{name} does not say why"
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS)
 def test_scenario_meets_its_declared_verdict(scenario, card):
-    """THE eval. Every scenario's overall letter must satisfy its bound.
+    """THE eval. Every scenario's overall score must satisfy its bound.
 
     `obedient_easy_straddling` is the one that would have caught the 2026-08-02
-    defect: it graded C there, against a declared minimum of B.
+    defect: it graded C there, against a declared minimum of B (now 3.50).
     """
     spec = EXPECTED_VERDICTS[scenario]
-    overall = card(scenario)["overall"]["grade"]
-    if "min" in spec:
-        assert _points(overall) >= _points(spec["min"]), (
-            f"{scenario}: got {overall}, expected at least {spec['min']} — {spec['why']}")
-    if "max" in spec:
-        assert _points(overall) <= _points(spec["max"]), (
-            f"{scenario}: got {overall}, expected at most {spec['max']} — {spec['why']}")
+    got = _score(card(scenario))
+    if "min_stars" in spec:
+        assert got >= spec["min_stars"], (
+            f"{scenario}: got {got:.2f}, expected at least "
+            f"{spec['min_stars']:.2f} — {spec['why']}")
+    if "max_stars" in spec:
+        assert got <= spec["max_stars"], (
+            f"{scenario}: got {got:.2f}, expected at most "
+            f"{spec['max_stars']:.2f} — {spec['why']}")
 
 
 # --- the prescribed-cap trio -----------------------------------------------
@@ -73,9 +84,11 @@ def test_straddling_a_cap_by_a_beat_is_not_a_breach(card):
     assert hr["cap"] == 140.0                       # the plan stated a ceiling
     assert hr["time_above_cap_pct"] == 60           # ...and 60% of the run cleared it
     assert hr["exceedance_bpm"] == pytest.approx(1.2, abs=0.1)   # by 1.2 bpm
-    assert rc.base_letter(hr["grade"]) == "A"
-    assert c["overall"]["grade"] == "A"
-    assert c["overall"].get("capped_by") is None
+    # 1.2 bpm is under HR_CAP_NOISE_BPM, so the breach is not distinguishable
+    # from rounding and the row must be a clean maximum — not "nearly".
+    assert hr["stars"] == rc.STAR_MAX
+    assert c["overall"]["stars"] == rc.STAR_MAX
+    assert c["overall"]["capped"] is False
 
 
 def test_the_three_cap_scenarios_are_strictly_ordered(card):
@@ -90,11 +103,11 @@ def test_the_three_cap_scenarios_are_strictly_ordered(card):
     straddled = card("obedient_easy_straddling")
     blown = card("cap_blown_hard")
 
-    assert _points(clean["overall"]["grade"]) >= _points(straddled["overall"]["grade"])
-    assert _points(straddled["overall"]["grade"]) > _points(blown["overall"]["grade"])
+    assert _score(clean) >= _score(straddled)
+    assert _score(straddled) > _score(blown)
     # And on the HR row itself, which is where the discrimination lives.
-    assert (_points(straddled["metrics"]["hr"]["grade"])
-            > _points(blown["metrics"]["hr"]["grade"]))
+    assert (straddled["metrics"]["hr"]["stars"]
+            > blown["metrics"]["hr"]["stars"])
     # The blown run is a genuine breach: >10 bpm over, sustained.
     assert blown["metrics"]["hr"]["exceedance_bpm"] > 10
 
@@ -114,11 +127,12 @@ def test_rep_pace_is_graded_on_the_reps_not_the_run_average(card):
 
     assert c["activity"]["avg_pace_sec_per_km"] == 399.0     # the misleading number
     assert pace["actual"] == pytest.approx(260.0, abs=1.0)   # the one it graded
-    assert rc.base_letter(pace["grade"]) == "A"
-    # The average would have been an F, so the exception is load-bearing here
-    # rather than incidentally agreeing with the fallback.
-    assert rc.base_letter(rc.grade_from_deviation(
-        rc.pace_deviation(399.0, 260.0, "quality"), widen=rc.PLAN_TIGHTEN)) == "F"
+    assert pace["stars"] == rc.STAR_MAX
+    # The average would have bottomed the scale, so the exception is
+    # load-bearing here rather than incidentally agreeing with the fallback.
+    assert rc.stars_from_deviation(
+        rc.pace_deviation(399.0, 260.0, "quality"), "pace",
+        rc.PLAN_TIGHTEN) == rc.STAR_FLOOR
 
 
 def test_the_reference_pool_excludes_walks_that_garmin_calls_running(card):
@@ -137,7 +151,7 @@ def test_the_reference_pool_excludes_walks_that_garmin_calls_running(card):
     assert ref["n"] == 16                      # the runs only
     assert ref["excluded_other_mode"] == 30    # ...and the card says so
     assert ref["median_hr"] > 130              # a running median, not a walking one
-    assert rc.base_letter(c["metrics"]["hr"]["grade"]) == "A"
+    assert c["metrics"]["hr"]["stars"] >= 4.25
 
 
 # --- fixture hygiene --------------------------------------------------------
@@ -177,4 +191,4 @@ def test_every_scenario_actually_grades_something(card):
     for scenario in SCENARIOS:
         c = card(scenario)
         assert c["overall"]["graded_metrics"] >= 3, scenario
-        assert c["overall"]["grade"] != "n/a", scenario
+        assert c["overall"]["stars"] is not None, scenario

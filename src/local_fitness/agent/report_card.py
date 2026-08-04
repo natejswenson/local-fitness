@@ -98,6 +98,7 @@ mirroring how ``plans.py`` is organized.
 """
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 from datetime import date as _date
@@ -108,9 +109,12 @@ from .. import plans
 from . import interpret, render, units
 
 __all__ = [
-    "grade_from_deviation", "intent_class", "infer_intent", "resolve_intent",
+    "stars_from_deviation", "display_stars", "star_bucket", "star_verdict",
+    "star_glyphs", "star_display", "STAR_MAX", "STAR_FLOOR", "STAR_KNOTS",
+    "STAR_SCALE", "STAR_NOISE", "STAR_VERDICT_CUTS", "OVERALL_STAR_HEADROOM",
+    "intent_class", "infer_intent", "resolve_intent",
     "distance_deviation", "pace_deviation", "hr_deviation", "load_deviation",
-    "overall_grade", "label_splits", "hr_drift_pct", "build_card",
+    "overall_stars", "label_splits", "hr_drift_pct", "build_card",
     "stimulus_level", "zone_summary", "stimulus_block", "stimulus_lines",
     "has_stimulus", "stimulus_rows", "stimulus_notes", "stimulus_heading",
     "COMPLIANCE_METRICS", "STIMULUS_METRICS",
@@ -200,12 +204,74 @@ _ACTIVITY_COLUMNS: tuple[str, ...] = (
 # the constant above, not user input (the whitelist-not-f-string rule).
 _ACTIVITY_SELECT = ", ".join(_ACTIVITY_COLUMNS)
 
-# The one band table. `d` is a non-negative relative deviation; every metric
-# reduces to one, which is why there is exactly one grader.
-GRADE_BANDS: tuple[tuple[float, str], ...] = (
-    (0.05, "A"), (0.10, "B"), (0.20, "C"), (0.35, "D"),
+# --- the star scale (0.50.0) ------------------------------------------------
+# `d` is a non-negative relative deviation; every metric reduces to one, which
+# is why there is exactly one grader. That grader now returns a CONTINUOUS
+# score in [1, 5] instead of a letter.
+#
+# Why the change: letters could not say how well a day went, only which of five
+# buckets it fell in, and the buckets were wildly unbalanced. Measured over 240
+# real cards (730 days), the `+` modifier was 545 of 749 graded rows (73%) and
+# A+ alone was 63% of distance rows, 90% of HR rows, 76% of continuity. A
+# quarter of all cards scored a perfect 4.00 GPA. The modifier was reporting
+# "this deviation was in the bottom third of a band whose bottom third holds
+# ~70% of all deviations" — decoration, not information.
+#
+# STAR_KNOTS IS `GRADE_BANDS` WITH THE LETTERS REMOVED. That is the load-bearing
+# property of this design and it must survive any future retune: every knot is a
+# boundary the module already shipped, already calibrated, and that
+# `scripts/calibrate_report_card.py` already gates. In particular
+# `d = 0.35 * widen` was the F floor and is now exactly STAR_FLOOR, so
+# HR_CAP_BPM_SCALE still puts the floor at 11.3 bpm sustained over a prescribed
+# cap — the boundary validated against Garmin's zone-4+5 share. Reshaping the
+# curve away from these knots silently recalibrates that, and CLAUDE.md requires
+# re-running the zone-4+5 comparison first.
+STAR_MAX = 5.0
+STAR_FLOOR = 1.0
+STAR_KNOTS: tuple[float, ...] = (0.05, 0.10, 0.20, 0.35)
+# Knots normalized by the last one, paired with the star value at each knot.
+# Derived rather than hand-written so a change to STAR_KNOTS cannot leave the
+# anchors stale: ((0, 5.0), (1/7, 4.0), (2/7, 3.0), (4/7, 2.0), (1.0, 1.0)).
+STAR_ANCHORS: tuple[tuple[float, float], ...] = ((0.0, STAR_MAX),) + tuple(
+    (k / STAR_KNOTS[-1], STAR_MAX - 1 - i) for i, k in enumerate(STAR_KNOTS)
 )
-GRADE_POINTS = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "F": 0.0}
+# Per-metric normalizer. Held uniform at the last knot on purpose — this is the
+# named place for the four metrics' incommensurability (continuity is a raw
+# ratio excess, HR's cap axis is bpm/HR_CAP_BPM_SCALE, distance changes
+# sidedness with its reference), so `calibrate_report_card.GOVERNING_CONSTANTS`
+# can point at it. Percentile-derived per-metric values WERE simulated
+# (distance 0.55 / pace 0.28, just past each metric's own data joint): they
+# bought +2 quarter-star buckets on pace and LOST 2 of the 10 cards today's
+# F-cap catches. A straight regression on validated behavior for a rounding
+# difference. Do not split these without re-running that comparison.
+STAR_SCALE = {"distance": 0.35, "pace": 0.35, "hr": 0.35, "continuity": 0.35}
+# Deviation below which a metric is not distinguishable from its own
+# measurement noise, subtracted before scaling. Load-bearing on distance, not
+# polish: a plan target is two-sided, so a plan-referenced distance has NO exact
+# zeros — 13 of the 17 plan runs in the live window sit at d = 0.0002..0.004,
+# pure GPS wobble and treadmill rounding. Without a floor, d = 0.0089 scores
+# 4.70 and displays a partial star on the same row where `_delta_text` prints
+# "on target" (it uses _DISTANCE_ON_TARGET_MI, 0.02 mi). 0.0075 is that same
+# 0.02 mi expressed relatively, for any target at or above 2.67 mi.
+#
+# pace's 0.002 is ~1 s/mi at 9:00/mi — the display resolution of the pace row.
+#
+# hr and continuity are deliberately 0.0: both already subtract their own floor
+# upstream (HR_CAP_NOISE_BPM inside `hr_cap_severity`, CONTINUITY_TOLERANCE
+# inside `continuity_deviation`), and HR's rolling axis is graded against a
+# *band* whose interior is already a 3-14% wide zero region. A second floor
+# there would move the 11.3 bpm boundary.
+STAR_NOISE = {"distance": 0.0075, "pace": 0.002, "hr": 0.0, "continuity": 0.0}
+# Display quantum for the star GLYPHS. The numeral beside them always prints the
+# real value to 2 dp, so this rounds the picture and never the score.
+#
+# A quarter, not a tenth, and the arithmetic is the standing answer to the
+# request for tenths (it will come): one quarter star spans a deviation of
+# 0.0125 in the top band and 0.0375 in the bottom, which on a 5-mile expectation
+# is 0.063-0.19 mi against a 0.02 mi measurement floor — a 3x to 9x margin. One
+# TENTH star spans 0.025-0.075 mi, i.e. 1.2x the GPS noise at the top of the
+# scale: the card would move a visible step for a difference it cannot measure.
+STAR_DISPLAY_STEP = 0.25
 # Weights are per intent class, because the metric a workout exists to satisfy
 # differs by workout. Running easy IS the easy day; hitting rep pace IS the
 # quality day; covering the distance IS the long run.
@@ -239,16 +305,47 @@ INTENT_METRIC_WEIGHTS: dict[str, dict[str, float]] = {
 # metric can never be in one and not the other.
 COMPLIANCE_METRICS: frozenset[str] = frozenset(METRIC_WEIGHTS)
 STIMULUS_METRICS: frozenset[str] = frozenset({"load"})
-_GPA_CUTS: tuple[tuple[float, str], ...] = (
-    (3.5, "A"), (2.5, "B"), (1.5, "C"), (0.5, "D"),
+# The overall may never sit more than this far above its worst graded row.
+#
+# This REPLACES the old discrete F-cap (an F on any weighted metric pinned the
+# overall to C). The rule it enforces is the same one and it is a hard contract:
+# a card that prints a fine overall above a row that failed is not reporting a
+# score, it is averaging away the finding. What changes is that the contract is
+# now an invariant of the arithmetic rather than a threshold that has to fire.
+#
+# 2.0 is calibrated, not chosen for roundness. STAR_FLOOR + 2.0 = 3.0, which is
+# exactly the C the old cap pinned to, so it reproduces the discrete rule at the
+# old boundary and degrades linearly on either side of it instead of stepping.
+# Measured over the 240-card corpus: it fires on 29 cards (12%) and catches
+# 10/10 of the cards today's F-cap catches. A headroom of 2.5 fires on 12 and
+# catches only 6 of those 10 — it silently stops capping cards the current
+# rubric considers self-contradictory, which is the one thing this constant
+# exists to prevent. A headroom of 1.5 fires on 66 cards (28%) and piles 20 of
+# them on exactly 2.50, at which point it is not a safety rail any more, it is
+# the primary scoring rule.
+OVERALL_STAR_HEADROOM = 2.0
+# Score -> the ONE severity word the coach's prompt is given in place of the
+# number (`workout_coach` never sees the score itself — see 0.28.1). The lower
+# four cuts reproduce the old A/B/C/D partition on the live corpus, so the
+# read's tone does not silently move when the scale does: >=4.25 covers 54% of
+# cards where A was 58%, >=3.5 covers 83% where A+B was 86%, >=2.5 covers 99%
+# where A+B+C was 98%.
+#
+# "dead on" at >=4.90 is NEW and is the only band with no letter ancestor. It
+# exists because A+ was 63-90% of rows per metric and A+/A/A- all collapsed to
+# "on target": on most cards the model was handed one identical word for every
+# metric and had nothing to write four different paragraphs about. The
+# distinction between "exactly what was prescribed" and "comfortably inside the
+# band" is real, actionable, and the only new information this change hands the
+# prose.
+STAR_VERDICT_CUTS: tuple[tuple[float, str], ...] = (
+    (4.90, "dead on"),
+    (4.25, "on target"),
+    (3.50, "slightly off target"),
+    (2.50, "off target"),
+    (1.50, "well off target"),
 )
-# An F on a COMPLIANCE metric caps the overall here. A card that prints
-# "Overall: A" above a row reading F is not reporting a grade, it is averaging
-# away the finding — that reasoning is unchanged and the cap is deliberately
-# kept. What changed in 0.40.0 is only its scope: `overall_grade` now tests the
-# weighted metrics rather than every metric, so a stimulus row can never fire
-# it. The cap was never the wrong rule; load was the wrong thing to apply it to.
-_F_FLOOR_GRADE = "C"
+_STAR_VERDICT_FLOOR = "missed badly"
 
 # Intent scaling. An easy day is EXPECTED to be shorter and slower than the
 # median; a long day longer. Applied to the rolling reference only — a plan
@@ -386,43 +483,156 @@ _EPS = 1e-9
 
 # --- grading primitives ----------------------------------------------------
 
-def grade_from_deviation(d: float | None, widen: float = 1.0) -> str | None:
-    """Relative deviation → letter grade, with a +/- modifier for position
-    within the band. ``None`` in, ``None`` out (an ungradeable metric).
+def stars_from_deviation(
+    d: float | None, metric: str, widen: float = 1.0
+) -> float | None:
+    """Relative deviation → a continuous score in ``[STAR_FLOOR, STAR_MAX]``.
+    ``None`` in, ``None`` out (an ungradeable metric).
 
-    ``widen`` scales every band boundary — used for steady/unknown-intent
-    pace, which has no stated target to be held tightly against.
+    One shared monotone curve over a normalized ``z``, so there is still exactly
+    ONE grader — the property that made the letter rubric testable — while the
+    four metrics finally compare like with like rather than sharing a table
+    calibrated for none of them in particular.
+
+    ``widen`` scales the whole curve, exactly as it scaled every band boundary
+    before, and it stays INSIDE the normalizer deliberately. An identical 5%
+    miss therefore scores 3.33 against a plan, 4.00 against the rolling median
+    and 4.33 on a steady day, and that spread is the point: ``widen`` is a
+    statement about the precision of the yardstick. Against a plan the question
+    is "did you follow the instruction", and 5% off an instruction is a real
+    miss; against a 60-day rolling median — an estimate carrying its own spread
+    — 5% is inside the noise of the reference itself. ``PLAN_TIGHTEN`` exists
+    because collapsing that distinction once let a prescribed 10:28 easy run
+    executed at 9:28 score a B- and print an overall A above its own read saying
+    "you never ran easy at all". The obligation this creates is on the display,
+    not the score: the card must state which reference each row was measured
+    against, or two cards side by side look inconsistent for no visible reason.
+
+    Saturating at both ends, and the top end is not the interesting one.
+    ``continuity``'s live maximum is 2.413 — 6.9x its own floor — so an
+    unsaturated linear extension would put that card at roughly -22 stars and
+    drag any mean containing it into nonsense. Past the floor the question stops
+    being "how much worse" and becomes "this was not the workout that was
+    prescribed", which is binary; the remaining severity lives in the Delta cell
+    and the note, where it can be stated in the row's own units.
     """
     if d is None:
         return None
-    d = max(0.0, float(d))
-    lo = 0.0
-    for threshold, letter in GRADE_BANDS:
-        hi = threshold * widen
-        if d <= hi + _EPS:
-            return letter + _modifier(d, lo, hi)
-        lo = hi
-    return "F"
+    z = max(0.0, float(d) - STAR_NOISE[metric]) / (widen * STAR_SCALE[metric])
+    if z <= 0:
+        return STAR_MAX
+    if z >= 1.0:
+        return STAR_FLOOR
+    for (z0, s0), (z1, s1) in zip(STAR_ANCHORS, STAR_ANCHORS[1:], strict=False):
+        if z <= z1 + _EPS:
+            return s0 + (s1 - s0) * (z - z0) / (z1 - z0)
+    return STAR_FLOOR
 
 
-def _modifier(d: float, lo: float, hi: float) -> str:
-    """Position within a band → "+", "" or "-". Lower deviation is better, so
-    the bottom third of the band earns the "+"."""
-    span = hi - lo
-    if span <= 0:
-        return ""
-    p = (d - lo) / span
-    if p < 1 / 3:
-        return "+"
-    if p < 2 / 3:
-        return ""
-    return "-"
+def display_stars(score: float | None) -> float | None:
+    """Score → the quarter-star value the GLYPHS draw.
+
+    Two rules beyond rounding, both load-bearing:
+
+    - a partial star never rounds up to a full one, and a full star is never
+      faked. 4.99 draws four full stars and a three-quarter one; 4.01 draws four
+      and a quarter, never four and a bare gap. Without the clamp, "don't round
+      the partial away" holds at the .5 boundary and fails at .01/.99 — which is
+      exactly where this distribution puts most of its mass.
+    - ``floor``-then-clamp rather than ``round``: Python's ``round`` is
+      banker's, so ``round(4.125 / 0.25)`` is 16 and a card would draw 4.00 for
+      4.125 while an identical 0.125 above the next knot drew 4.50.
+    """
+    if score is None:
+        return None
+    whole = math.floor(score)
+    if whole >= STAR_MAX:
+        return STAR_MAX
+    frac = score - whole
+    if frac <= 0:
+        return float(whole)
+    q = math.floor(frac / STAR_DISPLAY_STEP + 0.5) * STAR_DISPLAY_STEP
+    return whole + min(1.0 - STAR_DISPLAY_STEP, max(STAR_DISPLAY_STEP, q))
 
 
-def base_letter(grade: str | None) -> str | None:
-    """Strip the +/- modifier. GPA math runs on base letters so the weights
-    stay the approved ones and a modifier can never move an overall grade."""
-    return grade[0] if grade else None
+def star_bucket(score: float | None) -> float | None:
+    """Score → a plain half-up quarter over the whole range, for the calibration
+    gate's histogram only.
+
+    Deliberately NOT ``display_stars``: the gate is asking how the scale is
+    occupied, and ``display_stars``' clamp would push every 4.99 into the 4.75
+    bucket and empty the top one, making a healthy metric look like it never
+    reaches its maximum.
+    """
+    if score is None:
+        return None
+    return math.floor(score / STAR_DISPLAY_STEP + 0.5) * STAR_DISPLAY_STEP
+
+
+def star_verdict(score: float | None) -> str:
+    """Score → the severity word. See ``STAR_VERDICT_CUTS``."""
+    if score is None:
+        return "not rated"
+    for cut, word in STAR_VERDICT_CUTS:
+        if score >= cut:
+            return word
+    return _STAR_VERDICT_FLOOR
+
+
+#: Quarter-star tails. U+00BC/BD/BE, not a star-with-fill glyph: the brand mono
+#: (IBM Plex Mono, 963 codepoints) carries no star at all, so the terminal is
+#: already relying on per-glyph font fallback and the fractions at least fall
+#: back within the same East-Asian-Width class as the stars. Every candidate
+#: rendering was checked for that: ★ ☆ ¼ ½ ¾ are all Ambiguous, so a row with a
+#: half star and a row without produce ONE column width and the markdown table
+#: cannot go ragged. The quadrant circles (◐ ◕) and emoji (⭐) are Neutral and
+#: Wide respectively, which is why neither is used.
+_STAR_FRACTIONS = {0.25: "¼", 0.5: "½", 0.75: "¾"}
+STAR_NA_TEXT = "n/a"
+
+
+def star_glyphs(score: float | None, max_stars: int = 5) -> str:
+    """Score → the star row as text, e.g. ``★★★★¾``.
+
+    The terminal/markdown rendering. The PDF draws real geometry instead (see
+    ``visuals.star_row``) because a glyph there would render in whatever font
+    the host machine happens to have — Pango falls back per-glyph, so a star
+    appears, but at a non-monospace advance in a face that is not the brand's.
+    """
+    if score is None:
+        return STAR_NA_TEXT
+    q = display_stars(score)
+    whole = int(math.floor(q))
+    frac = round(q - whole, 2)
+    out = "★" * whole
+    if frac > 0:
+        out += _STAR_FRACTIONS[frac]
+        whole += 1
+    return out + "☆" * (max_stars - whole)
+
+
+def star_display(score: float | None) -> str:
+    """Score → the full rating as one string: glyphs AND the numeral.
+
+    THE single definition, consumed by the markdown renderer, the PDF and the
+    MCP payload. Two renderers of a rating that can disagree is exactly what the
+    already-built-card contract exists to prevent — the same reason
+    ``metric_table`` and ``split_table`` are single-sourced.
+
+    The numeral is not optional and is never dropped:
+
+    - quarter quantization cannot separate 4.88 from 4.75, and with a quarter of
+      cards near the top of the scale those are common neighbours;
+    - the markdown is read aloud by an agent, and ``★★★★¾`` is not speech;
+    - the card already printed a number (the GPA), so dropping it would be a
+      precision regression;
+    - at the metric table's real type size a 5.00 and a 4.88 star row are not
+      distinguishable by eye — measured on a rendered probe. The stars carry the
+      glance, the numeral carries the fact.
+    """
+    if score is None:
+        return STAR_NA_TEXT
+    return f"{star_glyphs(score)} {score:.2f}"
 
 
 def intent_class(intent: str | None) -> str:
@@ -978,54 +1188,68 @@ def stimulus_block(
     }
 
 
-def overall_grade(metrics: dict[str, dict], cls: str = "steady") -> dict:
-    """Intent-weighted GPA over gradeable COMPLIANCE metrics only.
+def overall_stars(metrics: dict[str, dict], cls: str = "steady") -> dict:
+    """Intent-weighted mean star score over gradeable COMPLIANCE metrics only.
 
     ``cls`` selects the weight table — see ``INTENT_METRIC_WEIGHTS`` for why the
-    weights aren't flat. It defaults to the neutral split so an older caller
-    passing only ``metrics`` keeps the previous behavior.
+    weights aren't flat. It defaults to the neutral split so a caller passing
+    only ``metrics`` keeps the neutral behavior.
 
     Stimulus metrics (``STIMULUS_METRICS``) are absent from every weight table,
     so they drop out here the same way an ``n/a`` does — by not being iterated.
     That is deliberate and is the whole 0.40.0 fix: it makes "training load can
-    never lower your grade" a property of the data structure rather than of a
+    never lower your score" a property of the data structure rather than of a
     small weight that a cap could still bypass.
 
-    An ``n/a`` metric drops out and its weight redistributes proportionally,
-    so a by-feel plan day with no pace target isn't silently scored as if pace
-    were worth 30% of nothing. Zero gradeable metrics yields "n/a" — never
-    "F", which would read as a judgment we did not actually make.
+    An ``n/a`` metric drops out and its weight redistributes proportionally, so
+    a by-feel plan day with no pace target isn't silently scored as if pace were
+    worth 30% of nothing. Zero gradeable metrics yields ``None`` — never
+    ``STAR_FLOOR``, because "failed" and "not measured" must not be the same
+    number.
 
-    Finally, an F on any single *weighted* metric caps the overall at
-    ``_F_FLOOR_GRADE``. Redistribution plus generous weighting can otherwise let
-    two good metrics average an outright failure up into a passing letter.
+    **Two quantizations disappear here** (0.50.0). The old path was
+    ``d -> letter -> base_letter -> GRADE_POINTS -> GPA -> _GPA_CUTS -> letter``,
+    and ``base_letter`` existed specifically so "a modifier can never move an
+    overall grade" — which rounded every metric UP to its band top before
+    averaging. That is why the old median GPA was 3.53 and a third of all cards
+    read exactly 4.00. With a continuous value there is no modifier to strip:
+    the interpolated score IS the judgment and it propagates. This deliberately
+    reverses that contract, and it is where most of the new resolution comes
+    from — 5.6% of card pairs reorder against the old GPA, all of them cases
+    where the discarded modifier was the difference.
+
+    The mean consumes UNQUANTIZED per-metric scores. Quantizing first would
+    compound four rounding errors into the one number the reader looks at first.
     """
     weights = INTENT_METRIC_WEIGHTS.get(cls, METRIC_WEIGHTS)
     pairs = [
-        (weights[k], GRADE_POINTS[base_letter(m["grade"])])
+        (weights[k], m["stars"], k)
         for k, m in metrics.items()
-        if m.get("grade") and k in weights
+        if m.get("stars") is not None and k in weights
     ]
     if not pairs:
-        return {"grade": "n/a", "gpa": None, "graded_metrics": 0}
-    total_w = sum(w for w, _ in pairs)
-    gpa = sum(w * p for w, p in pairs) / total_w
-    letter = "F"
-    for cut, candidate in _GPA_CUTS:
-        if gpa >= cut:
-            letter = candidate
-            break
-    out = {"grade": letter, "gpa": round(gpa, 2), "graded_metrics": len(pairs)}
+        return {"stars": None, "mean_stars": None, "graded_metrics": 0,
+                "capped": False, "capped_by": None}
+    total_w = sum(w for w, _, _ in pairs)
+    mean = sum(w * s for w, s, _ in pairs) / total_w
     # Scoped to the WEIGHTED metrics on purpose — an ungraded stimulus row has
-    # no letter to cap with, and a future one that grew a letter still must not
-    # be able to. See _F_FLOOR_GRADE.
-    if any(base_letter(m.get("grade")) == "F"
-           for k, m in metrics.items() if k in weights):
-        # Report the cap rather than quietly rewriting the letter — the GPA
-        # stays honest and the card can say why the two disagree.
-        if GRADE_POINTS[letter] > GRADE_POINTS[_F_FLOOR_GRADE]:
-            out["grade"] = _F_FLOOR_GRADE
-            out["capped_by"] = "F"
+    # no score to cap with, and a future one that grew a score still must not be
+    # able to. See OVERALL_STAR_HEADROOM.
+    worst_stars, worst_metric = min((s, k) for _, s, k in pairs)
+    capped = min(mean, worst_stars + OVERALL_STAR_HEADROOM)
+    out = {
+        "stars": round(capped, 3),
+        # Kept even when the cap bites, so the card can state BOTH numbers and
+        # say why they disagree — the same honesty the old path kept by leaving
+        # `gpa` untouched when it rewrote the letter.
+        "mean_stars": round(mean, 3),
+        "graded_metrics": len(pairs),
+        "capped": False,
+        "capped_by": None,
+    }
+    if capped < mean - _EPS:
+        out["capped"] = True
+        out["capped_by"] = {"metric": worst_metric, "stars": round(worst_stars, 3)}
     return out
 
 
@@ -1206,9 +1430,14 @@ def hr_drift_pct(full_rows: list[dict]) -> float | None:
 
 # --- card assembly ---------------------------------------------------------
 
-def _metric(grade, actual, expected, deviation, ref, note=None) -> dict:
+def _metric(stars, actual, expected, deviation, ref, note=None) -> dict:
     out = {
-        "grade": grade, "actual": actual, "expected": expected,
+        # Stored at 3 dp, not full float precision: `card_store`'s UPSERT is a
+        # byte-identical no-op for an equal-key re-render, so the value has to
+        # be deterministic across renders. 3 dp is finer than any display and
+        # coarse enough to be stable.
+        "stars": None if stars is None else round(stars, 3),
+        "actual": actual, "expected": expected,
         "deviation": None if deviation is None else round(deviation, 4),
         "reference": ref,
     }
@@ -1279,14 +1508,14 @@ def build_card(
         target = plan_workout["target_distance_m"]
         d = distance_deviation(activity.get("distance_meters"), target, two_sided=True)
         distance = _metric(
-            grade_from_deviation(d, PLAN_TIGHTEN), activity.get("distance_meters"),
-            target, d, "plan")
+            stars_from_deviation(d, "distance", PLAN_TIGHTEN),
+            activity.get("distance_meters"), target, d, "plan")
     elif has_rolling:
         expected = DISTANCE_FACTORS[cls] * (reference.get("median_distance_m") or 0)
         d = distance_deviation(activity.get("distance_meters"), expected, two_sided=False)
         distance = _metric(
-            grade_from_deviation(d), activity.get("distance_meters"), expected or None,
-            d, "rolling_60d", note=walk_note)
+            stars_from_deviation(d, "distance"), activity.get("distance_meters"),
+            expected or None, d, "rolling_60d", note=walk_note)
         # `two_sided=False` above: going LONGER than your rolling norm is never
         # a penalty, so this expectation is a floor and has to print as one.
         # The plan branch stays a bare number because it genuinely is a point
@@ -1359,7 +1588,7 @@ def build_card(
         pace_note = walk_note
     d = pace_deviation(graded_pace, expected_pace, cls)
     pace = _metric(
-        grade_from_deviation(d, widen),
+        stars_from_deviation(d, "pace", widen),
         # `actual` stays the number the grade was measured against, so the Delta
         # column can never compare two different quantities. When that isn't the
         # run average, `actual_display` says which number it is.
@@ -1387,7 +1616,7 @@ def build_card(
         above = time_above_cap_fraction(labelled_splits, plan_cap)
         exceedance = hr_exceedance_bpm(labelled_splits, plan_cap)
         d = hr_cap_deviation(actual_hr, plan_cap, exceedance)
-        hr = _metric(grade_from_deviation(d), actual_hr, plan_cap, d, "plan")
+        hr = _metric(stars_from_deviation(d, "hr"), actual_hr, plan_cap, d, "plan")
         hr["cap"] = plan_cap
         hr["expected_display"] = f"≤ {round(plan_cap)} bpm"
         hr["in_band"] = d == 0.0
@@ -1427,7 +1656,7 @@ def build_card(
         # see the range rather than infer it from one edge.
         hr_lo, hr_hi = hr_band_bounds(med_hr, cls)
         hr = _metric(
-            grade_from_deviation(d), actual_hr,
+            stars_from_deviation(d, "hr"), actual_hr,
             hr_expectation(actual_hr, med_hr, cls), d,
             "rolling_60d" if has_rolling else reference.get("mode"))
         if med_hr:
@@ -1456,7 +1685,8 @@ def build_card(
     ratio = continuity_ratio(labelled_splits)
     d = continuity_deviation(ratio)
     continuity = _metric(
-        grade_from_deviation(d), ratio, CONTINUITY_TOLERANCE, d, "own splits")
+        stars_from_deviation(d, "continuity"), ratio, CONTINUITY_TOLERANCE,
+        d, "own splits")
     if ratio is None:
         # Same shape as the quality-pace exception: state the reason rather than
         # printing a bare n/a, and let the weight redistribute.
@@ -1506,7 +1736,7 @@ def build_card(
         "reference": reference,
         "plan_workout": plan_workout,
         "metrics": metrics,
-        "overall": overall_grade(metrics, cls),
+        "overall": overall_stars(metrics, cls),
         "splits": labelled_splits,
         "hr_trace": bin_hr_trace(hr_samples or []),
         # Prompt-only, like splits and the trace: no grade reads either, so a
@@ -1658,7 +1888,10 @@ def _delta_text(key: str, metric: dict) -> str:
     actual, expected = metric.get("actual"), metric.get("expected")
     if actual is None or expected is None or not isinstance(expected, (int, float)):
         return "—"
-    if not metric.get("grade"):
+    # `is None`, never a falsy test: the value is a number now, and while
+    # STAR_FLOOR keeps it away from 0.0 today, a truthiness check on a numeric
+    # score is a bug waiting for someone to move the floor.
+    if metric.get("stars") is None:
         # An ungraded metric has no gap worth stating: the two numbers weren't
         # comparable, which is precisely why it wasn't graded. Printing
         # "224s/mi slower" beside an n/a re-makes the comparison the n/a exists
@@ -1802,7 +2035,7 @@ def stimulus_notes(card: dict) -> list[str]:
     return notes
 
 
-METRIC_TABLE_HEADERS = ["Metric", "Actual", "Expected", "Delta", "Grade"]
+METRIC_TABLE_HEADERS = ["Metric", "Actual", "Expected", "Delta", "Rating"]
 
 
 def metric_table(card: dict) -> tuple[list[str], list[list[str]]]:
@@ -1815,9 +2048,9 @@ def metric_table(card: dict) -> tuple[list[str], list[list[str]]]:
     twice, which is exactly the shape of the ``split_table`` divergence: a
     column added or dropped in one renderer and not the other.
 
-    Rows are ordered by ``_METRIC_LABELS``, and the grade is always the LAST
-    cell — the PDF colours that column by grade band, so its position is part
-    of the contract rather than an accident of ordering.
+    Rows are ordered by ``_METRIC_LABELS``, and the rating is always the LAST
+    cell — the PDF styles that column by score, so its position is part of the
+    contract rather than an accident of ordering.
     """
     rows = []
     for key, label in _METRIC_LABELS:
@@ -1826,12 +2059,17 @@ def metric_table(card: dict) -> tuple[list[str], list[list[str]]]:
         # hands those rows straight back. A missing metric renders as n/a
         # rather than raising KeyError halfway through a render.
         m = card["metrics"].get(key) or {}
+        # A card stored before 0.50.0 carries a letter and no score. Render the
+        # letter unchanged rather than an n/a: a stored card is a historical
+        # record of what was actually shown, and there is no backfill path by
+        # design (see `card_store`). Same defensiveness as the `.get` above.
         rows.append([
             label,
             actual_text(key, m),
             expected_text(key, m),
             _delta_text(key, m),
-            m.get("grade") or "n/a",
+            m["grade"] if m.get("stars") is None and m.get("grade")
+            else star_display(m.get("stars")),
         ])
     return list(METRIC_TABLE_HEADERS), rows
 
@@ -1984,7 +2222,7 @@ def reference_line(card: dict, *, markdown: bool = True) -> str:
         if mode == "insufficient_data":
             # The plan still graded what it has targets for, so the blanket
             # "not enough history to grade" sentence would contradict the
-            # letters printed directly above it. Scope the disclaimer to the
+            # ratings printed directly above it. Scope the disclaimer to the
             # metrics it actually applies to.
             n = ref.get("n", 0)
             # Only blame the thin pool for metrics that ACTUALLY use the pool.
@@ -1995,7 +2233,7 @@ def reference_line(card: dict, *, markdown: bool = True) -> str:
             # would not.
             ungraded = _prose_list([
                 _METRIC_PROSE[k] for k, _ in _METRIC_LABELS
-                if not card["metrics"].get(k, {}).get("grade")
+                if card["metrics"].get(k, {}).get("stars") is None
                 and (card["metrics"].get(k, {}).get("reference")
                      in (None, "rolling_60d", "insufficient_data"))])
             if not ungraded:
@@ -2020,7 +2258,6 @@ def render_markdown(card: dict) -> str:
     act = card["activity"]
     name = act.get("activity_name") or act.get("activity_type") or "Workout"
     overall = card["overall"]
-    gpa = f" ({overall['gpa']:.2f} GPA)" if overall.get("gpa") is not None else ""
 
     lines = [
         f"# Report Card — {name}",
@@ -2029,8 +2266,26 @@ def render_markdown(card: dict) -> str:
         f"{_fmt_pace(act.get('avg_pace_sec_per_km'))}",
         "",
     ]
-    lines += [f"## Overall: {overall['grade']}{gpa}", ""]
-    # One short paragraph per graded area, under the grade line. The yardstick
+    # A card stored before 0.50.0 has a letter and no score; render what it
+    # actually said rather than an n/a (see `metric_table`).
+    if overall.get("stars") is None and overall.get("grade"):
+        gpa = f" ({overall['gpa']:.2f} GPA)" if overall.get("gpa") is not None else ""
+        lines += [f"## Overall: {overall['grade']}{gpa}", ""]
+    else:
+        lines += [f"## Overall: {star_display(overall.get('stars'))} / 5", ""]
+        # The card must state its own claim, on every surface. A star row
+        # carries an unavoidable review-score connotation — Amazon and Yelp
+        # stars answer "how good was it", and this card answers "did you do what
+        # the day prescribed". Those are different questions, and this module
+        # has scar tissue proving it: the 0.40.0 compliance/stimulus split
+        # exists because conflating them inverted the rubric outright. A
+        # five-star easy day is BY DESIGN a low-stimulus day.
+        lines += [
+            "_5 stars = you did what the day prescribed — a compliance score, "
+            "not a verdict on how good the run was._",
+            "",
+        ]
+    # One short paragraph per graded area, under the rating line. The yardstick
     # is no longer printed as its own sentence — the Expected column states it
     # per metric, which is where a reader actually checks it.
     read = card.get("coach_read") or {}
@@ -2046,9 +2301,16 @@ def render_markdown(card: dict) -> str:
     # The load spike note moved to the Stimulus section in 0.40.0 — it is a
     # statement about stimulus, and leaving it under the graded table was half
     # the reason a low-load easy day read as a failure.
-    if card["overall"].get("capped_by") == "F":
+    if card["overall"].get("capped"):
+        # BOTH numbers, so the note reconciles by arithmetic — the same contract
+        # the HR row keeps. A bare "capped" states a penalty without its cause,
+        # and the cause is the entire point of the cap.
+        cb = card["overall"]["capped_by"]
         notes.append(
-            f"- Overall: capped at {card['overall']['grade']} — a metric graded F.")
+            f"- Overall: held to {card['overall']['stars']:.2f} by "
+            f"{_METRIC_PROSE.get(cb['metric'], cb['metric'])} at "
+            f"{cb['stars']:.2f} — the rows on their own average "
+            f"{card['overall']['mean_stars']:.2f}.")
     if notes:
         lines += ["", *notes]
 

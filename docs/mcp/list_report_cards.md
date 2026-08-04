@@ -1,6 +1,6 @@
 # `list_report_cards`
 
-> Past workout report cards as stored snapshots, newest run first — overall grade, GPA and the four metric grades per row, without re-grading anything. **Availability:** stdio + HTTP
+> Past workout report cards as stored snapshots, newest run first — the overall 1-5 star score and the four metric scores per row, without re-rating anything. **Availability:** stdio + HTTP
 
 ## What it does
 
@@ -9,7 +9,7 @@ Lists rows from the `report_cards` table: every card
 time. One call answers "how have my quality days trended", "what did I score on
 my last five long runs", "am I getting better at pacing".
 
-Nothing is computed here — no grading, no plan lookup, no SDK call. The grades
+Nothing is computed here — no rating, no plan lookup, no SDK call. The scores
 come back exactly as they were shown when the card was rendered.
 
 Two tools, two jobs: this one lists many cards shallowly;
@@ -44,7 +44,8 @@ stdio-only. A remote `/mcp/` client can read the history it can't extend.
       "overall": "B+",
       "gpa": 3.33,
       "capped_by": null,
-      "grades": {"distance": "D-", "pace": "A", "hr": "B+", "load": "A"}
+      "stars": {"distance": 1.31, "pace": 5.0, "hr": 3.76, "continuity": null},
+      "legacy_grade": null
     }
   ],
   "count": 1,
@@ -54,7 +55,7 @@ stdio-only. A remote `/mcp/` client can read the history it can't extend.
 
 | Key | Meaning |
 |---|---|
-| `cards` | Rows sorted `activity_date DESC, activity_id DESC` — newest **run** first, not most recently graded. |
+| `cards` | Rows sorted `activity_date DESC, activity_id DESC` — newest **run** first, not most recently rated. |
 | `count` | `len(cards)`. |
 | `truncated` | `true` when more cards matched than `limit` returned. Always present. |
 
