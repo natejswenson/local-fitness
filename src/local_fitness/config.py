@@ -64,6 +64,32 @@ def _coerce(db_raw, env_raw, default, cast):
         return default
 
 
+def _db_setting(key, db_path=None, conn: sqlite3.Connection | None = None):
+    """Read the DB layer, treating an unreachable database as UNSET.
+
+    A fresh clone has no ``data/fitness.db`` until the first ``fitness pull``,
+    and ``db.get_setting`` raises ``OperationalError: no such table: settings``
+    against an empty or absent one. CLAUDE.md's rule is that a stranger's clone
+    must run, and every knob resolved here has a working env/default layer
+    underneath — so an unreadable DB is a reason to fall through, never to
+    crash.
+
+    This was a live bug, not a hypothetical: ``mailer.load_config`` started
+    reading a setting (0.51.0) and took down ``fitness brief-email`` on any
+    machine without an initialized DB. It passed locally and failed in CI,
+    which is exactly the shape this fail-open prevents — the same fresh-clone
+    fail-open ``mcp_server._with_coach_persona`` already keeps for its cache
+    key.
+
+    Scoped to sqlite/OS errors: a bug in the *caller* (a bad key type, say)
+    still raises, because that is not a missing-database condition.
+    """
+    try:
+        return db.get_setting(key, db_path=db_path, conn=conn)
+    except (sqlite3.Error, OSError):
+        return None
+
+
 def _resolve(key, env, default, cast, db_path=None, conn: sqlite3.Connection | None = None):
     """Resolve a single knob (own DB read). For standalone single-knob use.
 
@@ -71,7 +97,7 @@ def _resolve(key, env, default, cast, db_path=None, conn: sqlite3.Connection | N
     connection instead of opening a fresh one per lookup; behavior is
     unchanged when omitted."""
     return _coerce(
-        db.get_setting(key, db_path=db_path, conn=conn), os.environ.get(env), default, cast
+        _db_setting(key, db_path=db_path, conn=conn), os.environ.get(env), default, cast
     )
 
 

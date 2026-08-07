@@ -102,6 +102,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `LOCAL_FITNESS_SMTP_PASSWORD` is unset rather than letting the discovery
   happen at 19:00 in a log file.
 
+### Fixed
+- **Config resolution no longer crashes without a database.** `config._resolve`
+  now treats an unreadable DB layer as UNSET and falls through to env/default,
+  via a new `_db_setting` helper. A fresh clone has no `data/fitness.db` until
+  the first `fitness pull`, and `db.get_setting` raises
+  `OperationalError: no such table: settings` against one — so `brief-email`,
+  whose `mailer.load_config` had just started reading a setting, died on any
+  machine without an initialized DB. That breaks CLAUDE.md's core promise that
+  a stranger's clone runs. `user_name` and `coach_profile` carried the same
+  latent exposure and are fixed by the same change; they simply had no caller
+  that ran before schema init.
+
+  **It passed locally and failed in CI**, because the dev machine has a
+  populated `data/fitness.db` and CI has none — the suite was silently reading
+  real data. `tests/test_mailer.py` and `tests/test_cli_brief_email.py` now
+  point `db.DEFAULT_DB_PATH` at a nonexistent path so they reproduce CI (and a
+  fresh clone) instead of borrowing the developer's database, and
+  `test_settings_resolve_with_no_database_at_all` pins the contract directly.
+
 ### Tests
 - `tests/test_email_render.py` and `tests/test_mailer.py` (65 cases). The
   load-bearing one is

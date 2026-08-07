@@ -114,7 +114,12 @@ def test_both_alternatives_are_present_and_distinct():
 # --- config ----------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
+def _clean_env(monkeypatch, tmp_path):
+    # Point the DB layer at a path that does not exist, so these tests
+    # reproduce CI (and a fresh clone) rather than reading whatever is in the
+    # developer's data/fitness.db. Config resolution must fall through to env.
+    from local_fitness import db
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "nope" / "fitness.db")
     for k in ("LOCAL_FITNESS_SMTP_HOST", "LOCAL_FITNESS_SMTP_PORT",
               "LOCAL_FITNESS_SMTP_USER", "LOCAL_FITNESS_SMTP_PASSWORD",
               "LOCAL_FITNESS_BRIEF_EMAIL_TO", "LOCAL_FITNESS_BRIEF_EMAIL_FROM"):

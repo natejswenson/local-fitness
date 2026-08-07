@@ -50,6 +50,49 @@ def cfgdb(tmp_path, monkeypatch):
     return p
 
 
+# --- the fresh-clone contract ----------------------------------------------
+
+@pytest.fixture
+def no_db(tmp_path, monkeypatch):
+    """CI's condition, and a stranger's first five minutes: no database yet."""
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "nope" / "fitness.db")
+    monkeypatch.setenv("LOCAL_FITNESS_SMTP_USER", "me@gmail.com")
+    monkeypatch.setenv("LOCAL_FITNESS_SMTP_PASSWORD", SECRET)
+    for k in ("LOCAL_FITNESS_BRIEF_EMAIL_ENABLED", "LOCAL_FITNESS_BRIEF_EMAIL_TO"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_settings_resolve_with_no_database_at_all(no_db):
+    # A fresh clone has no data/fitness.db until the first `fitness pull`, and
+    # db.get_setting raises "no such table: settings" against one. Every knob
+    # has a working env/default layer underneath, so an unreadable DB must
+    # fall through rather than crash. This shipped broken for one commit: it
+    # passed locally (a populated dev DB) and took out 21 tests in CI.
+    assert config.brief_email_enabled() is True
+    assert config.brief_email_to() == ()
+
+
+def test_the_whole_send_path_configures_with_no_database(no_db):
+    # The actual user-visible failure: `fitness brief-email` on a fresh clone.
+    assert mailer.load_config().to == ("me@gmail.com",)
+
+
+def test_the_pre_existing_resolvers_survive_it_too(no_db):
+    # The fix lives in config._resolve, so these were latently exposed as well
+    # — they simply had no caller that ran before schema init.
+    assert config.user_name() == config.DEFAULT_USER_NAME
+    assert config.coach_profile() == "hardass"
+
+
+def test_env_still_wins_over_the_default_with_no_database(no_db, monkeypatch):
+    # Falling through must reach the ENV layer, not jump straight to the
+    # default — otherwise a .env-configured clone silently ignores its config.
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_EMAIL_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_EMAIL_TO", "env@x.com")
+    assert config.brief_email_enabled() is False
+    assert config.brief_email_to() == ("env@x.com",)
+
+
 # --- the security invariant ------------------------------------------------
 
 def test_no_tool_output_ever_contains_the_smtp_password(cfgdb):

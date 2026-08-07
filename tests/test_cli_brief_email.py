@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from local_fitness import cli
+from local_fitness import cli, db
 from local_fitness.agent import briefs, mailer
 from local_fitness.agent import tools as agent_tools
 
@@ -49,6 +49,9 @@ def wired(tmp_path, monkeypatch):
     """A brief on disk, every heavy step stubbed, and a record of what ran."""
     calls: dict[str, int] = {"pull": 0, "recompute": 0, "generate": 0,
                              "send": 0, "notify": 0}
+    # No DB: `brief-email` never calls init_schema, so this is what a fresh
+    # clone and CI both look like. Settings must resolve from env/defaults.
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "nope" / "fitness.db")
     briefings = tmp_path / "briefings"
     briefings.mkdir()
     (briefings / f"{TODAY}.json").write_text(BRIEF_JSON % (TODAY, TODAY))
