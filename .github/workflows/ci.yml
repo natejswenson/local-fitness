@@ -48,9 +48,9 @@ jobs:
       # this repo can never silently drift from the brand every other product
       # renders from. Pinned, not @latest: a token change upstream should surface
       # as a failing check to be adopted deliberately, never land unreviewed.
-      #   npx -y @natjswenson/press@0.9.0 emit --repo .
+      #   npx -y @natjswenson/press@0.8.1 emit --repo .
       - name: Brand tokens in sync (press)
-        run: npx -y @natjswenson/press@0.9.0 check --repo .
+        run: npx -y @natjswenson/press@0.8.1 check --repo .
 
       - name: Lint
         run: uv run ruff check .
