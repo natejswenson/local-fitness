@@ -127,6 +127,43 @@ def user_name(db_path=None, conn: sqlite3.Connection | None = None) -> str:
                     DEFAULT_USER_NAME, _as_user_name, db_path, conn=conn)
 
 
+def brief_email_enabled(db_path=None, conn: sqlite3.Connection | None = None) -> bool:
+    """Whether the evening job sends (DB > env > default True).
+
+    The conversational kill switch — `update_brief_email_settings(enabled=
+    false)` writes the DB layer, so "stop emailing me the brief" needs neither
+    a text editor nor `launchctl`. Defaulting to True is safe for a fresh
+    clone because sending ALSO requires an SMTP password, which has no default
+    at any layer; a stranger who never sets one can never be mailed by this.
+    """
+    return _resolve("brief_email_enabled", "LOCAL_FITNESS_BRIEF_EMAIL_ENABLED",
+                    True, _as_bool, db_path, conn=conn)
+
+
+def _as_recipients(s) -> tuple[str, ...]:
+    """Parse a comma-separated recipient list, dropping blanks.
+
+    Raises on an empty result so ``_coerce`` falls through to the default
+    rather than returning an empty tuple — "configured to mail nobody" is a
+    silent no-send, and the fallback (the sending account) is the safer read
+    of a malformed value."""
+    out = tuple(a.strip() for a in str(s).split(",") if a.strip())
+    if not out:
+        raise ValueError("no recipients")
+    return out
+
+
+def brief_email_to(db_path=None, conn: sqlite3.Connection | None = None) -> tuple[str, ...]:
+    """Who the evening brief goes to (DB > env > default: empty).
+
+    Empty means "not configured" and lets ``mailer.load_config`` fall back to
+    the sending account — the resolution can't do that itself without reading
+    SMTP settings, and this module stays free of them so it holds no
+    credential-adjacent state."""
+    return _resolve("brief_email_to", "LOCAL_FITNESS_BRIEF_EMAIL_TO",
+                    (), _as_recipients, db_path, conn=conn)
+
+
 def riegel_lookback_days(db_path=None, conn: sqlite3.Connection | None = None) -> int:
     """Lookback window (days) for the projected-finish best effort. Clamps a
     nonsense value (< 1 or > ~10 years) to the default.

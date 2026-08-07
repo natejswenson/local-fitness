@@ -60,7 +60,12 @@ def test_tool_schemas_well_formed():
     # -get_today_status (0.48.0: byte-identical body to daily_snapshot, sharing
     # one description constant — two names for one tool, so the model
     # coin-flipped 16/5 between them)
-    assert len(agent_tools.ALL_TOOLS) == 44
+    # +get/update_brief_email_settings (0.51.0: the evening brief email's
+    # enabled state and recipients are configured by MCP call, not by editing
+    # .env — same agent-owns-the-writes pattern as the personality pair. The
+    # SMTP password is deliberately NOT in this surface; it stays a secret in
+    # .env, since /mcp/ is network-reachable)
+    assert len(agent_tools.ALL_TOOLS) == 46
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

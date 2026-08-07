@@ -164,6 +164,38 @@ def test_a_failed_generation_notifies_and_exits_nonzero(runner, wired, monkeypat
     assert not marker(wired).exists()
 
 
+# --- the conversational kill switch ----------------------------------------
+
+def test_disabled_skips_the_whole_job_not_just_the_send(runner, wired, monkeypatch):
+    # A kill switch that still spends a Garmin pull and an LLM run every night
+    # and throws the result away is not a kill switch.
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_EMAIL_ENABLED", "false")
+    result = runner.invoke(cli.main, ["brief-email"])
+
+    assert result.exit_code == 0
+    assert "disabled" in result.output
+    assert (wired["pull"], wired["generate"], wired["send"]) == (0, 0, 0)
+    assert not marker(wired).exists()
+
+
+def test_re_enabling_resumes_the_send(runner, wired, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_EMAIL_ENABLED", "true")
+    runner.invoke(cli.main, ["brief-email"])
+    assert wired["send"] == 1
+
+
+def test_dry_run_still_works_while_disabled(runner, wired, monkeypatch, tmp_path):
+    # Inspecting a disabled setup must stay possible — that is how you check
+    # what it WOULD send before turning it back on.
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_EMAIL_ENABLED", "false")
+    out = tmp_path / "b.eml"
+    result = runner.invoke(cli.main, ["brief-email", "--no-pull", "--no-generate",
+                                      "--dry-run", str(out)])
+    assert result.exit_code == 0
+    assert out.exists()
+    assert wired["send"] == 0
+
+
 # --- guards ----------------------------------------------------------------
 
 def test_missing_brief_exits_1_without_sending(runner, wired):

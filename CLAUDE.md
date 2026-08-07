@@ -628,6 +628,24 @@ These are settled — don't redesign without a reason.
   before any password exists. Both launchd jobs must stay **LaunchAgents** —
   the bundled Claude SDK CLI reads its credential from the login keychain,
   which a user agent reaches and a system daemon does not.
+  **Everything about it except the password is configured by MCP call**, not by
+  editing `.env` — `get_brief_email_settings`/`update_brief_email_settings` own
+  the enabled state and the recipient list, resolving **DB > env > default**
+  through `config.py`. This is the repo's standing pattern (plans, personality,
+  notes): there is no UI, so the agent owns the writes, and a new user-facing
+  knob belongs behind a tool pair by default. **The secret is the exception and
+  the reasoning is general**: `/mcp/` is network-reachable from a phone, so any
+  tool that echoed a credential would publish it to every client that can call
+  the endpoint. Secrets stay in `.env`, unreadable and unwritable by tools; the
+  get tool reports `password_configured` as a bool.
+  `test_no_tool_output_ever_contains_the_smtp_password` asserts on the WHOLE
+  serialized payload, not named fields — copy that shape for any future
+  settings tool, because the leak that happens is the field nobody reviewed.
+  The send TIME is deliberately NOT a setting (it lives in the plist) and is
+  returned as prose so it can't read as writable; a tool that reloaded launchd
+  was rejected as host mutation a networked caller can neither do nor need. The
+  CLI checks `enabled` BEFORE the pull and the regeneration — a kill switch
+  that still burns a Garmin call and an LLM run nightly is not a kill switch.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a

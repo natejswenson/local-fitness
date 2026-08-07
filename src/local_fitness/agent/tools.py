@@ -2095,6 +2095,143 @@ async def update_coach_personality(args: dict) -> dict:
                   "dials_changed": sorted(dial_args)})
 
 
+#: Static description of the launchd schedule. The send TIME lives in
+#: `ops/com.localfitness.briefmail.plist.template`, not in settings, so this is
+#: reported as prose rather than as an editable field — a tool that returned it
+#: as data would imply it could be written back, and it cannot be (changing it
+#: means regenerating and reloading the plist on the host, which a networked
+#: `/mcp/` caller has no business doing and no way to do).
+_BRIEF_EMAIL_SCHEDULE = "19:00 daily, backstop 20:00 (launchd com.localfitness.briefmail)"
+
+
+@tool(
+    "get_brief_email_settings",
+    "How the evening brief email is configured: whether it's enabled, who it "
+    "goes to, whether a sending credential is present, and the schedule. Call "
+    "before update_brief_email_settings so an edit patches what is actually "
+    "there. Reports `password_configured` as a boolean only — the SMTP "
+    "password is never returned by any tool. Changing the send TIME is not a "
+    "setting: edit the launchd plist template and re-run "
+    "./ops/install-launchd.sh briefmail.",
+    {},
+)
+async def get_brief_email_settings(_args: dict) -> dict:
+    from . import mailer
+
+    with db.connect() as conn:
+        enabled = config.brief_email_enabled(conn=conn)
+        recipients = config.brief_email_to(conn=conn)
+    smtp_user = os.environ.get("LOCAL_FITNESS_SMTP_USER", "").strip()
+    configured = mailer.password_configured()
+    return _text({
+        "enabled": enabled,
+        # Empty means "not configured"; mailer falls back to the sending
+        # account, so report the address that would actually be used.
+        "to": list(recipients) or ([smtp_user] if smtp_user else []),
+        "to_is_explicit": bool(recipients),
+        "password_configured": configured,
+        "smtp_user": smtp_user or None,
+        "smtp_host": os.environ.get("LOCAL_FITNESS_SMTP_HOST") or mailer.DEFAULT_SMTP_HOST,
+        "schedule": _BRIEF_EMAIL_SCHEDULE,
+        "can_send": bool(enabled and configured and smtp_user),
+        "blocked_reason": (
+            None if (enabled and configured and smtp_user)
+            else "disabled via settings" if not enabled
+            else "LOCAL_FITNESS_SMTP_PASSWORD is not set in <repo>/.env"
+            if not configured
+            else "LOCAL_FITNESS_SMTP_USER is not set in <repo>/.env"
+        ),
+    })
+
+
+#: Loose sanity check, not RFC 5322. The point is to catch a transposed or
+#: truncated address before it becomes a silent nightly bounce, not to
+#: adjudicate exotic-but-legal addresses — a false rejection here would be a
+#: worse failure than a permissive one.
+_EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
+
+
+@tool(
+    "update_brief_email_settings",
+    "Configure the evening brief email conversationally — the agent-owned "
+    "write path (there is no UI). `enabled: false` stops the nightly send "
+    "without touching launchd; `to` replaces the recipient list (pass every "
+    "address you want, not just the new one). Both optional; pass at least "
+    "one. The SMTP password is NOT settable here — it is a secret and lives "
+    "only in <repo>/.env. Takes effect on the next send; no restart.",
+    {
+        "type": "object",
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "False stops the nightly email; True resumes it.",
+            },
+            "to": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Full replacement recipient list, e.g. "
+                               "[\"you@gmail.com\", \"you@work.com\"].",
+            },
+        },
+        "required": [],
+    },
+)
+async def update_brief_email_settings(args: dict) -> dict:
+    from . import mailer
+
+    errors: list[str] = []
+
+    if unknown := sorted(set(args) - {"enabled", "to"}):
+        errors.extend(f"unknown field '{k}'" for k in unknown)
+
+    enabled = args.get("enabled")
+    if "enabled" in args and not isinstance(enabled, bool):
+        errors.append("enabled must be true or false")
+
+    recipients: list[str] = []
+    if "to" in args:
+        raw = args["to"]
+        # A bare string is the shape a model reaches for when there's one
+        # address; accepting it beats failing on an unambiguous intent.
+        if isinstance(raw, str):
+            raw = [a for a in (p.strip() for p in raw.split(",")) if a]
+        if not isinstance(raw, list) or not raw:
+            errors.append("to must be a non-empty list of email addresses")
+        else:
+            for addr in raw:
+                if not isinstance(addr, str) or not _EMAIL_RE.match(addr.strip()):
+                    errors.append(f"not a valid email address: {addr!r}")
+                else:
+                    recipients.append(addr.strip())
+
+    if errors:
+        return _err("; ".join(errors), editable_fields=["enabled", "to"])
+    if "enabled" not in args and not recipients:
+        return _err("nothing to update — pass `enabled` and/or `to`")
+
+    changed: list[str] = []
+    if "enabled" in args:
+        db.set_setting("brief_email_enabled", "true" if enabled else "false")
+        changed.append("enabled")
+    if recipients:
+        db.set_setting("brief_email_to", ",".join(recipients))
+        changed.append("to")
+
+    with db.connect() as conn:
+        now_enabled = config.brief_email_enabled(conn=conn)
+        now_to = config.brief_email_to(conn=conn)
+    return _text({
+        "updated": True,
+        "changed": changed,
+        "enabled": now_enabled,
+        "to": list(now_to),
+        "schedule": _BRIEF_EMAIL_SCHEDULE,
+        # Surfaced on every write so "I turned it on" can never be the last
+        # word when the send would still be blocked by a missing credential.
+        "password_configured": mailer.password_configured(),
+    })
+
+
 @tool(
     "daily_snapshot",
     _DAILY_SNAPSHOT_DESCRIPTION,
@@ -4319,6 +4456,8 @@ ALL_TOOLS = [
     recall_coach_memories,
     get_coach_personality,
     update_coach_personality,
+    get_brief_email_settings,
+    update_brief_email_settings,
     daily_snapshot,
     log_observation,
     list_observations,

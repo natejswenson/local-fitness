@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
+from .. import config
 from .email_render import chart_cid
 
 LOG = logging.getLogger(__name__)
@@ -96,11 +97,19 @@ def load_config(to_override: str | None = None) -> MailConfig:
             "mail, e.g. you@gmail.com). Add it to <repo>/.env."
         )
 
-    to_raw = to_override or _env("LOCAL_FITNESS_BRIEF_EMAIL_TO") or user
-    recipients = tuple(a.strip() for a in to_raw.split(",") if a.strip())
+    # Recipients resolve DB > env > the sending account, so the MCP tools can
+    # change them conversationally. `config` owns the first two layers; the
+    # fallback to `user` lives here because config deliberately holds no SMTP
+    # state. An explicit --to beats all of it.
+    if to_override:
+        recipients = tuple(a.strip() for a in to_override.split(",") if a.strip())
+    else:
+        recipients = config.brief_email_to() or (user,)
     if not recipients:
         raise MailNotConfigured(
-            "LOCAL_FITNESS_BRIEF_EMAIL_TO resolved to no recipients.")
+            "No recipients resolved. Set one with the "
+            "update_brief_email_settings MCP tool, or "
+            "LOCAL_FITNESS_BRIEF_EMAIL_TO in .env.")
 
     port_raw = _env("LOCAL_FITNESS_SMTP_PORT") or str(DEFAULT_SMTP_PORT)
     try:
@@ -117,6 +126,20 @@ def load_config(to_override: str | None = None) -> MailConfig:
         to=recipients,
         from_addr=_env("LOCAL_FITNESS_BRIEF_EMAIL_FROM") or user,
     )
+
+
+def password_configured() -> bool:
+    """Whether a sending credential is present — WITHOUT exposing it.
+
+    This is the only thing the MCP surface may learn about the password. The
+    value itself is deliberately unreachable from any tool: `/mcp/` is served
+    over the network and reachable from a phone, so a settings tool that
+    echoed the credential would publish a live Gmail app password to every
+    client that can call it. "Is it set?" answers the only question a
+    configuration reader legitimately has.
+    """
+    raw = _env("LOCAL_FITNESS_SMTP_PASSWORD")
+    return bool(raw and raw.replace(" ", ""))
 
 
 def placeholder_config() -> MailConfig:

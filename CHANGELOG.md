@@ -58,6 +58,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   written only after a confirmed send, so 20:00 re-sends exactly when 19:00
   failed and never when it succeeded.
 
+- **The email is configured conversationally, not by editing `.env`.** New
+  `get_brief_email_settings` / `update_brief_email_settings` MCP tools (both in
+  `ALL_TOOLS`, so reachable over stdio AND `/mcp/`) own the enabled state and
+  the recipient list, resolving **DB setting > env > default** through
+  `config.py`'s existing machinery. "Stop emailing me the brief" and "also send
+  it to my work address" are now sentences. This follows the pattern the repo
+  already set with `get`/`update_coach_personality` and the plan-lifecycle
+  tools: there is no UI, so the agent owns the writes.
+
+  **The SMTP password is the deliberate exception and stays `.env`-only.** It is
+  neither readable nor writable through any tool: `/mcp/` is served over the
+  network and reachable from a phone, so a settings tool that echoed the
+  credential would publish a live Gmail app password to every client that can
+  call it. `get_brief_email_settings` reports `password_configured` as a boolean
+  and nothing more.
+  `test_no_tool_output_ever_contains_the_smtp_password` asserts against the
+  **whole serialized payload** rather than named fields, so a future field added
+  to either tool is covered automatically — the leak that actually happens is
+  the field nobody thought to review.
+
+  The **send time is not a setting**, and is reported as prose rather than data
+  so it doesn't read as an editable field. It lives in the launchd plist;
+  changing it means editing the template and re-running the installer. A tool
+  that rewrote and reloaded the plist was considered and rejected: it mutates
+  the host from a tool call and cannot work for a networked caller at all.
+
+  The CLI checks `enabled` **before** the Garmin pull and the regeneration, not
+  just before the send — a kill switch that still spends a Garmin call and an
+  LLM run every night and discards the result is not a kill switch.
+
 ### Changed
 - **`tools.assemble_brief_render_inputs` extracted from
   `generate_brief_report`.** Chart PNGs and the resolved Training Plan section

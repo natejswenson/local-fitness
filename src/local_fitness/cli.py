@@ -247,6 +247,9 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
     """
     import asyncio
 
+    # Imported as app_config: this module defines a click GROUP named `config`
+    # at module scope, which shadows the package's config module.
+    from . import config as app_config
     from .agent import branding, briefs, email_render, mailer
     from .agent import tools as agent_tools
     from .agent.schemas import Brief
@@ -255,6 +258,18 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
 
     if if_unsent and _emailed_marker(target).exists():
         click.echo(f"Brief for {target} was already emailed — skipping.")
+        return
+
+    # The conversational kill switch. Checked BEFORE the pull and the
+    # regeneration, not just before the send: "stop emailing me the brief"
+    # must not leave a job that still spends a Garmin pull and an LLM run
+    # every night and then throws the result away. `--dry-run` ignores it, so
+    # a disabled setup can still be inspected.
+    if dry_run is None and not app_config.brief_email_enabled():
+        click.echo(
+            "Brief email is disabled (brief_email_enabled=false) — skipping. "
+            "Re-enable with the update_brief_email_settings MCP tool."
+        )
         return
 
     if not no_pull:
