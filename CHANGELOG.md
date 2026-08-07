@@ -6,6 +6,88 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-08-07
+
+### Added
+- **The daily brief is emailed every evening at 19:00.** New
+  `fitness brief-email` command plus a `com.localfitness.briefmail` launchd job
+  (19:00, backstop 20:00) that pulls fresh Garmin data, recomputes baselines,
+  regenerates the day's brief against it, and delivers it as a PRESS-styled
+  HTML email with the chart PNGs attached inline.
+
+  **The evening brief overwrites `briefings/<date>.json` on purpose.** By 19:00
+  the day's training is in the data, so the evening version is the better
+  record of the day; the 06:30 brief is describing a day that had not happened
+  yet. `save_brief` forces the date to today, so the overwrite is inherent
+  rather than something the command arranges. The coach does **not** journal
+  the day twice — `reflect` keys on `("brief", <date>)` and pre-checks
+  `journal.has_event`, so the second save is idempotent.
+
+  **Delivery is plain `smtplib` with no model in the path, and that is what
+  keeps the charts.** The Gmail MCP connector was the first design and it does
+  not work: its surface is `create_draft`/`update_draft`/`list_drafts` with no
+  send tool at all, so mail would land in Drafts and wait for a tap. Worse, any
+  connector route makes attachment bytes a *tool argument* — the model would
+  have to retype every chart PNG as base64, several hundred thousand characters
+  a night, with a truncated blob becoming a nightly failure. Sending directly
+  from Python means the same matplotlib PNGs the PDF uses go into the MIME tree
+  as CID parts at full fidelity.
+
+  New `agent/email_render.py` (pure) and `agent/mailer.py` (I/O), the same
+  divider as `plans.py`. `email_render` is a **sibling of `visuals._build_html`,
+  not a reuse of it**, because the two target renderers with nothing in common:
+  Gmail strips `<style>` blocks and `@font-face` and refuses `data:` URIs, so
+  every rule rides an inline `style=` attribute (including on the markdown
+  library's output, via `_style_fragment`), fonts fall back to the theme's plain
+  stacks, and charts are referenced by `cid:`. There is **no density ladder** —
+  a PDF page is a fixed budget, an email scrolls, so every takeaway renders in
+  full and nothing is ever truncated.
+
+  Config is provider-agnostic with Gmail's values as defaults
+  (`LOCAL_FITNESS_SMTP_HOST/PORT/USER/PASSWORD`,
+  `LOCAL_FITNESS_BRIEF_EMAIL_TO/FROM`) so a fresh clone can point anywhere
+  without editing tracked code. Only the password has no default. Port 465 uses
+  implicit TLS; anything else upgrades via STARTTLS, so credentials never cross
+  an unupgraded socket. `--dry-run` writes the composed `.eml` and opens no
+  socket, and works *before* a password is configured.
+
+  The backstop dedupe differs from the morning job's, and the difference is
+  load-bearing: `brief --if-missing` keys on the saved brief file, a test that
+  is useless here because the 06:30 job already wrote one. `brief-email
+  --if-unsent` keys on a per-date **sent marker** (`briefings/.emailed-<date>`)
+  written only after a confirmed send, so 20:00 re-sends exactly when 19:00
+  failed and never when it succeeded.
+
+### Changed
+- **`tools.assemble_brief_render_inputs` extracted from
+  `generate_brief_report`.** Chart PNGs and the resolved Training Plan section
+  are now built by one implementation shared by the PDF and the email. Which
+  takeaways get a chart, what window that chart covers, and what the plan
+  section says are properties of the brief, not of the output format — two
+  copies would drift silently, and the divergence would only be visible to
+  someone holding both artifacts side by side. `generate_brief_report`'s
+  behaviour is unchanged.
+- **`ops/install-launchd.sh` and `uninstall-launchd.sh` handle both jobs**, and
+  take an optional job name to act on one. The installer warns when
+  `LOCAL_FITNESS_SMTP_PASSWORD` is unset rather than letting the discovery
+  happen at 19:00 in a log file.
+
+### Tests
+- `tests/test_email_render.py` and `tests/test_mailer.py` (65 cases). The
+  load-bearing one is
+  `test_every_cid_reference_resolves_to_an_attached_image`: an HTML `cid:`
+  reference with nothing attached under that name renders as a broken-image
+  icon in the inbox while every browser preview still looks correct. The
+  email-safety rules (no `data:` URIs, no `<style>` block, no `@font-face`,
+  inline styles on markdown output) are guarded for the same reason — each
+  fails *silently* in Gmail. All four were confirmed to fail under deliberate
+  mutation of the code they cover.
+- `tests/conftest.py` gains an autouse `smtplib` guard, the third of its kind
+  after the Claude SDK and Garmin ones. It **raises** rather than no-opping:
+  unlike a missing HR trace, "the mail didn't send" is not a documented
+  degraded path, and a test that walks far enough down `cli.brief_email` would
+  otherwise deliver real mail to a real inbox.
+
 ## [0.50.0] - 2026-08-04
 
 ### Changed

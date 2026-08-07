@@ -79,6 +79,34 @@ def _no_live_garmin_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_smtp_calls(monkeypatch):
+    """Hard-block real mail sending for the whole suite.
+
+    Third guard, same lesson as the SDK and Garmin ones (0.51.0): the evening
+    brief path ends in ``smtplib``, and a test that walked far enough down
+    ``cli.brief_email`` would connect to Gmail and deliver actual mail — a
+    failure mode that is worse than slow, because it is not undoable and it
+    lands in a real inbox.
+
+    Raises rather than no-opping: unlike a missing HR trace, "the mail didn't
+    send" is not a documented degraded path any caller handles, so a test that
+    trips this has a wiring bug worth surfacing. A test that needs to exercise
+    the transport patches ``mailer.smtplib`` itself, which runs after this and
+    therefore wins.
+    """
+    import smtplib
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError(
+            "Live SMTP connection attempted in a test. Patch "
+            "mailer.smtplib.SMTP/SMTP_SSL in your test instead."
+        )
+
+    monkeypatch.setattr(smtplib, "SMTP", _blocked)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _blocked)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_profile_cache():
     """Drop ``coach.load_profile``'s memo around every test.
 

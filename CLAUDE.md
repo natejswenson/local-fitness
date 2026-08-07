@@ -586,6 +586,48 @@ These are settled — don't redesign without a reason.
   `daily_snapshot`) carries `latest_brief_date` +
   `brief_stale_days`, and the `fitness://brief/latest` resource leads
   with a STALE banner when serving a brief older than today.
+- **The brief is emailed every evening at 19:00, and the delivery path has no
+  model in it** (0.51.0). `fitness brief-email` (launchd
+  `com.localfitness.briefmail`, 19:00 + 20:00 backstop) pulls Garmin,
+  recomputes baselines, **regenerates the brief — overwriting
+  `briefings/<today>.json`** — and sends it as a PRESS-styled HTML email with
+  the chart PNGs attached inline. The overwrite is deliberate: by 19:00 the
+  day's training is in the data and the 06:30 brief describes a day that hadn't
+  happened. It does **not** double-journal — `reflect` keys on
+  `("brief", <date>)` behind a `journal.has_event` pre-check.
+  **The Gmail MCP connector cannot do this job, and the reason generalises to
+  any connector-based delivery.** Its surface is
+  `create_draft`/`update_draft`/`list_drafts` — there is no send tool, so mail
+  lands in Drafts awaiting a tap. And attachment bytes are a *tool argument*,
+  so a connector route makes the model retype every chart PNG as base64
+  (~40-80k chars each, several hundred thousand a night) with truncation
+  becoming a nightly failure. `smtplib` from Python puts the same matplotlib
+  PNGs into the MIME tree as CID parts at full fidelity. Before proposing an
+  MCP connector for any *scheduled* delivery, check both: does it actually
+  send, and do the bytes have to pass through a model turn?
+  `agent/email_render.py` (pure) + `agent/mailer.py` (I/O) is the usual
+  divider. **`email_render` is a SIBLING of `visuals._build_html`, never a
+  reuse**: Gmail strips `<style>` and `@font-face` and refuses `data:` URIs, so
+  every rule rides an inline `style=` attribute — including on the markdown
+  library's output, which arrives unstyled and is rewritten by
+  `_style_fragment`. Each of those three failures is *silent* (correct in a
+  browser preview, broken in the inbox), which is why they are the hardest-
+  guarded cases in `tests/test_email_render.py`. There is **no density ladder**:
+  a page is a fixed budget, an email scrolls, so nothing is ever truncated —
+  the one place the email is deliberately more complete than the PDF. Chart
+  naming has ONE definition (`email_render.chart_cid`) used by both the
+  `src="cid:…"` and the `Content-ID` header;
+  `test_every_cid_reference_resolves_to_an_attached_image` is what keeps a
+  reference from pointing at nothing. Config is provider-agnostic with Gmail
+  defaults (`LOCAL_FITNESS_SMTP_*`, `LOCAL_FITNESS_BRIEF_EMAIL_TO/FROM`); only
+  the password has no default, and port 465 is implicit TLS while anything else
+  upgrades via STARTTLS. **The backstop dedupe is NOT `--if-missing`'s**: a
+  saved brief proves nothing here because the morning job already wrote one, so
+  `--if-unsent` keys on `briefings/.emailed-<date>`, written only after a
+  confirmed send. `--dry-run` writes the `.eml` without a socket and works
+  before any password exists. Both launchd jobs must stay **LaunchAgents** —
+  the bundled Claude SDK CLI reads its credential from the login keychain,
+  which a user agent reaches and a system daemon does not.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a

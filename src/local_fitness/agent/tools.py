@@ -3582,28 +3582,31 @@ def _build_plan_section(target_date: str) -> dict | None:
     }
 
 
-@tool(
-    "generate_brief_report",
-    "Render a saved daily brief into a polished, beautiful PDF report "
-    "(visually comparable to the sibling budget project's monthly reports). "
-    "Local-only: reachable via stdio MCP clients (Claude Code/Claude Desktop "
-    "on this same machine), never over the network. Returns a local file "
-    "path the user can open directly.",
-    {"date": str},
-)
-async def generate_brief_report(args: dict) -> dict:
-    target_date = args["date"]
-    if msg := _validate_date(target_date):
-        return _err(msg)
+async def assemble_brief_render_inputs(
+    brief: Brief, target_date: str
+) -> tuple[dict[str, bytes], dict | None]:
+    """Chart PNGs + the resolved Training Plan section for one saved brief.
 
-    brief_path = briefs.DEFAULT_BRIEFINGS_DIR / f"{target_date}.json"
-    if not brief_path.exists():
-        return _err(f"no saved brief for {target_date}")
-    try:
-        brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
-    except ValidationError as e:
-        return _err(f"brief failed schema validation: {_validation_error_summary(e)}")
+    Extracted from ``generate_brief_report`` so the PDF and the evening email
+    (``cli.brief_email``) build their render inputs from ONE implementation.
+    They target different renderers, but "which takeaways get a chart", "what
+    window does that chart cover" and "what does the plan section say" are
+    properties of the brief, not of the output format. Two copies would drift
+    silently, and the divergence would only be visible to someone holding both
+    artifacts side by side.
 
+    Returns ``(charts_by_index, plan_section)``. ``charts_by_index`` is keyed by
+    ``str(index)`` over ``enumerate(brief.takeaways)`` — NOT by metric name (two
+    takeaways can cite the same metric). ``plan_section`` is None when there is
+    no active plan or no plan data in the trailing window, and otherwise carries
+    ``today["coaching_line"]`` already resolved.
+
+    Best-effort throughout, and deliberately so: a chart that will not render is
+    skipped, a malformed plan section becomes None, and a failed coaching-line
+    generation falls back to the deterministic template. Both callers are
+    enriching a brief that is already saved and already correct, so nothing here
+    may take that brief down with it.
+    """
     from . import visuals  # lazy: defers matplotlib/weasyprint import cost
 
     charts_by_index: dict[str, bytes] = {}
@@ -3707,6 +3710,36 @@ async def generate_brief_report(args: dict) -> dict:
             LOG.info("plan_coach_grounding flags=%d%s", len(flags), detail)
         except Exception:  # noqa: BLE001 — an advisory signal must never break the PDF
             LOG.exception("plan_coach_grounding failed (advisory, ignored)")
+
+    return charts_by_index, plan_section
+
+
+@tool(
+    "generate_brief_report",
+    "Render a saved daily brief into a polished, beautiful PDF report "
+    "(visually comparable to the sibling budget project's monthly reports). "
+    "Local-only: reachable via stdio MCP clients (Claude Code/Claude Desktop "
+    "on this same machine), never over the network. Returns a local file "
+    "path the user can open directly.",
+    {"date": str},
+)
+async def generate_brief_report(args: dict) -> dict:
+    target_date = args["date"]
+    if msg := _validate_date(target_date):
+        return _err(msg)
+
+    brief_path = briefs.DEFAULT_BRIEFINGS_DIR / f"{target_date}.json"
+    if not brief_path.exists():
+        return _err(f"no saved brief for {target_date}")
+    try:
+        brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
+    except ValidationError as e:
+        return _err(f"brief failed schema validation: {_validation_error_summary(e)}")
+
+    from . import visuals  # lazy: defers matplotlib/weasyprint import cost
+
+    charts_by_index, plan_section = await assemble_brief_render_inputs(
+        brief, target_date)
 
     # Shrink first, then truncate. The density ladder inside render_brief_pdf
     # handles the common case; only when even the densest rung still spills do
