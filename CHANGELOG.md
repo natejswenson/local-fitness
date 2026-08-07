@@ -6,6 +6,161 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-08-07
+
+### Added
+- **The daily brief is emailed every evening at 19:00.** New
+  `fitness brief-email` command plus a `com.localfitness.briefmail` launchd job
+  (19:00, backstop 20:00) that pulls fresh Garmin data, recomputes baselines,
+  regenerates the day's brief against it, and delivers it as a PRESS-styled
+  HTML email with the chart PNGs attached inline.
+
+  **The evening brief overwrites `briefings/<date>.json` on purpose.** By 19:00
+  the day's training is in the data, so the evening version is the better
+  record of the day; the 06:30 brief is describing a day that had not happened
+  yet. `save_brief` forces the date to today, so the overwrite is inherent
+  rather than something the command arranges. The coach does **not** journal
+  the day twice — `reflect` keys on `("brief", <date>)` and pre-checks
+  `journal.has_event`, so the second save is idempotent.
+
+  **Delivery is plain `smtplib` with no model in the path, and that is what
+  keeps the charts.** The Gmail MCP connector was the first design and it does
+  not work: its surface is `create_draft`/`update_draft`/`list_drafts` with no
+  send tool at all, so mail would land in Drafts and wait for a tap. Worse, any
+  connector route makes attachment bytes a *tool argument* — the model would
+  have to retype every chart PNG as base64, several hundred thousand characters
+  a night, with a truncated blob becoming a nightly failure. Sending directly
+  from Python means the same matplotlib PNGs the PDF uses go into the MIME tree
+  as CID parts at full fidelity.
+
+  New `agent/email_render.py` (pure) and `agent/mailer.py` (I/O), the same
+  divider as `plans.py`. `email_render` is a **sibling of `visuals._build_html`,
+  not a reuse of it**, because the two target renderers with nothing in common:
+  Gmail strips `<style>` blocks and `@font-face` and refuses `data:` URIs, so
+  every rule rides an inline `style=` attribute (including on the markdown
+  library's output, via `_style_fragment`), fonts fall back to the theme's plain
+  stacks, and charts are referenced by `cid:`. There is **no density ladder** —
+  a PDF page is a fixed budget, an email scrolls, so every takeaway renders in
+  full and nothing is ever truncated.
+
+  Config is provider-agnostic with Gmail's values as defaults
+  (`LOCAL_FITNESS_SMTP_HOST/PORT/USER/PASSWORD`,
+  `LOCAL_FITNESS_BRIEF_EMAIL_TO/FROM`) so a fresh clone can point anywhere
+  without editing tracked code. Only the password has no default. Port 465 uses
+  implicit TLS; anything else upgrades via STARTTLS, so credentials never cross
+  an unupgraded socket. `--dry-run` writes the composed `.eml` and opens no
+  socket, and works *before* a password is configured.
+
+  The backstop dedupe differs from the morning job's, and the difference is
+  load-bearing: `brief --if-missing` keys on the saved brief file, a test that
+  is useless here because the 06:30 job already wrote one. `brief-email
+  --if-unsent` keys on a per-date **sent marker** (`briefings/.emailed-<date>`)
+  written only after a confirmed send, so 20:00 re-sends exactly when 19:00
+  failed and never when it succeeded.
+
+- **The email is configured conversationally, not by editing `.env`.** New
+  `get_brief_email_settings` / `update_brief_email_settings` MCP tools (both in
+  `ALL_TOOLS`, so reachable over stdio AND `/mcp/`) own the enabled state and
+  the recipient list, resolving **DB setting > env > default** through
+  `config.py`'s existing machinery. "Stop emailing me the brief" and "also send
+  it to my work address" are now sentences. This follows the pattern the repo
+  already set with `get`/`update_coach_personality` and the plan-lifecycle
+  tools: there is no UI, so the agent owns the writes.
+
+  **The SMTP password is the deliberate exception and stays `.env`-only.** It is
+  neither readable nor writable through any tool: `/mcp/` is served over the
+  network and reachable from a phone, so a settings tool that echoed the
+  credential would publish a live Gmail app password to every client that can
+  call it. `get_brief_email_settings` reports `password_configured` as a boolean
+  and nothing more.
+  `test_no_tool_output_ever_contains_the_smtp_password` asserts against the
+  **whole serialized payload** rather than named fields, so a future field added
+  to either tool is covered automatically — the leak that actually happens is
+  the field nobody thought to review.
+
+  The **send time is not a setting**, and is reported as prose rather than data
+  so it doesn't read as an editable field. It lives in the launchd plist;
+  changing it means editing the template and re-running the installer. A tool
+  that rewrote and reloaded the plist was considered and rejected: it mutates
+  the host from a tool call and cannot work for a networked caller at all.
+
+  The CLI checks `enabled` **before** the Garmin pull and the regeneration, not
+  just before the send — a kill switch that still spends a Garmin call and an
+  LLM run every night and discards the result is not a kill switch.
+
+### Changed
+- **`tools.assemble_brief_render_inputs` extracted from
+  `generate_brief_report`.** Chart PNGs and the resolved Training Plan section
+  are now built by one implementation shared by the PDF and the email. Which
+  takeaways get a chart, what window that chart covers, and what the plan
+  section says are properties of the brief, not of the output format — two
+  copies would drift silently, and the divergence would only be visible to
+  someone holding both artifacts side by side. `generate_brief_report`'s
+  behaviour is unchanged.
+- **`ops/install-launchd.sh` and `uninstall-launchd.sh` handle both jobs**, and
+  take an optional job name to act on one. The installer warns when
+  `LOCAL_FITNESS_SMTP_PASSWORD` is unset rather than letting the discovery
+  happen at 19:00 in a log file.
+
+### Security
+- **SMTP now verifies TLS certificates.** `mailer.send` passed no SSL context to
+  either transport, and `smtplib` does **not** default to a verifying one: both
+  `SMTP_SSL.__init__` and `SMTP.starttls()` fall back to
+  `ssl._create_stdlib_context()`, which is `check_hostname=False,
+  verify_mode=CERT_NONE` — encrypted but unauthenticated, accepting any
+  certificate from any peer. Caught by the pre-release security review; never
+  released.
+
+  **Why it mattered more than usual here:** the send runs unattended from
+  launchd at 19:00 with a 20:00 retry, so no human is present to notice a bad
+  certificate, and the statement immediately after the handshake is `login()`,
+  which puts a Gmail app password on the wire in AUTH PLAIN. An attacker with a
+  network position (LAN ARP spoofing, a hostile router, DNS poisoning) would
+  have received a credential to the user's entire mailbox — nightly — plus the
+  health data in the brief.
+
+  Both paths now take `ssl.create_default_context()`. `tls_context()` is a
+  function rather than an inline call specifically so the tests can assert on
+  `check_hostname` / `verify_mode`: a test that only asserts "it sent" cannot
+  catch this, which is exactly how it survived the first review. A fourth test
+  pins the *ordering* on the STARTTLS path, since a `login()` before the upgrade
+  would put the password on a cleartext socket.
+
+### Fixed
+- **Config resolution no longer crashes without a database.** `config._resolve`
+  now treats an unreadable DB layer as UNSET and falls through to env/default,
+  via a new `_db_setting` helper. A fresh clone has no `data/fitness.db` until
+  the first `fitness pull`, and `db.get_setting` raises
+  `OperationalError: no such table: settings` against one — so `brief-email`,
+  whose `mailer.load_config` had just started reading a setting, died on any
+  machine without an initialized DB. That breaks CLAUDE.md's core promise that
+  a stranger's clone runs. `user_name` and `coach_profile` carried the same
+  latent exposure and are fixed by the same change; they simply had no caller
+  that ran before schema init.
+
+  **It passed locally and failed in CI**, because the dev machine has a
+  populated `data/fitness.db` and CI has none — the suite was silently reading
+  real data. `tests/test_mailer.py` and `tests/test_cli_brief_email.py` now
+  point `db.DEFAULT_DB_PATH` at a nonexistent path so they reproduce CI (and a
+  fresh clone) instead of borrowing the developer's database, and
+  `test_settings_resolve_with_no_database_at_all` pins the contract directly.
+
+### Tests
+- `tests/test_email_render.py` and `tests/test_mailer.py` (65 cases). The
+  load-bearing one is
+  `test_every_cid_reference_resolves_to_an_attached_image`: an HTML `cid:`
+  reference with nothing attached under that name renders as a broken-image
+  icon in the inbox while every browser preview still looks correct. The
+  email-safety rules (no `data:` URIs, no `<style>` block, no `@font-face`,
+  inline styles on markdown output) are guarded for the same reason — each
+  fails *silently* in Gmail. All four were confirmed to fail under deliberate
+  mutation of the code they cover.
+- `tests/conftest.py` gains an autouse `smtplib` guard, the third of its kind
+  after the Claude SDK and Garmin ones. It **raises** rather than no-opping:
+  unlike a missing HR trace, "the mail didn't send" is not a documented
+  degraded path, and a test that walks far enough down `cli.brief_email` would
+  otherwise deliver real mail to a real inbox.
+
 ## [0.50.0] - 2026-08-04
 
 ### Changed

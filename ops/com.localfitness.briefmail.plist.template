@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Evening "fitness brief-email" job for macOS launchd.
+
+  TEMPLATE — `ops/install-launchd.sh` fills in __UV_BIN__ and __REPO_ROOT__
+  with absolute paths resolved on the install host. Nothing host-specific is
+  committed.
+
+  The job runs `fitness brief-email --if-unsent`, which pulls fresh Garmin
+  data, recomputes baselines, REGENERATES today's brief (overwriting the
+  06:30 one — by 19:00 the day's training is in the data, so the evening
+  brief is the better record), renders it as a PRESS-styled HTML email with
+  the chart PNGs attached inline, and sends it over SMTP.
+
+  Credentials, all from <repo>/.env via the CLI's load_dotenv():
+    * LOCAL_FITNESS_SMTP_PASSWORD — a Gmail app password
+      (myaccount.google.com/apppasswords)
+    * LOCAL_FITNESS_SMTP_USER / LOCAL_FITNESS_BRIEF_EMAIL_TO
+  The brief GENERATION step additionally needs a Claude credential; the
+  bundled SDK CLI resolves it from the login keychain, which a LaunchAgent
+  can reach because it runs inside the user's security session (a system
+  daemon in /Library/LaunchDaemons could not — do not "promote" this job).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.localfitness.briefmail</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV_BIN__</string>
+        <string>run</string>
+        <string>--directory</string>
+        <string>__REPO_ROOT__</string>
+        <string>fitness</string>
+        <string>brief-email</string>
+        <string>--if-unsent</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <!-- Daily at 19:00 with a 20:00 backstop, mirroring the morning job's
+         06:30/09:30 pair and for the same reason: brief generation dies on
+         transient SDK stream failures often enough that one slot is not a
+         schedule, it is a coin flip.
+
+         The dedupe differs from the morning job's, and the difference is
+         load-bearing. `brief --if-missing` keys on the saved brief file; that
+         test is useless here because the 06:30 job already wrote one. This
+         job keys on a per-date SENT marker (`briefings/.emailed-<date>`,
+         written only after a confirmed send), so the 20:00 fire re-sends
+         exactly when 19:00 failed and never when it succeeded. A wake-
+         coalesced pileup after the Mac was asleep is de-duplicated the same
+         way. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>19</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>20</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Don't fire on install/load; wait for the scheduled hour. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/briefmail.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/briefmail.launchd.err.log</string>
+</dict>
+</plist>

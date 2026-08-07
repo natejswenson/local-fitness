@@ -7,6 +7,7 @@ Subcommands:
   recompute-baselines   — recompute rolling baselines + CTL/ATL/TSB
   recompute-body-battery — backfill body_battery_min/max from stored samples
   brief                 — pull + recompute + generate today's briefing
+  brief-email           — pull + regenerate + email the brief (evening job)
   status                — show DB stats and last ingest run
 """
 from __future__ import annotations
@@ -204,6 +205,136 @@ def brief(no_pull: bool, no_notify: bool, opus: bool, if_missing: bool):
     click.echo(f"Brief written to: {path}")
     if not no_notify:
         _notify("Today's brief is ready")
+
+
+def _emailed_marker(target: Date) -> Path:
+    """Marker proving today's brief email went out.
+
+    The evening job fires twice (19:00 + a 20:00 backstop, mirroring the
+    morning brief's 06:30/09:30 pattern), and unlike `brief --if-missing` the
+    presence of a saved brief proves nothing here — the morning job already
+    wrote one. Delivery needs its own record, or the backstop mails you a
+    second copy every single night.
+    """
+    from .agent import briefs
+    return briefs.DEFAULT_BRIEFINGS_DIR / f".emailed-{target.isoformat()}"
+
+
+@main.command(name="brief-email")
+@click.option("--date", "target_date", default=None,
+              help="YYYY-MM-DD to send (default: today)")
+@click.option("--no-pull", is_flag=True, help="Skip the Garmin pull step")
+@click.option("--no-generate", is_flag=True,
+              help="Email the saved brief as-is instead of regenerating it")
+@click.option("--if-unsent", is_flag=True,
+              help="No-op if this date's brief was already emailed (backstop mode)")
+@click.option("--dry-run", "dry_run", type=click.Path(path_type=Path), default=None,
+              help="Write the composed .eml to this path instead of sending")
+@click.option("--to", default=None, help="Override the recipient(s), comma-separated")
+@click.option("--no-notify", is_flag=True, help="Skip the macOS notification")
+def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
+                if_unsent: bool, dry_run: Path | None, to: str | None,
+                no_notify: bool):
+    """Pull, regenerate today's brief, and email it as a PRESS-styled report.
+
+    The evening counterpart to `brief`. Regenerating is the default and it
+    deliberately OVERWRITES `briefings/<today>.json`: the 19:00 brief sees a
+    full day of Garmin data the 06:30 one could not, so it is the better
+    record of the day. `save_brief` forces the date to today, so the overwrite
+    is inherent rather than something this command arranges. The coach does
+    not journal the day twice — `reflect` keys on `("brief", <date>)` and
+    pre-checks `journal.has_event`.
+    """
+    import asyncio
+
+    # Imported as app_config: this module defines a click GROUP named `config`
+    # at module scope, which shadows the package's config module.
+    from . import config as app_config
+    from .agent import branding, briefs, email_render, mailer
+    from .agent import tools as agent_tools
+    from .agent.schemas import Brief
+
+    target = Date.fromisoformat(target_date) if target_date else Date.today()
+
+    if if_unsent and _emailed_marker(target).exists():
+        click.echo(f"Brief for {target} was already emailed — skipping.")
+        return
+
+    # The conversational kill switch. Checked BEFORE the pull and the
+    # regeneration, not just before the send: "stop emailing me the brief"
+    # must not leave a job that still spends a Garmin pull and an LLM run
+    # every night and then throws the result away. `--dry-run` ignores it, so
+    # a disabled setup can still be inspected.
+    if dry_run is None and not app_config.brief_email_enabled():
+        click.echo(
+            "Brief email is disabled (brief_email_enabled=false) — skipping. "
+            "Re-enable with the update_brief_email_settings MCP tool."
+        )
+        return
+
+    if not no_pull:
+        result = daily_ingest.pull()
+        click.echo(f"Pull: {result['status']} ({result['days_pulled']} days)")
+        baselines.recompute()
+
+    if not no_generate:
+        try:
+            briefing_mod.generate_and_save(model=SONNET)
+        except Exception:
+            # Same reasoning as `brief`: an unattended failure that only shows
+            # up as a missing email is indistinguishable from "nothing to say".
+            if not no_notify:
+                _notify("Evening brief generation FAILED — check the logs")
+            raise
+
+    brief_path = briefs.DEFAULT_BRIEFINGS_DIR / f"{target.isoformat()}.json"
+    if not brief_path.exists():
+        click.echo(f"No saved brief for {target} — nothing to email.", err=True)
+        sys.exit(1)
+    brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
+
+    charts, plan_section = asyncio.run(
+        agent_tools.assemble_brief_render_inputs(brief, target.isoformat()))
+
+    theme = branding.load_theme()
+    html_body = email_render.build_html(
+        brief, {int(k) for k in charts}, plan_section, theme)
+    text_body = email_render.build_text(brief, plan_section)
+    subject = email_render.subject_for(brief)
+
+    if dry_run is not None:
+        cfg = mailer.placeholder_config()
+    else:
+        try:
+            cfg = mailer.load_config(to)
+        except mailer.MailNotConfigured as e:
+            click.echo(f"  ⚠ {e}", err=True)
+            sys.exit(2)
+
+    msg = mailer.build_message(subject, html_body, text_body, charts, cfg)
+
+    if dry_run is not None:
+        dry_run.parent.mkdir(parents=True, exist_ok=True)
+        dry_run.write_bytes(msg.as_bytes())
+        click.echo(
+            f"Dry run — wrote {dry_run} "
+            f"({len(charts)} chart(s), {len(html_body)} chars of HTML). "
+            "Nothing was sent."
+        )
+        return
+
+    try:
+        mailer.send(msg, cfg)
+    except Exception:
+        if not no_notify:
+            _notify("Evening brief email FAILED — check the logs")
+        raise
+    # Written only after a confirmed send, so a failure leaves the backstop
+    # slot free to try again rather than recording a delivery that never was.
+    _emailed_marker(target).write_text(msg["Message-ID"] or "", encoding="utf-8")
+    click.echo(f"Emailed {subject} to {', '.join(cfg.to)}")
+    if not no_notify:
+        _notify("Evening brief emailed")
 
 
 @main.group()

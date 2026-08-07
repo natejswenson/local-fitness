@@ -64,6 +64,32 @@ def _coerce(db_raw, env_raw, default, cast):
         return default
 
 
+def _db_setting(key, db_path=None, conn: sqlite3.Connection | None = None):
+    """Read the DB layer, treating an unreachable database as UNSET.
+
+    A fresh clone has no ``data/fitness.db`` until the first ``fitness pull``,
+    and ``db.get_setting`` raises ``OperationalError: no such table: settings``
+    against an empty or absent one. CLAUDE.md's rule is that a stranger's clone
+    must run, and every knob resolved here has a working env/default layer
+    underneath — so an unreadable DB is a reason to fall through, never to
+    crash.
+
+    This was a live bug, not a hypothetical: ``mailer.load_config`` started
+    reading a setting (0.51.0) and took down ``fitness brief-email`` on any
+    machine without an initialized DB. It passed locally and failed in CI,
+    which is exactly the shape this fail-open prevents — the same fresh-clone
+    fail-open ``mcp_server._with_coach_persona`` already keeps for its cache
+    key.
+
+    Scoped to sqlite/OS errors: a bug in the *caller* (a bad key type, say)
+    still raises, because that is not a missing-database condition.
+    """
+    try:
+        return db.get_setting(key, db_path=db_path, conn=conn)
+    except (sqlite3.Error, OSError):
+        return None
+
+
 def _resolve(key, env, default, cast, db_path=None, conn: sqlite3.Connection | None = None):
     """Resolve a single knob (own DB read). For standalone single-knob use.
 
@@ -71,7 +97,7 @@ def _resolve(key, env, default, cast, db_path=None, conn: sqlite3.Connection | N
     connection instead of opening a fresh one per lookup; behavior is
     unchanged when omitted."""
     return _coerce(
-        db.get_setting(key, db_path=db_path, conn=conn), os.environ.get(env), default, cast
+        _db_setting(key, db_path=db_path, conn=conn), os.environ.get(env), default, cast
     )
 
 
@@ -125,6 +151,43 @@ def user_name(db_path=None, conn: sqlite3.Connection | None = None) -> str:
     tracked code free of personal data, per CLAUDE.md's env-driven rule."""
     return _resolve("user_name", "LOCAL_FITNESS_USER_NAME",
                     DEFAULT_USER_NAME, _as_user_name, db_path, conn=conn)
+
+
+def brief_email_enabled(db_path=None, conn: sqlite3.Connection | None = None) -> bool:
+    """Whether the evening job sends (DB > env > default True).
+
+    The conversational kill switch — `update_brief_email_settings(enabled=
+    false)` writes the DB layer, so "stop emailing me the brief" needs neither
+    a text editor nor `launchctl`. Defaulting to True is safe for a fresh
+    clone because sending ALSO requires an SMTP password, which has no default
+    at any layer; a stranger who never sets one can never be mailed by this.
+    """
+    return _resolve("brief_email_enabled", "LOCAL_FITNESS_BRIEF_EMAIL_ENABLED",
+                    True, _as_bool, db_path, conn=conn)
+
+
+def _as_recipients(s) -> tuple[str, ...]:
+    """Parse a comma-separated recipient list, dropping blanks.
+
+    Raises on an empty result so ``_coerce`` falls through to the default
+    rather than returning an empty tuple — "configured to mail nobody" is a
+    silent no-send, and the fallback (the sending account) is the safer read
+    of a malformed value."""
+    out = tuple(a.strip() for a in str(s).split(",") if a.strip())
+    if not out:
+        raise ValueError("no recipients")
+    return out
+
+
+def brief_email_to(db_path=None, conn: sqlite3.Connection | None = None) -> tuple[str, ...]:
+    """Who the evening brief goes to (DB > env > default: empty).
+
+    Empty means "not configured" and lets ``mailer.load_config`` fall back to
+    the sending account — the resolution can't do that itself without reading
+    SMTP settings, and this module stays free of them so it holds no
+    credential-adjacent state."""
+    return _resolve("brief_email_to", "LOCAL_FITNESS_BRIEF_EMAIL_TO",
+                    (), _as_recipients, db_path, conn=conn)
 
 
 def riegel_lookback_days(db_path=None, conn: sqlite3.Connection | None = None) -> int:
