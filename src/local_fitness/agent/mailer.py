@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import smtplib
+import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
@@ -213,21 +214,53 @@ def build_message(
     return msg
 
 
+def tls_context() -> ssl.SSLContext:
+    """A CERTIFICATE-VERIFYING TLS context. Never omit this.
+
+    `smtplib` does NOT verify by default, on either transport. Both
+    `SMTP_SSL.__init__` and `SMTP.starttls()` fall back to
+    `ssl._create_stdlib_context()` when handed `context=None`, and that factory
+    returns `check_hostname=False, verify_mode=CERT_NONE` — encrypted but
+    UNAUTHENTICATED, accepting any certificate from any peer. `create_default_
+    context()` is the one that returns `check_hostname=True,
+    verify_mode=CERT_REQUIRED`.
+
+    This shipped wrong in 0.51.0 and was caught by the pre-release security
+    review. It matters more here than in an interactive client: the send runs
+    unattended from launchd at 19:00 with a 20:00 retry, so there is no human
+    to notice a bad certificate, and the very next statement after the
+    handshake is `login()` — which puts a Gmail app password on the wire in
+    AUTH PLAIN. An attacker with a network position (LAN ARP spoofing, a
+    hostile router, DNS poisoning) would have received the credential to the
+    user's entire mailbox, nightly, plus the health data in the brief.
+
+    Exposed as a function rather than inlined so the tests can assert on the
+    context's actual `check_hostname` / `verify_mode` — a test that only
+    asserts "it sent" cannot catch this, which is exactly how it survived
+    review the first time.
+    """
+    return ssl.create_default_context()
+
+
 def send(msg: EmailMessage, cfg: MailConfig) -> None:
     """Deliver via SMTP. Raises on failure — the caller decides what a failed
     send means (the CLI turns it into a macOS notification and a non-zero
     exit, so a silent evening is never the only signal)."""
+    context = tls_context()
     if cfg.port == 465:
-        smtp_cls, starttls = smtplib.SMTP_SSL, False
+        # Implicit TLS: the context must be supplied at CONNECT time, since
+        # the handshake happens inside __init__.
+        with smtplib.SMTP_SSL(cfg.host, cfg.port, timeout=SMTP_TIMEOUT_S,
+                              context=context) as smtp:
+            smtp.login(cfg.user, cfg.password)
+            smtp.send_message(msg)
     else:
         # 587 and anything custom: connect in the clear, then upgrade. Sending
         # credentials over an unupgraded socket is not an option, so a host
-        # that refuses STARTTLS fails loudly here.
-        smtp_cls, starttls = smtplib.SMTP, True
-
-    with smtp_cls(cfg.host, cfg.port, timeout=SMTP_TIMEOUT_S) as smtp:
-        if starttls:
-            smtp.starttls()
-        smtp.login(cfg.user, cfg.password)
-        smtp.send_message(msg)
+        # that refuses STARTTLS fails loudly here — and the upgrade itself must
+        # carry the verifying context or the "upgrade" authenticates nothing.
+        with smtplib.SMTP(cfg.host, cfg.port, timeout=SMTP_TIMEOUT_S) as smtp:
+            smtp.starttls(context=context)
+            smtp.login(cfg.user, cfg.password)
+            smtp.send_message(msg)
     LOG.info("brief_email sent to=%s subject=%r", ", ".join(cfg.to), msg["Subject"])

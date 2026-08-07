@@ -646,6 +646,18 @@ These are settled — don't redesign without a reason.
   was rejected as host mutation a networked caller can neither do nor need. The
   CLI checks `enabled` BEFORE the pull and the regeneration — a kill switch
   that still burns a Garmin call and an LLM run nightly is not a kill switch.
+  **`smtplib` does not verify TLS by default and you must pass a context**
+  (0.51.0, caught pre-release). `SMTP_SSL.__init__` AND `SMTP.starttls()` both
+  fall back to `ssl._create_stdlib_context()` on `context=None` —
+  `check_hostname=False, verify_mode=CERT_NONE`, i.e. encrypted but accepting
+  any certificate. `mailer.tls_context()` returns
+  `ssl.create_default_context()` and both paths take it; `starttls` must also
+  precede `login`, or the credential crosses a cleartext socket. It is a
+  FUNCTION so tests can assert `check_hostname`/`verify_mode` — "it sent"
+  passes happily while this is broken, which is how it got through review.
+  Generalise it: any new outbound TLS client here (SMTP, IMAP, a raw socket)
+  gets an explicit verifying context and a test that inspects the context, not
+  the outcome.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a

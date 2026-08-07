@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import email
 import re
+import ssl
 from email import policy
 
 import pytest
@@ -218,11 +219,16 @@ class _FakeSMTP:
     """Records what the transport did without opening a socket."""
     instances: list[_FakeSMTP] = []
 
-    def __init__(self, host, port, timeout=None):
+    def __init__(self, host, port, timeout=None, context=None):
         self.host, self.port, self.timeout = host, port, timeout
+        # The context handed to SMTP_SSL at CONNECT time (implicit TLS) —
+        # None on the STARTTLS path, where it arrives at upgrade time instead.
+        self.connect_context = context
+        self.starttls_context = None
         self.started_tls = False
         self.logged_in = None
         self.sent = None
+        self.order: list[str] = []
         _FakeSMTP.instances.append(self)
 
     def __enter__(self):
@@ -231,14 +237,18 @@ class _FakeSMTP:
     def __exit__(self, *exc):
         return False
 
-    def starttls(self):
+    def starttls(self, context=None):
         self.started_tls = True
+        self.starttls_context = context
+        self.order.append("starttls")
 
     def login(self, user, password):
         self.logged_in = (user, password)
+        self.order.append("login")
 
     def send_message(self, msg):
         self.sent = msg
+        self.order.append("send")
 
 
 @pytest.fixture
@@ -271,6 +281,56 @@ def test_a_custom_port_also_upgrades(fake_smtp):
     cfg = mailer.MailConfig(**{**CFG.__dict__, "port": 2525})
     mailer.send(build({}), cfg)
     assert fake_smtp.instances[0].started_tls is True
+
+
+# --- TLS certificate verification ------------------------------------------
+# The 0.51.0 pre-release security review found `send` handing `context=None`
+# to both transports. `smtplib` does NOT default to a verifying context: both
+# `SMTP_SSL.__init__` and `SMTP.starttls()` fall back to
+# `ssl._create_stdlib_context()`, which is `check_hostname=False,
+# verify_mode=CERT_NONE` — encrypted but accepting any certificate from any
+# peer, with `login()` putting a Gmail app password on the wire immediately
+# after. These assert on the context's actual settings rather than on "it
+# sent", because "it sent" is precisely what passed while this was broken.
+
+def test_tls_context_verifies_certificates_and_hostnames():
+    ctx = mailer.tls_context()
+    assert ctx.check_hostname is True
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+
+
+def test_tls_context_is_not_the_unverified_stdlib_default():
+    # Pin the distinction directly: the stdlib fallback smtplib would have
+    # used is the exact thing this must never be.
+    unverified = ssl._create_stdlib_context()
+    assert (unverified.check_hostname, unverified.verify_mode) == (False, ssl.CERT_NONE)
+    ctx = mailer.tls_context()
+    assert (ctx.check_hostname, ctx.verify_mode) != (False, ssl.CERT_NONE)
+
+
+def test_implicit_tls_passes_a_verifying_context_at_connect(fake_smtp):
+    mailer.send(build({}), CFG)
+    conn = fake_smtp.instances[0]
+    assert conn.connect_context is not None, "SMTP_SSL got context=None — unverified TLS"
+    assert conn.connect_context.check_hostname is True
+    assert conn.connect_context.verify_mode is ssl.CERT_REQUIRED
+
+
+def test_starttls_passes_a_verifying_context_at_upgrade(fake_smtp):
+    cfg = mailer.MailConfig(**{**CFG.__dict__, "port": 587})
+    mailer.send(build({}), cfg)
+    conn = fake_smtp.instances[0]
+    assert conn.starttls_context is not None, "starttls() got context=None — unverified TLS"
+    assert conn.starttls_context.check_hostname is True
+    assert conn.starttls_context.verify_mode is ssl.CERT_REQUIRED
+
+
+def test_credentials_never_cross_an_unupgraded_socket(fake_smtp):
+    # Ordering, not just presence: a login before the upgrade would put the
+    # app password on a cleartext socket.
+    cfg = mailer.MailConfig(**{**CFG.__dict__, "port": 587})
+    mailer.send(build({}), cfg)
+    assert fake_smtp.instances[0].order == ["starttls", "login", "send"]
 
 
 def test_the_socket_carries_a_timeout(fake_smtp):

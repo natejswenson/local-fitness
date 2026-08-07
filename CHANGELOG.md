@@ -102,6 +102,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `LOCAL_FITNESS_SMTP_PASSWORD` is unset rather than letting the discovery
   happen at 19:00 in a log file.
 
+### Security
+- **SMTP now verifies TLS certificates.** `mailer.send` passed no SSL context to
+  either transport, and `smtplib` does **not** default to a verifying one: both
+  `SMTP_SSL.__init__` and `SMTP.starttls()` fall back to
+  `ssl._create_stdlib_context()`, which is `check_hostname=False,
+  verify_mode=CERT_NONE` — encrypted but unauthenticated, accepting any
+  certificate from any peer. Caught by the pre-release security review; never
+  released.
+
+  **Why it mattered more than usual here:** the send runs unattended from
+  launchd at 19:00 with a 20:00 retry, so no human is present to notice a bad
+  certificate, and the statement immediately after the handshake is `login()`,
+  which puts a Gmail app password on the wire in AUTH PLAIN. An attacker with a
+  network position (LAN ARP spoofing, a hostile router, DNS poisoning) would
+  have received a credential to the user's entire mailbox — nightly — plus the
+  health data in the brief.
+
+  Both paths now take `ssl.create_default_context()`. `tls_context()` is a
+  function rather than an inline call specifically so the tests can assert on
+  `check_hostname` / `verify_mode`: a test that only asserts "it sent" cannot
+  catch this, which is exactly how it survived the first review. A fourth test
+  pins the *ordering* on the STARTTLS path, since a `login()` before the upgrade
+  would put the password on a cleartext socket.
+
 ### Fixed
 - **Config resolution no longer crashes without a database.** `config._resolve`
   now treats an unreadable DB layer as UNSET and falls through to env/default,
