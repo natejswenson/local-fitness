@@ -6,6 +6,86 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-08-08
+
+### Added
+- **Tomorrow's prescribed session goes on Google Calendar, on the brief
+  email's cadence.** New `fitness plan-calendar` command plus a
+  `com.localfitness.plancal` launchd job (19:05, backstop 20:05) that reads the
+  ACTIVE training plan and writes the next day's workout as an all-day event.
+  A rest day writes nothing, no active plan writes nothing, and both exit 0 —
+  most weeks carry two rest days, and a job that reported failure on those
+  would cry wolf twice a week.
+
+  **Why this is a raw REST client and not the Google Calendar MCP connector.**
+  0.51.0 settled the two questions to ask before routing a *scheduled* delivery
+  through a connector: does it actually send, and do the bytes have to pass
+  through a model turn? The Calendar connector passes both — `create_event`
+  really creates, unlike Gmail's draft-only surface, and an event body is a few
+  hundred bytes. It fails a third test that generalises further, and that test
+  is the durable half of this release: **a connector is authenticated
+  interactively in a chat client and is structurally absent from a launchd
+  Python process.** The job that runs at 19:05 has no model in it, and a job
+  with no model cannot call a model-mediated tool at all. The question to ask
+  first about any future scheduled integration is "will the thing that runs
+  this be a model?".
+
+  New `agent/calendar_render.py` (pure) and `agent/gcal.py` (I/O), the same
+  divider as `email_render`/`mailer`. `gcal` is deliberately
+  dependency-light — the refresh-token grant is a form POST and an insert is a
+  JSON POST, so it needs `requests` and nothing else, rather than
+  `google-api-python-client` and `google-auth`. `requests` was already present
+  transitively via `garminconnect` and is now a declared direct dependency.
+
+  **The event id is keyed on identity, never on content**, and that is what
+  makes the whole thing idempotent without a marker file. It is
+  `sha256(plan_id|date|seq)`, so the 20:05 backstop re-posts the same id, gets
+  a 409, reads the event back, finds identical content and does nothing. This
+  is why the command has no `--if-unsent` equivalent: the dedupe is a property
+  of the data instead of a file that can drift from it. It also handles what a
+  marker could not — if the plan *changed* between 19:05 and 20:05, the
+  backstop updates the event in place instead of skipping it as already-done.
+  A content-keyed id would instead leave one stale event per revision, which is
+  the shape of "helpful automation" that gets muted after a week.
+
+  **A 409 on a DELETED event is not "already there".** Google keeps a
+  tombstone, and a blind PUT would resurrect it — so the upsert reads the event
+  first and leaves a `cancelled` one exactly as it is. Deleting the event is
+  how a person says "not this one", and a job that puts it back an hour later
+  is a job that gets uninstalled.
+
+  Events are **all-day and `transparent`** (free, not busy). An all-day block
+  that marked the whole day busy would break every scheduling heuristic pointed
+  at the calendar, and this event is a reminder, not a commitment of the day.
+
+  **Its own launchd job rather than a tail step on `brief-email`.** It shares
+  none of that job's cost (no Garmin pull, no LLM), so it gets an independent
+  failure domain — a Google outage cannot make the email job look broken — and
+  its own retry slot. As a tail step it would have had *no* retry at all: by
+  then the `.emailed-<date>` marker already short-circuits the 20:00 backstop.
+
+  New MCP tools `get_plan_calendar_settings` / `update_plan_calendar_settings`
+  (enabled state, target calendar), following the repo's standing pattern that
+  a new user-facing knob belongs behind a tool pair because there is no UI.
+  **The OAuth values are the exception, for 0.51.0's reason**: `/mcp/` is
+  reachable from a phone, so a tool that echoed the refresh token would hand
+  every client that can call the endpoint write access to the calendar. They
+  live only in `.env`; the get tool reports `credentials_configured` as a bool,
+  and the test asserts on the whole serialized payload rather than named
+  fields.
+
+  Scope is `.../auth/calendar.events` — create/edit events only, no calendar
+  creation or deletion. Combined with identity-derived ids, the sync can only
+  ever see or touch events it created.
+
+  One-time setup is `fitness calendar-auth` (installed-app loopback flow with
+  PKCE, printing the refresh token rather than writing to `.env`) plus a Google
+  Cloud walkthrough in `docs/google-calendar.md`. **That doc leads with the
+  publishing-status trap**: an OAuth app left in "Testing" has its refresh
+  tokens expired by Google every 7 days, so the job would fail weekly and look
+  like a different bug each time — `access_token` detects `invalid_grant` and
+  says so directly in the log line.
+
 ## [0.51.0] - 2026-08-07
 
 ### Added

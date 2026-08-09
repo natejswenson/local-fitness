@@ -65,7 +65,11 @@ def test_tool_schemas_well_formed():
     # .env — same agent-owns-the-writes pattern as the personality pair. The
     # SMTP password is deliberately NOT in this surface; it stays a secret in
     # .env, since /mcp/ is network-reachable)
-    assert len(agent_tools.ALL_TOOLS) == 46
+    # +get/update_plan_calendar_settings (0.52.0: same pattern again for the
+    # Google Calendar sync — enabled state and target calendar by MCP call, the
+    # OAuth client secret and refresh token deliberately absent for the same
+    # network-reachability reason as the SMTP password)
+    assert len(agent_tools.ALL_TOOLS) == 48
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

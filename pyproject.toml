@@ -1,6 +1,6 @@
 [project]
 name = "local-fitness"
-version = "0.51.0"
+version = "0.52.0"
 description = "Local Garmin-data agent: hands-off ingest + Claude-powered daily briefings"
 readme = "README.md"
 authors = [
@@ -17,6 +17,11 @@ dependencies = [
     "markdown>=3.10.2",
     "matplotlib>=3.11.0",
     "python-dotenv>=1.0.1",
+    # Already present transitively (garminconnect), promoted to a direct
+    # dependency by the Google Calendar client in agent/gcal.py — a module that
+    # imports it directly must declare it, or a future garminconnect release
+    # that drops it breaks the calendar job with an ImportError at 19:05.
+    "requests>=2.32.0",
     "rich>=15.0.0",
     "uvicorn[standard]>=0.46.0",
     "weasyprint>=69.0",

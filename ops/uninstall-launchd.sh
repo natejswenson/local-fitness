@@ -4,11 +4,12 @@
 # Unloads each agent and deletes the installed plist. Safe to run if a job
 # was never installed.
 #
-# Usage:  ./ops/uninstall-launchd.sh            # both jobs
+# Usage:  ./ops/uninstall-launchd.sh            # all jobs
 #         ./ops/uninstall-launchd.sh briefmail  # just the evening email job
+#         ./ops/uninstall-launchd.sh plancal    # just the calendar job
 set -euo pipefail
 
-if [[ $# -gt 0 ]]; then JOBS=("$@"); else JOBS=(brief briefmail); fi
+if [[ $# -gt 0 ]]; then JOBS=("$@"); else JOBS=(brief briefmail plancal); fi
 
 for job in "${JOBS[@]}"; do
   LABEL="com.localfitness.$job"
