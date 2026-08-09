@@ -8,14 +8,18 @@ Subcommands:
   recompute-body-battery — backfill body_battery_min/max from stored samples
   brief                 — pull + recompute + generate today's briefing
   brief-email           — pull + regenerate + email the brief (evening job)
+  plan-calendar         — put tomorrow's session on Google Calendar (evening job)
+  calendar-auth         — one-time Google Calendar consent (prints a token)
   status                — show DB stats and last ingest run
 """
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from datetime import date as Date
+from datetime import timedelta
 from pathlib import Path
 
 import click
@@ -335,6 +339,219 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
     click.echo(f"Emailed {subject} to {', '.join(cfg.to)}")
     if not no_notify:
         _notify("Evening brief emailed")
+
+
+def _load_plan_events(target: Date) -> tuple[list[dict], str | None]:
+    """Tomorrow's (or ``target``'s) prescribed sessions as calendar events.
+
+    Returns ``(events, reason_there_are_none)`` — the second value is a
+    human sentence, not an error. A rest day and "no active plan" are both
+    ordinary outcomes here: most weeks carry two rest days, and a job that
+    reported failure on those would cry wolf twice a week.
+
+    Reads only SQLite. That is what lets the calendar job be independent of the
+    email job — no Garmin pull, no LLM, so it costs nothing to retry.
+    """
+    from . import plans
+    from .agent import calendar_render
+
+    with db.connect() as conn:
+        active = plans.get_active_plan(conn=conn)
+    if active is None:
+        return [], "No active training plan — nothing to schedule."
+
+    events = calendar_render.build_events(
+        active["workouts"], target.isoformat(), active["plan_id"])
+    if not events:
+        return [], f"Nothing prescribed for {target} (rest day or no entry)."
+    return events, None
+
+
+@main.command(name="plan-calendar")
+@click.option("--date", "target_date", default=None,
+              help="YYYY-MM-DD to schedule (default: tomorrow)")
+@click.option("--dry-run", is_flag=True,
+              help="Print the event body instead of writing it to Google")
+@click.option("--no-notify", is_flag=True, help="Skip the macOS notification")
+def plan_calendar(target_date: str | None, dry_run: bool, no_notify: bool):
+    """Put tomorrow's prescribed session on Google Calendar (evening job).
+
+    Runs on the same cadence as the brief email (launchd 19:05, backstop
+    20:05) but as its OWN job, because it shares none of that job's cost: no
+    Garmin pull, no LLM call, just a plan read and one HTTPS request. Its own
+    failure domain means a Google outage can't make the email job look broken,
+    and its own retry slot means a transient failure actually gets retried —
+    which it would not as a tail step, since by then the `.emailed-` marker
+    already short-circuits the backstop.
+
+    There is deliberately no `--if-unsent` flag. The event id is derived from
+    (plan, date, seq), so re-running is idempotent by construction: the second
+    fire re-posts the same id, sees the same content, and does nothing. A
+    marker file would be a second source of truth that can drift from the first.
+    """
+    import json
+
+    from . import config as app_config
+    from .agent import gcal
+
+    target = Date.fromisoformat(target_date) if target_date else (
+        Date.today() + timedelta(days=1))
+
+    # Checked before the plan read and before anything touches the network, for
+    # the same reason the email's kill switch precedes its pull: a switch that
+    # still does the work and throws the result away is not a switch.
+    if not dry_run and not app_config.plan_calendar_enabled():
+        click.echo(
+            "Plan calendar sync is disabled (plan_calendar_enabled=false) — "
+            "skipping. Re-enable with the update_plan_calendar_settings MCP tool."
+        )
+        return
+
+    events, reason = _load_plan_events(target)
+    if reason:
+        click.echo(reason)
+        return
+
+    if dry_run:
+        click.echo(json.dumps(events, indent=2))
+        click.echo(f"\nDry run — {len(events)} event(s) for {target}. "
+                   "Nothing was sent.")
+        return
+
+    try:
+        cfg = gcal.load_config()
+    except gcal.CalendarNotConfigured as e:
+        click.echo(f"  ⚠ {e}", err=True)
+        sys.exit(2)
+
+    try:
+        token = gcal.access_token(cfg)
+        results = [gcal.upsert_event(e, cfg, token) for e in events]
+    except Exception:
+        if not no_notify:
+            _notify("Plan calendar sync FAILED — check the logs")
+        raise
+
+    for event, result in zip(events, results, strict=True):
+        click.echo(f"  {result['action']:<18} {event['summary']}")
+    written = [r for r in results if r["action"] in ("created", "updated")]
+    click.echo(f"{len(written)} of {len(events)} event(s) written to "
+               f"calendar '{cfg.calendar_id}' for {target}.")
+    if not no_notify and written:
+        _notify(f"Tomorrow on the calendar: {events[0]['summary']}")
+
+
+#: Where Google sends the browser back after consent. A loopback redirect is
+#: the documented flow for an "installed app" client; the port is chosen by the
+#: OS at bind time and interpolated into the URI, so nothing has to be
+#: pre-registered beyond `http://127.0.0.1` itself.
+_OAUTH_LANDING = (
+    "<html><body style='font-family:system-ui;padding:3rem'>"
+    "<h2>local-fitness is connected.</h2>"
+    "<p>You can close this tab and go back to the terminal.</p>"
+    "</body></html>"
+)
+
+
+def _capture_oauth_redirect(build_url) -> tuple[str, dict[str, str]]:
+    """Serve exactly one loopback request and return `(redirect_uri, query)`.
+
+    The socket half of the consent flow, split out so the half that makes
+    SECURITY decisions — the state check, the denied-consent branch — is
+    testable without binding a port or driving a browser. This function is the
+    only untested part of `calendar-auth`, and all it does is bind, open a
+    browser and serve one request.
+
+    ``build_url`` is a callback rather than a string because the redirect URI
+    isn't known until the OS picks the port, and the URL has to carry it.
+    """
+    import http.server
+    import urllib.parse
+    import webbrowser
+
+    caught: dict[str, str] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler's contract
+            query = urllib.parse.urlparse(self.path).query
+            caught.update({k: v[0] for k, v in urllib.parse.parse_qs(query).items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_OAUTH_LANDING.encode())
+
+        def log_message(self, *args):
+            """Silence the default stderr access log — it would print the
+            authorization code, which is a credential, into the terminal."""
+
+    with http.server.HTTPServer(("127.0.0.1", 0), Handler) as server:
+        redirect_uri = f"http://127.0.0.1:{server.server_port}"
+        url = build_url(redirect_uri)
+        click.echo("Opening the Google consent screen…")
+        click.echo(f"If it doesn't open, paste this into a browser:\n\n{url}\n")
+        webbrowser.open(url)
+        server.handle_request()
+    return redirect_uri, caught
+
+
+@main.command(name="calendar-auth")
+def calendar_auth():
+    """One-time Google Calendar consent — prints a refresh token for `.env`.
+
+    Runs the installed-app loopback flow with PKCE: opens the consent screen,
+    catches the redirect on a throwaway localhost server, and exchanges the
+    code. The token is PRINTED rather than written, because `.env` is the one
+    file in this repo that must never be edited by a program — it holds every
+    other credential, and a bug here would be a bug that eats them.
+
+    Prerequisites (docs/google-calendar.md): a Google Cloud project with the
+    Calendar API enabled and an OAuth client of type "Desktop app", with the
+    consent screen set to "In production" — a Testing-mode app has its refresh
+    tokens expired by Google every 7 days.
+    """
+    import base64
+    import hashlib
+    import secrets
+
+    from .agent import gcal
+
+    client_id = os.environ.get("LOCAL_FITNESS_GCAL_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("LOCAL_FITNESS_GCAL_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        click.echo(
+            "  ⚠ Set LOCAL_FITNESS_GCAL_CLIENT_ID and "
+            "LOCAL_FITNESS_GCAL_CLIENT_SECRET in <repo>/.env first — they come "
+            "from the OAuth client you create in Google Cloud. Steps: "
+            "docs/google-calendar.md",
+            err=True,
+        )
+        sys.exit(2)
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+
+    redirect_uri, caught = _capture_oauth_redirect(
+        lambda uri: gcal.authorization_url(client_id, uri, state, challenge))
+
+    if caught.get("state") != state:
+        # A mismatched state means the response didn't come from the request we
+        # made — the whole point of the nonce.
+        click.echo("  ⚠ State mismatch — aborting without exchanging the code.",
+                   err=True)
+        sys.exit(1)
+    if "code" not in caught:
+        click.echo(f"  ⚠ No authorization code returned "
+                   f"({caught.get('error', 'consent was denied or cancelled')}).",
+                   err=True)
+        sys.exit(1)
+
+    token = gcal.exchange_code(
+        client_id, client_secret, caught["code"], redirect_uri, verifier)
+    click.echo("\n  ✓ Connected. Add this line to <repo>/.env:\n")
+    click.echo(f"LOCAL_FITNESS_GCAL_REFRESH_TOKEN={token}\n")
+    click.echo("Then check it end to end with:  uv run fitness plan-calendar")
 
 
 @main.group()

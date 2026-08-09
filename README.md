@@ -225,7 +225,7 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **48 tools over stdio** (46 over HTTP — two are
+Once connected you get **50 tools over stdio** (48 over HTTP — two are
 local-only, see below), **2 prompts**, and **2 resources**.
 
 📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool

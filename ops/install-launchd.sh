@@ -16,14 +16,20 @@
 #                               regenerates the brief against a full day of
 #                               it, and emails it. Needs a Claude credential
 #                               AND SMTP settings in <repo>/.env.
+#   com.localfitness.plancal    19:05 (+20:05 backstop) — `fitness
+#                               plan-calendar`, writes tomorrow's prescribed
+#                               session to Google Calendar. Needs OAuth
+#                               credentials in <repo>/.env; no Claude, no
+#                               Garmin.
 #
-# Both are LaunchAgents, not LaunchDaemons, and must stay that way: the
+# All are LaunchAgents, not LaunchDaemons, and must stay that way: the
 # bundled Claude SDK CLI reads its credential from the login keychain, which
 # is reachable from the user's security session and not from a system daemon.
 #
-# Usage:  ./ops/install-launchd.sh            # both jobs
+# Usage:  ./ops/install-launchd.sh            # all jobs
 #         ./ops/install-launchd.sh brief      # just the morning job
 #         ./ops/install-launchd.sh briefmail  # just the evening email job
+#         ./ops/install-launchd.sh plancal    # just the calendar job
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +50,7 @@ if [[ -z "$UV_BIN" ]]; then
 fi
 
 # Which jobs to install. No argument = all of them.
-if [[ $# -gt 0 ]]; then JOBS=("$@"); else JOBS=(brief briefmail); fi
+if [[ $# -gt 0 ]]; then JOBS=("$@"); else JOBS=(brief briefmail plancal); fi
 
 if [[ ! -f "$REPO_ROOT/.env" ]]; then
   echo "warning: $REPO_ROOT/.env not found — the scheduled jobs read their" >&2
@@ -59,6 +65,16 @@ if [[ " ${JOBS[*]} " == *" briefmail "* ]]; then
     echo "warning: LOCAL_FITNESS_SMTP_PASSWORD is unset or empty in .env." >&2
     echo "         com.localfitness.briefmail will exit(2) without sending." >&2
     echo "         Get an app password: myaccount.google.com/apppasswords" >&2
+  fi
+fi
+
+# Same reasoning for the calendar job: discovering an unconfigured OAuth client
+# at 19:05 via a log file is worse than being told now.
+if [[ " ${JOBS[*]} " == *" plancal "* ]]; then
+  if ! grep -qE '^\s*LOCAL_FITNESS_GCAL_REFRESH_TOKEN=\S' "$REPO_ROOT/.env" 2>/dev/null; then
+    echo "warning: LOCAL_FITNESS_GCAL_REFRESH_TOKEN is unset or empty in .env." >&2
+    echo "         com.localfitness.plancal will exit(2) without writing." >&2
+    echo "         Run: uv run fitness calendar-auth (see docs/google-calendar.md)" >&2
   fi
 fi
 
@@ -95,6 +111,10 @@ for job in "${JOBS[@]}"; do
     briefmail)
       echo "  runs:   $UV_BIN run --directory $REPO_ROOT fitness brief-email --if-unsent"
       echo "  when:   daily 19:00, backstop 20:00"
+      ;;
+    plancal)
+      echo "  runs:   $UV_BIN run --directory $REPO_ROOT fitness plan-calendar"
+      echo "  when:   daily 19:05, backstop 20:05"
       ;;
   esac
   echo "  logs:   $REPO_ROOT/logs/$job.launchd.{out,err}.log"

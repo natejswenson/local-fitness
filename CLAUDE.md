@@ -658,6 +658,61 @@ These are settled — don't redesign without a reason.
   Generalise it: any new outbound TLS client here (SMTP, IMAP, a raw socket)
   gets an explicit verifying context and a test that inspects the context, not
   the outcome.
+- **Tomorrow's prescribed session goes on Google Calendar at 19:05, and the
+  connector question now has a THIRD test** (0.52.0). `fitness plan-calendar`
+  (launchd `com.localfitness.plancal`, 19:05 + 20:05 backstop) reads the active
+  plan and writes the next day's workout as an all-day event. A rest day, no
+  active plan, or no row for the date all write nothing and exit 0 — most weeks
+  carry two rest days and a job that reported failure on those would be muted
+  inside a fortnight. **The rule that decides the transport generalises past
+  0.51.0's two questions.** The Calendar MCP connector passes both of those:
+  `create_event` really creates (unlike Gmail's draft-only surface) and an
+  event body is a few hundred bytes, so no model has to retype attachment
+  bytes. It fails a third: **a connector is authenticated interactively in a
+  chat client and is structurally absent from a launchd Python process.** A job
+  with no model in it cannot call a model-mediated tool at all. Ask that first
+  about any future scheduled integration: *will the thing that runs this be a
+  model?* So it is a raw REST client — `agent/calendar_render.py` (pure) +
+  `agent/gcal.py` (I/O), the usual divider — needing only `requests` (now a
+  declared direct dependency; it was transitive via `garminconnect`) rather
+  than `google-api-python-client` + `google-auth`.
+  **The event id is keyed on IDENTITY, never content**, and that single choice
+  is what makes the job idempotent with no marker file:
+  `sha256(plan_id|date|seq)`, so the 20:05 backstop re-posts the same id, gets
+  409, reads the event back, finds it identical and does nothing. That is why
+  there is no `--if-unsent` equivalent here — the dedupe is a property of the
+  data instead of a file that can drift from it, and it does what a marker
+  could not: a plan CHANGED between 19:05 and 20:05 updates the event in place
+  rather than being skipped as already-done. A content-keyed id would instead
+  leave one stale event per revision. **A 409 on a DELETED event is not
+  "already there"** — Google keeps a tombstone and a blind PUT resurrects it,
+  so `upsert_event` reads first and leaves a `cancelled` one alone; deleting
+  the event is how a person says "not this one". Events are all-day and
+  `transparent` (free, not busy) — an all-day block marking the day busy breaks
+  every scheduling heuristic pointed at the calendar. All-day `end.date` is
+  **exclusive** (day+1); getting it wrong renders a zero-length event some
+  clients hide, i.e. it fails by disappearing.
+  **Its own launchd job, not a tail step on `brief-email`**: it shares none of
+  that job's cost (no Garmin pull, no LLM) so it gets an independent failure
+  domain, and as a tail step it would have had *no* retry at all — by then the
+  `.emailed-<date>` marker already short-circuits the 20:00 backstop.
+  Configuration follows the standing pattern —
+  `get_plan_calendar_settings`/`update_plan_calendar_settings` own the enabled
+  state and `calendar_id` (DB > env > default), the OAuth values stay in `.env`
+  for the same network-reachability reason as the SMTP password, and
+  `test_no_tool_output_ever_contains_the_calendar_secrets` copies the
+  whole-payload assertion shape. Scope is `.../auth/calendar.events` only, so
+  with identity-derived ids the sync can only ever touch events it created.
+  Setup is `fitness calendar-auth` (loopback + PKCE, PRINTS the refresh token
+  rather than editing `.env`) plus `docs/google-calendar.md`, which leads with
+  the trap: **an OAuth app left in "Testing" has its refresh tokens expired by
+  Google every 7 days**, so the job dies weekly looking like a new bug —
+  `access_token` detects `invalid_grant` and says so in the log line.
+  `gcal._request` is the single HTTP choke point on purpose: `tests/conftest.py`
+  blocks that ONE function (fourth guard beside the SDK/Garmin/SMTP ones,
+  because a live call CREATES something in a real account), and TLS
+  verification is configured in one place. Per the rule above it never passes
+  `verify` at all, and the test inspects the source rather than the outcome.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a

@@ -16,13 +16,13 @@ worked examples, and gotchas.
 
 ## Connecting
 
-**Local, over stdio** — all 48 tools, no token:
+**Local, over stdio** — all 50 tools, no token:
 
 ```bash
 claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
 ```
 
-**Over the running server** — 46 tools, bearer-gated:
+**Over the running server** — 48 tools, bearer-gated:
 
 ```bash
 claude mcp add --transport http fitness \
@@ -39,7 +39,7 @@ unreachable over the networked `/mcp/` transport:
 
 | | stdio (`fitness mcp-stdio`) | HTTP (`/mcp/`) |
 |---|---|---|
-| Tool count | **48** | **46** |
+| Tool count | **50** | **48** |
 | [`generate_brief_report`](generate_brief_report.md) | ✅ | ❌ |
 | [`workout_report_card`](workout_report_card.md) | ✅ | ❌ |
 
@@ -175,6 +175,8 @@ profile file**.
 | [`update_coach_personality`](update_coach_personality.md) | ✍️ Patch the persona, the lists, per-topic intensity, or the dials |
 | [`get_brief_email_settings`](get_brief_email_settings.md) | Whether the evening brief email is on, who gets it, whether it can send |
 | [`update_brief_email_settings`](update_brief_email_settings.md) | ✍️ Stop/resume the nightly email, or change the recipients |
+| [`get_plan_calendar_settings`](get_plan_calendar_settings.md) | Whether tomorrow's session goes on Google Calendar, and to which calendar |
+| [`update_plan_calendar_settings`](update_plan_calendar_settings.md) | ✍️ Stop/resume the nightly calendar event, or change the calendar |
 
 ### Data and escape hatches
 

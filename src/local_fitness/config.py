@@ -190,6 +190,44 @@ def brief_email_to(db_path=None, conn: sqlite3.Connection | None = None) -> tupl
                     (), _as_recipients, db_path, conn=conn)
 
 
+def plan_calendar_enabled(db_path=None, conn: sqlite3.Connection | None = None) -> bool:
+    """Whether the evening job writes tomorrow's session to Google Calendar
+    (DB > env > default True).
+
+    The conversational kill switch, exactly like ``brief_email_enabled``:
+    `update_plan_calendar_settings(enabled=false)` writes the DB layer, so
+    "stop putting runs on my calendar" needs neither a text editor nor
+    `launchctl`. Defaulting to True is safe for a fresh clone because writing
+    ALSO requires an OAuth refresh token, which has no default at any layer; a
+    stranger who never runs `fitness calendar-auth` can never have an event
+    created by this.
+    """
+    return _resolve("plan_calendar_enabled", "LOCAL_FITNESS_PLAN_CALENDAR_ENABLED",
+                    True, _as_bool, db_path, conn=conn)
+
+
+def _as_calendar_id(s) -> str:
+    """Normalize a calendar id (strip only). Not lowercased: a calendar id is
+    usually an email address, and while the domain is case-insensitive the
+    local part is not — Google matches it verbatim."""
+    out = str(s).strip()
+    if not out:
+        raise ValueError("empty calendar id")
+    return out
+
+
+def plan_calendar_id(db_path=None, conn: sqlite3.Connection | None = None) -> str:
+    """Which calendar tomorrow's session lands on (DB > env > 'primary').
+
+    ``primary`` is the authenticated account's own default calendar, which is
+    what the OAuth flow authorizes — so the default works with no configuration
+    at all. Set it to a specific calendar id only to keep training off the main
+    grid.
+    """
+    return _resolve("plan_calendar_id", "LOCAL_FITNESS_PLAN_CALENDAR_ID",
+                    "primary", _as_calendar_id, db_path, conn=conn)
+
+
 def riegel_lookback_days(db_path=None, conn: sqlite3.Connection | None = None) -> int:
     """Lookback window (days) for the projected-finish best effort. Clamps a
     nonsense value (< 1 or > ~10 years) to the default.
