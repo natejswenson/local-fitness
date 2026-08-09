@@ -1,6 +1,6 @@
 # `update_plan_calendar_settings`
 
-> Turn the nightly Google Calendar event on or off, and pick which calendar it lands on. **Availability:** stdio + HTTP
+> Turn the Google Calendar plan sync on or off, and pick which calendar it writes to. **Availability:** stdio + HTTP
 
 ## What it does
 
@@ -18,7 +18,7 @@ nothing restarts.
 
 | Name | Type | Required | Meaning |
 |---|---|---|---|
-| `enabled` | boolean | no | `false` stops the nightly event; `true` resumes it. |
+| `enabled` | boolean | no | `false` stops all syncing (nightly and on plan edits); `true` resumes it. |
 | `calendar_id` | string | no | `primary` (the default) or a specific calendar's address. |
 
 Both optional, but pass at least one — an empty call is an error rather than a
@@ -32,7 +32,7 @@ silent no-op.
   "changed": ["enabled"],
   "enabled": false,
   "calendar_id": "primary",
-  "schedule": "19:05 daily, backstop 20:05 (launchd com.localfitness.plancal)",
+  "schedule": "reconciled on every plan edit, plus 19:05 daily with a 20:05 backstop (launchd com.localfitness.plancal)",
   "credentials_configured": true
 }
 ```
@@ -43,7 +43,7 @@ values rather than an echo of the request.
 
 ## Example
 
-> "Stop adding my runs to my calendar."
+> "Stop syncing my plan to my calendar."
 
 ```json
 {"enabled": false}
@@ -63,10 +63,12 @@ so if the user's phrasing suggests they expect a cleanup.
   `<repo>/.env`; `credentials_configured` is reported on every write so
   "I turned it on" can never be the last word when the write would still be
   blocked. A `password`-shaped argument is rejected as an unknown field.
-- **Turning it off does not delete existing events.** It stops new ones. If the
-  user wants tomorrow's event gone, they delete it in Google Calendar — and the
-  job will not put it back (a deleted event is a tombstone the sync leaves
-  alone, deliberately).
+- **Turning it off does not delete existing events.** It freezes the calendar
+  where it is. If the user wants the plan off their calendar entirely, deleting
+  the events by hand works and the sync will not put them back (a deleted event
+  is a tombstone it leaves alone, deliberately) — but re-enabling later then
+  leaves those days permanently missing, so prefer `abandon_active_plan` if the
+  plan itself is over.
 - **`calendar_id` must be `primary` or an address-shaped id.** Anything else is
   rejected here rather than becoming a 404 at 19:05 that nobody sees until the
   event doesn't appear.

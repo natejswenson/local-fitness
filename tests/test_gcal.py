@@ -424,3 +424,104 @@ def test_the_enabled_setting_defaults_on_and_parses_both_layers(
 
     db.set_setting("plan_calendar_enabled", "true")
     assert config.plan_calendar_enabled() is True
+
+
+# --- listing our own events ------------------------------------------------
+
+def test_the_listing_is_scoped_to_our_events_for_one_plan(transport):
+    # The caller DELETES from this list. An unscoped listing would put
+    # someone's dentist appointment in the delete set.
+    t = transport(FakeResponse(200, {"items": [{"id": "a"}, {"id": "b"}]}))
+    assert gcal.list_plan_events(CFG, "at-123", 4) == [{"id": "a"}, {"id": "b"}]
+
+    (call,) = t.calls
+    assert call["method"] == "GET"
+    assert call["params"]["privateExtendedProperty"] == [
+        "source=local-fitness", "planId=4"]
+
+
+def test_the_listing_asks_for_deleted_events(transport):
+    # Load-bearing: a deleted event is a TOMBSTONE that still owns its id. If
+    # the listing hides it, the reconcile sees an absence, recreates it, and
+    # the one gesture a person has for "not this one" stops working.
+    t = transport(FakeResponse(200, {"items": []}))
+    gcal.list_plan_events(CFG, "at-123", 4)
+    assert t.calls[0]["params"]["showDeleted"] == "true"
+
+
+def test_the_listing_follows_page_tokens(transport):
+    t = transport(
+        FakeResponse(200, {"items": [{"id": "a"}], "nextPageToken": "p2"}),
+        FakeResponse(200, {"items": [{"id": "b"}]}),
+    )
+    assert [e["id"] for e in gcal.list_plan_events(CFG, "at-123", 4)] == ["a", "b"]
+    assert "pageToken" not in t.calls[0]["params"]
+    assert t.calls[1]["params"]["pageToken"] == "p2"
+
+
+def test_the_listing_refuses_to_page_forever(transport):
+    # A server that always returns a token would otherwise hang the 19:05 job.
+    transport(*[FakeResponse(200, {"items": [], "nextPageToken": "x"})
+                for _ in range(gcal.MAX_LIST_PAGES)])
+    with pytest.raises(gcal.CalendarApiError) as e:
+        gcal.list_plan_events(CFG, "at-123", 4)
+    assert "did not terminate" in str(e.value)
+
+
+def test_a_failed_listing_raises(transport):
+    transport(FakeResponse(403, {"error": {"message": "insufficient scope"}}))
+    with pytest.raises(gcal.CalendarApiError) as e:
+        gcal.list_plan_events(CFG, "at-123", 4)
+    assert "403" in str(e.value)
+
+
+def test_the_listing_source_tag_is_the_renderer_s(transport):
+    # One definition of "ours" — a second literal here would silently stop
+    # matching the events the renderer actually tags.
+    from local_fitness.agent import calendar_render
+
+    assert gcal.calendar_render_source_tag() == calendar_render.SOURCE_TAG
+
+
+# --- deleting --------------------------------------------------------------
+
+def test_delete_issues_one_request_against_the_event(transport):
+    t = transport(FakeResponse(204, None))
+    got = gcal.delete_event("lfplanabc", CFG, "at-123")
+
+    assert got == {"action": "deleted", "id": "lfplanabc", "already_gone": False}
+    (call,) = t.calls
+    assert call["method"] == "DELETE"
+    assert call["url"].endswith("/events/lfplanabc")
+    assert call["headers"] == {"Authorization": "Bearer at-123"}
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_an_already_gone_event_is_a_success_not_an_error(transport, status):
+    # 410 = Google already deleted it, 404 = it never existed. Both mean the
+    # calendar is in the state we asked for. Treating either as a failure would
+    # make a half-finished sync a run that can never complete.
+    transport(FakeResponse(status, None))
+    got = gcal.delete_event("lfplanabc", CFG, "at-123")
+    assert got["action"] == "deleted" and got["already_gone"] is True
+
+
+def test_a_real_delete_failure_raises(transport):
+    transport(FakeResponse(500, None, text="boom"))
+    with pytest.raises(gcal.CalendarApiError) as e:
+        gcal.delete_event("lfplanabc", CFG, "at-123")
+    assert "500" in str(e.value)
+
+
+def test_the_upsert_comparison_has_one_definition():
+    # `_matches` and `reconcile` both decide "do we write?". Two field lists
+    # would drift into one path rewriting what the other calls unchanged.
+    from local_fitness.agent import calendar_render
+
+    same = {**EVENT, "status": "confirmed"}
+    assert gcal._matches(same, EVENT) is True
+    assert calendar_render._differs(same, EVENT) is False
+
+    changed = {**same, "summary": "different"}
+    assert gcal._matches(changed, EVENT) is False
+    assert calendar_render._differs(changed, EVENT) is True

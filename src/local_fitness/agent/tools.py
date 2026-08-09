@@ -2234,20 +2234,23 @@ async def update_brief_email_settings(args: dict) -> dict:
 
 #: Same contract as `_BRIEF_EMAIL_SCHEDULE` above — prose, not a writable
 #: field. 19:05 rather than 19:00 so the two evening jobs don't contend for the
-#: same wake; nothing about the calendar push depends on the email having run.
+#: same wake; nothing about the calendar sync depends on the email having run.
+#: Since 0.53.0 this job RECONCILES rather than writes-once, because the plan
+#: tools sync themselves — so it is a self-heal pass, not the only writer.
 _PLAN_CALENDAR_SCHEDULE = (
-    "19:05 daily, backstop 20:05 (launchd com.localfitness.plancal)")
+    "reconciled on every plan edit, plus 19:05 daily with a 20:05 backstop "
+    "(launchd com.localfitness.plancal)")
 
 
 @tool(
     "get_plan_calendar_settings",
     "How the Google Calendar sync is configured: whether it's enabled, which "
-    "calendar tomorrow's prescribed session is written to, whether OAuth "
-    "credentials are present, and the schedule. Call before "
-    "update_plan_calendar_settings so an edit patches what is actually there. "
-    "Reports `credentials_configured` as a boolean only — the OAuth client "
-    "secret and refresh token are never returned by any tool. Changing the "
-    "send TIME is not a setting: edit the launchd plist template and re-run "
+    "calendar the training plan is written to, whether OAuth credentials are "
+    "present, and the schedule. Call before update_plan_calendar_settings so "
+    "an edit patches what is actually there. Reports "
+    "`credentials_configured` as a boolean only — the OAuth client secret and "
+    "refresh token are never returned by any tool. Changing the sync TIME is "
+    "not a setting: edit the launchd plist template and re-run "
     "./ops/install-launchd.sh plancal.",
     {},
 )
@@ -2263,8 +2266,10 @@ async def get_plan_calendar_settings(_args: dict) -> dict:
         "calendar_id": calendar_id,
         "credentials_configured": configured,
         "schedule": _PLAN_CALENDAR_SCHEDULE,
-        "creates_events_for": "the NEXT day's prescribed session on the active "
-                              "plan; a rest day creates nothing",
+        "creates_events_for": "every prescribed session on the active plan "
+                              "from today through its last day, as all-day "
+                              "events; a rest day creates nothing, and a day "
+                              "the plan drops is DELETED from the calendar",
         "requires_active_plan": True,
         "can_write": bool(enabled and configured),
         "blocked_reason": (
@@ -2279,8 +2284,8 @@ async def get_plan_calendar_settings(_args: dict) -> dict:
 @tool(
     "update_plan_calendar_settings",
     "Configure the Google Calendar sync conversationally — the agent-owned "
-    "write path (there is no UI). `enabled: false` stops the nightly event "
-    "without touching launchd; `calendar_id` picks which calendar to write to "
+    "write path (there is no UI). `enabled: false` stops the sync without "
+    "touching launchd; `calendar_id` picks which calendar to write to "
     "('primary' is the authenticated account's default). Both optional; pass "
     "at least one. OAuth credentials are NOT settable here — they are secrets "
     "and live only in <repo>/.env. Takes effect on the next run; no restart.",
@@ -2951,14 +2956,40 @@ async def update_plan_workout(args: dict) -> dict:
     # duration_seconds key _augment_workout formats into duration_formatted,
     # mirroring the distance_meters/avg_pace_sec_per_km remaps beside it. seq
     # tells the user which session of a double day was edited.
-    return _text(_augment_workout({
+    return _text(await _calendar_after_plan_write(_augment_workout({
         "date": row["date"], "type": row["type"], "seq": row["seq"],
         "distance_meters": row["target_distance_m"],
         "avg_pace_sec_per_km": row["target_pace_sec_per_km"],
         "duration_seconds": row["target_duration_sec"],
         "target_hr_max": row["target_hr_max"],
         "description": row["description"],
-    }))
+    })))
+
+
+async def _calendar_after_plan_write(payload: dict) -> dict:
+    """Push the plan's new state to Google Calendar and note it in ``payload``.
+
+    Every tool that mutates an ACTIVE plan calls this. Three properties, and
+    all three are the point:
+
+    * **It never raises.** The plan write has already committed and is the
+      source of truth; the calendar is a projection. Letting a Google outage
+      raise here would turn a successful edit into a failed tool call, and the
+      model would reasonably retry the edit — which is how a transport problem
+      becomes a data problem. ``calendar_sync`` swallows and reports.
+    * **It runs in a worker thread.** The sync is blocking HTTPS, and the
+      repo's rule for blocking I/O inside a handler is ``asyncio.to_thread``
+      (see ``run_sql``, ``sync_garmin_data``).
+    * **The key is OMITTED, not null, when nothing was attempted.** A clone
+      with no Google credentials should not get a line of calendar noise
+      appended to every plan edit it ever makes.
+    """
+    from . import calendar_sync
+
+    result = await asyncio.to_thread(calendar_sync.sync_after_plan_write)
+    if result is not None:
+        payload["calendar"] = result
+    return payload
 
 
 def _echo_workout(row: dict) -> dict:
@@ -3042,7 +3073,8 @@ async def update_plan_workouts(args: dict) -> dict:
 
     # Echo every written row, so a 20-day restructure can be confirmed from
     # this one result without a follow-up read.
-    return _text({"updated": len(rows), "workouts": [_echo_workout(r) for r in rows]})
+    return _text(await _calendar_after_plan_write(
+        {"updated": len(rows), "workouts": [_echo_workout(r) for r in rows]}))
 
 
 @tool(
@@ -3054,14 +3086,33 @@ async def update_plan_workouts(args: dict) -> dict:
     {"type": "object", "properties": {"plan_id": {"type": "integer"}}, "required": ["plan_id"]},
 )
 async def commit_training_plan(args: dict) -> dict:
+    from . import calendar_sync
+
     plan_id = args.get("plan_id")
     if not isinstance(plan_id, int):
         return _err("plan_id (int) is required")
+
+    # Read the outgoing plan BEFORE the commit archives it. Its calendar events
+    # can't be overwritten by the new plan's — `event_id` keys on plan_id, so
+    # the new plan lands on entirely different ids — and two plans' worth of
+    # sessions sitting on one calendar is worse than none. Gated on the sync
+    # being configured at all, so an unconfigured clone pays no extra read.
+    superseded = None
+    if calendar_sync.blocked_reason() is None:
+        with db.connect() as conn:
+            prior = plans.get_active_plan(conn=conn)
+        superseded = prior["plan_id"] if prior else None
+
     try:
         plans.commit_plan(plan_id, now=datetime.now().isoformat(timespec="seconds"))
     except (plans.PlanNotFoundError, plans.NotDraftError) as e:
         return _err(str(e))
-    return _text({"plan_id": plan_id, "status": "active"})
+
+    payload = {"plan_id": plan_id, "status": "active"}
+    calendar = await asyncio.to_thread(calendar_sync.sync_after_commit, superseded)
+    if calendar is not None:
+        payload["calendar"] = calendar
+    return _text(payload)
 
 
 @tool(
@@ -3094,11 +3145,22 @@ async def discard_training_plan_draft(args: dict) -> dict:
     {"type": "object", "properties": {}},
 )
 async def abandon_active_plan(_args: dict) -> dict:
+    from . import calendar_sync
+
     try:
         plan_id = plans.abandon_active_plan()
     except plans.NoActivePlanError as e:
         return _err(str(e))
-    return _text({"plan_id": plan_id, "status": "archived"})
+
+    # The one path that only DELETES. A plan nobody follows must not keep
+    # prescribing work from the calendar, and there is no new plan to reconcile
+    # against — so this is `remove`, not `sync`. Past events stay: they record
+    # what was prescribed at the time.
+    payload = {"plan_id": plan_id, "status": "archived"}
+    calendar = await asyncio.to_thread(calendar_sync.remove_after_abandon, plan_id)
+    if calendar is not None:
+        payload["calendar"] = calendar
+    return _text(payload)
 
 
 def weekly_rollup(workouts: list[dict], target_date: str) -> dict:

@@ -20,6 +20,11 @@ Two contracts are load-bearing and both have tests pinning them:
 The event is also ``transparent`` (free, not busy): an all-day block that marks
 a whole day busy would break every meeting-scheduling heuristic anyone points
 at the calendar, and this event is a reminder, not a commitment of the day.
+
+``reconcile`` at the bottom is the third contract, added in 0.53.0 when the
+calendar went from carrying tomorrow to carrying the whole remaining plan: the
+diff has a DELETE side. An upsert can only add or correct, so it cannot express
+"this day is no longer a session" — see that function's docstring.
 """
 from __future__ import annotations
 
@@ -205,13 +210,132 @@ def build_event(workout: dict | None, plan_id: int) -> dict | None:
     }
 
 
-def build_events(workouts: list[dict], target_date: str, plan_id: int) -> list[dict]:
-    """Every event for one date, in ``seq`` order (AM/PM doubles → two events).
+#: Blast-radius bound on one sync. Equal to ``plans.MAX_WORKOUTS`` — a plan
+#: cannot hold more prescriptions than this, so hitting it means something is
+#: wrong with the inputs rather than that a plan is long. Over the cap
+#: ``build_plan_events`` REFUSES; it never truncates, because a silently
+#: half-written calendar is worse than one that didn't get written (the
+#: ``warm_report_cards --max-calls`` precedent).
+MAX_SYNC_EVENTS = 200
 
-    Supporting the double-day is free because ``event_id`` already keys on
-    ``seq``; skipping it would silently drop the second session of the day, and
-    a plan that prescribes one is exactly the plan you most want on a calendar.
+
+class TooManyEvents(ValueError):
+    """A sync would exceed ``MAX_SYNC_EVENTS``."""
+
+
+def build_plan_events(workouts: list[dict], plan_id: int, start: str) -> list[dict]:
+    """Every event a plan should have on the calendar from ``start`` onward.
+
+    Ordered by ``(date, seq)``, rest days dropped, one event per remaining
+    prescription — including both halves of an AM/PM double day, which is free
+    because ``event_id`` already keys on ``seq``.
+
+    ``start`` bounds the FUTURE only. Days already elapsed are deliberately not
+    rebuilt: their events are a record of what was prescribed at the time, and
+    reconciling them would either recreate deleted history or rewrite it to
+    match a plan that has since been edited.
     """
-    rows = [w for w in workouts if w.get("date") == target_date]
-    rows.sort(key=lambda w: int(w.get("seq") or 1))
-    return [e for e in (build_event(w, plan_id) for w in rows) if e is not None]
+    rows = [w for w in workouts if (w.get("date") or "") >= start]
+    rows.sort(key=lambda w: ((w.get("date") or ""), int(w.get("seq") or 1)))
+    events = [e for e in (build_event(w, plan_id) for w in rows) if e is not None]
+    if len(events) > MAX_SYNC_EVENTS:
+        raise TooManyEvents(
+            f"{len(events)} events would be written, over the "
+            f"{MAX_SYNC_EVENTS} cap — refusing rather than writing part of a "
+            "plan to the calendar"
+        )
+    return events
+
+
+#: The fields that decide whether a stored event still says what the plan says.
+#: Ids and extended properties are identity — they cannot differ, because the id
+#: is how the event was matched in the first place.
+COMPARED_FIELDS = ("summary", "description", "transparency")
+
+#: Google's word for a deleted event. It is a TOMBSTONE, not an absence: the id
+#: stays claimed, a re-insert 409s, and a blind update resurrects it.
+CANCELLED = "cancelled"
+
+
+def _event_date(event: dict) -> str:
+    """The start date of an all-day event, tolerating the timestamp form.
+
+    ``events.list`` echoes ``start.date`` for all-day events, but the API has
+    been seen to return ``2026-08-09T00:00:00Z`` on some paths; slicing to 10
+    chars normalizes both without a parse that could raise mid-reconcile.
+    """
+    return str((event.get("start") or {}).get("date") or "")[:10]
+
+
+def _differs(existing: dict, desired: dict) -> bool:
+    if any(existing.get(f) != desired.get(f) for f in COMPARED_FIELDS):
+        return True
+    return any(
+        str((existing.get(side) or {}).get("date") or "")[:10] != desired[side]["date"]
+        for side in ("start", "end")
+    )
+
+
+def reconcile(desired: list[dict], existing: list[dict], start: str) -> dict:
+    """Diff what the plan says against what is on the calendar.
+
+    Returns ``{"create": [...], "update": [...], "delete": [...],
+    "unchanged": [...], "skipped_cancelled": [...]}`` — events for the first
+    two, whole existing-event dicts for ``delete``, ids for the last two.
+
+    | desired | on calendar | outcome |
+    |---------|-------------|---------|
+    | yes     | absent      | create  |
+    | yes     | differs     | update  |
+    | yes     | identical   | unchanged — no request at all |
+    | yes     | cancelled   | skipped_cancelled |
+    | **no**  | present     | **delete** |
+
+    **That last row is why this is a reconcile and not an upsert loop.** An
+    upsert can only ever add or correct; it has no way to express "this day is
+    no longer a session", so a run turned into a rest day, or a plan abandoned
+    outright, would leave the calendar confidently prescribing work that the
+    plan no longer asks for. Deletion is the whole reason this function exists.
+
+    Two rails on that deletion, both tested:
+
+    * ``existing`` is filtered to ``date >= start`` first, so **the past is
+      never deleted**. Yesterday's event describes what was prescribed
+      yesterday; the plan may have changed since, and rewriting history to
+      match is not a sync, it is amnesia.
+    * A ``cancelled`` event is neither resurrected nor re-deleted. Deleting the
+      event is how a person says "not this one" — a sync that put it back would
+      be uninstalled within the week, and a sync that "deleted" it again would
+      burn a request per run forever.
+
+    Callers must pass only events they own (``gcal.list_plan_events`` scopes by
+    ``planId``); nothing here inspects provenance, so an unscoped ``existing``
+    would put someone's dentist appointment in ``delete``.
+    """
+    by_id = {e["id"]: e for e in desired}
+    create, update, unchanged, delete, skipped = [], [], [], [], []
+
+    seen: set[str] = set()
+    for row in existing:
+        eid = row.get("id")
+        if eid is None or _event_date(row) < start:
+            # Past events are the record of what was prescribed. Untouched.
+            continue
+        seen.add(eid)
+        want = by_id.get(eid)
+        if row.get("status") == CANCELLED:
+            # Only a tombstone the plan still WANTS is worth reporting; one for
+            # a day the plan dropped is doubly gone and not news.
+            if want is not None:
+                skipped.append(eid)
+            continue
+        if want is None:
+            delete.append(row)
+        elif _differs(row, want):
+            update.append(want)
+        else:
+            unchanged.append(eid)
+
+    create = [e for e in desired if e["id"] not in seen]
+    return {"create": create, "update": update, "delete": delete,
+            "unchanged": unchanged, "skipped_cancelled": skipped}

@@ -80,6 +80,16 @@ The previously active plan (if any) is now `archived`, and `get_training_plan_st
 
 ## Gotchas
 
+- **This writes Google Calendar too, when it's configured** (0.53.0). The response carries a
+  `calendar` object with `created`/`updated`/`deleted`/`unchanged` and the dates that moved —
+  quote the dates, not the counts, when confirming an edit. The key is **absent** when no sync
+  was attempted (no credentials, or the kill switch is off); `{"status": "error"}` means the
+  plan write still succeeded and only the calendar failed, so never retry the plan edit because
+  of it. Configure with [`get_plan_calendar_settings`](get_plan_calendar_settings.md).
+  Committing also **deletes the superseded plan's remaining events**: event ids key on
+  `plan_id`, so the new plan lands on different ids and the two plans would otherwise sit
+  on the calendar together, both looking authoritative.
+
 - **Draft-only, and the check is strict.** An already-active plan_id gives
   `plan N is 'active', not draft` — commit is not idempotent and cannot "re-commit" a live plan.
   An archived draft (one you superseded with a newer `propose_training_plan` call) is equally

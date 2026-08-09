@@ -658,14 +658,16 @@ These are settled — don't redesign without a reason.
   Generalise it: any new outbound TLS client here (SMTP, IMAP, a raw socket)
   gets an explicit verifying context and a test that inspects the context, not
   the outcome.
-- **Tomorrow's prescribed session goes on Google Calendar at 19:05, and the
-  connector question now has a THIRD test** (0.52.0). `fitness plan-calendar`
-  (launchd `com.localfitness.plancal`, 19:05 + 20:05 backstop) reads the active
-  plan and writes the next day's workout as an all-day event. A rest day, no
-  active plan, or no row for the date all write nothing and exit 0 — most weeks
-  carry two rest days and a job that reported failure on those would be muted
-  inside a fortnight. **The rule that decides the transport generalises past
-  0.51.0's two questions.** The Calendar MCP connector passes both of those:
+- **The whole remaining plan lives on Google Calendar, and the connector
+  question now has a THIRD test** (0.52.0, reshaped in 0.53.0).
+  `fitness plan-calendar` (launchd `com.localfitness.plancal`, 19:05 + 20:05
+  backstop) makes the calendar **equal** the active plan from today through its
+  last day, and the four plan-write MCP tools run the same reconcile themselves
+  so an edit lands in the same turn. No active plan, a rest day, or nothing
+  remaining all write nothing and exit 0 — a job that reported failure on those
+  would be muted inside a fortnight. **The rule that decides the transport
+  generalises past 0.51.0's two questions.** The Calendar MCP connector passes
+  both of those:
   `create_event` really creates (unlike Gmail's draft-only surface) and an
   event body is a few hundred bytes, so no model has to retype attachment
   bytes. It fails a third: **a connector is authenticated interactively in a
@@ -677,25 +679,55 @@ These are settled — don't redesign without a reason.
   declared direct dependency; it was transitive via `garminconnect`) rather
   than `google-api-python-client` + `google-auth`.
   **The event id is keyed on IDENTITY, never content**, and that single choice
-  is what makes the job idempotent with no marker file:
-  `sha256(plan_id|date|seq)`, so the 20:05 backstop re-posts the same id, gets
-  409, reads the event back, finds it identical and does nothing. That is why
-  there is no `--if-unsent` equivalent here — the dedupe is a property of the
-  data instead of a file that can drift from it, and it does what a marker
-  could not: a plan CHANGED between 19:05 and 20:05 updates the event in place
-  rather than being skipped as already-done. A content-keyed id would instead
-  leave one stale event per revision. **A 409 on a DELETED event is not
-  "already there"** — Google keeps a tombstone and a blind PUT resurrects it,
-  so `upsert_event` reads first and leaves a `cancelled` one alone; deleting
-  the event is how a person says "not this one". Events are all-day and
-  `transparent` (free, not busy) — an all-day block marking the day busy breaks
-  every scheduling heuristic pointed at the calendar. All-day `end.date` is
-  **exclusive** (day+1); getting it wrong renders a zero-length event some
-  clients hide, i.e. it fails by disappearing.
+  is what makes everything here idempotent with no marker file:
+  `sha256(plan_id|date|seq)`, so a re-run finds what it wrote last time. A
+  content-keyed id would leave one stale event per revision. That is why there
+  is no `--if-unsent` equivalent — the dedupe is a property of the data instead
+  of a file that can drift from it, and it does what a marker could not: a plan
+  CHANGED between 19:05 and 20:05 gets applied rather than skipped as
+  already-done. Events are all-day and `transparent` (free, not busy) — an
+  all-day block marking the day busy breaks every scheduling heuristic pointed
+  at the calendar. All-day `end.date` is **exclusive** (day+1); getting it
+  wrong renders a zero-length event some clients hide, i.e. it fails by
+  disappearing.
+  **The unit of work is a RECONCILE, and the reason is the delete side**
+  (0.53.0). An upsert can only add or correct — it cannot express "this day is
+  no longer a session", so a run turned into a rest day, or a plan abandoned,
+  would leave the calendar confidently prescribing work the plan no longer asks
+  for. `calendar_render.reconcile` is a pure five-way diff with two rails:
+  **the past is never touched** (`existing` filtered to `date >= start` —
+  yesterday's event records what was prescribed yesterday, and rewriting
+  history to match today's plan is not a sync), and **a tombstone is never
+  resurrected or re-deleted**, which is why `list_plan_events` passes
+  `showDeleted=true` — a deleted event still owns its id, and a listing that
+  hides it makes the reconcile recreate it and break the one gesture a person
+  has for "not this one". The steady state is ONE request: list, everything
+  equal, no writes. `MAX_SYNC_EVENTS` (200 = `plans.MAX_WORKOUTS`) **refuses**
+  rather than truncating — a half-written calendar is worse than an unwritten
+  one, because you would trust the days that made it. `gcal._matches` delegates
+  to `calendar_render._differs`: both decide "do we write?", and two field
+  lists would drift into one path rewriting what the other calls unchanged.
+  **Committing a plan must clear the plan it supersedes** — `event_id` keys on
+  `plan_id`, so a new plan lands on entirely different ids and the old plan's
+  sessions would otherwise sit beside the new ones, both tagged and both
+  looking authoritative. `commit_training_plan` reads the outgoing plan id
+  BEFORE the commit archives it.
+  **Every plan-write hook is fail-soft, and that is correctness, not
+  politeness**: the write is committed before the calendar is touched and is
+  the source of truth, the calendar is a projection. A raise would turn a
+  successful edit into a failed tool call, the model would retry the edit, and
+  a transport problem would become a data problem. Failures return
+  `calendar: {"status": "error"}` in the payload; when no sync was attempted at
+  all the key is **omitted rather than null**, so a clone that never set this
+  up gets no noise on every plan edit. `blocked_reason` checks credentials
+  before the setting because that check is a pure env read and the other opens
+  the DB.
   **Its own launchd job, not a tail step on `brief-email`**: it shares none of
   that job's cost (no Garmin pull, no LLM) so it gets an independent failure
   domain, and as a tail step it would have had *no* retry at all — by then the
-  `.emailed-<date>` marker already short-circuits the 20:00 backstop.
+  `.emailed-<date>` marker already short-circuits the 20:00 backstop. Since
+  0.53.0 it is a RECONCILER rather than the only writer: it repairs a sync that
+  failed mid-edit, a plan changed through `run_sql`, or a drifted day.
   Configuration follows the standing pattern —
   `get_plan_calendar_settings`/`update_plan_calendar_settings` own the enabled
   state and `calendar_id` (DB > env > default), the OAuth values stay in `.env`

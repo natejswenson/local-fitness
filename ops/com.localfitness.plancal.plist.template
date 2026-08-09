@@ -8,9 +8,15 @@
   with absolute paths resolved on the install host. Nothing host-specific is
   committed.
 
-  The job runs `fitness plan-calendar`, which reads the ACTIVE training plan
-  and writes tomorrow's prescribed session to Google Calendar as an all-day
-  event. A rest day (or no active plan) writes nothing and exits 0.
+  The job runs `fitness plan-calendar`, which makes Google Calendar equal the
+  ACTIVE training plan: every prescribed session from today through the plan's
+  last day as an all-day event, updated where it drifted, and DELETED where the
+  plan no longer asks for it. A rest day (or no active plan) writes nothing and
+  exits 0.
+
+  Since 0.53.0 the four plan-write MCP tools sync themselves, so this job is a
+  RECONCILER rather than the only writer — it repairs a sync that failed
+  mid-edit, a plan changed through `run_sql`, or a day that drifted.
 
   Credentials, all from <repo>/.env via the CLI's load_dotenv():
     * LOCAL_FITNESS_GCAL_CLIENT_ID / _CLIENT_SECRET — the OAuth client
@@ -48,15 +54,15 @@
          There is NO dedupe flag, and that is deliberate. The brief jobs each
          need one (`--if-missing` keys on the saved brief, `--if-unsent` on a
          per-date sent marker) because sending mail twice is not reversible.
-         Here the event id is a hash of (plan, date, seq), so the backstop
-         re-posts the same id, Google answers 409, the job reads the event back,
-         finds identical content and does nothing. Idempotence is a property of
+         Here the whole run is a reconcile against ids hashed from
+         (plan, date, seq): the backstop lists what is there, finds it already
+         equal to the plan, and issues zero writes. Idempotence is a property of
          the data instead of a marker file that can drift from it — and it
          covers a wake-coalesced pileup and a manual re-run for free.
 
          It also handles the case a marker file could not: if the plan CHANGED
-         between 19:05 and 20:05, the backstop updates the event in place
-         rather than skipping it as already-done. -->
+         between 19:05 and 20:05, the backstop applies the change rather than
+         skipping it as already-done. -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
