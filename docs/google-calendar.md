@@ -1,9 +1,14 @@
 # Google Calendar setup
 
-`fitness plan-calendar` writes the **next day's** prescribed session from your
-active training plan to Google Calendar as an all-day event. On macOS it runs
-from launchd at 19:05 with a 20:05 backstop — the brief email's cadence, offset
-five minutes so the two evening jobs don't contend for the same wake.
+`fitness plan-calendar` makes Google Calendar **equal** your active training
+plan: every prescribed session from today through the plan's last day, as an
+all-day event. It updates what drifted and deletes what the plan no longer asks
+for.
+
+The four plan-editing MCP tools run the same sync themselves, so a change you
+make in conversation reaches the calendar in the same turn. On macOS a launchd
+job also reconciles at 19:05 with a 20:05 backstop — the brief email's cadence,
+offset five minutes so the two evening jobs don't contend for the same wake.
 
 A rest day writes nothing. No active plan writes nothing. Both exit 0.
 
@@ -100,9 +105,10 @@ uv run fitness plan-calendar
 
 Then check the two properties that matter:
 
-- **Run it a second time.** You should get `unchanged`, not a duplicate event.
-- **Delete the event in Google Calendar, then run it again.** It should report
-  `skipped_cancelled` and stay deleted.
+- **Run it a second time.** It must report `0 created, 0 updated, 0 deleted` —
+  not a second copy of your plan.
+- **Delete one event in Google Calendar, then run it again.** It should say
+  `1 day(s) skipped` and leave it deleted.
 
 ## 6. Install the nightly job (macOS)
 
@@ -121,25 +127,37 @@ instead.
 
 | Situation | What happens |
 |---|---|
-| Rest day, or no plan row for tomorrow | Nothing written, exit 0 |
+| Rest day, or no plan row for a date | No event for that day |
 | No active plan | Nothing written, exit 0 |
-| Event already there, plan unchanged | `unchanged` — no write |
-| Event already there, plan edited since | `updated` in place, no duplicate |
-| You deleted the event | `skipped_cancelled` — it is not put back |
+| Everything already matches | `0 created, 0 updated, 0 deleted` — one request |
+| A day was edited | `updated` in place, no duplicate |
+| A day became a rest day | The event is **deleted** |
+| You deleted an event by hand | Skipped and reported — it is not put back |
+| You abandoned the plan | Every remaining event is deleted |
+| You committed a new plan | The old plan's remaining events are deleted first |
+| A past date | Never touched, in either direction |
 | Credentials missing | Exit 2, naming the missing variable |
 
-The event id is a hash of `(plan_id, date, seq)`, which is what makes all of
-that true without a marker file: re-running is idempotent because of the *data*,
-not because of bookkeeping that could drift from it. It also means the job can
-only ever see or touch events it created.
+Event ids are a hash of `(plan_id, date, seq)`, which is what makes all of that
+true without a marker file: re-running is idempotent because of the *data*, not
+because of bookkeeping that could drift from it. It also means the sync can only
+ever see or touch events it created — it lists by its own tag and its own plan
+id, and everything else on your calendar is invisible to it.
 
 Events are **all-day and marked free**, not busy — an all-day block that marked
 you busy would break every scheduling tool pointed at the calendar.
 
+Two things it will not do, deliberately. It never rewrites the **past**:
+yesterday's event records what was prescribed yesterday, and the plan may have
+changed since. And it never puts back an event you **deleted** — that is how you
+say "not this one", and a job that overruled you an hour later is a job you
+would uninstall.
+
 ## Configuration
 
 Everything except the secrets is set conversationally through MCP, the same as
-the brief email:
+the brief email. `enabled: false` stops future syncs; it does **not** remove
+events already on the calendar.
 
 - `get_plan_calendar_settings` — enabled state, target calendar, whether
   credentials are present
@@ -168,6 +186,11 @@ run the command again.
 **HTTP 404 on the calendar.** `calendar_id` points at a calendar this account
 can't write to. `primary` always works; check with
 `get_plan_calendar_settings`.
+
+**A session never appears.** You probably deleted that event by hand at some
+point — the sync reports how many days it skipped for that reason on every run,
+and it will not put them back. Delete nothing and re-run, or edit the day in the
+plan (which changes its content and does not resurrect the tombstone).
 
 **The event is on the wrong day.** All-day events use the host's local date.
 Unlike the container (see `docs/deployment.md`), this job only ever runs on the

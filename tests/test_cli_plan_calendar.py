@@ -1,17 +1,18 @@
 """Tests for `fitness plan-calendar` (the 19:05 launchd job's entry point).
 
 Scope matches ``test_cli_brief_email.py``: WIRING, not the downstream modules.
-The event body is covered by ``test_calendar_render.py`` and the upsert by
-``test_gcal.py``; what is under test here is the ordering and the guards —
-which steps run, which are skipped, what the exit code is, and above all
-**that the no-op paths never reach the network**.
+The diff is covered by ``test_calendar_render.py``, each request by
+``test_gcal.py``, and the reconcile end to end by ``test_calendar_sync.py``.
+What is under test here is what the COMMAND does with each outcome — above all
+that the ordinary nothing-to-do cases exit 0, print a sentence, and never reach
+the network.
 
-Those no-op paths are the load-bearing piece here, the way the sent marker is
-in the email job. A rest day and "no active plan" are ordinary outcomes that
-happen several times a week, so they must exit 0 and quietly — a job that
-reported failure on them would be muted inside a fortnight. And the kill switch
-has to fire before the plan read, not just before the write: a switch that
-still does the work and throws the result away is not a switch.
+Those cases are the load-bearing piece, the way the sent marker is in the email
+job. No active plan and a disabled switch are not failures; a job that exited
+non-zero on them would be muted inside a fortnight. Everything else the command
+adds is reporting, and the one report that must not be dropped is
+`skipped_deleted_by_hand` — without it, a session that never appears on the
+calendar has no explanation anywhere.
 """
 from __future__ import annotations
 
@@ -23,8 +24,9 @@ import pytest
 from click.testing import CliRunner
 
 from local_fitness import cli, db, plans
-from local_fitness.agent import gcal
+from local_fitness.agent import calendar_sync, gcal
 
+TODAY = Date.today().isoformat()
 TOMORROW = (Date.today() + timedelta(days=1)).isoformat()
 
 
@@ -44,9 +46,15 @@ def _workout(date, seq=1, wtype="easy", **over):
     return row
 
 
+def _plan_fields():
+    return {"title": "T", "goal_type": "10k",
+            "race_date": (Date.today() + timedelta(days=90)).isoformat(),
+            "created_at": "2026-08-01T00:00:00"}
+
+
 @pytest.fixture
 def planned(tmp_path, monkeypatch):
-    """A DB with an ACTIVE plan prescribing an easy run tomorrow."""
+    """A DB with an ACTIVE plan; call it with the workouts to seed."""
     p = tmp_path / "fitness.db"
     monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
     db.init_schema(p)
@@ -59,192 +67,201 @@ def planned(tmp_path, monkeypatch):
     return seed
 
 
-def _plan_fields():
-    return {
-        "title": "T", "goal_type": "10k",
-        "race_date": (Date.today() + timedelta(days=90)).isoformat(),
-        "created_at": "2026-08-01T00:00:00",
-    }
-
-
 @pytest.fixture
 def calendar(monkeypatch):
-    """Credentials present + a recording stub for the two gcal entry points."""
+    """Credentials present + a recording stub for the sync entry point."""
     monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_ID", "cid")
     monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("LOCAL_FITNESS_GCAL_REFRESH_TOKEN", "rtoken")
     monkeypatch.delenv("LOCAL_FITNESS_PLAN_CALENDAR_ID", raising=False)
     monkeypatch.delenv("LOCAL_FITNESS_PLAN_CALENDAR_ENABLED", raising=False)
-
-    written: list[dict] = []
-
-    def _token(cfg):
-        written.append({"kind": "token"})
-        return "at-123"
-
-    def _upsert(event, cfg, token):
-        written.append({"kind": "upsert", "event": event})
-        return {"action": "created", "id": event["id"], "html_link": "https://cal/x"}
-
-    monkeypatch.setattr(gcal, "access_token", _token)
-    monkeypatch.setattr(gcal, "upsert_event", _upsert)
     monkeypatch.setattr(cli, "_notify", lambda *a: None)
-    return written
+
+    seen: list[dict] = []
+
+    def install(result=None, raises=None):
+        def _sync(start=None, dry_run=False, **kw):
+            seen.append({"start": start, "dry_run": dry_run})
+            if raises is not None:
+                raise raises
+            return result
+        monkeypatch.setattr(calendar_sync, "sync_active_plan", _sync)
+        return seen
+
+    install.seen = seen
+    return install
+
+
+SYNCED = {
+    "status": "synced", "plan_id": 4, "calendar_id": "primary", "start": TODAY,
+    "created": 2, "updated": 1, "deleted": 1, "unchanged": 38,
+    "skipped_deleted_by_hand": 0, "changed_dates": [TODAY, TOMORROW],
+}
 
 
 # --- the happy path --------------------------------------------------------
 
-def test_tomorrows_session_is_written_to_the_calendar(runner, planned, calendar):
-    planned([_workout(TOMORROW)])
+def test_a_sync_reports_every_bucket(runner, calendar):
+    calendar(SYNCED)
     result = runner.invoke(cli.main, ["plan-calendar"])
 
     assert result.exit_code == 0, result.output
-    upserts = [c for c in calendar if c["kind"] == "upsert"]
-    assert len(upserts) == 1
-    event = upserts[0]["event"]
-    assert event["summary"] == "Easy run 5.0 mi @ 9:39/mi"
-    assert event["start"]["date"] == TOMORROW
-    assert "created" in result.output
+    assert "2 created" in result.output
+    assert "1 updated" in result.output
+    assert "1 deleted" in result.output
+    assert "38 unchanged" in result.output
+    assert "primary" in result.output
 
 
-def test_it_targets_tomorrow_not_today(runner, planned, calendar):
-    # The whole point of the job: you get tomorrow's session tonight. Grabbing
-    # today's would be a reminder that arrives after the run.
-    today = Date.today().isoformat()
-    planned([
-        _workout(today, description="TODAY — should not be scheduled"),
-        _workout(TOMORROW, description="TOMORROW"),
-    ])
+def test_the_changed_dates_are_named(runner, calendar):
+    # Counts can't answer "did MY edit land"; the dates can.
+    calendar(SYNCED)
+    result = runner.invoke(cli.main, ["plan-calendar"])
+    assert f"changed: {TODAY}, {TOMORROW}" in result.output
+
+
+def test_a_hand_deleted_day_is_explained_not_swallowed(runner, calendar):
+    # Without this line, a session that never appears has no explanation.
+    calendar({**SYNCED, "skipped_deleted_by_hand": 3})
+    result = runner.invoke(cli.main, ["plan-calendar"])
+    assert "3 day(s) skipped" in result.output
+    assert "not being put back" in result.output
+
+
+def test_a_quiet_sync_says_nothing_changed(runner, calendar):
+    quiet = {**SYNCED, "created": 0, "updated": 0, "deleted": 0,
+             "unchanged": 42, "changed_dates": []}
+    calendar(quiet)
+    result = runner.invoke(cli.main, ["plan-calendar"])
+    assert result.exit_code == 0
+    assert "0 created, 0 updated, 0 deleted, 42 unchanged" in result.output
+    assert "changed:" not in result.output
+
+
+def test_a_quiet_sync_fires_no_notification(runner, calendar, monkeypatch):
+    # The 20:05 backstop runs every night and normally changes nothing. A
+    # nightly "calendar updated" toast for zero changes is how a notification
+    # stops being read.
+    notified: list[str] = []
+    monkeypatch.setattr(cli, "_notify", notified.append)
+    calendar({**SYNCED, "created": 0, "updated": 0, "deleted": 0,
+              "changed_dates": []})
     runner.invoke(cli.main, ["plan-calendar"])
-
-    (upsert,) = [c for c in calendar if c["kind"] == "upsert"]
-    assert "TOMORROW" in upsert["event"]["description"]
+    assert notified == []
 
 
-def test_an_explicit_date_overrides_tomorrow(runner, planned, calendar):
-    far = (Date.today() + timedelta(days=5)).isoformat()
-    planned([_workout(TOMORROW), _workout(far, description="FRIDAY")])
-    runner.invoke(cli.main, ["plan-calendar", "--date", far])
-
-    (upsert,) = [c for c in calendar if c["kind"] == "upsert"]
-    assert upsert["event"]["start"]["date"] == far
-
-
-def test_both_halves_of_a_double_day_are_written(runner, planned, calendar):
-    planned([_workout(TOMORROW, seq=1),
-             _workout(TOMORROW, seq=2, wtype="tempo", target_duration_sec=1800)])
-    result = runner.invoke(cli.main, ["plan-calendar"])
-
-    assert result.exit_code == 0
-    assert len([c for c in calendar if c["kind"] == "upsert"]) == 2
-    assert "2 of 2 event(s) written" in result.output
-
-
-def test_one_token_is_fetched_for_the_whole_run(runner, planned, calendar):
-    planned([_workout(TOMORROW, seq=1), _workout(TOMORROW, seq=2)])
+def test_a_sync_that_changed_something_does_notify(runner, calendar, monkeypatch):
+    notified: list[str] = []
+    monkeypatch.setattr(cli, "_notify", notified.append)
+    calendar(SYNCED)
     runner.invoke(cli.main, ["plan-calendar"])
-    assert len([c for c in calendar if c["kind"] == "token"]) == 1
+    assert notified and "4 day(s)" in notified[0]
 
 
-# --- the no-op paths: quiet, exit 0, and NO network ------------------------
-
-def test_a_rest_day_writes_nothing_and_succeeds(runner, planned, calendar):
-    planned([_workout(TOMORROW, wtype="rest", target_distance_m=None,
-                      target_pace_sec_per_km=None, target_hr_max=None,
-                      description="Rest day")])
-    result = runner.invoke(cli.main, ["plan-calendar"])
-
-    assert result.exit_code == 0
-    assert calendar == []          # not even a token was fetched
-    assert "Nothing prescribed" in result.output
+def test_from_overrides_the_start_date(runner, calendar):
+    seen = calendar(SYNCED)
+    runner.invoke(cli.main, ["plan-calendar", "--from", "2026-01-01"])
+    assert seen[0]["start"] == "2026-01-01"
 
 
-def test_a_date_with_no_prescription_writes_nothing_and_succeeds(
-        runner, planned, calendar):
-    planned([_workout(Date.today().isoformat())])   # nothing for tomorrow
-    result = runner.invoke(cli.main, ["plan-calendar"])
-
-    assert result.exit_code == 0
-    assert calendar == []
-    assert "Nothing prescribed" in result.output
+def test_the_default_start_is_left_to_the_sync(runner, calendar):
+    # `sync_active_plan` owns "today", so the CLI must not compute a second one.
+    seen = calendar(SYNCED)
+    runner.invoke(cli.main, ["plan-calendar"])
+    assert seen[0]["start"] is None
 
 
-def test_no_active_plan_writes_nothing_and_succeeds(runner, planned, calendar):
-    # `planned` is not called: schema exists, no plan in it.
-    result = runner.invoke(cli.main, ["plan-calendar"])
+# --- the no-op paths: quiet, exit 0 ----------------------------------------
 
-    assert result.exit_code == 0
-    assert calendar == []
-    assert "No active training plan" in result.output
-
-
-def test_a_draft_plan_is_not_treated_as_active(runner, tmp_path, monkeypatch,
-                                               calendar):
-    p = tmp_path / "fitness.db"
-    monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
-    db.init_schema(p)
-    # commit_plan deliberately NOT called — the plan stays a draft.
-    plans.insert_draft(_plan_fields(), [_workout(TOMORROW)], db_path=p)
-
+def test_no_active_plan_exits_zero_with_a_sentence(runner, calendar):
+    calendar({"status": "no_active_plan", "reason": "no active training plan"})
     result = runner.invoke(cli.main, ["plan-calendar"])
     assert result.exit_code == 0
-    assert calendar == []
-    assert "No active training plan" in result.output
+    assert "Nothing to sync — no active training plan." in result.output
 
 
-# --- the guards ------------------------------------------------------------
+def test_a_blocked_sync_exits_zero_with_its_reason(runner, calendar):
+    calendar({"status": "blocked", "reason": "disabled via settings"})
+    result = runner.invoke(cli.main, ["plan-calendar"])
+    assert result.exit_code == 0
+    assert "disabled via settings" in result.output
 
-def test_the_kill_switch_fires_before_the_plan_is_even_read(
-        runner, planned, calendar, monkeypatch):
+
+def test_a_real_no_active_plan_never_reaches_the_network(runner, planned,
+                                                         monkeypatch):
+    # Same as above but through the REAL sync, so the guard order is exercised
+    # rather than asserted about a stub.
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_ID", "cid")
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_REFRESH_TOKEN", "rtoken")
+    called: list[str] = []
+    monkeypatch.setattr(gcal, "access_token", lambda cfg: called.append("t"))
+
+    result = runner.invoke(cli.main, ["plan-calendar"])
+    assert result.exit_code == 0 and called == []
+
+
+def test_the_kill_switch_stops_it_before_the_plan_is_read(runner, planned,
+                                                          monkeypatch):
     planned([_workout(TOMORROW)])
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_REFRESH_TOKEN", "rtoken")
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_ID", "cid")
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("LOCAL_FITNESS_PLAN_CALENDAR_ENABLED", "0")
-
-    def _boom(*a, **k):
-        raise AssertionError("the plan was read despite the kill switch")
-
-    monkeypatch.setattr(cli, "_load_plan_events", _boom)
+    called: list[str] = []
+    monkeypatch.setattr(gcal, "access_token", lambda cfg: called.append("t"))
 
     result = runner.invoke(cli.main, ["plan-calendar"])
     assert result.exit_code == 0
-    assert calendar == []
+    assert called == []
     assert "disabled" in result.output
 
 
-def test_missing_credentials_exit_2_naming_the_variable(
-        runner, planned, calendar, monkeypatch):
+# --- failures --------------------------------------------------------------
+
+def test_missing_credentials_exit_2_naming_the_variable(runner, planned,
+                                                         monkeypatch):
     planned([_workout(TOMORROW)])
-    monkeypatch.delenv("LOCAL_FITNESS_GCAL_REFRESH_TOKEN")
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_ID", "cid")
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("LOCAL_FITNESS_GCAL_REFRESH_TOKEN", "rtoken")
+    monkeypatch.setattr(
+        calendar_sync, "sync_active_plan",
+        lambda **kw: (_ for _ in ()).throw(
+            gcal.CalendarNotConfigured("LOCAL_FITNESS_GCAL_CLIENT_ID is not set")))
 
     result = runner.invoke(cli.main, ["plan-calendar"])
     assert result.exit_code == 2
-    assert "LOCAL_FITNESS_GCAL_REFRESH_TOKEN" in result.output
-    assert not [c for c in calendar if c["kind"] == "upsert"]
+    assert "LOCAL_FITNESS_GCAL_CLIENT_ID" in result.output
 
 
-def test_an_api_failure_propagates_as_a_nonzero_exit(
-        runner, planned, calendar, monkeypatch):
-    # launchd's only signal is the exit code and the log; swallowing this would
-    # make a broken calendar indistinguishable from a rest day.
-    planned([_workout(TOMORROW)])
+def test_over_the_cap_exits_2_rather_than_writing_part_of_a_plan(runner,
+                                                                 calendar):
+    from local_fitness.agent import calendar_render
+
+    calendar(raises=calendar_render.TooManyEvents("217 events, over the 200 cap"))
+    result = runner.invoke(cli.main, ["plan-calendar"])
+    assert result.exit_code == 2
+    assert "over the 200 cap" in result.output
+
+
+def test_a_transport_failure_exits_nonzero_and_notifies(runner, calendar,
+                                                         monkeypatch):
+    # launchd's only signals are the exit code and the log.
     notified: list[str] = []
     monkeypatch.setattr(cli, "_notify", notified.append)
-    monkeypatch.setattr(gcal, "upsert_event", _raise)
+    calendar(raises=gcal.CalendarApiError("boom"))
 
     result = runner.invoke(cli.main, ["plan-calendar"])
     assert result.exit_code != 0
     assert notified and "FAILED" in notified[0]
 
 
-def _raise(*args, **kwargs):
-    raise gcal.CalendarApiError("boom")
-
-
-def test_no_notify_suppresses_the_failure_notification(
-        runner, planned, calendar, monkeypatch):
-    planned([_workout(TOMORROW)])
+def test_no_notify_suppresses_the_failure_notification(runner, calendar,
+                                                        monkeypatch):
     notified: list[str] = []
     monkeypatch.setattr(cli, "_notify", notified.append)
-    monkeypatch.setattr(gcal, "upsert_event", _raise)
+    calendar(raises=gcal.CalendarApiError("boom"))
 
     runner.invoke(cli.main, ["plan-calendar", "--no-notify"])
     assert notified == []
@@ -252,42 +269,39 @@ def test_no_notify_suppresses_the_failure_notification(
 
 # --- dry run ---------------------------------------------------------------
 
-def test_dry_run_prints_the_event_and_opens_no_socket(runner, planned, calendar):
-    planned([_workout(TOMORROW)])
+def test_dry_run_prints_every_event_and_opens_no_socket(runner, planned,
+                                                         monkeypatch):
+    planned([_workout(TODAY), _workout(TOMORROW)])
+    called: list[str] = []
+    monkeypatch.setattr(gcal, "access_token", lambda cfg: called.append("t"))
+
     result = runner.invoke(cli.main, ["plan-calendar", "--dry-run"])
 
-    assert result.exit_code == 0
-    assert calendar == []
+    assert result.exit_code == 0 and called == []
     payload = json.loads(result.output[:result.output.rindex("]") + 1])
-    assert payload[0]["start"]["date"] == TOMORROW
-    assert payload[0]["end"]["date"] == (
-        (Date.today() + timedelta(days=2)).isoformat())
-    assert "Nothing was sent" in result.output
+    assert [e["start"]["date"] for e in payload] == [TODAY, TOMORROW]
+    assert "2 event(s)" in result.output and "Nothing was sent" in result.output
 
 
-def test_dry_run_works_with_no_credentials_at_all(
-        runner, planned, calendar, monkeypatch):
-    # Same contract as `brief-email --dry-run`: inspectable BEFORE setup, which
-    # is exactly when the real path refuses.
+def test_dry_run_works_with_no_credentials_at_all(runner, planned, monkeypatch):
+    # Inspectable BEFORE setup, which is exactly when the real path refuses.
     planned([_workout(TOMORROW)])
     for var in ("LOCAL_FITNESS_GCAL_CLIENT_ID", "LOCAL_FITNESS_GCAL_CLIENT_SECRET",
                 "LOCAL_FITNESS_GCAL_REFRESH_TOKEN"):
-        monkeypatch.delenv(var)
+        monkeypatch.delenv(var, raising=False)
 
     result = runner.invoke(cli.main, ["plan-calendar", "--dry-run"])
-    assert result.exit_code == 0
-    assert "Nothing was sent" in result.output
+    assert result.exit_code == 0 and "Nothing was sent" in result.output
 
 
-def test_dry_run_ignores_the_kill_switch(runner, planned, calendar, monkeypatch):
+def test_dry_run_ignores_the_kill_switch(runner, planned, monkeypatch):
     # A disabled setup must still be inspectable, or debugging "why is nothing
     # on my calendar" starts by re-enabling the thing you're debugging.
     planned([_workout(TOMORROW)])
     monkeypatch.setenv("LOCAL_FITNESS_PLAN_CALENDAR_ENABLED", "0")
 
     result = runner.invoke(cli.main, ["plan-calendar", "--dry-run"])
-    assert result.exit_code == 0
-    assert "Nothing was sent" in result.output
+    assert result.exit_code == 0 and "Nothing was sent" in result.output
 
 
 # --- calendar-auth ---------------------------------------------------------

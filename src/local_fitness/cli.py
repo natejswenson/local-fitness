@@ -19,7 +19,6 @@ import os
 import subprocess
 import sys
 from datetime import date as Date
-from datetime import timedelta
 from pathlib import Path
 
 import click
@@ -341,104 +340,88 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
         _notify("Evening brief emailed")
 
 
-def _load_plan_events(target: Date) -> tuple[list[dict], str | None]:
-    """Tomorrow's (or ``target``'s) prescribed sessions as calendar events.
-
-    Returns ``(events, reason_there_are_none)`` — the second value is a
-    human sentence, not an error. A rest day and "no active plan" are both
-    ordinary outcomes here: most weeks carry two rest days, and a job that
-    reported failure on those would cry wolf twice a week.
-
-    Reads only SQLite. That is what lets the calendar job be independent of the
-    email job — no Garmin pull, no LLM, so it costs nothing to retry.
-    """
-    from . import plans
-    from .agent import calendar_render
-
-    with db.connect() as conn:
-        active = plans.get_active_plan(conn=conn)
-    if active is None:
-        return [], "No active training plan — nothing to schedule."
-
-    events = calendar_render.build_events(
-        active["workouts"], target.isoformat(), active["plan_id"])
-    if not events:
-        return [], f"Nothing prescribed for {target} (rest day or no entry)."
-    return events, None
-
-
 @main.command(name="plan-calendar")
-@click.option("--date", "target_date", default=None,
-              help="YYYY-MM-DD to schedule (default: tomorrow)")
+@click.option("--from", "start_date", default=None,
+              help="YYYY-MM-DD to sync from (default: today)")
 @click.option("--dry-run", is_flag=True,
-              help="Print the event body instead of writing it to Google")
+              help="Print the events instead of writing them to Google")
 @click.option("--no-notify", is_flag=True, help="Skip the macOS notification")
-def plan_calendar(target_date: str | None, dry_run: bool, no_notify: bool):
-    """Put tomorrow's prescribed session on Google Calendar (evening job).
+def plan_calendar(start_date: str | None, dry_run: bool, no_notify: bool):
+    """Make Google Calendar equal the remaining training plan (evening job).
+
+    Writes every prescribed session from today through the last day of the
+    active plan as an all-day event, updates the ones that changed, and
+    DELETES the ones the plan no longer asks for. Nothing prescribed and
+    nothing stale — that last half is what a push could never do.
 
     Runs on the same cadence as the brief email (launchd 19:05, backstop
     20:05) but as its OWN job, because it shares none of that job's cost: no
-    Garmin pull, no LLM call, just a plan read and one HTTPS request. Its own
-    failure domain means a Google outage can't make the email job look broken,
-    and its own retry slot means a transient failure actually gets retried —
-    which it would not as a tail step, since by then the `.emailed-` marker
-    already short-circuits the backstop.
+    Garmin pull, no LLM call, just a plan read and — in the steady state — a
+    single HTTPS request. Its own failure domain means a Google outage can't
+    make the email job look broken, and its own retry slot means a transient
+    failure actually gets retried, which it would not as a tail step (by then
+    the `.emailed-` marker already short-circuits the backstop).
 
-    There is deliberately no `--if-unsent` flag. The event id is derived from
-    (plan, date, seq), so re-running is idempotent by construction: the second
-    fire re-posts the same id, sees the same content, and does nothing. A
-    marker file would be a second source of truth that can drift from the first.
+    Since 0.53.0 the four plan-write MCP tools sync themselves, so this job is
+    a RECONCILER rather than the only writer: it repairs a sync that failed
+    mid-edit, a plan changed through `run_sql`, or a day that drifted. There is
+    deliberately no dedupe flag — the reconcile is idempotent by construction,
+    and a marker file would be a second source of truth that can drift from the
+    first.
     """
     import json
 
-    from . import config as app_config
-    from .agent import gcal
-
-    target = Date.fromisoformat(target_date) if target_date else (
-        Date.today() + timedelta(days=1))
-
-    # Checked before the plan read and before anything touches the network, for
-    # the same reason the email's kill switch precedes its pull: a switch that
-    # still does the work and throws the result away is not a switch.
-    if not dry_run and not app_config.plan_calendar_enabled():
-        click.echo(
-            "Plan calendar sync is disabled (plan_calendar_enabled=false) — "
-            "skipping. Re-enable with the update_plan_calendar_settings MCP tool."
-        )
-        return
-
-    events, reason = _load_plan_events(target)
-    if reason:
-        click.echo(reason)
-        return
-
-    if dry_run:
-        click.echo(json.dumps(events, indent=2))
-        click.echo(f"\nDry run — {len(events)} event(s) for {target}. "
-                   "Nothing was sent.")
-        return
+    from .agent import calendar_sync, gcal
 
     try:
-        cfg = gcal.load_config()
+        result = calendar_sync.sync_active_plan(start=start_date, dry_run=dry_run)
     except gcal.CalendarNotConfigured as e:
         click.echo(f"  ⚠ {e}", err=True)
         sys.exit(2)
-
-    try:
-        token = gcal.access_token(cfg)
-        results = [gcal.upsert_event(e, cfg, token) for e in events]
+    except calendar_render_too_many() as e:
+        click.echo(f"  ⚠ {e}", err=True)
+        sys.exit(2)
     except Exception:
         if not no_notify:
             _notify("Plan calendar sync FAILED — check the logs")
         raise
 
-    for event, result in zip(events, results, strict=True):
-        click.echo(f"  {result['action']:<18} {event['summary']}")
-    written = [r for r in results if r["action"] in ("created", "updated")]
-    click.echo(f"{len(written)} of {len(events)} event(s) written to "
-               f"calendar '{cfg.calendar_id}' for {target}.")
+    status = result["status"]
+    if status == "dry_run":
+        click.echo(json.dumps(result["events"], indent=2))
+        click.echo(f"\nDry run — {len(result['events'])} event(s) from "
+                   f"{result['start']} on plan #{result['plan_id']}. "
+                   "Nothing was sent.")
+        return
+    if status in ("no_active_plan", "blocked"):
+        # Both are ordinary outcomes, not failures: a fresh clone has no plan,
+        # and the kill switch exists to be used.
+        click.echo(f"Nothing to sync — {result['reason']}.")
+        return
+
+    click.echo(
+        f"Calendar '{result['calendar_id']}' now matches plan "
+        f"#{result['plan_id']} from {result['start']}: "
+        f"{result['created']} created, {result['updated']} updated, "
+        f"{result['deleted']} deleted, {result['unchanged']} unchanged."
+    )
+    if result["skipped_deleted_by_hand"]:
+        # Otherwise a session that never appears has no explanation anywhere.
+        click.echo(f"  {result['skipped_deleted_by_hand']} day(s) skipped — "
+                   "you deleted those events; they are not being put back.")
+    if result["changed_dates"]:
+        click.echo(f"  changed: {', '.join(result['changed_dates'])}")
+    written = result["created"] + result["updated"] + result["deleted"]
     if not no_notify and written:
-        _notify(f"Tomorrow on the calendar: {events[0]['summary']}")
+        _notify(f"Training calendar updated ({written} day(s))")
+
+
+def calendar_render_too_many():
+    """`calendar_render.TooManyEvents`, imported lazily to keep the CLI's
+    module-scope imports free of the agent package (which pulls the SDK)."""
+    from .agent import calendar_render
+
+    return calendar_render.TooManyEvents
 
 
 #: Where Google sends the browser back after consent. A loopback redirect is

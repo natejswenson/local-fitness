@@ -140,10 +140,14 @@ def test_the_read_tool_reports_the_schedule_as_prose(cfgdb):
     assert "time" not in got  # no editable-looking twin
 
 
-def test_the_read_tool_states_that_a_rest_day_creates_nothing(cfgdb):
-    # "Will tomorrow show up?" must be answerable without inferring it.
+def test_the_read_tool_states_what_it_writes_and_what_it_deletes(cfgdb):
+    # "Will my plan show up?" must be answerable without inferring it — and the
+    # DELETE half especially, since a sync that removes calendar entries is not
+    # what "calendar integration" usually means.
     got, _ = call(tools.get_plan_calendar_settings, {})
+    assert "through its last day" in got["creates_events_for"]
     assert "rest day creates nothing" in got["creates_events_for"]
+    assert "DELETED" in got["creates_events_for"]
     assert got["requires_active_plan"] is True
 
 

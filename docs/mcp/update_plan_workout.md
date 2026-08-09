@@ -183,6 +183,14 @@ Second returns the re-prescribed Sunday, as above.
 
 ## Gotchas
 
+- **This writes Google Calendar too, when it's configured** (0.53.0). The response carries a
+  `calendar` object with `created`/`updated`/`deleted`/`unchanged` and the dates that moved —
+  quote the dates, not the counts, when confirming an edit. The key is **absent** when no sync
+  was attempted (no credentials, or the kill switch is off); `{"status": "error"}` means the
+  plan write still succeeded and only the calendar failed, so never retry the plan edit because
+  of it. Configure with [`get_plan_calendar_settings`](get_plan_calendar_settings.md).
+  A day re-prescribed as `rest` has its calendar event **deleted**, not blanked.
+
 - **"Move a long run" means re-prescribe two days.** You cannot change `date` — it is part of the
   row's identity and outside the whitelist. Rest the old day, prescribe the new one.
 - **It cannot ADD a day.** The `UPDATE` matches on `(plan_id, date, seq)`; a date with no

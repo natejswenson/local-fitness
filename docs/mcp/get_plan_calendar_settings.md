@@ -4,8 +4,8 @@
 
 ## What it does
 
-Reads back what the 19:05 job will actually do tonight — whether tomorrow's
-prescribed session lands on the calendar, and on which one. Read-only.
+Reads back whether the training plan is being mirrored to Google Calendar, and
+to which calendar. Read-only.
 
 **Call this before [`update_plan_calendar_settings`](update_plan_calendar_settings.md)**
 so an edit patches what is actually there.
@@ -25,8 +25,8 @@ None. Takes no arguments.
   "enabled": true,
   "calendar_id": "primary",
   "credentials_configured": true,
-  "schedule": "19:05 daily, backstop 20:05 (launchd com.localfitness.plancal)",
-  "creates_events_for": "the NEXT day's prescribed session on the active plan; a rest day creates nothing",
+  "schedule": "reconciled on every plan edit, plus 19:05 daily with a 20:05 backstop (launchd com.localfitness.plancal)",
+  "creates_events_for": "every prescribed session on the active plan from today through its last day, as all-day events; a rest day creates nothing, and a day the plan drops is DELETED from the calendar",
   "requires_active_plan": true,
   "can_write": true,
   "blocked_reason": null
@@ -35,10 +35,10 @@ None. Takes no arguments.
 
 | Key | Meaning |
 |---|---|
-| `enabled` | `false` means the nightly job exits before reading the plan or touching the network. The conversational kill switch. |
+| `enabled` | `false` means neither the nightly job nor a plan edit touches the calendar. The conversational kill switch. It does **not** remove events already there. |
 | `calendar_id` | Which calendar gets the event. `primary` is the authenticated account's default. |
 | `credentials_configured` | Whether all three OAuth values are present in `.env`. **A boolean and nothing more** — see gotchas. |
-| `schedule` | Prose, not data. The run time is not a setting — see gotchas. |
+| `schedule` | Prose, not data. The run time is not a setting — see gotchas. Note the sync also fires on every plan edit, not only on the schedule. |
 | `creates_events_for` | What actually gets written, stated so the answer to "will tomorrow show up?" doesn't have to be inferred. |
 | `requires_active_plan` | Always `true`. With no active plan the job is a clean no-op, not a failure. |
 | `can_write` | `enabled` AND credentials present. The single field worth checking before promising the user an event tonight. |
@@ -46,7 +46,7 @@ None. Takes no arguments.
 
 ## Example
 
-> "Is tomorrow's run going on my calendar?"
+> "Is my training plan on my calendar?"
 
 ```json
 {}
@@ -56,7 +56,7 @@ None. Takes no arguments.
 {"enabled": true, "calendar_id": "primary", "credentials_configured": false,
  "can_write": false,
  "blocked_reason": "OAuth credentials are not set in <repo>/.env — run `uv run fitness calendar-auth` (see docs/google-calendar.md)",
- "schedule": "19:05 daily, backstop 20:05 (launchd com.localfitness.plancal)"}
+ "schedule": "reconciled on every plan edit, plus 19:05 daily…"}
 ```
 
 The honest answer is no, and `blocked_reason` says which of the two possible
@@ -70,18 +70,22 @@ reasons it is — so the reply names the setup step instead of guessing.
   endpoint write access to the user's calendar. `credentials_configured`
   answers the only question a configuration reader legitimately has. Changing
   them is always "put it in `<repo>/.env`", never a tool call.
-- **`enabled: true` does not mean an event will appear.** Check `can_write` —
-  and note that even `can_write: true` produces nothing on a rest day or with
-  no active plan, both of which are normal outcomes rather than errors.
+- **`enabled: true` does not mean events will appear.** Check `can_write` — and
+  note that even `can_write: true` produces nothing with no active plan, or on a
+  rest day, both of which are normal outcomes rather than errors.
+- **The sync DELETES as well as writes.** A day the plan drops, a plan
+  abandoned, a plan superseded by a commit — all remove events. Two things it
+  never does: touch a past date, or restore an event the user deleted by hand.
+  Say that plainly if asked what it has access to.
 - **The run time is not a setting and cannot be changed from here.** It lives in
   `ops/com.localfitness.plancal.plist.template`; changing it means editing that
   file and re-running `./ops/install-launchd.sh plancal` on the host. It is
   reported as prose specifically so it doesn't read as an editable field.
 - **`schedule` describes the plist this repo ships, not the job actually
   installed on the machine.** Nothing here inspects `launchctl`.
-- **The sync only ever writes events it created.** Ids are derived from
-  `(plan_id, date, seq)`, so it can neither see nor touch anything else on the
-  calendar — worth saying plainly if the user asks what it has access to.
+- **The sync only ever sees events it created.** It lists by its own tag and
+  its own plan id, and ids are derived from `(plan_id, date, seq)` — nothing
+  else on the calendar is reachable from here.
 - **This is a snapshot.** An update takes effect on the next run with no
   restart, but env-layer changes need the process restarted, since `.env` is
   read once at CLI startup.

@@ -209,20 +209,17 @@ def _events_url(cfg: GcalConfig) -> str:
     return f"{CALENDAR_API}/calendars/{quote(cfg.calendar_id, safe='')}/events"
 
 
-#: The fields that decide whether a stored event still matches the plan. Ids
-#: and extended properties are identity (they can't differ — the id is how we
-#: found the event), and everything else Google attaches is server-owned.
-_COMPARED_FIELDS = ("summary", "description", "transparency")
-
-
 def _matches(existing: dict, event: dict) -> bool:
-    """Whether the event already on the calendar says what the plan now says."""
-    if any(existing.get(f) != event.get(f) for f in _COMPARED_FIELDS):
-        return False
-    for side in ("start", "end"):
-        if (existing.get(side) or {}).get("date") != event[side]["date"]:
-            return False
-    return True
+    """Whether the event already on the calendar says what the plan now says.
+
+    Delegates to ``calendar_render._differs`` rather than keeping a second
+    field list. The comparison decides "do we write?" in two places — here, on
+    the 409 path, and in ``reconcile`` — and two definitions of "the same
+    event" would drift into one path rewriting what the other calls unchanged.
+    """
+    from . import calendar_render
+
+    return not calendar_render._differs(existing, event)
 
 
 def upsert_event(event: dict, cfg: GcalConfig, token: str) -> dict:
@@ -290,6 +287,105 @@ def upsert_event(event: dict, cfg: GcalConfig, token: str) -> dict:
              event["id"], event.get("summary"))
     return {"action": "updated", "id": event["id"],
             "html_link": _body(put).get("htmlLink")}
+
+
+#: Page size for the events listing. Google caps this at 2500; a plan is at
+#: most `calendar_render.MAX_SYNC_EVENTS` (200) events, so one page covers
+#: every real case and the pagination loop below is the safety net rather than
+#: the normal path.
+LIST_PAGE_SIZE = 250
+
+#: Refuses to page forever. `maxResults` × this is far above any real plan, so
+#: reaching it means a pageToken loop, not a big calendar.
+MAX_LIST_PAGES = 10
+
+
+def list_plan_events(cfg: GcalConfig, token: str, plan_id: int) -> list[dict]:
+    """Every event WE wrote for one plan, tombstones included.
+
+    Two query parameters carry the whole safety argument:
+
+    * ``privateExtendedProperty`` filters to events tagged by
+      ``calendar_render.build_event`` — ``source=local-fitness`` AND
+      ``planId=<id>``. Google ANDs repeated values, so this returns our events
+      for this plan and nothing else. **The caller deletes from this list**, so
+      an unscoped listing would put someone's dentist appointment in the delete
+      set. Scoping by ``planId`` is also what stops a sync from reaching back
+      and rewriting a previous plan's events.
+    * ``showDeleted=true`` is load-bearing in the other direction: a deleted
+      event is a *tombstone* that still owns its id, and the reconcile has to
+      SEE it to leave it alone. Without this flag a manually-deleted event
+      looks absent, the sync creates it again, and the one thing a person can
+      do to say "not this one" stops working.
+    """
+    url = _events_url(cfg)
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "privateExtendedProperty": [
+            f"source={calendar_render_source_tag()}",
+            f"planId={plan_id}",
+        ],
+        "showDeleted": "true",
+        "maxResults": LIST_PAGE_SIZE,
+        "singleEvents": "true",
+    }
+
+    out: list[dict] = []
+    page_token = None
+    for _ in range(MAX_LIST_PAGES):
+        query = dict(params)
+        if page_token:
+            query["pageToken"] = page_token
+        resp = _request("GET", url, headers=headers, params=query)
+        if resp.status_code != 200:
+            raise CalendarApiError(
+                f"Calendar list failed (HTTP {resp.status_code}): "
+                f"{_body(resp).get('error', resp.text[:300])}"
+            )
+        payload = _body(resp)
+        out.extend(payload.get("items") or [])
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            return out
+    raise CalendarApiError(
+        f"Calendar list did not terminate after {MAX_LIST_PAGES} pages")
+
+
+def calendar_render_source_tag() -> str:
+    """``calendar_render.SOURCE_TAG``, imported lazily.
+
+    A function rather than a module-scope import because ``calendar_render``
+    is the pure layer and this is the transport: keeping the dependency inside
+    the call means the pure module stays importable on its own, which is what
+    lets its tests run with no transport in the picture at all.
+    """
+    from . import calendar_render
+
+    return calendar_render.SOURCE_TAG
+
+
+def delete_event(event_id: str, cfg: GcalConfig, token: str) -> dict:
+    """Remove one event. Idempotent: an already-gone event is a success.
+
+    Google answers 410 for an event it has already deleted and 404 for one it
+    never had; both mean "the calendar is in the state you asked for", so
+    neither is an error. Treating them as failures would make the nightly
+    reconcile noisy exactly when it had nothing to do — and would turn a
+    half-finished sync into a run that can never complete.
+    """
+    resp = _request(
+        "DELETE", f"{_events_url(cfg)}/{event_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if resp.status_code in (200, 204, 404, 410):
+        LOG.info("plan_calendar deleted id=%s status=%s",
+                 event_id, resp.status_code)
+        return {"action": "deleted", "id": event_id,
+                "already_gone": resp.status_code in (404, 410)}
+    raise CalendarApiError(
+        f"Calendar delete failed (HTTP {resp.status_code}): "
+        f"{_body(resp).get('error', resp.text[:300])}"
+    )
 
 
 # --- one-time consent (drives `fitness calendar-auth`) ---------------------

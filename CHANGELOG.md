@@ -6,6 +6,78 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-08-08
+
+### Changed
+- **The calendar now carries the whole remaining plan, and plan edits push
+  themselves.** 0.52.0's nightly job wrote *tomorrow's* session. One day is the
+  wrong unit — you can't see the week, you can't see the taper, and an edit made
+  today didn't reach the calendar until 19:05 tomorrow. `fitness plan-calendar`
+  now makes the calendar **equal** the active plan from today through its last
+  day, and the four plan-write MCP tools (`update_plan_workout`,
+  `update_plan_workouts`, `commit_training_plan`, `abandon_active_plan`) run the
+  same reconcile themselves, so a change lands in the same turn. The
+  tomorrow-only path is **deleted**, not kept beside the new one: two ways to
+  write the same event is exactly the ambiguity the one-tool-one-name rule
+  exists to prevent.
+
+  **The unit of work is a reconcile, and the reason is the DELETE side.** An
+  upsert can only add or correct; it has no way to express "this day is no
+  longer a session". So a run turned into a rest day, or a plan abandoned
+  outright, would leave the calendar confidently prescribing work the plan no
+  longer asks for — with the only hint being a plan number in a description
+  nobody reads. `calendar_render.reconcile` is a pure five-way diff (create /
+  update / unchanged / delete / skipped-cancelled) with two rails on that
+  deletion:
+
+  - **The past is never touched.** `existing` is filtered to `date >= start`
+    before diffing. Yesterday's event records what was prescribed yesterday; the
+    plan may have changed since, and rewriting history to match is not a sync.
+  - **A tombstone is never resurrected and never re-deleted.** This is why
+    `gcal.list_plan_events` passes `showDeleted=true` — a deleted event still
+    owns its id, and a listing that hides it makes the reconcile see an absence,
+    recreate the event, and break the one gesture a person has for "not this
+    one".
+
+  **The steady state is one request.** A second sync lists, finds everything
+  equal, and writes nothing — which is what makes the 20:05 backstop, the hook
+  firing on every edit, and a manual re-run all free. That property is the
+  single thing `tests/test_calendar_sync.py` is built around, driven through an
+  in-memory calendar that holds real state rather than a stub replaying canned
+  values.
+
+  **Committing a plan clears the plan it supersedes.** `event_id` keys on
+  `plan_id` by design, so a new plan's events land on entirely different ids —
+  the old plan's remaining sessions would otherwise sit beside the new ones,
+  both tagged and both looking authoritative. `commit_training_plan` reads the
+  outgoing plan id *before* the commit archives it and deletes its future
+  events.
+
+  **Every hook is fail-soft, and that is a correctness property, not politeness.**
+  The plan write is committed before the calendar is touched and is the source
+  of truth; the calendar is a projection. A raise here would turn a successful
+  edit into a failed tool call, the model would reasonably retry the edit, and a
+  transport problem would become a data problem. Failures come back as
+  `calendar: {"status": "error", …}` in the tool payload. When no sync was
+  attempted at all — no credentials, or the kill switch is off — the key is
+  **omitted rather than null**, so a clone that never set this up gets no
+  calendar noise appended to every plan edit it ever makes. The credential check
+  runs before the settings check because it is a pure env read and the other
+  opens the DB.
+
+  New `agent/calendar_sync.py` holds the orchestration; `calendar_render` stays
+  pure and `gcal` stays transport. `gcal._matches` now delegates to
+  `calendar_render._differs` — both decide "do we write?", and two field lists
+  would drift into one path rewriting what the other calls unchanged.
+  `MAX_SYNC_EVENTS` (200, equal to `plans.MAX_WORKOUTS`) **refuses** rather than
+  truncating: a half-written calendar is worse than one that didn't get written,
+  because you would trust the days that made it.
+
+  `fitness plan-calendar` takes `--from` in place of `--date`, and reports
+  created/updated/deleted/unchanged plus the changed dates — counts alone can't
+  answer "did my edit land". A quiet run fires no macOS notification; a nightly
+  toast for zero changes is how a notification stops being read.
+
 ## [0.52.0] - 2026-08-08
 
 ### Added
