@@ -6,6 +6,90 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.60.1] - 2026-08-10
+
+### Changed
+- **Eval baseline invention rates recaptured post-#217** (the deferred
+  follow-up from 0.60.0). 12 generations (6 scenarios × 2 runs, under the
+  16-generation hard cap, Max-subscription auth, zero flakes) on the same
+  V2 composer with the fixed grounding checker. The parser-artifact
+  inflation is gone from the floor the shadow-run gates on: sliding_fitness
+  0.834→0.5, fatigued_recovery 0.875→0.75, sparse 0.167→0.0, missed_steps
+  0.333→0.167, taper_plan 0.667→0.625; green_light moved 0.167→0.333
+  (2-run generation noise, not a checker change). The residue is the
+  checker's designed tolerance — model-computed deltas aren't pool
+  numbers — so these rates are the honest floor, not near-zero; document
+  schema stays version 2 (`captured` timestamp records the refresh).
+
+## [0.60.0] - 2026-08-10
+
+### Fixed
+- **Grounding no longer misattributes number claims across units** (#217).
+  The 2026-08-10 live brief measured `invention_rate=1.000` — 7 flags, every
+  one a false positive, which both buries any real invention in noise and
+  means the recorded eval baselines partially encode parser artifacts. Three
+  mechanisms, three fixes in `grounding.flag`:
+  - **A prose unit word binds its token** (`_prose_unit_after`): "45 steps"
+    matches only steps-unit pool entries — it was matching rhr=50 at rel
+    0.10 and flagging twice. A unit-bound token with no same-unit pool entry
+    is skipped outright ("no same-unit number to contradict", the contract
+    the percent partition already had) — never falling back to the shared
+    bucket, because the fallback IS the misbind. Only unambiguous words map
+    (bpm / mi / mile(s) / step(s)); "min" stays unmapped on purpose. Bare
+    tokens keep full sensitivity — the schema's `GroundedUnit` tags were
+    already on every pool entry (0.55-era foundation), prose just never
+    used them.
+  - **The sign check is now asymmetric** — fires only for prose-positive vs
+    pool-NEGATIVE (the measured true case: TSB +22.4 cited when the truth
+    is -22.4). A negative prose token near an always-positive metric is a
+    range dash ("3-4mi" tokenizes as -4, sign-flagged against distance 4.2)
+    or a computed table delta ("-1.2%" against frac_of_goal), not an
+    inversion.
+  - The live brief is frozen as a regression fixture
+    (`test_issue_217_the_live_brief_carries_no_false_positives`).
+  Follow-up (deferred, costs generations): recapture `tests/evals/
+  baseline.json` per-scenario invention rates — they can only drop, so the
+  shadow-run gate stays passable in the meantime; the two fixtures recorded
+  at 0.83-0.88 should land near zero.
+
+## [0.59.0] - 2026-08-10
+
+### Fixed
+- **A settled verdict is never derived from an unsettled number.** Garmin
+  REVISES some today-values through the day rather than accumulating them —
+  rhr and sleep settle once the night is fully processed, body battery's
+  min/max move until the day ends. Measured live 2026-08-10: the 06:30
+  launchd pull ran mid-sleep and stored rhr 54; `get_metric_trend` served
+  that 3.5-hour-old snapshot at 10:04 as "elevated, +1.93 SD"; the 10:09
+  post-wake pull revised it to 50 and the brief (which pulls first) reported
+  50 — two contradictory "today" readings in one morning, no signal on
+  either. New `SETTLING_METRICS` contract, distinct from Fix 8's
+  running-tally anchor (a tally is partial ALL day; these settle mid-morning
+  and are then exactly what a recovery read wants):
+  - `get_metric_trend`: today's settling row counts only when a successful
+    pull COVERING today (`data_as_of_today`, coverage-filtered on
+    `last_date_fetched` so a recent backfill can't stamp a stale snapshot
+    "fresh") completed within the sync window (~10 min, the same bar as
+    `sync_garmin_data`'s short-circuit). Fresh → counted, labeled
+    `current_provisional` + `data_as_of`. Stale → excluded from
+    current/mean/slope/vs_baseline (the verdict is computed on the settled
+    series instead — deterministic, not a flag the model might skip), raw
+    snapshot kept in `provisional_today_value`, `note` says to sync first.
+  - `daily_snapshot`: same treatment via an opt-in `settling_guard` on
+    `assemble_status` (default OFF so the brief pipeline — which pulls
+    immediately before reading — and the planner fixtures stay
+    byte-identical; only the MCP tool, which serves ad-hoc reads with no
+    pull in front, opts in). Staleness rides the existing connection: the
+    tool is on the perf gate's `db.connect()` open-count.
+  - `find_anomalies`: today never scans — an anomaly is a settled fact, and
+    both supported metrics (rhr, sleep_seconds) are settling.
+- **The morning brief no longer races Nate's wake.** The 06:30 launchd fire
+  pulled mid-sleep, so the flagship surface shipped provisional recovery
+  numbers (today's 06:30 brief carried rhr 54 and a partial night; the
+  10:09 regeneration silently corrected it). Moved to 08:30 — past typical
+  wake, so rhr/sleep are settled-by-construction — keeping the 09:30
+  backstop. Re-run `ops/install-launchd.sh` to apply.
+
 ## [0.58.0] - 2026-08-10
 
 ### Changed

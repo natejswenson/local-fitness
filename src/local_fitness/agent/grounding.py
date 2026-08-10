@@ -65,6 +65,29 @@ def _in_duration_fragment(text: str, start: int, end: int) -> bool:
         for dm in _HOUR_MIN_DURATION.finditer(text)
     )
 
+
+# A unit word directly after a numeric token binds that token to ONE
+# GroundedUnit — the prose author told us what the number measures, and
+# ignoring that is how "45 steps" matched rhr=50 (issue #217, live
+# 2026-08-10: the brief's "cleared 10,000 by 45 steps" flagged twice as
+# rhr:45Δ-5.0 and drove invention_rate to 1.000 on pure false positives).
+# Only the units a bare prose word can unambiguously signal are mapped;
+# everything else stays in the shared plain bucket exactly as before.
+# "min"/"m" are deliberately absent ("45 min" is a duration, "m" is
+# meters/minutes ambiguity); "mi\b" cannot match inside "min".
+_UNIT_AFTER = re.compile(r"\s*(bpm|miles|mile|mi|steps|step)\b", re.IGNORECASE)
+_PROSE_UNITS = {
+    "bpm": "bpm", "mi": "mi", "mile": "mi", "miles": "mi",
+    "step": "steps", "steps": "steps",
+}
+
+
+def _prose_unit_after(text: str, end: int) -> str | None:
+    """The GroundedUnit a unit word directly after position ``end`` binds the
+    preceding token to, or None when no unit word follows."""
+    m = _UNIT_AFTER.match(text, end)
+    return _PROSE_UNITS[m.group(1).lower()] if m else None
+
 # Per the design: relative bands. A token within EXACT of a known number counts
 # as faithful; within NEARBY (but past EXACT) is a close-but-unequal mis-state;
 # beyond NEARBY is a different quantity and is ignored. ABS_FLOOR keeps tiny
@@ -377,12 +400,35 @@ def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
     (a magnitude mis-state, e.g. RHR 53 cited when it's really 58) is still
     the ``kind="value"`` flag with the SIGNED gap as ``delta`` — the old
     ``delta`` was ``prose − abs(nearest)``, so a -24.0 cited against a real
-    -22.4 (a 1.6-unit miss) reported delta -46.4 instead of -1.6."""
+    -22.4 (a 1.6-unit miss) reported delta -46.4 instead of -1.6.
+
+    Two refinements from the 2026-08-10 live false-positive audit (#217,
+    invention_rate 1.000 with zero real inventions):
+
+    * **A prose unit word binds its token** (``_prose_unit_after``): "45
+      steps" matches only steps-unit pool entries — never rhr=50, which sat
+      at rel 0.10 and flagged twice. A unit-bound token with no same-unit
+      pool entries is skipped ("no same-unit number to contradict"), the
+      same contract the percent partition already had; it never falls back
+      to the shared bucket, because the fallback IS the misbind.
+    * **The sign check fires only for prose-positive vs pool-NEGATIVE**
+      (``x > 0 > near_val`` — the measured true case: TSB +22.4 cited when
+      the truth is -22.4). A NEGATIVE prose token near an always-positive
+      metric is not an inversion of it: measured, "3-4mi" tokenizes as
+      ``-4`` (range dash, sign-flagged against distance 4.2 at rel 0.048)
+      and a table's "-1.2%" delta sign-flagged against frac_of_goal — both
+      are different quantities wearing a minus, and no pool metric that can
+      actually go negative (TSB) is ever cited with a phantom minus by a
+      generator reading a rendered "-22" display."""
     tagged_pool = _grounded_pool(context)
     if not tagged_pool:
         return []
     pct_pool = [(v, n) for v, n, unit in tagged_pool if unit == "pct"]
     plain_pool = [(v, n) for v, n, unit in tagged_pool if unit != "pct"]
+    unit_pools: dict[str, list[tuple[float, str]]] = {}
+    for v, n, unit in tagged_pool:
+        if unit in _PROSE_UNITS.values():
+            unit_pools.setdefault(unit, []).append((v, n))
     flags: list[GroundingFlag] = []
     for i, tk in enumerate(brief.takeaways):
         text = f"{tk.headline} {tk.summary} {tk.details}"
@@ -395,7 +441,11 @@ def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
             x = _parse(tok)
             if x is None:  # pragma: no cover - defensive; _NUM_RE only matches parseable tokens
                 continue
-            pool = pct_pool if _is_percent_token(tok) else plain_pool
+            if _is_percent_token(tok):
+                pool = pct_pool
+            else:
+                unit = _prose_unit_after(text, m.end())
+                pool = plain_pool if unit is None else unit_pools.get(unit, [])
             if not pool:
                 continue  # no same-kind numbers to contradict
             ax = abs(x)
@@ -403,7 +453,7 @@ def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
             aval = abs(near_val)
             denom = max(ax, aval, 1.0)
             rel = abs(ax - aval) / denom
-            if rel <= _SIGN_MISMATCH_REL and ((x > 0 > near_val) or (x < 0 < near_val)):
+            if rel <= _SIGN_MISMATCH_REL and x > 0 > near_val:
                 # Close enough (within the WIDER sign band) to be "the same
                 # metric, wrong sign" — flagged regardless of whether rel
                 # also clears the tighter NEARBY_REL check below.

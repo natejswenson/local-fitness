@@ -335,3 +335,83 @@ def test_anomalies_off_value_is_flagged():
     flags = g.flag(_brief("RHR spiked to 65 this morning"), ctx)
     assert len(flags) == 1
     assert flags[0].nearest_metric == "anomalies.rhr"
+
+
+# --------------------------------------------------------------------------- #
+# Issue #217 (2026-08-10): the live morning brief measured invention_rate
+# 1.000 — 7 flags, every one a false positive. Three mechanisms, fixed
+# together: (1) "45 steps" matched rhr=50 because a prose unit word didn't
+# bind its token to a unit; (2) "3-4mi" tokenizes as -4 (range dash) and
+# sign-flagged against distance 4.2; (3) a table's "-1.2%" delta
+# sign-flagged against a positive frac_of_goal. The sign check now fires
+# only for prose-positive vs pool-negative (the measured true case).
+# --------------------------------------------------------------------------- #
+def test_issue_217_the_live_brief_carries_no_false_positives():
+    ctx = _ctx(
+        snapshot=[
+            GroundedValue(name="rhr", value=50, unit="bpm", display="50 bpm"),
+            GroundedValue(name="rhr_baseline", value=51, unit="bpm", display="51 bpm"),
+            GroundedValue(name="steps", value=10045, unit="steps", display="10,045"),
+            GroundedValue(name="frac_of_goal", value=1.0, unit="pct", display="100.4%"),
+        ],
+        training_load=[],
+        workouts_14d=[{"distance_mi": 4.2, "avg_hr": 132}],
+    )
+    b = _brief(
+        "Yesterday cleared 10,000 by 45 steps. Walk 3-4mi today.",
+        "| RHR | 50 bpm | 51 bpm | -1.2% | ↓ |",
+    )
+    assert g.flag(b, ctx) == []
+    assert g.invention_rate(b, ctx) == 0.0
+
+
+def test_a_unit_word_binds_its_token_and_a_bare_token_still_flags():
+    ctx = _ctx(snapshot=[
+        GroundedValue(name="rhr", value=50, unit="bpm", display="50 bpm"),
+        GroundedValue(name="steps", value=10045, unit="steps", display="10,045"),
+    ], training_load=[])
+    # "45 steps" is a steps quantity: it may only match steps-unit entries,
+    # where 45 is nowhere near 10,045 -> ignored, not an rhr mis-state.
+    assert g.flag(_brief("won by 45 steps"), ctx) == []
+    # The same magnitude WITHOUT a unit word keeps the old sensitivity: a
+    # bare 45 within the nearby band of rhr=50 is still a value flag.
+    flags = g.flag(_brief("sitting at 45 this morning"), ctx)
+    assert [f.kind for f in flags] == ["value"]
+    assert flags[0].nearest_metric == "rhr"
+
+
+def test_a_unit_bound_token_with_no_same_unit_pool_entry_is_skipped():
+    # "13 mi" when the pool has no mi entries must NOT fall back to the
+    # shared bucket (load=13.5 sits inside the nearby band) — the fallback
+    # is the misbind.
+    ctx = _ctx(snapshot=[
+        GroundedValue(name="load", value=13.5, unit="none", display="13.5"),
+    ], training_load=[])
+    assert g.flag(_brief("ran 13 mi this week"), ctx) == []
+
+
+def test_a_range_dash_negative_is_not_a_sign_inversion():
+    ctx = _ctx(snapshot=[
+        GroundedValue(name="distance", value=4.2, unit="mi", display="4.2 mi"),
+    ], training_load=[])
+    # "3-4mi" tokenizes as 3 then -4; -4 abs-matches 4.2 inside the sign
+    # band but distance can't be negative — no inversion, no flag.
+    assert g.flag(_brief("prescribed a 3-4mi walk"), ctx) == []
+
+
+def test_a_negative_delta_is_not_a_sign_inversion_of_a_positive_pct():
+    ctx = _ctx(snapshot=[
+        GroundedValue(name="frac_of_goal", value=2.0, unit="pct", display="200%"),
+    ], training_load=[])
+    # Old behavior: -1.2 vs 2.0 -> rel 0.4, opposite signs -> kind="sign".
+    # A negative prose percent near an always-positive pct is a computed
+    # delta, not an inversion.
+    assert g.flag(_brief("down -1.2% on the day"), ctx) == []
+
+
+def test_prose_positive_vs_pool_negative_still_flags_sign_inversion():
+    # The measured TRUE case the sign check exists for is untouched: a
+    # negative pool metric (TSB -22) cited positive.
+    flags = g.flag(_brief("TSB is +22, you're rested"), _ctx())
+    assert [f.kind for f in flags] == ["sign"]
+    assert flags[0].nearest_metric == "tsb"

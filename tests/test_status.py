@@ -601,3 +601,70 @@ def test_non_partial_metrics_unaffected_rhr_and_sleep(tmp_path, monkeypatch):
     assert "partial_today_excluded" not in rhr_row
     assert sleep_row["value"] == 27000
     assert "partial_today_excluded" not in sleep_row
+
+
+# --------------------------------------------------------------------------- #
+# 0.59.0: the settling guard is OPT-IN (settling_guard=True) — the brief
+# pipeline pulls immediately before reading, so its snapshot is fresh by
+# construction and must stay byte-identical (its output feeds the eval'd
+# grounding pool). Only the daily_snapshot MCP tool opts in.
+# --------------------------------------------------------------------------- #
+def _stamp_status_pull(p, completed_at: str, last_date_fetched: str):
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO ingest_runs (started_at, completed_at, status, "
+            "last_date_fetched, source) VALUES (?, ?, 'success', ?, 'daily')",
+            (completed_at, completed_at, last_date_fetched),
+        )
+
+
+def test_settling_guard_defaults_off_so_the_brief_pipeline_is_unchanged(
+    seeded_status_db,
+):
+    # No ingest_runs rows at all — maximally stale — and the UNGUARDED call
+    # still reports today's rhr (55) with a computed delta and no provisional
+    # keys anywhere. This is the brief-pipeline / eval-fixture contract.
+    status = assemble_status()
+    rhr_row = next(r for r in status["metrics"] if r["metric"] == "rhr")
+    assert rhr_row["value"] == 55
+    assert rhr_row["delta_pct"] == 10.0  # (55 - 50) / 50
+    assert "provisional_today_excluded" not in rhr_row
+    assert "provisional_today" not in rhr_row
+    assert "data_as_of" not in status
+
+
+def test_settling_guard_stale_anchors_rhr_to_yesterday(seeded_status_db):
+    # seeded_status_db has no yesterday daily_metrics row, so the guarded
+    # stale read reports value=None (nothing settled to report) — never
+    # today's unsettled 55 — with the raw snapshot kept, labeled.
+    status = assemble_status(settling_guard=True)
+    rhr_row = next(r for r in status["metrics"] if r["metric"] == "rhr")
+    assert rhr_row["provisional_today_excluded"] is True
+    assert rhr_row["provisional_today_value"] == 55
+    assert rhr_row["value"] is None
+    assert rhr_row["delta_pct"] is None
+    assert "data_as_of" not in status
+
+
+def test_settling_guard_fresh_keeps_today_labeled(seeded_status_db):
+    from datetime import datetime
+
+    now = datetime.now().isoformat()
+    _stamp_status_pull(seeded_status_db, now, date.today().isoformat())
+    status = assemble_status(settling_guard=True)
+    rhr_row = next(r for r in status["metrics"] if r["metric"] == "rhr")
+    assert rhr_row["value"] == 55
+    assert rhr_row["delta_pct"] == 10.0
+    assert rhr_row["provisional_today"] is True
+    assert "provisional_today_excluded" not in rhr_row
+    assert status["data_as_of"] == now
+
+
+def test_settling_guard_leaves_partial_tallies_alone(seeded_status_db):
+    # steps is a PARTIAL_DAY tally — its treatment (yesterday anchor,
+    # partial_today_excluded) predates the guard and must not change under it.
+    status = assemble_status(settling_guard=True)
+    steps_row = next(r for r in status["metrics"] if r["metric"] == "steps")
+    assert steps_row["partial_today_excluded"] is True
+    assert "provisional_today_excluded" not in steps_row
+    assert "provisional_today" not in steps_row

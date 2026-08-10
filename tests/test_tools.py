@@ -19,7 +19,7 @@ import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -168,7 +168,10 @@ def test_trend_without_include_values_has_no_series(seeded):
 
 def test_trend_values_cap_and_truncation_flag(seeded):
     # seeded has 40 daily rhr rows; a wide window with a tiny cap must keep
-    # the MOST RECENT rows and say it cut the rest.
+    # the MOST RECENT rows and say it cut the rest. rhr settles (0.59.0), so
+    # a fresh covering pull is stamped to keep today's row in the series.
+    _stamp_pull(seeded, completed_at=datetime.now().isoformat(),
+                last_date_fetched=date.today().isoformat())
     real_cap = tools._TREND_MAX_VALUES
     try:
         tools._TREND_MAX_VALUES = 5
@@ -780,7 +783,10 @@ def test_get_metric_trend_vs_baseline_strict_boundary_for_rhr(seeded):
     # seeded's rhr baseline is mean=52.0, sd=2.0 constant; today's (most
     # recent) rhr is 50 -> current_vs_baseline_sd == (50-52)/2 == -1.0
     # exactly — the strict-band boundary (baseline_position's exactly -1.0
-    # is "normal", not "suppressed").
+    # is "normal", not "suppressed"). Fresh covering pull stamped so today's
+    # settling rhr counts (0.59.0).
+    _stamp_pull(seeded, completed_at=datetime.now().isoformat(),
+                last_date_fetched=date.today().isoformat())
     payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
     assert not err
     assert payload["current_vs_baseline_sd"] == -1.0
@@ -919,20 +925,22 @@ def test_find_anomalies_sleep_formats_and_rounds(seeded):
     # voice speaks, and the raw AVG()/SD baseline floats must be rounded at the
     # payload boundary (pre-fix they passed through as ~10-digit floats and the
     # value stayed raw seconds).
-    today = date.today()
+    # On yesterday, not today — today is always excluded from the scan
+    # (0.59.0: sleep settles through the morning).
+    target = (date.today() - timedelta(days=1)).isoformat()
     with db.connect(seeded) as conn:
         # A clear low-sleep anomaly against a fabricated non-round baseline.
         conn.execute("UPDATE daily_metrics SET sleep_seconds=? WHERE date=?",
-                     (18000, today.isoformat()))
+                     (18000, target))
         conn.execute(
             "UPDATE baselines SET sleep_seconds_60day_mean=?, sleep_seconds_60day_sd=? "
             "WHERE date=?",
-            (26784.333333333, 3600.6666666, today.isoformat()),
+            (26784.333333333, 3600.6666666, target),
         )
     payload, err = call(tools.find_anomalies, {"metric": "sleep_seconds", "sd_threshold": 1.0})
     assert not err
     assert payload["anomalies"]
-    row = next(r for r in payload["anomalies"] if r["date"] == today.isoformat())
+    row = next(r for r in payload["anomalies"] if r["date"] == target)
     assert row["value_formatted"] == units.format_hm(18000)      # "5h 00m"
     assert row["baseline_formatted"] == units.format_hm(26784.333333333)
     assert row["baseline_mean"] == 26784.33                       # rounded 2dp
@@ -4986,6 +4994,8 @@ def test_report_card_pdf_failure_returns_stable_reason_and_logs(rc_seeded, repor
 def test_trend_include_values_still_attaches_vs_baseline(seeded):
     """The baseline block the former get_metric attached (0.37.0) survives the
     fold-in: same numbers whether or not the raw series is requested."""
+    _stamp_pull(seeded, completed_at=datetime.now().isoformat(),
+                last_date_fetched=date.today().isoformat())
     payload, err = call(tools.get_metric_trend,
                         {"metric": "rhr", "days": 14, "include_values": True})
     assert not err
@@ -5294,3 +5304,128 @@ def test_plan_progress_rows_omit_nulls_and_raw_twins(seeded, monkeypatch):
     assert "actual_distance_m" not in rest
     for w in payload["workouts"]:
         assert all(v is not None for v in w.values()), w
+
+
+# --------------------------------------------------------------------------- #
+# 0.59.0: SETTLING_METRICS — values Garmin REVISES through the day (rhr and
+# sleep settle once the night is fully processed; body battery min/max move
+# until the day ends). Measured live 2026-08-10: a 06:30 mid-sleep pull stored
+# rhr 54, served at 10:04 as "elevated, +1.93 SD"; the 10:09 post-wake pull
+# revised it to 50. The contract: a settled verdict is never derived from an
+# unsettled number — stale ⇒ today drops out of every stat (raw reading kept,
+# labeled), fresh (a pull covering today within the sync window) ⇒ counted
+# but labeled provisional. Freshness is coverage-filtered: only a successful
+# run whose last_date_fetched reached today counts.
+# --------------------------------------------------------------------------- #
+def _stamp_pull(p, *, completed_at: str, last_date_fetched: str, status: str = "success"):
+    with db.connect(p) as conn:
+        conn.execute(
+            "INSERT INTO ingest_runs (started_at, completed_at, status, "
+            "last_date_fetched, source) VALUES (?, ?, ?, ?, 'daily')",
+            (completed_at, completed_at, status, last_date_fetched),
+        )
+
+
+def test_stale_settling_metric_never_drives_the_verdict(seeded):
+    # seeded has NO ingest_runs rows -> today's rhr (50) is an unattributable
+    # snapshot -> stale. current/mean/slope/vs_baseline anchor on yesterday
+    # (51); today's raw reading stays visible, labeled.
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "rhr", "days": 14, "include_values": True})
+    assert not err
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    assert payload["provisional_today_excluded"] is True
+    assert payload["provisional_today_value"] == 50  # today's snapshot, i=0
+    assert payload["current"] == 51                  # yesterday, i=1: 50 + 1
+    assert payload["values"][-1]["date"] == yesterday
+    # The verdict is computed on the settled series: (51 - 52) / 2.0.
+    assert payload["current_vs_baseline_sd"] == -0.5
+    assert "sync_garmin_data" in payload["note"]
+    assert "data_as_of" not in payload  # no pull covering today exists at all
+
+
+def test_fresh_settling_metric_keeps_today_labeled_provisional(seeded):
+    _stamp_pull(seeded, completed_at=datetime.now().isoformat(),
+                last_date_fetched=date.today().isoformat())
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["current"] == 50  # today's value counts when fresh
+    assert payload["current_provisional"] is True
+    assert payload["data_as_of"]  # stamped by the covering pull
+    assert "provisional_today_excluded" not in payload
+    assert "note" not in payload
+
+
+def test_a_recent_backfill_does_not_count_as_covering_today(seeded):
+    # A pull that completed seconds ago but only reached 30 days back never
+    # touched today's row — counting it would stamp a stale snapshot "fresh",
+    # the exact direction of lie data_as_of_today exists to prevent.
+    _stamp_pull(seeded, completed_at=datetime.now().isoformat(),
+                last_date_fetched=(date.today() - timedelta(days=30)).isoformat())
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["provisional_today_excluded"] is True
+    assert payload["current"] == 51
+    assert "data_as_of" not in payload
+
+
+def test_an_hours_old_pull_covering_today_is_stale_but_stamped(seeded):
+    three_hours_ago = (datetime.now() - timedelta(hours=3)).isoformat()
+    _stamp_pull(seeded, completed_at=three_hours_ago,
+                last_date_fetched=date.today().isoformat())
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["provisional_today_excluded"] is True
+    assert payload["data_as_of"] == three_hours_ago  # stamped, still stale
+    assert payload["current"] == 51
+
+
+def test_failed_pull_never_counts_as_fresh(seeded):
+    _stamp_pull(seeded, completed_at=datetime.now().isoformat(),
+                last_date_fetched=date.today().isoformat(), status="failure")
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["provisional_today_excluded"] is True
+    assert "data_as_of" not in payload
+
+
+def test_settling_guard_only_fires_when_today_has_a_row(seeded):
+    # Delete today's rhr: the newest row is yesterday's, already settled —
+    # no flags, no exclusion, regardless of ingest_runs state.
+    with db.connect(seeded) as conn:
+        conn.execute("UPDATE daily_metrics SET rhr = NULL WHERE date = ?",
+                     (date.today().isoformat(),))
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
+    assert not err
+    assert payload["current"] == 51
+    assert "provisional_today_excluded" not in payload
+    assert "current_provisional" not in payload
+
+
+def test_find_anomalies_never_scans_today(seeded):
+    # Today at rhr 80 is 14 SD out — and still must not scan as an anomaly,
+    # because rhr settles through the morning (the live incident: a mid-sleep
+    # 54, revised to 50 post-wake, would have scanned as a +2 SD spike). The
+    # same 80 on a COMPLETE day is exactly what the tool exists to find.
+    past = (date.today() - timedelta(days=10)).isoformat()
+    with db.connect(seeded) as conn:
+        conn.execute("UPDATE daily_metrics SET rhr = 80 WHERE date = ?",
+                     (date.today().isoformat(),))
+        conn.execute("UPDATE daily_metrics SET rhr = 80 WHERE date = ?", (past,))
+    payload, err = call(tools.find_anomalies, {"metric": "rhr"})
+    assert not err
+    dates = [a["date"] for a in payload["anomalies"]]
+    assert past in dates
+    assert date.today().isoformat() not in dates
+
+
+def test_daily_snapshot_tool_opts_into_the_settling_guard(seeded):
+    # The MCP tool serves ad-hoc reads with no pull in front of them — the
+    # one snapshot surface where the guard must be on. No ingest_runs rows
+    # in seeded -> stale -> the rhr row anchors to yesterday, labeled.
+    payload, err = call(tools.daily_snapshot, {})
+    assert not err
+    rhr_row = next(r for r in payload["metrics"] if r["metric"] == "rhr")
+    assert rhr_row["provisional_today_excluded"] is True
+    assert rhr_row["provisional_today_value"] == 50
+    assert rhr_row["value"] == 51

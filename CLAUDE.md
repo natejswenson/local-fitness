@@ -380,14 +380,19 @@ These are settled — don't redesign without a reason.
   is the tested half (`tests/test_brief_planner.py`, `test_grounding.py`); the
   generator is the eval'd half (`tests/evals/` fixtures + `baseline.json` +
   `scripts/{capture_baseline,shadow_run}.py`). **The committed baseline is
-  version 2 (0.58.0): captured on the V2 composer** — version 1 described the
-  retired V1 monolith for six weeks after the cutover — **and it carries a
-  per-scenario `invention_rate` that `shadow_run.py` GATES on** (`rate <=
-  baseline + 0.15`; the 0.5 absolute budget applies only to scenarios the
-  baseline has no rate for — two fixtures MEASURE 0.83-0.88 baseline rate,
-  grounding's false positives concentrated, so a cap under the recorded
-  baseline would be permanently unpassable; a breach fails parity and the
-  exit code). The
+  version 2 (document schema; 0.58.0): captured on the V2 composer** —
+  version 1 described the retired V1 monolith for six weeks after the
+  cutover — **and it carries a per-scenario `invention_rate` that
+  `shadow_run.py` GATES on** (`rate <= baseline + 0.15`; the 0.5 absolute
+  budget applies only to scenarios the baseline has no rate for; a breach
+  fails parity and the exit code). Rates were RE-measured at 0.60.1 after
+  the #217 unit-binding fix removed the checker's false-positive classes:
+  the two worst fixtures fell 0.875→0.75 and 0.834→0.5 (max is now
+  fatigued_recovery at 0.75, sparse sits at 0.0). The residue is the
+  checker's designed tolerance — model-computed deltas aren't pool
+  numbers — so a rate near these floors is normal, not a regression; a
+  future drop toward zero needs a pool that carries derived deltas, not a
+  tighter cap. The
   advisory-vs-constant "Phase 4 backfill" is done; note the live-path
   `grounding.flag` above stays advisory — the gate is the shadow-run script,
   which is the manual pre-flight for any brief prompt/model change (like
@@ -498,6 +503,33 @@ These are settled — don't redesign without a reason.
   `slope_direction`, etc.) to their payloads instead of leaving the model to
   apply a static legend string by hand. The rule holds project-wide: the LLM
   phrases a judgment, it never derives one that tested Python can compute.
+- **A settled verdict is never derived from an unsettled number** (0.59.0).
+  `tools.SETTLING_METRICS` (rhr, all sleep_*, sleep_score, body_battery_max/
+  min) are values Garmin REVISES through the day — a third temporal class
+  beside point-in-time metrics and Fix 8's running tallies (a tally is
+  partial ALL day and always anchors yesterday; a settling metric settles
+  mid-morning and is then exactly what a recovery read wants, so it cannot
+  just join `PARTIAL_DAY_METRICS`). Measured live 2026-08-10: the 06:30 pull
+  ran mid-sleep and stored rhr 54; `get_metric_trend` served the 3.5h-old
+  snapshot as "elevated, +1.93 SD"; the post-wake pull revised it to 50.
+  Freshness = a successful pull COVERING today (`data_as_of_today`,
+  filtered on `last_date_fetched` — a recent backfill must never stamp a
+  stale snapshot "fresh") within the sync window, the same ~10-min bar as
+  `sync_garmin_data`'s short-circuit, so the remedy for stale is always one
+  sync call. Stale ⇒ today's row drops out of every derived stat
+  (current/mean/slope/vs_baseline in `get_metric_trend`; delta/arrow in
+  `daily_snapshot`) — the gate is deterministic exclusion, never a flag the
+  model might skip — with the raw reading kept, labeled
+  (`provisional_today_value`). Fresh ⇒ counted, labeled
+  `current_provisional`/`provisional_today`. `find_anomalies` never scans
+  today at all (an anomaly is a settled fact). The snapshot guard is
+  **opt-in** (`assemble_status(settling_guard=True)`, only the MCP tool
+  passes it) because the brief pipeline pulls immediately before reading —
+  fresh by construction — and guarding it would change the eval'd grounding
+  pool; the staleness read rides the existing connection (perf gate counts
+  `db.connect()` opens). vo2_max is deliberately excluded (moves only after
+  an activity sync, drifts slowly). When adding a metric, decide its class:
+  tally → `PARTIAL_DAY_METRICS`, revised-during-day → `SETTLING_METRICS`.
 - **The coach has a two-layer memory on every voice surface** (0.30.0). Layer 1
   is the deterministic relationship ledger (`agent/ledger.py`, pure +
   persistence divider like `plans.py`): adherence miss/done streaks (reusing
@@ -566,11 +598,15 @@ These are settled — don't redesign without a reason.
   only.
 - **Daily brief job needs a Claude credential in `.env`.** The launchd job
   (`com.localfitness.brief` → `fitness brief --if-missing`) couples pull →
-  recompute-baselines → generate → save atomically, firing at **06:30 with
+  recompute-baselines → generate → save atomically, firing at **08:30 with
   a 09:30 backstop slot** (same command both times; `--if-missing` makes
   any fire a no-op once today's brief exists, so the backstop only acts
-  when the 06:30 run failed — re-run `ops/install-launchd.sh` after
-  changing the template for it to take effect). Its *generate* step
+  when the 08:30 run failed — re-run `ops/install-launchd.sh` after
+  changing the template for it to take effect). 08:30, not earlier, is
+  load-bearing (0.59.0): the old 06:30 fire pulled MID-SLEEP, so the brief
+  shipped provisional recovery numbers Garmin later revised (measured
+  2026-08-10: rhr 54 at 06:30, settled 50 post-wake) — past typical wake,
+  rhr/sleep are settled-by-construction. Its *generate* step
   spawns a **headless** Claude via the Agent SDK, which authenticates from
   the process env only — `cli.py` `load_dotenv()`s `<repo>/.env`, so the
   token must live there as `CLAUDE_CODE_OAUTH_TOKEN` (Nate's Max token,
@@ -608,7 +644,7 @@ These are settled — don't redesign without a reason.
   recomputes baselines, **regenerates the brief — overwriting
   `briefings/<today>.json`** — and sends it as a PRESS-styled HTML email with
   the chart PNGs attached inline. The overwrite is deliberate: by 19:00 the
-  day's training is in the data and the 06:30 brief describes a day that hadn't
+  day's training is in the data and the morning brief describes a day that hadn't
   happened. It does **not** double-journal — `reflect` keys on
   `("brief", <date>)` behind a `journal.has_event` pre-check.
   **The Gmail MCP connector cannot do this job, and the reason generalises to
@@ -794,7 +830,7 @@ These are settled — don't redesign without a reason.
   overrides it. **First run must be interactive** (`uv run fitness pull` once) so
   the MFA prompt can seed the token; after that the launchd job resumes from it.
   The cached OAuth token eventually expires (no fixed TTL) — when it lapses the
-  non-interactive 06:30 job may hit a login/MFA and fail; the remedy is to
+  non-interactive morning job may hit a login/MFA and fail; the remedy is to
   re-seed with an interactive `uv run fitness pull`. `~/.garminconnect` is
   outside the repo; `Path.home()` resolves from `HOME`, so the launchd job and
   the seeding shell must share the same `HOME`. **Activity details are

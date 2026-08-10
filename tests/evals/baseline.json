@@ -1,35 +1,17 @@
 {
-  "captured_at": "2026-08-10T09:39:01",
+  "captured_at": "2026-08-10T12:52:20",
   "model": "claude-sonnet-4-6",
   "note": "Structural + grounding baseline of the V2 composer (the live default). shadow_run.py gates prompt/model changes against it: structural parity, plus per-scenario invention_rate within margin of the values recorded here.",
   "runs_per_scenario": 2,
   "scenarios": {
     "fatigued_recovery": {
       "consistency": {
-        "consistent": true,
-        "divergences": []
+        "consistent": false,
+        "divergences": [
+          "plan content present with NO active plan in: ['run#2']"
+        ]
       },
       "fingerprints": [
-        {
-          "has_steps": true,
-          "mentions_plan": false,
-          "metrics": [
-            "ctl",
-            "steps",
-            "tsb"
-          ],
-          "n_takeaways": 3,
-          "tones": [
-            [
-              "critical",
-              2
-            ],
-            [
-              "neutral",
-              1
-            ]
-          ]
-        },
         {
           "has_steps": true,
           "mentions_plan": false,
@@ -54,12 +36,37 @@
               1
             ]
           ]
+        },
+        {
+          "has_steps": true,
+          "mentions_plan": true,
+          "metrics": [
+            "ctl",
+            "rhr",
+            "steps",
+            "tsb"
+          ],
+          "n_takeaways": 4,
+          "tones": [
+            [
+              "caution",
+              1
+            ],
+            [
+              "critical",
+              2
+            ],
+            [
+              "neutral",
+              1
+            ]
+          ]
         }
       ],
       "flakes": [],
-      "invention_rate": 0.875,
+      "invention_rate": 0.75,
       "invention_rates": [
-        1.0,
+        0.75,
         0.75
       ],
       "plan_active": false,
@@ -115,10 +122,10 @@
         }
       ],
       "flakes": [],
-      "invention_rate": 0.167,
+      "invention_rate": 0.333,
       "invention_rates": [
         0.333,
-        0.0
+        0.333
       ],
       "plan_active": false,
       "runs": 2,
@@ -135,7 +142,7 @@
           "has_steps": true,
           "mentions_plan": false,
           "metrics": [
-            "ctl",
+            "body_battery_max",
             "steps",
             "tsb"
           ],
@@ -143,7 +150,15 @@
           "tones": [
             [
               "critical",
-              3
+              1
+            ],
+            [
+              "neutral",
+              1
+            ],
+            [
+              "positive",
+              1
             ]
           ]
         },
@@ -151,7 +166,7 @@
           "has_steps": true,
           "mentions_plan": false,
           "metrics": [
-            "ctl",
+            "body_battery_max",
             "steps",
             "tsb"
           ],
@@ -159,16 +174,20 @@
           "tones": [
             [
               "critical",
-              3
+              2
+            ],
+            [
+              "neutral",
+              1
             ]
           ]
         }
       ],
       "flakes": [],
-      "invention_rate": 0.333,
+      "invention_rate": 0.167,
       "invention_rates": [
         0.333,
-        0.333
+        0.0
       ],
       "plan_active": false,
       "runs": 2,
@@ -215,10 +234,10 @@
         }
       ],
       "flakes": [],
-      "invention_rate": 0.834,
+      "invention_rate": 0.5,
       "invention_rates": [
-        1.0,
-        0.667
+        0.667,
+        0.333
       ],
       "plan_active": false,
       "runs": 2,
@@ -242,12 +261,12 @@
           "n_takeaways": 3,
           "tones": [
             [
-              "critical",
-              2
+              "caution",
+              1
             ],
             [
-              "neutral",
-              1
+              "critical",
+              2
             ]
           ]
         },
@@ -255,8 +274,8 @@
           "has_steps": true,
           "mentions_plan": false,
           "metrics": [
+            "body_battery_max",
             "ctl",
-            "rhr",
             "steps"
           ],
           "n_takeaways": 3,
@@ -273,9 +292,9 @@
         }
       ],
       "flakes": [],
-      "invention_rate": 0.167,
+      "invention_rate": 0.0,
       "invention_rates": [
-        0.333,
+        0.0,
         0.0
       ],
       "plan_active": false,
@@ -297,11 +316,15 @@
             "steps",
             "tsb"
           ],
-          "n_takeaways": 3,
+          "n_takeaways": 4,
           "tones": [
             [
               "caution",
               2
+            ],
+            [
+              "neutral",
+              1
             ],
             [
               "positive",
@@ -317,10 +340,14 @@
             "steps",
             "tsb"
           ],
-          "n_takeaways": 3,
+          "n_takeaways": 4,
           "tones": [
             [
               "caution",
+              1
+            ],
+            [
+              "critical",
               2
             ],
             [
@@ -331,10 +358,10 @@
         }
       ],
       "flakes": [],
-      "invention_rate": 0.667,
+      "invention_rate": 0.625,
       "invention_rates": [
-        0.667,
-        0.667
+        0.5,
+        0.75
       ],
       "plan_active": true,
       "runs": 2,

@@ -10,7 +10,7 @@ On macOS, `launchd` runs three jobs a day:
 
 | Job | When | Command | What it does |
 | --- | --- | --- | --- |
-| `com.localfitness.brief` | 06:30, backstop 09:30 | `fitness brief --if-missing` | Generates and saves the day's brief |
+| `com.localfitness.brief` | 08:30, backstop 09:30 | `fitness brief --if-missing` | Generates and saves the day's brief |
 | `com.localfitness.briefmail` | 19:00, backstop 20:00 | `fitness brief-email --if-unsent` | Pulls fresh Garmin data, regenerates the brief against it, emails it |
 | `com.localfitness.plancal` | 19:05, backstop 20:05 | `fitness plan-calendar` | Reconciles Google Calendar against the remaining training plan |
 
@@ -45,14 +45,14 @@ so it needs neither `LOCAL_FITNESS_API_TOKEN` nor an allowed-host entry.
 baselines, regenerate the brief, send it.
 
 Regenerating **overwrites** `briefings/<today>.json`. That is intended — by
-19:00 the day's training is in the data and the 06:30 brief is describing a
+19:00 the day's training is in the data and the morning brief is describing a
 day that hadn't happened yet, so the evening version is the better record.
 The coach does not journal the day twice; `reflect` keys on
 `("brief", <date>)` and pre-checks `journal.has_event`.
 
 Dedupe differs from the morning job's, and the difference matters. `brief
 --if-missing` keys on the saved brief file, a test that is useless here
-because the 06:30 job already wrote one. `brief-email --if-unsent` keys on a
+because the morning job already wrote one. `brief-email --if-unsent` keys on a
 per-date **sent marker** (`briefings/.emailed-<date>`) written only after a
 confirmed send — so the 20:00 backstop re-sends exactly when 19:00 failed, and
 never when it succeeded.

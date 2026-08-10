@@ -122,7 +122,7 @@ headless agent (in-process MCP, no HTTP transport) and persists it through
 jobs:
 
 - **macOS (host CLI):** `./ops/install-launchd.sh` installs a launchd agent
-  that runs `fitness brief` daily at 06:30 (catch-up at next wake if the Mac
+  that runs `fitness brief` daily at 08:30 (catch-up at next wake if the Mac
   was asleep). See `ops/README.md`.
 - **Linux / container host:** add a cron entry or systemd timer for
   `uv run fitness brief` in the repo directory.
@@ -155,7 +155,7 @@ Those aren't rounding differences — they are opposite coaching calls, and
 the UTC column is the exact false-recovery reading 0.39.0 was written to
 eliminate.
 
-Two reasons this is easy to miss. First, a 06:30 brief is unaffected for
+Two reasons this is easy to miss. First, a morning brief is unaffected for
 any zone west of UTC that still shares the calendar date at that hour, so
 the flagship surface looks correct while evening chat, report cards and
 PDF renders drift. Second, nothing errors — you get a confident answer

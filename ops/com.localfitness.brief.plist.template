@@ -36,19 +36,23 @@
     <key>WorkingDirectory</key>
     <string>__REPO_ROOT__</string>
 
-    <!-- Daily at 06:30 local, with a 09:30 backstop fire (2026-07-19 facet
-         review: the 06:30 run failed ~half the mornings on transient SDK
-         stream deaths — in-process retry helps, but a second launchd slot
-         catches the runs where all attempts failed). Both fires run the
-         same `brief --if-missing` command: if 06:30 saved today's brief,
-         09:30 is a no-op; if not, it's a full retry. If the Mac is asleep
-         at a fire time, launchd runs the missed job once at the next wake —
-         a wake-coalesced pileup is also de-duplicated by --if-missing. -->
+    <!-- Daily at 08:30 local (0.59.0 — moved from 06:30: that fire ran
+         MID-SLEEP, so the pull stored provisional recovery numbers Garmin
+         later revised — measured 2026-08-10, rhr 54 at 06:30 vs 50 settled —
+         and the brief shipped them; 08:30 is past typical wake, so rhr and
+         sleep are settled-by-construction), with a 09:30 backstop fire
+         (2026-07-19 facet review: transient SDK stream deaths — in-process
+         retry helps, but a second launchd slot catches the runs where all
+         attempts failed). Both fires run the same `brief --if-missing`
+         command: if 08:30 saved today's brief, 09:30 is a no-op; if not,
+         it's a full retry. If the Mac is asleep at a fire time, launchd runs
+         the missed job once at the next wake — a wake-coalesced pileup is
+         also de-duplicated by --if-missing. -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
             <key>Hour</key>
-            <integer>6</integer>
+            <integer>8</integer>
             <key>Minute</key>
             <integer>30</integer>
         </dict>
