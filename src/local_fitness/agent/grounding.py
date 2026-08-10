@@ -46,6 +46,37 @@ _NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?\s*[kK%]?")
 # magnitudes and produce false positives.)
 _WINDOW_AFTER = re.compile(r"[\s-]*(?:day|week|month|year)s?\b", re.IGNORECASE)
 
+# The generator's own markdown routinely renders negatives with the
+# typographic MINUS SIGN (U+2212 — "−7.5", "−1.2%"), which the ASCII-only
+# _NUM_RE reads as a bare positive 7.5 — sign-flagged against tsb=-7.5 in the
+# 2026-08-10 second live audit. One-char, offset-safe replacement (both are
+# length-1, so every m.start()/m.end() lookaround stays valid) applied at the
+# top of both tokenizing entry points. The EN DASH (U+2013) is deliberately
+# NOT mapped: it is a range mark, not a minus.
+_MINUS_SIGN = "−"
+
+
+def _normalize(text: str) -> str:
+    return text.replace(_MINUS_SIGN, "-")
+
+
+# A number directly PRECEDED by a month name is a calendar date ("the Aug 7
+# long run", "race Sept 18"), never a metric claim — the mirror of
+# _WINDOW_AFTER's rule for windows. Measured 2026-08-10 (second live audit):
+# "Aug 7" sign-flagged against tsb=-7.5 three times across two generations
+# and "Sept 18" value-flagged against a workout's training load. Abbreviated
+# ("Aug", "Sept."), and full ("August") forms all match; the 12-char
+# lookback window comfortably covers "September " plus a word boundary.
+_MONTH_BEFORE = re.compile(
+    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+$",
+    re.IGNORECASE,
+)
+
+
+def _after_month_name(text: str, start: int) -> bool:
+    return bool(_MONTH_BEFORE.search(text, max(0, start - 12), start))
+
+
 # A written duration like "7h 30m" (this is literally `_hm()`'s own render
 # for sleep_seconds — see brief_planner.py — so real coach prose says this
 # constantly) is a composite of TWO numbers glued to their unit letters;
@@ -336,15 +367,21 @@ def parse_number(token: str) -> float | None:
 def numeric_tokens(text: str) -> list[str]:
     """Numeric tokens in ``text``, in order, skipping any token immediately
     followed by a time-window word ("14 days", "7-day", "two-week") — those
-    are windows, not metric citations (see ``_WINDOW_AFTER``) — and any token
-    that's half of an "Nh Mm" duration composite (see ``_HOUR_MIN_DURATION``).
-    Public re-export of ``flag()``'s tokenizing step so other callers scan
-    prose identically."""
+    are windows, not metric citations (see ``_WINDOW_AFTER``) — any token
+    that's half of an "Nh Mm" duration composite (see ``_HOUR_MIN_DURATION``),
+    and any token directly preceded by a month name ("Aug 7" — a date, see
+    ``_MONTH_BEFORE``). Text is normalized first (U+2212 → "-") so a
+    typographic "−7.5" tokenizes as the negative it renders as. Public
+    re-export of ``flag()``'s tokenizing step so other callers scan prose
+    identically."""
+    text = _normalize(text)
     tokens: list[str] = []
     for m in _NUM_RE.finditer(text):
         if _WINDOW_AFTER.match(text, m.end()):
             continue
         if _in_duration_fragment(text, m.start(), m.end()):
+            continue
+        if _after_month_name(text, m.start()):
             continue
         tokens.append(m.group())
     return tokens
@@ -431,12 +468,14 @@ def flag(brief: Brief, context: BriefContext) -> list[GroundingFlag]:
             unit_pools.setdefault(unit, []).append((v, n))
     flags: list[GroundingFlag] = []
     for i, tk in enumerate(brief.takeaways):
-        text = f"{tk.headline} {tk.summary} {tk.details}"
+        text = _normalize(f"{tk.headline} {tk.summary} {tk.details}")
         for m in _NUM_RE.finditer(text):
             if _WINDOW_AFTER.match(text, m.end()):
                 continue  # a time window ("14 days"), not a metric claim
             if _in_duration_fragment(text, m.start(), m.end()):
                 continue  # half of "7h 30m" — a composite, not a scalar citation
+            if _after_month_name(text, m.start()):
+                continue  # a calendar date ("Aug 7"), not a metric claim
             tok = m.group()
             x = _parse(tok)
             if x is None:  # pragma: no cover - defensive; _NUM_RE only matches parseable tokens
