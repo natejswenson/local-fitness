@@ -49,6 +49,17 @@ three baseline fields appear only for the metrics that have a baseline column.
 | `values` | Only with `include_values=true`: `{date, value}` oldest-first (within the 120-row cap); `*_seconds` rows add `value_formatted`. Nulls are dropped, same as the stats. |
 | `values_truncated` | `true` only when the window held more than 120 rows — the cap keeps the most recent. |
 | `partial_today_excluded` | `true` only for running-tally metrics (`steps`, `avg_stress`, `max_stress`, `active_calories`, intensity minutes, `body_battery_charged`/`drained`), whose window anchors on **yesterday** — today's tally is partial all day, and a slope fit against it would manufacture a false dip. Absent for point-in-time metrics. |
+| `data_as_of` | Settling metrics only (0.59.0): `completed_at` of the newest successful pull that covered today. Omitted when no pull has covered today. |
+| `current_provisional` | `true` when a settling metric's today-value is counted because a covering pull is **fresh** (within the ~10-min sync window) — as current as it gets, but Garmin can still revise it until the day settles. |
+| `provisional_today_excluded` + `provisional_today_value` + `note` | The **stale** settling branch: today's snapshot is old enough that Garmin may have revised it since, so it is excluded from `current`/`mean`/`slope`/`vs_baseline` (which then describe the settled series ending yesterday). The raw snapshot stays visible in `provisional_today_value`; the `note` says to call `sync_garmin_data` first. |
+
+**Settling metrics** (`rhr`, all `sleep_*`, `sleep_score`, `body_battery_max`/
+`min`) are values Garmin *revises* through the day rather than accumulates —
+rhr and sleep settle once the night is fully processed (measured 2026-08-10: a
+06:30 mid-sleep pull stored rhr 54, revised to 50 post-wake; the stale 54 was
+served as "elevated, +1.93 SD"). The contract: **a settled verdict is never
+derived from an unsettled number.** When you get the stale branch, call
+[`sync_garmin_data`](sync_garmin_data.md) and re-read.
 
 `flat` means the fitted *total* change across the window stays inside half a
 sample SD (`interpret.TREND_FLAT_SD_MULTIPLIER`), so a noisy series doesn't get

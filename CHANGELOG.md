@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-08-10
+
+### Fixed
+- **A settled verdict is never derived from an unsettled number.** Garmin
+  REVISES some today-values through the day rather than accumulating them —
+  rhr and sleep settle once the night is fully processed, body battery's
+  min/max move until the day ends. Measured live 2026-08-10: the 06:30
+  launchd pull ran mid-sleep and stored rhr 54; `get_metric_trend` served
+  that 3.5-hour-old snapshot at 10:04 as "elevated, +1.93 SD"; the 10:09
+  post-wake pull revised it to 50 and the brief (which pulls first) reported
+  50 — two contradictory "today" readings in one morning, no signal on
+  either. New `SETTLING_METRICS` contract, distinct from Fix 8's
+  running-tally anchor (a tally is partial ALL day; these settle mid-morning
+  and are then exactly what a recovery read wants):
+  - `get_metric_trend`: today's settling row counts only when a successful
+    pull COVERING today (`data_as_of_today`, coverage-filtered on
+    `last_date_fetched` so a recent backfill can't stamp a stale snapshot
+    "fresh") completed within the sync window (~10 min, the same bar as
+    `sync_garmin_data`'s short-circuit). Fresh → counted, labeled
+    `current_provisional` + `data_as_of`. Stale → excluded from
+    current/mean/slope/vs_baseline (the verdict is computed on the settled
+    series instead — deterministic, not a flag the model might skip), raw
+    snapshot kept in `provisional_today_value`, `note` says to sync first.
+  - `daily_snapshot`: same treatment via an opt-in `settling_guard` on
+    `assemble_status` (default OFF so the brief pipeline — which pulls
+    immediately before reading — and the planner fixtures stay
+    byte-identical; only the MCP tool, which serves ad-hoc reads with no
+    pull in front, opts in). Staleness rides the existing connection: the
+    tool is on the perf gate's `db.connect()` open-count.
+  - `find_anomalies`: today never scans — an anomaly is a settled fact, and
+    both supported metrics (rhr, sleep_seconds) are settling.
+- **The morning brief no longer races Nate's wake.** The 06:30 launchd fire
+  pulled mid-sleep, so the flagship surface shipped provisional recovery
+  numbers (today's 06:30 brief carried rhr 54 and a partial night; the
+  10:09 regeneration silently corrected it). Moved to 08:30 — past typical
+  wake, so rhr/sleep are settled-by-construction — keeping the 09:30
+  backstop. Re-run `ops/install-launchd.sh` to apply.
+
 ## [0.58.0] - 2026-08-10
 
 ### Changed

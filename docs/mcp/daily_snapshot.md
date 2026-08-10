@@ -53,6 +53,18 @@ Each `metrics` row carries a `treatment` naming how to read it:
   2 present readings. No `baseline` (`max_stress` has no baseline column at all).
 - `raw` — everything else. `metric` and `value` only.
 
+**Settling metrics** (0.59.0 — `rhr`, all `sleep_*`, `sleep_score`,
+`body_battery_max`/`min`: values Garmin revises through the day) are guarded
+on this tool, which serves ad-hoc reads with no pull in front of them. When no
+successful pull covering today is fresh (~10 min), a settling row's
+comparisons anchor on **yesterday** and the row carries
+`provisional_today_excluded: true` plus the raw snapshot in
+`provisional_today_value`; when fresh, today's value is used and labeled
+`provisional_today: true`, and the payload carries a top-level `data_as_of`.
+Call [`sync_garmin_data`](sync_garmin_data.md) first for a settled same-day
+read. (The brief pipeline reads `assemble_status()` unguarded — it pulls
+immediately beforehand, so it is fresh by construction.)
+
 `training_load.interpretation` is `interpret.tsb_zone` — the same TSB bands
 [`training_load_status`](training_load_status.md) reports, so the two agree by
 construction: `very fatigued` (< -20), `fatigued` (< -10), `fresh` (> +5),
