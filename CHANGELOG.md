@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.60.0] - 2026-08-10
+
+### Fixed
+- **Grounding no longer misattributes number claims across units** (#217).
+  The 2026-08-10 live brief measured `invention_rate=1.000` — 7 flags, every
+  one a false positive, which both buries any real invention in noise and
+  means the recorded eval baselines partially encode parser artifacts. Three
+  mechanisms, three fixes in `grounding.flag`:
+  - **A prose unit word binds its token** (`_prose_unit_after`): "45 steps"
+    matches only steps-unit pool entries — it was matching rhr=50 at rel
+    0.10 and flagging twice. A unit-bound token with no same-unit pool entry
+    is skipped outright ("no same-unit number to contradict", the contract
+    the percent partition already had) — never falling back to the shared
+    bucket, because the fallback IS the misbind. Only unambiguous words map
+    (bpm / mi / mile(s) / step(s)); "min" stays unmapped on purpose. Bare
+    tokens keep full sensitivity — the schema's `GroundedUnit` tags were
+    already on every pool entry (0.55-era foundation), prose just never
+    used them.
+  - **The sign check is now asymmetric** — fires only for prose-positive vs
+    pool-NEGATIVE (the measured true case: TSB +22.4 cited when the truth
+    is -22.4). A negative prose token near an always-positive metric is a
+    range dash ("3-4mi" tokenizes as -4, sign-flagged against distance 4.2)
+    or a computed table delta ("-1.2%" against frac_of_goal), not an
+    inversion.
+  - The live brief is frozen as a regression fixture
+    (`test_issue_217_the_live_brief_carries_no_false_positives`).
+  Follow-up (deferred, costs generations): recapture `tests/evals/
+  baseline.json` per-scenario invention rates — they can only drop, so the
+  shadow-run gate stays passable in the meantime; the two fixtures recorded
+  at 0.83-0.88 should land near zero.
+
 ## [0.59.0] - 2026-08-10
 
 ### Fixed
