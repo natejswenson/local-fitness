@@ -3500,20 +3500,6 @@ _PLAN_RAW_DISPLAY_PAIRS = (
 )
 
 
-def _compact_plan_workout(w: dict) -> dict:
-    """The compact plan-workout row: drop raw-when-twinned, omit None values.
-
-    Only ``get_training_plan_progress`` takes this — the status/draft
-    surfaces are slim already, and the write-echo payloads deliberately show
-    the raw columns they just wrote.
-    """
-    if units.display_units() == "miles":
-        for raw, display in _PLAN_RAW_DISPLAY_PAIRS:
-            if display in w:
-                w.pop(raw, None)
-    return {k: v for k, v in w.items() if v is not None}
-
-
 @tool(
     "get_training_plan_status",
     "Status of the ACTIVE training plan: goal, days to race, the most recent "
@@ -3632,42 +3618,51 @@ async def get_training_plan_progress(args: dict) -> dict:
 
     # Deliberate projection: keep the fields an agent needs to answer a
     # plan-progress question; drop identifiers / internal rollups (plan_id,
-    # status, ability_snapshot, weekly_mileage, …) that build_plan_detail spreads.
-    workouts_full = [
-        {
-            "date": w.get("date"),
-            "seq": w.get("seq", 1),
-            "week_index": w.get("week_index"),
-            "type": w.get("type"),
-            "target_distance_m": w.get("target_distance_m"),
-            "target_pace_sec_per_km": w.get("target_pace_sec_per_km"),
-            "target_duration_sec": w.get("target_duration_sec"),
-            "target_hr_max": w.get("target_hr_max"),
-            "description": w.get("description"),
-            "verdict": w.get("verdict"),
-            "actual_distance_m": w.get("actual_distance_m"),
-            "actual_pace_sec_per_km": w.get("actual_pace_sec_per_km"),
-            "actual_activity_types": w.get("actual_activity_types"),
+    # status, ability_snapshot, weekly_mileage, …) that build_plan_detail
+    # spreads. Compaction (0.56.0): this tool measured as 24% of ALL chars
+    # returned across recorded sessions (median ~11 KB/call) — the single
+    # worst context hog on the surface. Two pure cuts, applied before
+    # windowing so full=true gets them too: (1) None-valued keys are omitted
+    # AT BUILD TIME (a pending day shipped 4+ nulls per row; an absent key
+    # reads the same as null to the model — and the single-pass build is
+    # perf-gate-load-bearing: a build-then-strip second dict pass measured
+    # 15.4% over the CI benchmark floor), and (2) in miles mode a raw field
+    # is popped once its display twin landed (same rule as
+    # workout_rows.display_workout — the twin is gated, so a paceless or
+    # distance-less row keeps its raw column). Rollups untouched.
+    miles_mode = units.display_units() == "miles"
+    workouts_full = []
+    for w in detail["workouts"]:
+        row = {
+            k: v for k, v in (
+                ("date", w.get("date")),
+                ("seq", w.get("seq", 1)),
+                ("week_index", w.get("week_index")),
+                ("type", w.get("type")),
+                ("target_distance_m", w.get("target_distance_m")),
+                ("target_pace_sec_per_km", w.get("target_pace_sec_per_km")),
+                ("target_duration_sec", w.get("target_duration_sec")),
+                ("target_hr_max", w.get("target_hr_max")),
+                ("description", w.get("description")),
+                ("verdict", w.get("verdict")),
+                ("actual_distance_m", w.get("actual_distance_m")),
+                ("actual_pace_sec_per_km", w.get("actual_pace_sec_per_km")),
+                ("actual_activity_types", w.get("actual_activity_types")),
+            ) if v is not None
         }
-        for w in detail["workouts"]
-    ]
-    # 2d/2e: per-workout mile/pace convenience fields (Fix C) + a formatted
-    # target duration — pure computation over rows already fetched, applied
-    # before windowing so both full=true and the default window see it.
-    for w in workouts_full:
-        _augment_plan_workout(w)
-        duration_formatted = units.format_duration(w.get("target_duration_sec"))
+        # 2d/2e: per-workout mile/pace convenience fields (Fix C) + a
+        # formatted target duration — pure computation over rows already
+        # fetched. _augment_plan_workout only ADDS non-None fields, so the
+        # no-nulls invariant established above survives it.
+        _augment_plan_workout(row)
+        duration_formatted = units.format_duration(row.get("target_duration_sec"))
         if duration_formatted is not None:
-            w["target_duration_formatted"] = duration_formatted
-    # Compaction (0.56.0): this tool measured as 24% of ALL chars returned
-    # across recorded sessions (median ~11 KB/call) — the single worst context
-    # hog on the surface. Two pure cuts, applied before windowing so full=true
-    # gets them too: (1) None-valued keys are omitted (a pending day shipped
-    # 4+ nulls per row; an absent key reads the same as null to the model),
-    # and (2) in miles mode a raw field is dropped when its display twin
-    # landed (same rule as workout_rows.display_workout — the twin is gated,
-    # so a paceless/distance-less row keeps its raw column). Rollups untouched.
-    workouts_full = [_compact_plan_workout(w) for w in workouts_full]
+            row["target_duration_formatted"] = duration_formatted
+        if miles_mode:
+            for raw, display in _PLAN_RAW_DISPLAY_PAIRS:
+                if display in row:
+                    row.pop(raw, None)
+        workouts_full.append(row)
 
     full = bool(args.get("full", False))
     if full:
