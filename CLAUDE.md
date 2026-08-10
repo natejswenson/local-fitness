@@ -846,6 +846,26 @@ These are settled — don't redesign without a reason.
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
   could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
+  **A successful sync inside the last ~10 min short-circuits as `status:
+  "fresh"` with no Garmin call** (0.56.0) — measured across recorded
+  sessions, 8 of 24 sync calls were pure repeats minutes apart (the user
+  re-asks, the agent re-syncs). The guard lives at the TOOL layer keyed on
+  `ingest_runs.completed_at` (failure statuses never count as fresh; fail-open
+  on any DB problem so a fresh clone still pulls), deliberately NOT inside
+  `daily.pull` — the scheduled jobs want every pull to refresh day-end
+  totals. `force: true` bypasses per call;
+  `LOCAL_FITNESS_SYNC_MIN_INTERVAL_MIN` tunes the window. Every
+  non-short-circuit success (and the fresh payload too) carries
+  `latest_activity` `{activity_id, date, activity_type, distance_mi, effort}`
+  so "pull and grade my run" is sync → `workout_report_card`, never a
+  `query_workouts` id-lookup in between — that triple fired 7× in recorded
+  sessions. **Every tool handler is wrapped in a guarded decorator** (0.56.0,
+  the local `tool()` in `tools.py`): an unanticipated `sqlite3.DatabaseError`
+  returns the standard `_err` envelope with a `remediation` field instead of
+  a bare exception string (observed live: `database disk image is malformed`
+  with `is_error` unset). PDF-render failures now name the exception class +
+  message plus a recovery (`format='table'` / read the brief via resource) —
+  "see the server log" is a dead end for an agent that can't read the log.
 - **The two PDF-writing tools are stdio-only — `generate_brief_report` and
   `workout_report_card` (0.25.0); `generate_chart` moved into `ALL_TOOLS`
   (2026-07-13, MCP-speed-and-UX-01 fold-in Fix A).** The rule that decides

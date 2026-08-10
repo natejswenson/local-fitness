@@ -71,7 +71,8 @@ of metrics the agent reads when you ask it something or it writes a brief.
   analysis tools attach those fields to their payloads. The model phrases a
   judgment; it never derives one code can compute.
 - **Runner-facing units:** distances and pace render in miles / min-per-mile by
-  default (`LOCAL_FITNESS_DISPLAY_UNITS`); raw metric values are always present.
+  default (`LOCAL_FITNESS_DISPLAY_UNITS`); detail views keep raw metric values
+  alongside, while list payloads carry just the display form.
 - **Privacy by default:** the database, briefings, and logs stay on your
   machine and are gitignored.
 
@@ -366,7 +367,7 @@ map.
 | `LOCAL_FITNESS_HOST` | Bind host for `fitness serve` | `127.0.0.1` |
 | `LOCAL_FITNESS_API_TOKEN` | Bearer token gating `/mcp/` (required for non-loopback binds) | unset |
 | `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` | Host allowlist for the MCP transport's DNS-rebinding guard | `127.0.0.1,localhost` |
-| `LOCAL_FITNESS_DISPLAY_UNITS` | Runner-facing display units; non-`miles` suppresses the `*_mi` convenience fields (raw values always present) | `miles` |
+| `LOCAL_FITNESS_DISPLAY_UNITS` | Runner-facing display units. List payloads carry the display form for the configured units; detail views keep raw values alongside | `miles` |
 | `LOCAL_FITNESS_USER_NAME` | Fallback display name when the `user_name` setting is unset | `the user` |
 | `LOCAL_FITNESS_TZ` | Container timezone (compose interpolates it into `TZ` — a UTC container reads the wrong "today" all evening) | host zone |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude subscription token for the headless brief jobs | unset |

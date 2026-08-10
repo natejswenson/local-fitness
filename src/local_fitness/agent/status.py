@@ -27,7 +27,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .. import db, notes
-from . import briefs, interpret, units
+from . import briefs, interpret, units, workout_rows
 from .tools import DAILY_NUMERIC_METRICS, PARTIAL_DAY_METRICS
 
 # Explicit metric → (baseline mean column, baseline sd column | None). Do NOT
@@ -301,12 +301,11 @@ def _training_load(
 
 
 def _recent_workouts(conn, limit: int = 5) -> list[dict[str, Any]]:
-    """Last ~5 workouts with raw fields plus mile/formatted convenience fields
-    from units.py. Omits a formatted field when units.py returns None (null or
-    zero distance / pace). Mirrors tools._augment_workout's exact field set
-    (including the measured ``effort`` read below) — this module duplicates
-    the augmentation inline rather than importing it, to avoid a status <->
-    tools import cycle."""
+    """Last ~5 workouts in the compact list shape (workout_rows.display_workout
+    — display fields only, None-optionals omitted). This used to be an inline
+    byte-for-byte copy of tools._augment_workout, kept to avoid a status <->
+    tools import cycle; workout_rows is the pure shared module that retires
+    the duplication."""
     rows = conn.execute(
         """SELECT activity_id, date, activity_type, activity_name, duration_seconds,
                   distance_meters, avg_hr, max_hr, avg_pace_sec_per_km,
@@ -314,28 +313,7 @@ def _recent_workouts(conn, limit: int = 5) -> list[dict[str, Any]]:
            FROM activities ORDER BY date DESC, start_time DESC LIMIT ?""",
         (limit,),
     ).fetchall()
-
-    miles = units.display_units() == "miles"
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        w = dict(r)
-        if miles:
-            distance_mi = units.to_miles(w.get("distance_meters"))
-            if distance_mi is not None:
-                w["distance_mi"] = distance_mi
-        pace = units.format_pace_min_per_mi(w.get("avg_pace_sec_per_km"))
-        if pace is not None:
-            w["pace_min_per_mi"] = pace
-        duration = units.format_duration(w.get("duration_seconds"))
-        if duration is not None:
-            w["duration_formatted"] = duration
-        # Measured run-vs-walk (interpret.is_running_effort, pace only) — NOT
-        # activity_type, which Garmin mislabels (walking-desk sessions log as
-        # treadmill_running). Additive only; never filters/excludes a workout.
-        mode = interpret.is_running_effort(w.get("avg_pace_sec_per_km"))
-        w["effort"] = {True: "run", False: "walk", None: None}[mode]
-        out.append(w)
-    return out
+    return [workout_rows.display_workout(dict(r)) for r in rows]
 
 
 def _latest_brief_freshness(today: str) -> tuple[str | None, int | None]:

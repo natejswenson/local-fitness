@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -1885,7 +1886,7 @@ def test_brief_loop_excludes_write_tools():
 
 # --- sync_garmin_data --------------------------------------------------------
 
-def test_sync_garmin_data_success_recomputes_baselines(monkeypatch):
+def test_sync_garmin_data_success_recomputes_baselines(seeded, monkeypatch):
     calls = {}
 
     def fake_pull(*, max_days):
@@ -1916,7 +1917,7 @@ def test_sync_garmin_data_success_recomputes_baselines(monkeypatch):
     )
 
 
-def test_sync_garmin_data_skipped_does_not_recompute(monkeypatch):
+def test_sync_garmin_data_skipped_does_not_recompute(seeded, monkeypatch):
     monkeypatch.setattr(
         daily_ingest_mod, "pull",
         lambda **_: {
@@ -1936,7 +1937,7 @@ def test_sync_garmin_data_skipped_does_not_recompute(monkeypatch):
     assert payload["sync_state"] == "skipped — already up to date; baselines unchanged"
 
 
-def test_sync_garmin_data_partial_is_not_an_error_and_recomputes(monkeypatch):
+def test_sync_garmin_data_partial_is_not_an_error_and_recomputes(seeded, monkeypatch):
     """A pull that landed real days is a success for the caller's purposes.
 
     daily.pull reports `partial` whenever ANY gap remains back to
@@ -1974,7 +1975,7 @@ def test_sync_garmin_data_partial_is_not_an_error_and_recomputes(monkeypatch):
     )
 
 
-def test_sync_garmin_data_recomputes_when_only_activities_landed(monkeypatch):
+def test_sync_garmin_data_recomputes_when_only_activities_landed(seeded, monkeypatch):
     # A ride/run can be written by _ingest_activity_range without any new
     # wellness day, so days_pulled alone is the wrong recompute trigger.
     calls = {}
@@ -2002,7 +2003,7 @@ def test_sync_garmin_data_recomputes_when_only_activities_landed(monkeypatch):
 
 
 @pytest.mark.parametrize("status", ["auth_failure", "not_configured", "failure", "interrupted"])
-def test_sync_garmin_data_hard_failures_are_errors(monkeypatch, status):
+def test_sync_garmin_data_hard_failures_are_errors(seeded, monkeypatch, status):
     monkeypatch.setattr(
         daily_ingest_mod, "pull",
         lambda **_: {
@@ -2024,7 +2025,7 @@ def test_sync_garmin_data_hard_failures_are_errors(monkeypatch, status):
     assert "sync_state" not in payload
 
 
-def test_sync_garmin_data_hard_failure_without_error_string_still_errors(monkeypatch):
+def test_sync_garmin_data_hard_failure_without_error_string_still_errors(seeded, monkeypatch):
     # `interrupted` can close a run with error=None; the tool must not fall
     # through to a success payload just because the string is empty.
     monkeypatch.setattr(
@@ -4917,6 +4918,11 @@ def test_save_brief_validation_error_is_compact_loc_msg_pairs(seeded):
 
 
 def test_report_card_pdf_failure_returns_stable_reason_and_logs(rc_seeded, reports_tmp, monkeypatch, caplog):
+    """0.56.0 contract: the error names the exception class + message (the
+    run_sql precedent — render-stack detail, not secrets) and carries a
+    remediation the agent can act on. The old "see the server log" was
+    observed live (2026-08-03) as a dead end for an agent that cannot read
+    the log. The full traceback still goes ONLY to the log."""
     from local_fitness.agent import visuals
 
     def boom(*_a, **_k):
@@ -4926,8 +4932,11 @@ def test_report_card_pdf_failure_returns_stable_reason_and_logs(rc_seeded, repor
     with caplog.at_level(logging.WARNING, logger="local_fitness.agent.tools"):
         payload, err = call(tools.workout_report_card, {})
     assert err
-    assert payload["error"] == "PDF render failed — see the server log for the traceback"
-    assert "cairo exploded" not in payload["error"]
+    assert payload["error"] == (
+        "PDF render failed: RuntimeError: cairo exploded with a 40-line traceback"
+    )
+    # The recovery is named: the grading exists without the PDF.
+    assert "format='table'" in payload["remediation"]
     assert any(r.exc_info for r in caplog.records)  # the traceback IS in the log
 
 
@@ -4954,3 +4963,287 @@ def test_training_load_status_description_renders_interpret_constants():
     text = tools.training_load_status.description
     assert f"TSB > {interpret.TSB_FRESH:g} fresh" in text
     assert f"< {interpret.TSB_VERY_FATIGUED:g} very fatigued" in text
+
+
+# --- 0.56.0: error envelopes, compaction, sync short-circuit -----------------
+
+
+def test_unhandled_database_error_returns_envelope_with_remediation(seeded, monkeypatch):
+    """The guarded `tool` wrapper: an unanticipated sqlite3.DatabaseError
+    (observed live 2026-08-10 as a bare 'database disk image is malformed'
+    with is_error unset) must come back as the standard _err envelope with a
+    remediation the agent can act on. Patched at db.connect so the failure is
+    exactly the corrupt-file shape no per-tool code anticipates."""
+    def corrupt(*_a, **_k):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(db, "connect", corrupt)
+    payload, err = call(tools.get_training_plan_status, {})
+    assert err
+    assert payload["error"] == "database error: database disk image is malformed"
+    assert "integrity_check" in payload["remediation"]
+    assert "do not retry" in payload["remediation"]
+
+
+def test_every_registered_tool_carries_the_database_error_guard(seeded, monkeypatch):
+    """The guard lives in the decorator, so membership in a registry IS the
+    proof — but pin one more tool from each registry end to catch a future
+    handler registered around the local `tool` wrapper."""
+    def corrupt(*_a, **_k):
+        raise sqlite3.DatabaseError("file is not a database")
+
+    monkeypatch.setattr(db, "connect", corrupt)
+    for t in (tools.query_workouts, tools.list_report_cards):
+        payload, err = call(t, {})
+        assert err and "remediation" in payload, t.name
+
+
+def test_query_workouts_rows_are_compact_in_miles_mode(seeded, monkeypatch):
+    monkeypatch.delenv("LOCAL_FITNESS_DISPLAY_UNITS", raising=False)
+    payload, err = call(tools.query_workouts, {})
+    assert not err and payload["count"] >= 1
+    w = payload["workouts"][0]
+    # Display fields present, raw twins gone (the ~25% duplication cut).
+    assert w["distance_mi"] == 6.21
+    assert w["duration_formatted"]
+    assert "distance_meters" not in w
+    assert "duration_seconds" not in w
+    assert "avg_pace_sec_per_km" not in w
+    # Paceless seeded activity: effort stays as an explicit null.
+    assert "effort" in w and w["effort"] is None
+
+
+def test_query_workouts_rows_keep_raw_fields_in_km_mode(seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_DISPLAY_UNITS", "km")
+    payload, err = call(tools.query_workouts, {})
+    assert not err
+    w = payload["workouts"][0]
+    assert w["distance_meters"] == 10000
+    assert "distance_mi" not in w
+
+
+def test_daily_snapshot_recent_workouts_use_the_same_compact_shape(seeded, monkeypatch):
+    """status._recent_workouts used to be an inline byte-copy of the tools
+    augmentation; both now flow through workout_rows.display_workout, so the
+    two surfaces cannot drift."""
+    monkeypatch.delenv("LOCAL_FITNESS_DISPLAY_UNITS", raising=False)
+    payload, err = call(tools.daily_snapshot, {})
+    assert not err
+    w = payload["recent_workouts"][0]
+    assert w["distance_mi"] == 6.21
+    assert "distance_meters" not in w
+    assert "duration_seconds" not in w
+
+
+def test_training_load_status_static_legend_is_gone(seeded):
+    """The 3-line interpretation dict re-shipped on every call while the tool
+    description already carries the zone bands — same duplication once
+    removed from correlate's legend."""
+    payload, err = call(tools.training_load_status, {})
+    assert not err
+    assert "interpretation" not in payload
+    assert payload["tsb_zone"]  # the computed read still rides along
+    # The description now carries the CTL/ATL/TSB translations instead.
+    assert "CTL = fitness" in tools.training_load_status.description
+
+
+def test_list_observations_rejects_non_integer_limit(seeded):
+    payload, err = call(tools.list_observations, {"limit": "abc"})
+    assert err
+    assert "limit must be an integer" in payload["error"]
+
+
+def test_list_observations_rejects_negative_limit_no_false_truncated(seeded):
+    """limit: -1 used to reach SQLite as LIMIT 0 — an empty page that then
+    reported truncated: true about rows it never fetched."""
+    payload, err = call(tools.list_observations, {"limit": -1})
+    assert err
+    assert "limit must be between" in payload["error"]
+    assert "truncated" not in payload
+
+
+def test_list_observations_limit_boundaries(seeded):
+    for i in range(3):
+        call(tools.log_observation, {"obs_type": "rpe", "value": 5 + i})
+    payload, err = call(tools.list_observations, {"limit": 500})
+    assert not err and payload["count"] == 3
+    payload, err = call(tools.list_observations, {"limit": 501})
+    assert err
+    payload, err = call(tools.list_observations, {"limit": 2})
+    assert not err and payload["count"] == 2 and payload["truncated"] is True
+
+
+def _seed_ingest_run(minutes_ago: int, status: str = "success") -> None:
+    from datetime import datetime
+    completed = (datetime.now() - timedelta(minutes=minutes_ago)).isoformat()
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO ingest_runs (started_at, completed_at, status, source) "
+            "VALUES (?, ?, ?, 'daily')",
+            (completed, completed, status),
+        )
+
+
+def test_sync_short_circuits_when_a_recent_pull_succeeded(seeded, monkeypatch):
+    """8 of 24 recorded sync calls were pure repeats minutes apart, each a
+    full Garmin round-trip that landed nothing. A successful run inside the
+    freshness window now answers without touching Garmin at all."""
+    _seed_ingest_run(minutes_ago=3)
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **_: pytest.fail("a fresh sync must not reach Garmin"),
+    )
+    payload, err = call(tools.sync_garmin_data, {})
+    assert not err
+    assert payload["status"] == "fresh"
+    assert "force:true" in payload["sync_state"]
+    # The report-card handoff still rides the short-circuit payload.
+    assert payload["latest_activity"]["activity_id"] == 1
+
+
+def test_sync_force_bypasses_the_short_circuit(seeded, monkeypatch):
+    _seed_ingest_run(minutes_ago=3)
+    calls = []
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **kw: calls.append(kw) or {
+            "status": "success", "days_pulled": 1, "activities_loaded": 0,
+            "last_date": date.today().isoformat(), "error": None,
+        },
+    )
+    monkeypatch.setattr(tools.baselines_mod, "recompute", lambda **_: 90)
+    payload, err = call(tools.sync_garmin_data, {"force": True})
+    assert not err and payload["status"] == "success"
+    assert len(calls) == 1
+
+
+def test_sync_pulls_when_the_last_success_is_stale(seeded, monkeypatch):
+    _seed_ingest_run(minutes_ago=45)  # outside the 10-min window
+    calls = []
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **kw: calls.append(kw) or {
+            "status": "success", "days_pulled": 1, "activities_loaded": 0,
+            "last_date": date.today().isoformat(), "error": None,
+        },
+    )
+    monkeypatch.setattr(tools.baselines_mod, "recompute", lambda **_: 90)
+    payload, err = call(tools.sync_garmin_data, {})
+    assert not err and len(calls) == 1
+
+
+def test_sync_ignores_recent_failed_runs(seeded, monkeypatch):
+    """A failed pull ten seconds ago is a reason to retry, not to skip."""
+    _seed_ingest_run(minutes_ago=1, status="failure")
+    calls = []
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **kw: calls.append(kw) or {
+            "status": "success", "days_pulled": 1, "activities_loaded": 0,
+            "last_date": date.today().isoformat(), "error": None,
+        },
+    )
+    monkeypatch.setattr(tools.baselines_mod, "recompute", lambda **_: 90)
+    payload, err = call(tools.sync_garmin_data, {})
+    assert not err and len(calls) == 1
+
+
+def test_sync_success_payload_carries_latest_activity_and_no_null_error(seeded, monkeypatch):
+    """latest_activity is the report-card handoff (kills the observed
+    sync -> query_workouts -> workout_report_card triple), and a success
+    payload no longer ships "error": null (it fooled the audit's own
+    error detector)."""
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **_: {
+            "status": "success", "days_pulled": 1, "activities_loaded": 1,
+            "last_date": date.today().isoformat(), "error": None,
+        },
+    )
+    monkeypatch.setattr(tools.baselines_mod, "recompute", lambda **_: 90)
+    payload, err = call(tools.sync_garmin_data, {})
+    assert not err
+    assert "error" not in payload
+    latest = payload["latest_activity"]
+    assert latest["activity_id"] == 1
+    assert latest["date"] == date.today().isoformat()
+    assert latest["distance_mi"] == 6.21
+
+
+def test_sync_min_interval_env_override(seeded, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_SYNC_MIN_INTERVAL_MIN", "60")
+    _seed_ingest_run(minutes_ago=45)  # stale under 10, fresh under 60
+    monkeypatch.setattr(
+        daily_ingest_mod, "pull",
+        lambda **_: pytest.fail("45 min < 60 min window — must short-circuit"),
+    )
+    payload, err = call(tools.sync_garmin_data, {})
+    assert not err and payload["status"] == "fresh"
+
+
+def test_compare_periods_days_shortcut_derives_adjacent_windows(seeded):
+    """days=N is the convenience the tool's zero recorded calls were missing:
+    every 'last 30d vs prior 30d' ask forced four hand-computed ISO dates
+    (run_sql hand-rolled the comparison instead)."""
+    payload, err = call(tools.compare_periods, {"metric": "rhr", "days": 14})
+    assert not err
+    today = date.today()
+    derived = payload["derived_periods"]
+    assert derived["period_a_end"] == today.isoformat()
+    assert derived["period_a_start"] == (today - timedelta(days=13)).isoformat()
+    assert derived["period_b_end"] == (today - timedelta(days=14)).isoformat()
+    assert derived["period_b_start"] == (today - timedelta(days=27)).isoformat()
+    # Windows are adjacent and equal-length: 14 days each, no gap, no overlap.
+    assert payload["period_a"]["n"] == 14
+    assert payload["period_b"]["n"] == 14
+
+
+def test_compare_periods_rejects_days_mixed_with_dates(seeded):
+    payload, err = call(tools.compare_periods, {
+        "metric": "rhr", "days": 14, "period_a_start": "2026-01-01",
+    })
+    assert err
+    assert "not both" in payload["error"]
+
+
+def test_compare_periods_names_both_forms_when_dates_missing(seeded):
+    payload, err = call(tools.compare_periods, {
+        "metric": "rhr", "period_a_start": "2026-01-01",
+    })
+    assert err
+    assert "days=N" in payload["error"]
+
+
+def test_plan_progress_rows_omit_nulls_and_raw_twins(seeded, monkeypatch):
+    """The single worst context hog (24% of all returned chars across
+    recorded sessions): pending days shipped 4+ null fields per row and every
+    graded row carried raw/display pairs."""
+    monkeypatch.delenv("LOCAL_FITNESS_DISPLAY_UNITS", raising=False)
+    today = date.today()
+    _, err = call(tools.propose_training_plan, {
+        "goal_type": "10k",
+        "race_date": (today + timedelta(days=30)).isoformat(),
+        "workouts": [
+            {"date": today.isoformat(), "week_index": 0, "type": "easy",
+             "target_distance_m": 8046.7, "description": "Easy 5"},
+            {"date": (today + timedelta(days=2)).isoformat(), "week_index": 0,
+             "type": "rest", "description": "Rest day"},
+        ],
+    })
+    assert not err
+    _, err = call(tools.commit_training_plan, {"plan_id": 1})
+    assert not err
+    payload, err = call(tools.get_training_plan_progress, {"full": True})
+    assert not err
+    rows = {w["date"]: w for w in payload["workouts"]}
+    easy = rows[today.isoformat()]
+    # Display twin present, raw dropped.
+    assert easy["target_distance_mi"] == 5.0
+    assert "target_distance_m" not in easy
+    # The rest day has no targets at all — nulls omitted, not shipped.
+    rest = rows[(today + timedelta(days=2)).isoformat()]
+    assert "target_distance_m" not in rest and "target_distance_mi" not in rest
+    assert "target_pace_sec_per_km" not in rest
+    assert "actual_distance_m" not in rest
+    for w in payload["workouts"]:
+        assert all(v is not None for v in w.values()), w

@@ -58,8 +58,9 @@ services:
       # loopback only ("127.0.0.1,localhost"), so a deployment serving at a
       # real hostname must set this — the value below is that override.
       - LOCAL_FITNESS_MCP_ALLOWED_HOSTS=${LOCAL_FITNESS_MCP_ALLOWED_HOSTS:-fitness.home.local,127.0.0.1,localhost}
-      # Display units for runner-facing output (mi, min/mi). Raw meters/sec-per-km
-      # are always present; non-"miles" only suppresses the *_mi fields. Default miles.
+      # Display units for runner-facing output (mi, min/mi). List payloads
+      # carry the display form for the configured units (raw meters/sec-per-km
+      # stay on detail surfaces and in km mode). Default miles.
       - LOCAL_FITNESS_DISPLAY_UNITS=${LOCAL_FITNESS_DISPLAY_UNITS:-miles}
     volumes:
       - ./data:/data
