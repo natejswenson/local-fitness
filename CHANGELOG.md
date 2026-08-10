@@ -6,6 +6,271 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-08-09
+
+### Fixed
+- **A PRESCRIBED walk is now compliance, not evasion.** Surfaced by a real
+  edit: a back injury turned a week of runs into 3-4 mi daily walks, and the
+  rubric punished obeying the new prescription. Two defects with one root —
+  **nothing could tell a walk the plan ASKED for from a walk masquerading as a
+  run.**
+
+  `pace_deviation`'s walk floor fired against the prescription itself. Measured
+  on a prescribed 3.5 mi walk at 17:00/mi: walking it exactly scored **1.30
+  stars**, walking it *slower* — the more recovery-appropriate choice — hit the
+  **1.00 floor**, and the only way to score well was to walk faster than an
+  injured athlete had been told to. That is the same inversion as 0.40.0's load
+  metric, where obeying an easy day's HR cap mechanically failed the grade.
+
+  `plan_walk_mismatch` compounded it. It fires on "walked + plan type is a
+  running type", and a prescribed walk is stored as `easy` (CLAUDE.md
+  prescribes walks that way deliberately — it is what makes the day gradeable).
+  So every day of a walking block refused its own target and printed a note
+  claiming the prescription "doesn't apply" to the very effort it prescribed,
+  falling back to a rolling reference which, in an injury block, is itself all
+  walks and can grade nothing. The pre-fix card on the new eval fixture is a
+  **vacuous 5.00 off continuity alone** — one graded metric.
+
+  Both now key off `plan_prescribes_walk`: a prescription whose own pace target
+  is slower than the run/walk boundary is an instruction to walk. Judged by
+  prescribed PACE via `interpret.is_running_effort`, not by a new workout type
+  — run-vs-walk is decided by measured pace everywhere in this repo and that is
+  the one definition. **The floor is disabled only when the PLAN reference is
+  what is being graded against**, never when a rolling median merely happens to
+  be slow; that distinction is what keeps the documented quality-day hole shut
+  (a 15:20/mi walk on a prescribed tempo day scoring A+ against a walking-pool
+  median).
+
+  New eval scenario `prescribed_walk_obeyed` (`min_stars: 4.25`). It fails
+  without the fix, and the way it fails is instructive: `min_stars` alone does
+  NOT catch it, because the pre-fix card scores a vacuous 5.00 —
+  `test_every_scenario_actually_grades_something` is what bites. Both guards
+  are load-bearing; neither is sufficient.
+
+  **Calibration gate run before and after — byte-identical output**, 43 running
+  efforts over 90 days, every metric `ok`:
+
+  ```
+  metric                 1.00 .. 5.00        mean    n  verdict
+  distance               ##.#...#..#.#.###   4.37   43  ok — 9 buckets, top 72%, interior 26%, <=2.0* 14%
+  pace                   #.#...##.##.#####   4.17   43  ok — 11 buckets, top 47%, interior 51%, <=2.0* 7%
+  hr (rolling band)      ....#.#....##.###   4.64   32  ok — 7 buckets, top 75%, interior 25%, <=2.0* 6%
+  hr (prescribed cap)    #.#..##.#.....#.#   2.88   11  ok — 7 buckets, top 27%, interior 45%, <=2.0* 36%
+  continuity             #.#...##....#..##   4.31   40  ok — 7 buckets, top 75%, interior 18%, <=2.0* 12%
+  ```
+
+  The change is inert on all 43 historical runs — none carries a prescribed
+  walk — so it moves only the case it was written for.
+
+- **The calendar no longer titles a walk "Easy run".** Same root, same
+  signal: `plan_workouts.type` has no walk value, so a 3.5 mi recovery walk
+  rendered as `Easy run 3.5 mi @ 17:00/mi` — a title contradicting both the
+  pace beside it and the description below it. `calendar_render.workout_label`
+  now derives the label from the prescribed pace through the same
+  `interpret.is_running_effort` boundary the report card grades against, so a
+  session the card treats as a walk can never be titled a run.
+  A **paceless** prescription keeps its type label: mode is genuinely unknown
+  there, and guessing "walk" would mislabel every by-feel easy day.
+
+## [0.54.0] - 2026-08-09
+
+### Changed
+- **Calendar events carry no reminders, stated explicitly.** Omitting the
+  `reminders` key is not the same as saying "none" — the calendar's own default
+  applies, and on a personal calendar that is typically a 30-minute popup. An
+  all-day event starts at **midnight**, so "30 minutes before" fires at **23:30
+  the night before**: 41 consecutive nights of late-evening notifications, which
+  is how a calendar gets muted. Every event now sets
+  `{"useDefault": false, "overrides": []}`.
+
+  **A day-of reminder on an all-day event is not expressible, and Google fails
+  at it SILENTLY.** `minutes` is strictly *before* the start, and a negative
+  value is accepted with HTTP 200 and then clamped — measured 2026-08-09,
+  `minutes: -480` (08:00 day-of) stored as `minutes: 0` (midnight). Nothing
+  errors; you simply get a different reminder than the one you asked for. A
+  morning-of nudge would require the events to stop being all-day and become
+  timed blocks; no arithmetic on the constant produces one.
+
+  **Reminders are normalized before comparison, and that is load-bearing.**
+  Google does not echo back what you send: `{"useDefault": false, "overrides":
+  []}` returns as `{"useDefault": false}` with the empty list dropped. A raw
+  dict comparison would report a difference forever and the reconcile would
+  rewrite all 41 events on every run — the same non-convergence the
+  timestamp-shaped-date normalization already guards against. Overrides compare
+  as a SET, since their order is the server's to choose. A **missing**
+  `reminders` key reads as *unknown*, never as silence: treating absence as
+  "no reminders" would leave an event that is actually inheriting the 23:30
+  popup comparing equal to our explicit silence and never repaired. That costs
+  at most one redundant write; the other reading costs a nightly notification
+  forever.
+
+### Fixed
+- **The test suite no longer inherits the developer's real Google credentials.**
+  `local_fitness.cli` calls `load_dotenv()` at module scope, so the moment any
+  test file imported it, `<repo>/.env` was merged into `os.environ` for the rest
+  of the pytest process. `calendar_sync.blocked_reason()` then returned None
+  everywhere and unrelated plan-write tests began attempting a live sync
+  (`test_commit_activates_draft` found an unexpected `calendar` key in its
+  payload). **CI has no `.env`, so CI stayed green while the suite broke on
+  every machine that actually had the feature configured** — the inverse of the
+  0.51.0 no-database bug, and strictly worse because nothing forces anyone to
+  notice. An autouse fixture now strips `LOCAL_FITNESS_GCAL_*` for every test,
+  making "not configured" the default (which is also a fresh clone's state);
+  tests that want the calendar path set them explicitly.
+  `test_the_suite_never_inherits_real_calendar_credentials` asserts the guard.
+
+## [0.53.0] - 2026-08-08
+
+### Changed
+- **The calendar now carries the whole remaining plan, and plan edits push
+  themselves.** 0.52.0's nightly job wrote *tomorrow's* session. One day is the
+  wrong unit — you can't see the week, you can't see the taper, and an edit made
+  today didn't reach the calendar until 19:05 tomorrow. `fitness plan-calendar`
+  now makes the calendar **equal** the active plan from today through its last
+  day, and the four plan-write MCP tools (`update_plan_workout`,
+  `update_plan_workouts`, `commit_training_plan`, `abandon_active_plan`) run the
+  same reconcile themselves, so a change lands in the same turn. The
+  tomorrow-only path is **deleted**, not kept beside the new one: two ways to
+  write the same event is exactly the ambiguity the one-tool-one-name rule
+  exists to prevent.
+
+  **The unit of work is a reconcile, and the reason is the DELETE side.** An
+  upsert can only add or correct; it has no way to express "this day is no
+  longer a session". So a run turned into a rest day, or a plan abandoned
+  outright, would leave the calendar confidently prescribing work the plan no
+  longer asks for — with the only hint being a plan number in a description
+  nobody reads. `calendar_render.reconcile` is a pure five-way diff (create /
+  update / unchanged / delete / skipped-cancelled) with two rails on that
+  deletion:
+
+  - **The past is never touched.** `existing` is filtered to `date >= start`
+    before diffing. Yesterday's event records what was prescribed yesterday; the
+    plan may have changed since, and rewriting history to match is not a sync.
+  - **A tombstone is never resurrected and never re-deleted.** This is why
+    `gcal.list_plan_events` passes `showDeleted=true` — a deleted event still
+    owns its id, and a listing that hides it makes the reconcile see an absence,
+    recreate the event, and break the one gesture a person has for "not this
+    one".
+
+  **The steady state is one request.** A second sync lists, finds everything
+  equal, and writes nothing — which is what makes the 20:05 backstop, the hook
+  firing on every edit, and a manual re-run all free. That property is the
+  single thing `tests/test_calendar_sync.py` is built around, driven through an
+  in-memory calendar that holds real state rather than a stub replaying canned
+  values.
+
+  **Committing a plan clears the plan it supersedes.** `event_id` keys on
+  `plan_id` by design, so a new plan's events land on entirely different ids —
+  the old plan's remaining sessions would otherwise sit beside the new ones,
+  both tagged and both looking authoritative. `commit_training_plan` reads the
+  outgoing plan id *before* the commit archives it and deletes its future
+  events.
+
+  **Every hook is fail-soft, and that is a correctness property, not politeness.**
+  The plan write is committed before the calendar is touched and is the source
+  of truth; the calendar is a projection. A raise here would turn a successful
+  edit into a failed tool call, the model would reasonably retry the edit, and a
+  transport problem would become a data problem. Failures come back as
+  `calendar: {"status": "error", …}` in the tool payload. When no sync was
+  attempted at all — no credentials, or the kill switch is off — the key is
+  **omitted rather than null**, so a clone that never set this up gets no
+  calendar noise appended to every plan edit it ever makes. The credential check
+  runs before the settings check because it is a pure env read and the other
+  opens the DB.
+
+  New `agent/calendar_sync.py` holds the orchestration; `calendar_render` stays
+  pure and `gcal` stays transport. `gcal._matches` now delegates to
+  `calendar_render._differs` — both decide "do we write?", and two field lists
+  would drift into one path rewriting what the other calls unchanged.
+  `MAX_SYNC_EVENTS` (200, equal to `plans.MAX_WORKOUTS`) **refuses** rather than
+  truncating: a half-written calendar is worse than one that didn't get written,
+  because you would trust the days that made it.
+
+  `fitness plan-calendar` takes `--from` in place of `--date`, and reports
+  created/updated/deleted/unchanged plus the changed dates — counts alone can't
+  answer "did my edit land". A quiet run fires no macOS notification; a nightly
+  toast for zero changes is how a notification stops being read.
+
+## [0.52.0] - 2026-08-08
+
+### Added
+- **Tomorrow's prescribed session goes on Google Calendar, on the brief
+  email's cadence.** New `fitness plan-calendar` command plus a
+  `com.localfitness.plancal` launchd job (19:05, backstop 20:05) that reads the
+  ACTIVE training plan and writes the next day's workout as an all-day event.
+  A rest day writes nothing, no active plan writes nothing, and both exit 0 —
+  most weeks carry two rest days, and a job that reported failure on those
+  would cry wolf twice a week.
+
+  **Why this is a raw REST client and not the Google Calendar MCP connector.**
+  0.51.0 settled the two questions to ask before routing a *scheduled* delivery
+  through a connector: does it actually send, and do the bytes have to pass
+  through a model turn? The Calendar connector passes both — `create_event`
+  really creates, unlike Gmail's draft-only surface, and an event body is a few
+  hundred bytes. It fails a third test that generalises further, and that test
+  is the durable half of this release: **a connector is authenticated
+  interactively in a chat client and is structurally absent from a launchd
+  Python process.** The job that runs at 19:05 has no model in it, and a job
+  with no model cannot call a model-mediated tool at all. The question to ask
+  first about any future scheduled integration is "will the thing that runs
+  this be a model?".
+
+  New `agent/calendar_render.py` (pure) and `agent/gcal.py` (I/O), the same
+  divider as `email_render`/`mailer`. `gcal` is deliberately
+  dependency-light — the refresh-token grant is a form POST and an insert is a
+  JSON POST, so it needs `requests` and nothing else, rather than
+  `google-api-python-client` and `google-auth`. `requests` was already present
+  transitively via `garminconnect` and is now a declared direct dependency.
+
+  **The event id is keyed on identity, never on content**, and that is what
+  makes the whole thing idempotent without a marker file. It is
+  `sha256(plan_id|date|seq)`, so the 20:05 backstop re-posts the same id, gets
+  a 409, reads the event back, finds identical content and does nothing. This
+  is why the command has no `--if-unsent` equivalent: the dedupe is a property
+  of the data instead of a file that can drift from it. It also handles what a
+  marker could not — if the plan *changed* between 19:05 and 20:05, the
+  backstop updates the event in place instead of skipping it as already-done.
+  A content-keyed id would instead leave one stale event per revision, which is
+  the shape of "helpful automation" that gets muted after a week.
+
+  **A 409 on a DELETED event is not "already there".** Google keeps a
+  tombstone, and a blind PUT would resurrect it — so the upsert reads the event
+  first and leaves a `cancelled` one exactly as it is. Deleting the event is
+  how a person says "not this one", and a job that puts it back an hour later
+  is a job that gets uninstalled.
+
+  Events are **all-day and `transparent`** (free, not busy). An all-day block
+  that marked the whole day busy would break every scheduling heuristic pointed
+  at the calendar, and this event is a reminder, not a commitment of the day.
+
+  **Its own launchd job rather than a tail step on `brief-email`.** It shares
+  none of that job's cost (no Garmin pull, no LLM), so it gets an independent
+  failure domain — a Google outage cannot make the email job look broken — and
+  its own retry slot. As a tail step it would have had *no* retry at all: by
+  then the `.emailed-<date>` marker already short-circuits the 20:00 backstop.
+
+  New MCP tools `get_plan_calendar_settings` / `update_plan_calendar_settings`
+  (enabled state, target calendar), following the repo's standing pattern that
+  a new user-facing knob belongs behind a tool pair because there is no UI.
+  **The OAuth values are the exception, for 0.51.0's reason**: `/mcp/` is
+  reachable from a phone, so a tool that echoed the refresh token would hand
+  every client that can call the endpoint write access to the calendar. They
+  live only in `.env`; the get tool reports `credentials_configured` as a bool,
+  and the test asserts on the whole serialized payload rather than named
+  fields.
+
+  Scope is `.../auth/calendar.events` — create/edit events only, no calendar
+  creation or deletion. Combined with identity-derived ids, the sync can only
+  ever see or touch events it created.
+
+  One-time setup is `fitness calendar-auth` (installed-app loopback flow with
+  PKCE, printing the refresh token rather than writing to `.env`) plus a Google
+  Cloud walkthrough in `docs/google-calendar.md`. **That doc leads with the
+  publishing-status trap**: an OAuth app left in "Testing" has its refresh
+  tokens expired by Google every 7 days, so the job would fail weekly and look
+  like a different bug each time — `access_token` detects `invalid_grant` and
+  says so directly in the log line.
+
 ## [0.51.0] - 2026-08-07
 
 ### Added

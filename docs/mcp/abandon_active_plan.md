@@ -79,6 +79,16 @@ A follow-up `get_training_plan_status` now returns `{"active": false}`.
 
 ## Gotchas
 
+- **This writes Google Calendar too, when it's configured** (0.53.0). The response carries a
+  `calendar` object with `created`/`updated`/`deleted`/`unchanged` and the dates that moved —
+  quote the dates, not the counts, when confirming an edit. The key is **absent** when no sync
+  was attempted (no credentials, or the kill switch is off); `{"status": "error"}` means the
+  plan write still succeeded and only the calendar failed, so never retry the plan edit because
+  of it. Configure with [`get_plan_calendar_settings`](get_plan_calendar_settings.md).
+  This is the one path that only deletes: every remaining event for the plan goes, from
+  today forward. **Past events stay** — they record what was prescribed at the time. The
+  calendar is not restorable by re-committing; a new plan writes new events.
+
 - **No undo — see the banner above.** Confirm with the user before calling; do not infer intent
   from "I might skip this week" or "this plan isn't working".
 - **Do not use it to swap plans.** `commit_training_plan(new_draft_id)` archives the old active plan

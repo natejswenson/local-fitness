@@ -30,6 +30,8 @@ cannot see it.
                              off rep pace by construction
   walk_mislabelled         — a real run whose 60-day pool is mostly walking-desk
                              sessions logged as `treadmill_running`
+  prescribed_walk_obeyed   — the plan ASKED for a walk (injury recovery) and the
+                             walk was executed exactly as prescribed
 
 The builder is **deterministic**: for a fixed ``(scenario, today)`` it writes
 byte-identical rows (no RNG, no wall-clock).
@@ -60,6 +62,7 @@ SCENARIOS = (
     "cap_blown_hard",
     "interval_manual_laps",
     "walk_mislabelled",
+    "prescribed_walk_obeyed",
 )
 
 
@@ -104,6 +107,27 @@ EXPECTED_VERDICTS: dict[str, dict] = {
                "slower than rep pace by construction (warmup + cooldown are "
                "in it), so grading the average guarantees an F on a session "
                "that was executed correctly.",
+    },
+    "prescribed_walk_obeyed": {
+        "min_stars": 4.25,
+        "why": "THE 2026-08-09 guard. The plan prescribed a 3.5 mi walk at "
+               "17:00/mi for a back injury and the walk was executed exactly. "
+               "Two defects, one root — the rubric could not tell a "
+               "PRESCRIBED walk from a walk masquerading as a run. "
+               "`pace_deviation`'s walk floor fired against the prescription "
+               "itself (measured in isolation: obeying scored 1.30 stars, "
+               "walking SLOWER hit the 1.00 floor, and the only way to score "
+               "well was to walk faster than an injured athlete was told to — "
+               "the same inversion as 0.40.0's load metric). And "
+               "`plan_walk_mismatch` refused the plan reference outright, "
+               "printing a note claiming the prescription did not apply to the "
+               "effort it prescribed. On THIS fixture the second defect "
+               "dominates: the reference pool is walks, so with the plan "
+               "refused there is nothing left to grade against and distance "
+               "AND pace both abstain. The pre-fix card is a vacuous 5.00 off "
+               "continuity alone — which `min_stars` cannot catch and "
+               "`test_every_scenario_actually_grades_something` can. Both "
+               "guards are load-bearing here; neither is sufficient.",
     },
     "walk_mislabelled": {
         "min_stars": 3.50,
@@ -181,6 +205,21 @@ _GRADED = {
         + [{"distance_meters": 2 * MILE_M, "duration_seconds": 1700, "avg_hr": 132,
             "avg_pace_sec_per_km": 528.0}],
     ),
+    # The plan asked for a walk and got one. Stored as type `easy` because that
+    # is how CLAUDE.md says a walk is prescribed (it is what makes the day
+    # gradeable at all) — so the TYPE says run and only the prescribed PACE
+    # says walk. Executed at exactly the prescribed 17:00/mi.
+    "prescribed_walk_obeyed": (
+        {"activity_type": "walking", "activity_name": "Recovery walk",
+         "distance_meters": 3.5 * MILE_M, "duration_seconds": 3570,
+         "avg_pace_sec_per_km": 633.8, "avg_hr": 98, "training_load": 12.0,
+         "aerobic_te": 1.2},
+        {"type": "easy", "target_distance_m": 3.5 * MILE_M,
+         "target_pace_sec_per_km": 633.8, "target_hr_max": None,
+         "description": "WALK 3-4 mi, easy. Back injury recovery — no running."},
+        [{"distance_meters": MILE_M, "duration_seconds": 1020, "avg_hr": 97,
+          "avg_pace_sec_per_km": 633.8} for _ in range(3)],
+    ),
     # An ordinary outdoor easy run, no plan. Its reference pool is where the
     # interest is — see _walk_pool below.
     "walk_mislabelled": (
@@ -226,6 +265,10 @@ def _walk_pool(n: int = 30) -> list[dict]:
 
 _POOLS = {
     "obedient_easy_clean": _run_pool(),
+    # A walking pool, because that is what an injury block actually looks like
+    # — and it makes the scenario prove the grade comes from the PLAN, not from
+    # a conveniently slow rolling median.
+    "prescribed_walk_obeyed": _walk_pool(),
     "obedient_easy_straddling": _run_pool(),
     "cap_blown_hard": _run_pool(),
     "interval_manual_laps": _run_pool(),

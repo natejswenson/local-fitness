@@ -658,6 +658,115 @@ These are settled — don't redesign without a reason.
   Generalise it: any new outbound TLS client here (SMTP, IMAP, a raw socket)
   gets an explicit verifying context and a test that inspects the context, not
   the outcome.
+- **The whole remaining plan lives on Google Calendar, and the connector
+  question now has a THIRD test** (0.52.0, reshaped in 0.53.0).
+  `fitness plan-calendar` (launchd `com.localfitness.plancal`, 19:05 + 20:05
+  backstop) makes the calendar **equal** the active plan from today through its
+  last day, and the four plan-write MCP tools run the same reconcile themselves
+  so an edit lands in the same turn. No active plan, a rest day, or nothing
+  remaining all write nothing and exit 0 — a job that reported failure on those
+  would be muted inside a fortnight. **The rule that decides the transport
+  generalises past 0.51.0's two questions.** The Calendar MCP connector passes
+  both of those:
+  `create_event` really creates (unlike Gmail's draft-only surface) and an
+  event body is a few hundred bytes, so no model has to retype attachment
+  bytes. It fails a third: **a connector is authenticated interactively in a
+  chat client and is structurally absent from a launchd Python process.** A job
+  with no model in it cannot call a model-mediated tool at all. Ask that first
+  about any future scheduled integration: *will the thing that runs this be a
+  model?* So it is a raw REST client — `agent/calendar_render.py` (pure) +
+  `agent/gcal.py` (I/O), the usual divider — needing only `requests` (now a
+  declared direct dependency; it was transitive via `garminconnect`) rather
+  than `google-api-python-client` + `google-auth`.
+  **The event id is keyed on IDENTITY, never content**, and that single choice
+  is what makes everything here idempotent with no marker file:
+  `sha256(plan_id|date|seq)`, so a re-run finds what it wrote last time. A
+  content-keyed id would leave one stale event per revision. That is why there
+  is no `--if-unsent` equivalent — the dedupe is a property of the data instead
+  of a file that can drift from it, and it does what a marker could not: a plan
+  CHANGED between 19:05 and 20:05 gets applied rather than skipped as
+  already-done. Events are all-day and `transparent` (free, not busy) — an
+  all-day block marking the day busy breaks every scheduling heuristic pointed
+  at the calendar. All-day `end.date` is **exclusive** (day+1); getting it
+  wrong renders a zero-length event some clients hide, i.e. it fails by
+  disappearing.
+  **Events carry NO reminders, explicitly** (0.54.0, `NO_REMINDERS`). Omitting
+  the key inherits the *calendar's* default — typically a 30-minute popup, and
+  since an all-day event starts at midnight that fires at **23:30 the night
+  before**, 41 nights running. **A day-of reminder is not expressible on an
+  all-day event and Google fails at it SILENTLY**: `minutes` is strictly
+  *before* the start and a negative is accepted with HTTP 200 then clamped
+  (measured 2026-08-09: `-480` stored as `0`). A morning-of nudge would require
+  timed events, not arithmetic. **Reminders are normalized before comparison**
+  and that is load-bearing: Google returns `{"useDefault": false}` for what we
+  sent as `{"useDefault": false, "overrides": []}`, so a raw dict compare never
+  converges and rewrites all 41 events every run — the same trap as the
+  timestamp-shaped `start.date`. Overrides compare as a SET (server chooses
+  order); a **missing** key reads as *unknown*, never silence, so an event
+  actually inheriting the popup gets repaired rather than compared equal.
+  **The unit of work is a RECONCILE, and the reason is the delete side**
+  (0.53.0). An upsert can only add or correct — it cannot express "this day is
+  no longer a session", so a run turned into a rest day, or a plan abandoned,
+  would leave the calendar confidently prescribing work the plan no longer asks
+  for. `calendar_render.reconcile` is a pure five-way diff with two rails:
+  **the past is never touched** (`existing` filtered to `date >= start` —
+  yesterday's event records what was prescribed yesterday, and rewriting
+  history to match today's plan is not a sync), and **a tombstone is never
+  resurrected or re-deleted**, which is why `list_plan_events` passes
+  `showDeleted=true` — a deleted event still owns its id, and a listing that
+  hides it makes the reconcile recreate it and break the one gesture a person
+  has for "not this one". The steady state is ONE request: list, everything
+  equal, no writes. `MAX_SYNC_EVENTS` (200 = `plans.MAX_WORKOUTS`) **refuses**
+  rather than truncating — a half-written calendar is worse than an unwritten
+  one, because you would trust the days that made it. `gcal._matches` delegates
+  to `calendar_render._differs`: both decide "do we write?", and two field
+  lists would drift into one path rewriting what the other calls unchanged.
+  **Committing a plan must clear the plan it supersedes** — `event_id` keys on
+  `plan_id`, so a new plan lands on entirely different ids and the old plan's
+  sessions would otherwise sit beside the new ones, both tagged and both
+  looking authoritative. `commit_training_plan` reads the outgoing plan id
+  BEFORE the commit archives it.
+  **Every plan-write hook is fail-soft, and that is correctness, not
+  politeness**: the write is committed before the calendar is touched and is
+  the source of truth, the calendar is a projection. A raise would turn a
+  successful edit into a failed tool call, the model would retry the edit, and
+  a transport problem would become a data problem. Failures return
+  `calendar: {"status": "error"}` in the payload; when no sync was attempted at
+  all the key is **omitted rather than null**, so a clone that never set this
+  up gets no noise on every plan edit. `blocked_reason` checks credentials
+  before the setting because that check is a pure env read and the other opens
+  the DB.
+  **Its own launchd job, not a tail step on `brief-email`**: it shares none of
+  that job's cost (no Garmin pull, no LLM) so it gets an independent failure
+  domain, and as a tail step it would have had *no* retry at all — by then the
+  `.emailed-<date>` marker already short-circuits the 20:00 backstop. Since
+  0.53.0 it is a RECONCILER rather than the only writer: it repairs a sync that
+  failed mid-edit, a plan changed through `run_sql`, or a drifted day.
+  Configuration follows the standing pattern —
+  `get_plan_calendar_settings`/`update_plan_calendar_settings` own the enabled
+  state and `calendar_id` (DB > env > default), the OAuth values stay in `.env`
+  for the same network-reachability reason as the SMTP password, and
+  `test_no_tool_output_ever_contains_the_calendar_secrets` copies the
+  whole-payload assertion shape. Scope is `.../auth/calendar.events` only, so
+  with identity-derived ids the sync can only ever touch events it created.
+  Setup is `fitness calendar-auth` (loopback + PKCE, PRINTS the refresh token
+  rather than editing `.env`) plus `docs/google-calendar.md`, which leads with
+  the trap: **an OAuth app left in "Testing" has its refresh tokens expired by
+  Google every 7 days**, so the job dies weekly looking like a new bug —
+  `access_token` detects `invalid_grant` and says so in the log line.
+  `gcal._request` is the single HTTP choke point on purpose: `tests/conftest.py`
+  blocks that ONE function (fourth guard beside the SDK/Garmin/SMTP ones,
+  because a live call CREATES something in a real account), and TLS
+  verification is configured in one place. **`conftest` also strips
+  `LOCAL_FITNESS_GCAL_*` from every test's environment** (0.54.0) — `cli.py`
+  `load_dotenv()`s at MODULE scope, so any test importing it merged the real
+  `.env` into `os.environ` for the whole process and unrelated plan-write tests
+  started attempting a live sync. **CI has no `.env`, so CI stayed green while
+  the suite broke only on configured machines** — the inverse of the 0.51.0
+  no-database bug and strictly worse, since nothing forces anyone to notice.
+  Any future credential that gates a network side effect gets the same
+  treatment: default to unconfigured, opt in per test. Per the rule above it never passes
+  `verify` at all, and the test inspects the source rather than the outcome.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a
   no-arg login, so a pull resumes the saved garminconnect session instead of a
@@ -971,6 +1080,26 @@ These are settled — don't redesign without a reason.
     the bpm ("58% … by 1.2 bpm on average — inside sensor noise"), because the
     fraction alone beside an A+ reads as the card noticing a breach and
     ignoring it.
+  - **A PRESCRIBED walk is compliance, and the rubric had no way to know**
+    (0.55.0). `plan_workouts.type` has no walk value — a walk is prescribed as
+    `easy` deliberately, since that is what makes it gradeable — so two
+    mechanisms both read a prescribed walk as evasion. `pace_deviation`'s walk
+    floor fired against the prescription itself (measured: obeying a 17:00/mi
+    walk scored 1.30 stars, walking SLOWER hit the 1.00 floor, and only walking
+    faster than an injured athlete was told scored well — the 0.40.0 load
+    inversion again), and `plan_walk_mismatch` refused the plan reference
+    outright, printing a note that the prescription "doesn't apply" to the
+    effort it prescribed. Both now key off `plan_prescribes_walk`, judged by
+    prescribed PACE via `interpret.is_running_effort` — never a new workout
+    type, because measured pace is the repo's one definition. **The floor is
+    disabled only when the PLAN reference is being graded against**, never for
+    a rolling median that merely happens to be slow: that is what keeps the
+    quality-day hole shut (a 15:20/mi walk on a prescribed tempo day scoring
+    A+ against a walking-pool median). Guarded by the
+    `prescribed_walk_obeyed` eval — and note `min_stars` does NOT catch the
+    regression on its own, because the pre-fix card is a *vacuous* 5.00 off
+    continuity alone; `test_every_scenario_actually_grades_something` is what
+    bites. A metric that abstains satisfies any lower bound.
   - **The card always names its yardstick.** Plan-prescribed (distance, pace,
     and HR when `target_hr_max` is set) or a 60-day rolling *median* of
     comparable activities. Median, not mean: the history carries real

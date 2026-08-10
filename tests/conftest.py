@@ -107,6 +107,63 @@ def _no_live_smtp_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_calendar_credentials(monkeypatch):
+    """Strip `LOCAL_FITNESS_GCAL_*` from the environment for every test.
+
+    Importing ``local_fitness.cli`` runs ``load_dotenv()`` at MODULE SCOPE, so
+    the moment any test file imports it the developer's real ``<repo>/.env`` is
+    merged into ``os.environ`` for the rest of the pytest process. Once that
+    happens ``calendar_sync.blocked_reason()`` returns None everywhere, and
+    unrelated plan-write tests start attempting a live sync — observed as
+    ``test_commit_activates_draft`` finding an unexpected ``calendar`` key in
+    its payload.
+
+    The failure mode is the dangerous direction: **CI has no ``.env``, so CI
+    stays green while the suite breaks on every configured machine.** That is
+    the inverse of the 0.51.0 no-database bug (green locally, red in CI) and
+    strictly worse, because nothing forces anyone to notice.
+
+    Clearing them makes "not configured" the default, which is also the state a
+    fresh clone is in — the behavior most tests should be asserting against
+    anyway. A test that wants the calendar path sets these itself via
+    ``monkeypatch.setenv``; autouse fixtures are set up first, so an explicit
+    set always wins.
+    """
+    for name in ("LOCAL_FITNESS_GCAL_CLIENT_ID",
+                 "LOCAL_FITNESS_GCAL_CLIENT_SECRET",
+                 "LOCAL_FITNESS_GCAL_REFRESH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_calendar_calls(monkeypatch):
+    """Hard-block real Google Calendar traffic for the whole suite.
+
+    Fourth guard, same lesson as the SDK, Garmin and SMTP ones: the calendar
+    path ends in an HTTP POST that CREATES something in an account, and a test
+    that walked far enough down ``cli.plan_calendar`` would put a real event on
+    a real calendar. Like the mail send, that is worse than slow — it is not
+    undoable from inside the test run.
+
+    Raises rather than no-opping, for the SMTP guard's reason: no caller treats
+    "the calendar write silently didn't happen" as a documented degraded path,
+    so a test that trips this has a wiring bug worth surfacing. ``gcal`` funnels
+    every request through one function precisely so this fixture has a single
+    thing to patch; a test exercising the transport patches
+    ``gcal._request`` itself, which runs after this and therefore wins.
+    """
+    from local_fitness.agent import gcal
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError(
+            "Live Google Calendar request attempted in a test. Patch "
+            "gcal._request in your test instead."
+        )
+
+    monkeypatch.setattr(gcal, "_request", _blocked)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_profile_cache():
     """Drop ``coach.load_profile``'s memo around every test.
 

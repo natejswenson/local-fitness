@@ -140,6 +140,15 @@ is still there — which is the whole point.
 
 ## Gotchas
 
+- **This writes Google Calendar too, when it's configured** (0.53.0). The response carries a
+  `calendar` object with `created`/`updated`/`deleted`/`unchanged` and the dates that moved —
+  quote the dates, not the counts, when confirming an edit. The key is **absent** when no sync
+  was attempted (no credentials, or the kill switch is off); `{"status": "error"}` means the
+  plan write still succeeded and only the calendar failed, so never retry the plan edit because
+  of it. Configure with [`get_plan_calendar_settings`](get_plan_calendar_settings.md).
+  The whole batch syncs once, not once per entry — another reason a reshape belongs in
+  one call.
+
 - **It cannot add or move a day.** A "move" is still rest-the-old + prescribe-the-new, and the new
   day must already exist. Batching does not change that; it only makes the pair atomic.
 - **A duplicate `(date, seq)` in one batch is an error**, not last-wins. Two entries for the same day
