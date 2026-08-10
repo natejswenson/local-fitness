@@ -6,7 +6,7 @@ live brief, prove the new toolless generator behaves like the old monolith. This
 runs the V2 path across the same golden fixtures (with ``save=False`` so it can
 never touch ``briefings/``), fingerprints each brief with
 ``ab_brief.extract_features``, and diffs those fingerprints against the committed
-``tests/evals/baseline.json`` (captured on V1).
+``tests/evals/baseline.json`` (version 2: captured on the V2 composer, with per-scenario invention rates).
 
 The gate is **deterministic and judge-free** (per the design): structural parity
 only. The structural checks per scenario are —
@@ -17,9 +17,11 @@ only. The structural checks per scenario are —
     the others, because ab_brief's plan-keyword heuristic is noisy on the
     prompt's own "today's session" phrasing — the baseline itself recorded that)
 
-Invention-rate (≤ baseline) is the OTHER half of the gate but needs
-``grounding.flag``, which lands in Phase 4 and backfills it here. Until then this
-reports structural parity only and says so.
+Invention-rate is the OTHER half of the gate (0.58.0): each scenario's rate
+must sit within ``_INVENTION_MARGIN`` of the committed baseline's recorded rate
+(the version-2 baseline carries one per scenario). ``_INVENTION_BUDGET`` is
+the rule only for a scenario the baseline has no rate for. A breach fails
+parity and the exit code, same as a structural mismatch.
 
 Cost discipline (the project's "quote spend + hard cap" rule), same as
 capture_baseline.py: dry-run by DEFAULT; ``--run`` guarded by a hard cap;
@@ -52,13 +54,17 @@ import eval_fixtures
 
 _BASELINE_PATH = cb._BASELINE_PATH
 _V2_ENV = "LOCAL_FITNESS_BRIEF_V2"
-# Invention-rate budget: V1-with-tools fetches real numbers so its rate ≈ 0; the
-# committed baseline stores fingerprints only (no prose to score retroactively),
-# so the gate is an absolute budget rather than "≤ baseline". Loose because the
-# signal is advisory (occasional false positives) — it catches gross invention,
-# not every near-miss. A scenario whose V2 briefs invent in >half their takeaways
-# fails parity.
+# Invention-rate gate (0.58.0 — was advisory-vs-constant while the baseline
+# predated grounding). Per scenario: rate <= baseline_rate + _INVENTION_MARGIN.
+# The margin absorbs run-to-run noise; the recorded baseline absorbs
+# grounding's known per-scenario false positives (derived baselines,
+# continuity recalls) — MEASURED on the 2026-08-10 v2 capture, two fixtures
+# baseline at 0.83-0.88, so any absolute cap below that would make them
+# permanently unpassable. _INVENTION_BUDGET therefore applies ONLY to a
+# scenario the baseline has no rate for (there is no reference to be
+# relative to), never as a cap under a recorded baseline.
 _INVENTION_BUDGET = 0.5
+_INVENTION_MARGIN = 0.15
 
 
 def _median_count(fingerprints: list[dict]) -> int | None:
@@ -100,16 +106,26 @@ def parity_report(baseline_doc: dict, shadow: dict[str, dict]) -> dict:
                     "mentions_plan flipped on a non-plan scenario — ab_brief "
                     "plan-keyword noise on 'today's session' phrasing (advisory)")
 
-        # Invention-rate is ADVISORY, not a hard gate — grounding is a
-        # measurement with known false positives (derived baselines, continuity
-        # recalls), so a high rate flags tokens for human review rather than
-        # failing parity. Structural parity is the automated verdict.
+        # Invention-rate GATE (0.58.0): within margin of the baseline's own
+        # recorded rate, bounded by the absolute budget. Unscored (mock path,
+        # rate None) leaves the check passing — the mock path has no context
+        # to score against, and structural parity is still gated.
         inv = rec.get("invention_rate")
-        if inv is not None and inv > _INVENTION_BUDGET:
-            warnings.append(
-                f"invention_rate {inv} > {_INVENTION_BUDGET} (advisory) — review the "
-                "flagged tokens; grounding false-positives on derived baselines / "
-                "continuity numbers are expected")
+        base_inv = base.get(name, {}).get("invention_rate")
+        if inv is None:
+            checks["invention_rate"] = True
+            warnings.append("invention_rate not scored (no context on this path)")
+        else:
+            ceiling = (
+                base_inv + _INVENTION_MARGIN
+                if base_inv is not None else _INVENTION_BUDGET
+            )
+            checks["invention_rate"] = inv <= ceiling
+            if not checks["invention_rate"]:
+                warnings.append(
+                    f"invention_rate {inv} > ceiling {round(ceiling, 3)} "
+                    f"(baseline {base_inv}, margin {_INVENTION_MARGIN}, "
+                    f"budget {_INVENTION_BUDGET})")
 
         parity = all(checks.values())
         overall = overall and parity
@@ -123,8 +139,10 @@ def parity_report(baseline_doc: dict, shadow: dict[str, dict]) -> dict:
             "flakes": len(rec.get("flakes", [])),
         }
     scored = any(s["invention_rate"] is not None for s in scenarios.values())
-    gate = (f"advisory (reported, not gated; budget {_INVENTION_BUDGET})" if scored
-            else "not computed — run live (--run) to score invention_rate via grounding")
+    gate = (f"GATED: per-scenario <= baseline + {_INVENTION_MARGIN} "
+            f"(budget {_INVENTION_BUDGET} only when the baseline has no rate)"
+            if scored
+            else "not scored on this path (mock) — structural parity only")
     return {
         "overall_parity": overall,
         "invention_rate_gate": gate,
@@ -223,8 +241,7 @@ def _print_report(report: dict) -> None:
             print(f"      warning: {w}")
     print(f"\n  invention-rate gate: {report['invention_rate_gate']}")
     if report["overall_parity"]:
-        print("\nOVERALL: STRUCTURAL PARITY HOLDS. Invention-rate is advisory — "
-              "review any flagged-token warnings above before flipping the flag.")
+        print("\nOVERALL: PARITY HOLDS (structure + invention rate).")
     else:
         print("\nOVERALL: PARITY FAILED — keep the flag OFF; investigate the "
               "mismatched scenarios before retry.")
