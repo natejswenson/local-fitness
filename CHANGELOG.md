@@ -6,6 +6,72 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-08-09
+
+### Fixed
+- **A PRESCRIBED walk is now compliance, not evasion.** Surfaced by a real
+  edit: a back injury turned a week of runs into 3-4 mi daily walks, and the
+  rubric punished obeying the new prescription. Two defects with one root —
+  **nothing could tell a walk the plan ASKED for from a walk masquerading as a
+  run.**
+
+  `pace_deviation`'s walk floor fired against the prescription itself. Measured
+  on a prescribed 3.5 mi walk at 17:00/mi: walking it exactly scored **1.30
+  stars**, walking it *slower* — the more recovery-appropriate choice — hit the
+  **1.00 floor**, and the only way to score well was to walk faster than an
+  injured athlete had been told to. That is the same inversion as 0.40.0's load
+  metric, where obeying an easy day's HR cap mechanically failed the grade.
+
+  `plan_walk_mismatch` compounded it. It fires on "walked + plan type is a
+  running type", and a prescribed walk is stored as `easy` (CLAUDE.md
+  prescribes walks that way deliberately — it is what makes the day gradeable).
+  So every day of a walking block refused its own target and printed a note
+  claiming the prescription "doesn't apply" to the very effort it prescribed,
+  falling back to a rolling reference which, in an injury block, is itself all
+  walks and can grade nothing. The pre-fix card on the new eval fixture is a
+  **vacuous 5.00 off continuity alone** — one graded metric.
+
+  Both now key off `plan_prescribes_walk`: a prescription whose own pace target
+  is slower than the run/walk boundary is an instruction to walk. Judged by
+  prescribed PACE via `interpret.is_running_effort`, not by a new workout type
+  — run-vs-walk is decided by measured pace everywhere in this repo and that is
+  the one definition. **The floor is disabled only when the PLAN reference is
+  what is being graded against**, never when a rolling median merely happens to
+  be slow; that distinction is what keeps the documented quality-day hole shut
+  (a 15:20/mi walk on a prescribed tempo day scoring A+ against a walking-pool
+  median).
+
+  New eval scenario `prescribed_walk_obeyed` (`min_stars: 4.25`). It fails
+  without the fix, and the way it fails is instructive: `min_stars` alone does
+  NOT catch it, because the pre-fix card scores a vacuous 5.00 —
+  `test_every_scenario_actually_grades_something` is what bites. Both guards
+  are load-bearing; neither is sufficient.
+
+  **Calibration gate run before and after — byte-identical output**, 43 running
+  efforts over 90 days, every metric `ok`:
+
+  ```
+  metric                 1.00 .. 5.00        mean    n  verdict
+  distance               ##.#...#..#.#.###   4.37   43  ok — 9 buckets, top 72%, interior 26%, <=2.0* 14%
+  pace                   #.#...##.##.#####   4.17   43  ok — 11 buckets, top 47%, interior 51%, <=2.0* 7%
+  hr (rolling band)      ....#.#....##.###   4.64   32  ok — 7 buckets, top 75%, interior 25%, <=2.0* 6%
+  hr (prescribed cap)    #.#..##.#.....#.#   2.88   11  ok — 7 buckets, top 27%, interior 45%, <=2.0* 36%
+  continuity             #.#...##....#..##   4.31   40  ok — 7 buckets, top 75%, interior 18%, <=2.0* 12%
+  ```
+
+  The change is inert on all 43 historical runs — none carries a prescribed
+  walk — so it moves only the case it was written for.
+
+- **The calendar no longer titles a walk "Easy run".** Same root, same
+  signal: `plan_workouts.type` has no walk value, so a 3.5 mi recovery walk
+  rendered as `Easy run 3.5 mi @ 17:00/mi` — a title contradicting both the
+  pace beside it and the description below it. `calendar_render.workout_label`
+  now derives the label from the prescribed pace through the same
+  `interpret.is_running_effort` boundary the report card grades against, so a
+  session the card treats as a walk can never be titled a run.
+  A **paceless** prescription keeps its type label: mode is genuinely unknown
+  there, and guessing "walk" would mislabel every by-feel easy day.
+
 ## [0.54.0] - 2026-08-09
 
 ### Changed

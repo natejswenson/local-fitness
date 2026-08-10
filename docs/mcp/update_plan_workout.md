@@ -183,6 +183,13 @@ Second returns the re-prescribed Sunday, as above.
 
 ## Gotchas
 
+- **To prescribe a WALK, set a walking pace** — there is no `walk` type. Keep `type: "easy"`
+  (that is what makes the day gradeable) and give `pace_min_per_mi` a value slower than 13:00,
+  the repo's run/walk boundary. That one signal drives everything downstream: the report card
+  grades it as a walk instead of refusing the prescription, and the calendar titles it "Walk"
+  rather than "Easy run". A walk prescribed with a *running* pace, or none at all, is still read
+  as a run.
+
 - **This writes Google Calendar too, when it's configured** (0.53.0). The response carries a
   `calendar` object with `created`/`updated`/`deleted`/`unchanged` and the dates that moved —
   quote the dates, not the counts, when confirming an edit. The key is **absent** when no sync

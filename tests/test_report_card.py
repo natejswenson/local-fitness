@@ -2913,3 +2913,85 @@ def test_metric_notes_are_shared_and_table_ordered():
     # A metric with no note contributes nothing.
     assert all(label not in ("Avg HR", "Continuity")
                for label, _n in rc.metric_notes(card))
+
+
+# --- prescribed walks (0.55.0) ---------------------------------------------
+#
+# The walk floor exists to catch a walk MASQUERADING as a run. A plan is also
+# allowed to prescribe a walk outright, and then walking is compliance. The
+# rubric could not tell the two apart, so obeying a prescribed walk was
+# punished — the same inversion as 0.40.0's load metric.
+
+def _spk(mmss: str) -> float:
+    m, s = mmss.split(":")
+    return (int(m) * 60 + int(s)) / 1.609344
+
+
+def test_obeying_a_prescribed_walk_is_not_penalized():
+    exact = rc.pace_deviation(
+        _spk("17:00"), _spk("17:00"), "easy", prescribed_walk=True)
+    assert exact == 0.0
+    assert rc.stars_from_deviation(exact, "pace") == 5.0
+
+
+def test_walking_slower_than_prescribed_is_still_compliance():
+    # An easy day is free on the slow side, and a recovery walk taken gently is
+    # the LAST thing that should be marked down. Pre-fix this hit the 1.00 floor.
+    for slower in ("18:00", "20:00", "25:00"):
+        d = rc.pace_deviation(
+            _spk(slower), _spk("17:00"), "easy", prescribed_walk=True)
+        assert d == 0.0, slower
+
+
+def test_walking_faster_than_prescribed_still_costs():
+    # The easy-day gate must keep working — this is a recovery prescription,
+    # and hurrying it is the one thing worth flagging.
+    d = rc.pace_deviation(
+        _spk("14:00"), _spk("17:00"), "easy", prescribed_walk=True)
+    assert d > 0.15
+    assert rc.stars_from_deviation(d, "pace") < 3.0
+
+
+def test_the_floor_is_unchanged_when_the_walk_was_not_prescribed():
+    # The regression this guard exists to prevent: a walk graded against a
+    # RUNNING expectation must still be floored, or a walking-desk session
+    # scores a perfect pace against an easy target again (the 0.26.0 case).
+    d = rc.pace_deviation(_spk("20:00"), _spk("9:39"), "easy")
+    assert d > 0.35
+    assert rc.stars_from_deviation(d, "pace") == 1.0
+
+
+def test_a_slow_rolling_reference_is_not_an_instruction_to_walk():
+    # `prescribed_walk` is gated on the PLAN reference in build_card. A rolling
+    # median that merely happens to be walk-paced must keep the floor, or the
+    # documented quality-day hole reopens (a 15:20/mi walk on a prescribed
+    # tempo day scoring A+ against a walking-pool median).
+    # 15:20 is FASTER than the 16:00 walking median, so quality's slow-only
+    # gate scores 0.0 and the floor is the only thing standing between this and
+    # a perfect pace. Pinned as the DIFFERENCE the flag makes, so neither side
+    # can drift silently.
+    d = rc.pace_deviation(_spk("15:20"), _spk("16:00"), "quality")
+    assert d > 0.15, "quality walk floor stopped firing"
+    assert rc.pace_deviation(
+        _spk("15:20"), _spk("16:00"), "quality", prescribed_walk=True) == 0.0
+
+
+def test_a_walk_prescription_keeps_its_plan_reference(tmp_path):
+    """The compounding half: `plan_walk_mismatch` refused the plan outright.
+
+    It fires on "walked + plan type is a running type", and a prescribed walk
+    is stored as `easy`. So every day of a walking block refused its own
+    target, printed a note claiming the prescription did not apply to the
+    effort it prescribed, and fell back to a rolling reference that — in an
+    injury block — is itself all walks and cannot grade anything.
+    """
+    import pathlib
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).parent / "evals"))
+    from report_cards import grade
+
+    card = grade("prescribed_walk_obeyed", tmp_path)
+    assert card["metrics"]["pace"]["reference"] == "plan"
+    assert card["metrics"]["distance"]["reference"] == "plan"
+    assert not card["metrics"]["pace"].get("note")
+    assert card["overall"]["graded_metrics"] >= 3
