@@ -592,8 +592,8 @@ def build_server(extra_tools: list | None = None) -> Server:
     membership and the rule that decides it: a tool handing back a filesystem
     path a remote caller can't retrieve is local-only) off the streamable-HTTP
     /mcp/ transport. Today that set is generate_brief_report + workout_report_card
-    (both write PDFs); generate_chart is NOT in it — it moved into ALL_TOOLS
-    once it returned an inline image block. If a future edit ever passes
+    (both write PDFs); chart's png format (the former generate_chart) is NOT
+    in it — an inline image block needs no file retrieval. If a future edit ever passes
     ``LOCAL_ONLY_TOOLS`` there too "for consistency", the HTTP transport
     silently regains tools this whole boundary exists to keep off it."""
     instance = agent_tools.make_server(extra_tools=extra_tools)["instance"]
@@ -632,7 +632,7 @@ def build_session_manager(
 
 def _prewarm_matplotlib() -> None:
     """Best-effort background warm-up (Fix 11): matplotlib's own import costs
-    157-210ms, paid today on whichever of generate_chart/PDF-rendering tools
+    157-210ms, paid today on whichever of chart-png/PDF-rendering tools
     a stdio session calls first (the lazy `import matplotlib` in
     visuals.py) — a warm process renders in 42-60ms. Importing it here, off
     the request path, absorbs that cost while the client is still doing its

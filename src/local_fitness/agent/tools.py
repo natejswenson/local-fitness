@@ -120,14 +120,6 @@ QUERYABLE_SCHEMA: dict[str, list[str]] = {
 }
 
 
-def _render_schema() -> str:
-    """One-line `table(col, col, ...); ...` rendering of QUERYABLE_SCHEMA, used
-    in run_sql's advertised table list so it can't drift from the source."""
-    return "; ".join(
-        f"{table}({', '.join(cols)})" for table, cols in QUERYABLE_SCHEMA.items()
-    )
-
-
 DAILY_NUMERIC_METRICS = {
     "sleep_seconds", "sleep_score", "sleep_deep_seconds", "sleep_rem_seconds",
     "sleep_light_seconds", "sleep_awake_seconds",
@@ -334,96 +326,38 @@ _DAILY_SNAPSHOT_DESCRIPTION = (
 )
 
 
-@tool(
-    "get_metric",
-    "Get raw daily values for one metric over the last N days, oldest-first. "
-    "Skips days with no reading (NULL) and reports days_with_data vs the window. "
-    "*_seconds metrics carry a value_formatted (e.g. '7h 33m') alongside the raw value. "
-    "For same-day running-tally metrics (steps, avg_stress, max_stress, "
-    "active_calories, intensity minutes, body_battery_charged/drained) the "
-    "window anchors on YESTERDAY, not today — today's tally is partial all "
-    "day, so `partial_today_excluded: true` is attached and 'the last N days' "
-    "means N complete days ending yesterday, not today.",
-    {"metric": str, "days": int},
-)
-async def get_metric(args: dict) -> dict:
-    metric = args["metric"]
-    if metric not in DAILY_NUMERIC_METRICS:
-        return _err(f"unknown metric '{metric}'", allowed=sorted(DAILY_NUMERIC_METRICS))
-    err = _validate_days(args["days"])
-    if err:
-        return _err(err)
-    days = args["days"]
-    today = date.today()
-    anchor = _partial_day_anchor(metric, today)
-    cutoff = (anchor - timedelta(days=days)).isoformat()
-    # Skip NULL readings: for sparse columns (vo2_max updates only on run days)
-    # a long window is otherwise mostly {"value": null} rows — pure token cost.
-    # get_metric_trend already filters the same way; this aligns the two on what
-    # "a day with data" means. days_with_data vs days_window surfaces the gap so
-    # nothing is silently hidden.
-    with db.connect() as conn:
-        rows = conn.execute(
-            f"SELECT date, {metric} AS value FROM daily_metrics "
-            f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date",
-            (cutoff, anchor.isoformat()),
-        ).fetchall()
-        # Same latest-baseline fetch as get_metric_trend (mirrored exactly):
-        # without it, "is 52 high?" on a raw-values payload needed a second
-        # tool call — the sibling attaches the read, this one didn't (the
-        # interpret.py house rule: deterministic interpretation rides along).
-        baseline = None
-        if metric in BASELINE_METRICS:
-            baseline = conn.execute(
-                f"SELECT {metric}_60day_mean AS m, {metric}_60day_sd AS sd "
-                f"FROM baselines WHERE {metric}_60day_mean IS NOT NULL "
-                f"ORDER BY date DESC LIMIT 1"
-            ).fetchone()
-    # Formatted companion for duration-shaped metrics — the coach voice never
-    # speaks raw seconds ("25200 seconds"); attach the "7h 33m" shape at the
-    # payload boundary, same discipline get_metric_trend/compare_periods follow.
-    fmt = units.format_hm if metric.endswith("_seconds") else None
-    values = []
-    for r in rows:
-        row = dict(r)
-        if fmt is not None:
-            formatted = fmt(row["value"])
-            if formatted is not None:
-                row["value_formatted"] = formatted
-        values.append(row)
-    payload = {
-        "metric": metric,
-        "days_window": days,
-        "days_with_data": len(values),
-        "values": values,
-    }
-    if anchor != today:
-        payload["partial_today_excluded"] = True
-    current_vs_baseline_sd = None
-    if values and baseline and baseline["m"] is not None:
-        payload["baseline_60day_mean"] = baseline["m"]
-        payload["baseline_60day_sd"] = baseline["sd"]
-        if baseline["sd"]:
-            current_vs_baseline_sd = round(
-                (values[-1]["value"] - baseline["m"]) / baseline["sd"], 2)
-            payload["current_vs_baseline_sd"] = current_vs_baseline_sd
-    # ALWAYS attached, mirroring get_metric_trend: "no data" whenever the SD
-    # distance is unavailable (non-baselined metric, empty window, zero SD).
-    payload["vs_baseline"] = interpret.baseline_position(current_vs_baseline_sd)
-    return _text(payload)
+#: Cap on the raw series get_metric_trend attaches with include_values=true
+#: (0.57.0, the former `get_metric` — its unbounded dump measured 63 KB at
+#: days=3650). Most-recent rows win; values_truncated flags the cut.
+_TREND_MAX_VALUES = 120
 
 
 @tool(
     "get_metric_trend",
-    "Trend stats (mean, slope, current vs baseline) for a metric over N days. "
-    "For same-day running-tally metrics (steps, avg_stress, max_stress, "
-    "active_calories, intensity minutes, body_battery_charged/drained) the "
-    "window anchors on YESTERDAY — today's tally is partial all day and a "
-    "trend/mean computed against it is misleading (a 06:30 read of 50 "
-    "overnight stress samples is not the day's average). `current` is "
-    "therefore yesterday's value for those metrics, and "
-    "`partial_today_excluded: true` is attached.",
-    {"metric": str, "days": int},
+    # 0.57.0: `get_metric` folded in as include_values=true — identical
+    # {metric, days} schema, same anchor logic, and its unbounded raw dump
+    # (63 KB at days=3650, measured) is now capped at _TREND_MAX_VALUES rows.
+    "Trend stats (mean, slope, current vs baseline) for a metric over N "
+    "days. Pass include_values=true to also get the raw {date, value} series "
+    "(most-recent 120 rows max, values_truncated flags the cut; *_seconds "
+    "rows carry a value_formatted like '7h 33m'). For same-day running-tally "
+    "metrics (steps, avg_stress, max_stress, active_calories, intensity "
+    "minutes, body_battery_charged/drained) the window anchors on YESTERDAY "
+    "— today's tally is partial all day and a trend/mean computed against it "
+    "is misleading; `current` is therefore yesterday's value for those "
+    "metrics, and `partial_today_excluded: true` is attached.",
+    {
+        "type": "object",
+        "properties": {
+            "metric": {"type": "string"},
+            "days": {"type": "integer"},
+            "include_values": {
+                "type": "boolean",
+                "description": "Attach the raw daily series (capped). Default false.",
+            },
+        },
+        "required": ["metric", "days"],
+    },
 )
 async def get_metric_trend(args: dict) -> dict:
     metric = args["metric"]
@@ -489,6 +423,22 @@ async def get_metric_trend(args: dict) -> dict:
     }
     if anchor != today:
         payload["partial_today_excluded"] = True
+    if args.get("include_values"):
+        # The former get_metric's raw series, capped: most-recent
+        # _TREND_MAX_VALUES rows, oldest-first within the cap, with the
+        # duration-shaped value_formatted companion the coach voice speaks.
+        fmt = units.format_hm if metric.endswith("_seconds") else None
+        out = []
+        for r in rows[-_TREND_MAX_VALUES:]:
+            row = {"date": r["date"], "value": r["v"]}
+            if fmt is not None:
+                formatted = fmt(row["value"])
+                if formatted is not None:
+                    row["value_formatted"] = formatted
+            out.append(row)
+        payload["values"] = out
+        if n > _TREND_MAX_VALUES:
+            payload["values_truncated"] = True
     if baseline and baseline["m"] is not None:
         payload["baseline_60day_mean"] = baseline["m"]
         payload["baseline_60day_sd"] = baseline["sd"]
@@ -514,7 +464,7 @@ async def get_metric_trend(args: dict) -> dict:
 # training-load series from `baselines` (fitness / fatigue / freshness), and one
 # derived series — Garmin's weekly-badge "active minutes" (moderate + 2×vigorous).
 # Used as a frozen whitelist before any column name reaches an f-string, same as
-# get_metric. Derived/baseline names are mapped to safe SQL below, never f-strung
+# get_metric_trend. Derived/baseline names are mapped to safe SQL below, never f-strung
 # from user input.
 _CHART_BASELINE_METRICS = frozenset({"ctl", "atl", "tsb"})
 _CHART_DERIVED_METRICS = frozenset({"intensity_minutes_weighted"})
@@ -571,15 +521,20 @@ _CHART_SCHEMA = {
             "type": "string",
             "enum": ["calendar", "line", "bar", "combo", "spark"],
             "description": (
-                "calendar = week-stacked emoji heat-grid (default; compact and "
-                "fully visible for any window); line = smooth monochrome curve "
-                "in box-drawing glyphs with a y-axis (heavily smoothed and "
-                "down-sampled to fit the width — reads as the trend, not the "
-                "daily values); bar = emoji-color horizontal bars, one row per "
-                "day, weekly-averaged past ~3 weeks (best ≤ ~2 weeks); combo = "
-                "2D vertical bars + trend line (mono, handles negatives like "
-                "TSB), weekly-averaged on the same threshold; spark = one-line "
-                "sparkline."
+                "calendar = week-stacked emoji heat-grid (ascii default; "
+                "compact and fully visible for any window); line = value "
+                "curve; bar = per-day bars, weekly-bucketed past ~3 weeks; "
+                "combo = bars + trend line (handles negatives like TSB); "
+                "spark = one-line sparkline (ascii only). png supports "
+                "line/bar/combo, default line."
+            ),
+        },
+        "format": {
+            "type": "string",
+            "enum": ["ascii", "png"],
+            "description": (
+                "ascii (default) = terminal chart to reproduce in the reply; "
+                "png = rendered matplotlib image returned inline."
             ),
         },
     },
@@ -603,12 +558,12 @@ def _chart_value_fmt(metric: str):
 def _fetch_metric_series(
     metric: str, days: int, end: str | None = None
 ) -> tuple[list[str], list[float]]:
-    """Shared whitelisted fetch for chart()/generate_chart() — dates + values
+    """Shared whitelisted fetch for chart()'s ascii and png branches — dates
     for `metric` over the `days` days ending on `end` (default today).
 
     Validates `metric` against `_CHART_METRICS` before building any SQL —
     the check lives inside this helper, not left to each caller to remember;
-    both `chart()` and `generate_chart()` inherit it from here. Raises
+    every chart surface inherits it from here. Raises
     ValueError on an unwhitelisted metric so callers translate it into their
     own `_err()` response.
 
@@ -616,8 +571,8 @@ def _fetch_metric_series(
     ``date.today()`` with no upper bound, so re-rendering a PAST brief drew
     charts running to today and could show data the brief's prose never saw.
     ``generate_brief_report`` passes the brief's own date, matching the rule
-    ``_build_plan_section`` already follows. Live callers (``chart``,
-    ``generate_chart``) keep today's behavior via the default.
+    ``_build_plan_section`` already follows. The live caller (``chart``,
+    both formats) keeps today's behavior via the default.
     """
     if metric not in _CHART_METRICS:
         raise ValueError(f"unknown metric '{metric}'")
@@ -626,7 +581,7 @@ def _fetch_metric_series(
     end_iso = end_date.isoformat()
 
     # metric is whitelisted above; the column name interpolated here can only be
-    # a frozen-set member, never raw user input — same contract as get_metric.
+    # a frozen-set member, never raw user input — same contract as get_metric_trend.
     if metric in _CHART_BASELINE_METRICS:
         sql = (f"SELECT date, {metric} AS v FROM baselines "
                f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date")
@@ -672,7 +627,21 @@ def _bucket_weekly(
     return weeks, agg
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, weekly-bucketed past ~3wk), combo (2D bars + trend line, handles negatives, weekly-bucketed past ~3wk), spark (one-liner). Reproduce the full output in a fenced code block in your reply, then add the coach read — never leave it only in the collapsed tool call.", _CHART_SCHEMA)
+@tool(
+    "chart",
+    # One tool, two formats (0.57.0) — `generate_chart` folded in as
+    # format="png". They shared _fetch_metric_series, _CHART_METRICS and
+    # overlapping style enums: two names for one job, the exact ambiguity
+    # the get_today_status removal (0.48.0) documented.
+    "Chart a metric over the last N days. format 'ascii' (default): "
+    "terminal chart (styles: calendar heat-grid [default], line, bar, "
+    "combo, spark) — reproduce the full output in a fenced code block in "
+    "your reply, never leave it only in the collapsed tool call. format "
+    "'png': polished matplotlib image returned inline as an image content "
+    "block plus its saved file path (styles: line [default], bar, combo). "
+    "For scheduled-vs-actual plan views use plan_chart instead.",
+    _CHART_SCHEMA,
+)
 async def chart(args: dict) -> dict:
     metric = args["metric"]
     if metric not in _CHART_METRICS:
@@ -680,6 +649,11 @@ async def chart(args: dict) -> dict:
     err = _validate_days(args["days"])
     if err:
         return _err(err)
+    fmt_arg = args.get("format") or "ascii"
+    if fmt_arg not in ("ascii", "png"):
+        return _err(f"unknown format '{fmt_arg}'", allowed=["ascii", "png"])
+    if fmt_arg == "png":
+        return await _chart_png(args)
     style = args.get("style") or "calendar"
     if style not in _CHART_STYLES:
         return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
@@ -857,8 +831,10 @@ _QUERY_WORKOUTS_SCHEMA = {
     "properties": {
         "activity_type": {"type": "string", "description": "Substring match, e.g. 'running'"},
         "days": {"type": "integer", "description": "Look back this many days"},
+        # min_distance_km left the ADVERTISED schema at 0.57.0 (a deprecated
+        # alias re-shipped in every session's preamble); _min_distance_meters
+        # still accepts it silently, so an old client keeps working.
         "min_distance_mi": {"type": "number", "description": "Minimum distance in MILES (the app's display unit)"},
-        "min_distance_km": {"type": "number", "description": "(deprecated — use min_distance_mi; mi wins if both given)"},
         "min_duration_min": {"type": "integer"},
         "limit": {"type": "integer", "description": "Max rows 1-500, default 50"},
     },
@@ -1837,8 +1813,14 @@ def _run_sql_blocking(q: str) -> list[dict]:
 
 @tool(
     "run_sql",
+    # 0.57.0: the full per-table column dump (1.6 KB re-shipped every
+    # session) is gone from this description — table names only; columns live
+    # in the fitness://schema resource, and a bad column gets a corrective
+    # error naming the valid ones (observed retries succeed first try).
     "Execute a read-only SELECT or WITH query against the fitness DB. "
-    "Tables and columns: " + _render_schema() + ". "
+    "Tables: " + ", ".join(QUERYABLE_SCHEMA) + ". "
+    "Column lists: read the fitness://schema resource, or expect a "
+    "corrective error naming the valid columns on a miss. "
     "Use this for ad-hoc analysis the other tools don't cover. "
     f"Results are capped at {_RUN_SQL_ROW_CAP} rows; when more match, the "
     "payload carries \"truncated\": true — add a LIMIT or aggregate to see the rest.",
@@ -3033,20 +3015,16 @@ _UPDATE_WORKOUT_SCHEMA = {
         "distance_mi": {"type": "number", "description": "target distance in miles (omit for rest / by-feel)"},
         "pace_min_per_mi": {
             "type": ["string", "number"],
-            "description": 'target pace per mile as "M:SS" (e.g. "9:39" — '
-                           "preferred). A bare number is DECIMAL minutes: "
-                           "9.65 is 9:39/mi, while 9.39 is 9:23/mi — do not "
-                           "copy a display string as a number.",
+            "description": 'target pace per mile as "M:SS" (preferred). A bare '
+                           "number is DECIMAL minutes — 9.65 is 9:39/mi, 9.39 "
+                           "is 9:23/mi; never copy a display string as a number.",
         },
         "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
         "hr_max": {
             "type": "number",
-            "description": "prescribed heart-rate CEILING in bpm (e.g. 140 for "
-                           "'keep HR under 140'). The report card grades the "
-                           "run's average HR and how far above this ceiling it "
-                           "ran (in bpm) against this number, so state it here "
-                           "rather than only in the description — prose in the "
-                           "description is not readable by the grader.",
+            "description": "prescribed heart-rate CEILING in bpm. The grader "
+                           "reads THIS field only — a cap stated just in the "
+                           "prose description is invisible to it.",
         },
         "description": {"type": "string", "description": "prose prescription for the day"},
         "seq": {"type": "integer", "description": "intra-day session on a double day: 1 = first/AM (default), 2 = second/PM"},
@@ -3126,15 +3104,12 @@ def _validate_seq(seq) -> tuple[int | None, str | None]:
 
 @tool(
     "update_plan_workout",
-    "Re-prescribe ONE day on the ACTIVE training plan. Pass the date plus any "
-    "of type/distance_mi/pace_min_per_mi/duration_min/hr_max/description — use "
-    "it to move a long run, swap days, or adjust a session (tempo/interval "
-    "sessions are graded on duration_min). Pass hr_max whenever the day has a "
-    "heart-rate ceiling: the report card grades against it, and a cap stated "
-    "only in the description is invisible to the grader. type='rest' clears "
-    "distance/pace/duration/hr_max and defaults the description to 'Rest day' "
-    "unless you pass one. Edits the prescription only; it cannot re-key or "
-    "restructure the plan.",
+    "Re-prescribe ONE day on the ACTIVE training plan: date plus any of "
+    "type/distance_mi/pace_min_per_mi/duration_min/hr_max/description. "
+    "type='rest' clears distance/pace/duration/hr_max and defaults the "
+    "description to 'Rest day'. Edits the prescription only — it cannot "
+    "re-key or restructure the plan. For 2+ days use update_plan_workouts "
+    "(one atomic call), never a loop of this.",
     _UPDATE_WORKOUT_SCHEMA,
 )
 async def update_plan_workout(args: dict) -> dict:
@@ -3240,16 +3215,13 @@ _UPDATE_WORKOUTS_SCHEMA = {
 
 @tool(
     "update_plan_workouts",
-    "Re-prescribe MANY days on the ACTIVE training plan in ONE atomic call — "
-    "the batch form of update_plan_workout, and the right tool for reshaping a "
-    "week or a training block. Each entry takes the same fields as the "
-    "single-day tool. ALL-OR-NOTHING: every entry is validated and every date "
-    "checked to exist before anything is written, so a bad entry leaves the "
-    "plan untouched rather than half-rewritten. Like the single-day tool it "
-    "re-prescribes EXISTING days only — it cannot add, move or delete a day, "
-    "so a swap is two entries (rest the old day, prescribe the new one) and "
-    "the new day must already be on the plan. For a whole new structure use "
-    f"propose_training_plan instead. Max {plans.MAX_BATCH_UPDATES} entries.",
+    "Re-prescribe MANY days on the ACTIVE plan in ONE atomic all-or-nothing "
+    "call (a bad entry writes nothing) — the right tool for reshaping a week "
+    "or block; same fields per entry as update_plan_workout. Re-prescribes "
+    "EXISTING days only: a swap is two entries (rest the old day, prescribe "
+    "the new one) and the new day must already be on the plan. For a whole "
+    f"new structure use propose_training_plan. Max {plans.MAX_BATCH_UPDATES} "
+    "entries.",
     _UPDATE_WORKOUTS_SCHEMA,
 )
 async def update_plan_workouts(args: dict) -> dict:
@@ -3831,7 +3803,7 @@ async def save_brief(args: dict) -> dict:
     "days-to-race, and recent-brief continuity. Prefer this over orchestrating "
     "many tools when answering 'how am I doing / what's today's read / what should "
     "I do today' — every number is pre-computed and traceable to the data. "
-    "Overkill for a single-metric question — use get_metric/get_metric_trend instead.",
+    "Overkill for a single-metric question — use get_metric_trend instead.",
     {},
 )
 async def get_brief_context(_args: dict) -> dict:
@@ -3852,10 +3824,10 @@ async def get_brief_context(_args: dict) -> dict:
 # phone-triggered call over that network transport would get back a
 # container-internal path with no way to retrieve the file; this boundary is
 # structural, not just documented (see
-# docs/plans/2026-07-07-pdf-chart-reports-design.md). generate_chart used to
-# share this boundary but no longer does (Fix A, 2026-07-10 doc) — it's now
-# in ALL_TOOLS, since its inline image content block sidesteps the
-# no-file-retrieval problem that still applies to a PDF.
+# docs/plans/2026-07-07-pdf-chart-reports-design.md). chart's png format
+# (the former generate_chart, folded in 0.57.0) does NOT share this boundary
+# — its inline image content block sidesteps the no-file-retrieval problem
+# that still applies to a PDF.
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -4377,51 +4349,20 @@ async def generate_brief_report(args: dict) -> dict:
 
 _GENERATE_CHART_TYPES = frozenset({"line", "bar", "combo"})
 
-_GENERATE_CHART_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "metric": {
-            "type": "string",
-            "description": "Any daily metric, training-load series (ctl/atl/tsb), or intensity_minutes_weighted — same whitelist as the chart tool.",
-        },
-        "days": {"type": "integer", "description": "Look back this many days"},
-        "chart_type": {
-            "type": "string",
-            "enum": sorted(_GENERATE_CHART_TYPES),
-            "description": (
-                "line = axis chart with gridlines; bar = vertical bars; "
-                "combo = bars + a least-squares trend line of the same "
-                "metric (matches the ASCII chart tool's combo style, one "
-                "metric, one axis — not a two-metric dual-axis chart)."
-            ),
-        },
-    },
-    "required": ["metric", "days", "chart_type"],
-}
-
-
-@tool(
-    "generate_chart",
-    "Render a beautiful standalone PNG chart (line/bar/combo) of a metric "
-    "over the last N days, for any ad-hoc trend question. Returns the chart "
-    "inline as an image content block (plus its saved file path as text) — "
-    "reachable over any transport, local or networked. Use the `chart` tool "
-    "instead when a text-reproducible ASCII/emoji read is what's wanted.",
-    _GENERATE_CHART_SCHEMA,
-)
-async def generate_chart(args: dict) -> dict:
+async def _chart_png(args: dict) -> dict:
+    """chart's format="png" branch — the former `generate_chart` tool body
+    (folded in 0.57.0). `style` maps onto the old `chart_type`; the ascii-only
+    styles error with the allowed list (the get_metric_trend pattern) rather
+    than silently falling back."""
     metric = args["metric"]
     days = args["days"]
-    chart_type = args["chart_type"]
+    chart_type = args.get("style") or "line"
     if chart_type not in _GENERATE_CHART_TYPES:
-        return _err(f"unknown chart_type '{chart_type}'", allowed=sorted(_GENERATE_CHART_TYPES))
-    err = _validate_days(days)
-    if err:
-        return _err(err)
-    try:
-        dates, values = _fetch_metric_series(metric, days)
-    except ValueError as e:
-        return _err(str(e), allowed=sorted(_CHART_METRICS))
+        return _err(
+            f"style '{chart_type}' is not available as png",
+            allowed=sorted(_GENERATE_CHART_TYPES),
+        )
+    dates, values = _fetch_metric_series(metric, days)
     if not values:
         return _err("no data in window", metric=metric, days=days)
 
@@ -4878,7 +4819,11 @@ async def get_report_card(args: dict) -> dict:
 
 ALL_TOOLS = [
     get_brief_context,
-    get_metric,
+    # 0.57.0: get_metric and generate_chart are GONE — folded into
+    # get_metric_trend (include_values=true) and chart (format="png"). Both
+    # were near-duplicates of their survivor (identical schema/anchor logic;
+    # shared fetch + whitelist), i.e. two names for one job — the
+    # get_today_status ambiguity (0.48.0) again.
     get_metric_trend,
     chart,
     plan_chart,
@@ -4922,7 +4867,6 @@ ALL_TOOLS = [
     get_training_plan_progress,
     get_training_plan_draft,
     save_brief,
-    generate_chart,
     list_report_cards,
     get_report_card,
 ]
@@ -4932,10 +4876,10 @@ ALL_TOOLS = [
 # build_session_manager()'s HTTP /mcp/ transport. A phone-triggered call over
 # that transport would get back a container-internal path with no way to
 # retrieve the file — a real constraint for a PDF, which isn't representable
-# as MCP ImageContent. generate_chart moved OUT of this list (Fix A,
-# 2026-07-10 doc): once it returns an inline image content block, the
-# "no way to retrieve the file remotely" problem no longer applies to it, so
-# it's reachable over both stdio and the networked /mcp/ transport via
+# as MCP ImageContent. chart's png format (the former
+# generate_chart, folded in 0.57.0) is deliberately NOT here: it returns an
+# inline image content block, so the "no way to retrieve the file remotely"
+# problem does not apply and it stays reachable over both transports via
 # ALL_TOOLS above. Only the heavy `import matplotlib`/`import weasyprint`
 # statements (inside generate_brief_report's body and visuals.py's own module
 # body) are deferred, not this list.
@@ -4997,7 +4941,10 @@ _READ_ONLY_TOOL_NAMES = (
     # while both names existed; with one name left, excluding it would strip
     # the daily snapshot from the rollback path entirely.
     "daily_snapshot",
-    "get_metric",
+    # 0.57.0: "get_metric" left with its tool (folded into get_metric_trend's
+    # include_values) — a grant naming an unregistered tool would be dead
+    # weight, and briefing_prompt never named it (verified against
+    # tests/test_tools.py's grant-matching test).
     "get_metric_trend",
     "query_workouts",
     "get_workout_detail",

@@ -867,14 +867,19 @@ These are settled — don't redesign without a reason.
   message plus a recovery (`format='table'` / read the brief via resource) —
   "see the server log" is a dead end for an agent that can't read the log.
 - **The two PDF-writing tools are stdio-only — `generate_brief_report` and
-  `workout_report_card` (0.25.0); `generate_chart` moved into `ALL_TOOLS`
-  (2026-07-13, MCP-speed-and-UX-01 fold-in Fix A).** The rule that decides
+  `workout_report_card` (0.25.0); the PNG chart renderer lives in `ALL_TOOLS`
+  as `chart`'s `format="png"` (0.57.0 — the former `generate_chart` tool,
+  which had moved into `ALL_TOOLS` 2026-07-13, folded into `chart` because
+  the two shared fetch/whitelist/styles: two names for one job, the
+  get_today_status ambiguity again; `get_metric` folded into
+  `get_metric_trend`'s `include_values=true` the same release, raw series
+  capped at 120 rows).** The rule that decides
   membership: a tool that hands back a *filesystem path* is local-only,
   because a remote `/mcp/` caller gets a container-internal path it cannot
-  retrieve. `generate_chart` renders a standalone matplotlib PNG on
-  demand and now returns it as an inline MCP image content block (alongside
+  retrieve. The png chart renders a standalone matplotlib PNG on
+  demand and returns it as an inline MCP image content block (alongside
   the saved file path as text) — reachable over both `fitness mcp-stdio` and
-  the networked `/mcp/` transport, since a client no longer needs the local
+  the networked `/mcp/` transport, since a client never needs the local
   file path to see the chart. `generate_brief_report` (`agent/tools.py`'s
   `LOCAL_ONLY_TOOLS`) renders a saved daily brief
   into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline, reusing the
@@ -901,7 +906,7 @@ These are settled — don't redesign without a reason.
   diverged on ~50% of paired Linux renders, measured 2026-07-23; macOS's
   allocator usually masks it), so the "identical content reuses one filename"
   half of the contract failed at random and its CI test was a coin flip.
-  `generate_chart`'s PNG still uses `_content_tag()` (bytes) — matplotlib's
+  The png chart still uses `_content_tag()` (bytes) — matplotlib's
   PNG writer IS reproducible. This is not cosmetic — macOS `open`
   RE-FOCUSES an already-open Preview window for a path it has seen rather than
   reloading the bytes, so the old deterministic `brief-<date>.pdf` showed a
