@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-08-10
+
+### Changed
+- **The brief eval baseline now describes the composer that actually runs.**
+  `tests/evals/baseline.json` was captured 2026-07-05 on the V1 tool-driven
+  monolith; `LOCAL_FITNESS_BRIEF_V2` has defaulted ON since 2026-06-27, so
+  every shadow-run compared the live generator against a retired one.
+  Recaptured (version 2) on the V2 composer — 6 scenarios × 2 runs, under the
+  existing `MAX_GENERATIONS` hard cap, fabricated fixtures only — and the
+  document now carries a per-scenario `invention_rate` scored against the
+  same `BriefContext` the composer saw.
+- **Invention-rate is a GATE, not an advisory line.** The "Phase 4 backfill"
+  deferral had outlived the feature it deferred: `grounding.invention_rate`
+  shipped, `shadow_run.py` computed it live, and then compared it against a
+  loose constant (0.5) and printed "advisory" — a worse-inventing prompt
+  change could ship on a green structural report, and
+  `test_build_baseline_shape` literally pinned the deferral sentence.
+  Now: per scenario, `rate <= baseline_rate + 0.15` — the margin absorbs
+  run-to-run noise, the recorded baseline absorbs grounding's known
+  per-scenario false positives — and a breach fails parity and the exit code
+  like any structural mismatch. The 0.5 absolute budget survives ONLY for
+  scenarios the baseline has no rate for: the capture itself settled this
+  (two fixtures measure 0.83-0.88 baseline invention rate, where grounding's
+  false positives concentrate — an absolute cap under the recorded baseline
+  would have made them permanently unpassable, and the gate's first draft
+  did exactly that). Measured capture: 12/12 schema-valid, 0 flakes,
+  per-scenario rates 0.167-0.875. An unscored rate (the mock path) passes
+  with an explicit "not scored" warning, never silently.
+  `capture_baseline._generate_one` now assembles the scenario's context and
+  scores each generation (the shadow_run pattern — version-1 captures
+  discarded the context, which is why the column stayed "deferred" for six
+  weeks).
+
 ## [0.57.0] - 2026-08-10
 
 ### Changed

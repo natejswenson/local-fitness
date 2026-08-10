@@ -113,12 +113,42 @@ def test_schema_valid_helper():
 def test_build_baseline_shape():
     doc = cb.build_baseline({"green_light": {"runs": 2}}, model="claude-sonnet-4-6",
                             runs=2, captured_at="2026-06-26T08:00:00")
-    assert doc["version"] == 1
+    # Version 2 (0.58.0): captured on the V2 composer WITH invention_rate —
+    # version 1 described the retired V1 monolith and pinned the "Phase 4"
+    # deferral in this very test, which is how the deferral outlived the
+    # feature it was deferring by six weeks.
+    assert doc["version"] == 2
     assert doc["model"] == "claude-sonnet-4-6"
     assert doc["runs_per_scenario"] == 2
     assert doc["captured_at"] == "2026-06-26T08:00:00"
     assert "green_light" in doc["scenarios"]
-    assert "grounding.flag" in doc["note"]  # documents the Phase-4 backfill
+    assert "V2 composer" in doc["note"]
+    assert "invention_rate" in doc["note"]
+    assert "Phase 4" not in doc["note"]
+
+
+def test_aggregate_scenario_propagates_invention_rates():
+    briefs = [_three_with_steps(), _three_with_steps()]
+    rec = cb.aggregate_scenario(briefs, plan_active=False,
+                                invention_rates=[0.2, 0.1])
+    assert rec["invention_rate"] == 0.15
+    assert rec["invention_rates"] == [0.2, 0.1]
+
+
+def test_aggregate_scenario_without_rates_records_none():
+    # The mock path has no context to score against — None, never 0.0
+    # (unscored must be distinguishable from measured-clean).
+    rec = cb.aggregate_scenario([_three_with_steps()], plan_active=False)
+    assert rec["invention_rate"] is None
+    assert rec["invention_rates"] == []
+
+
+def test_aggregate_scenario_skips_none_rates_from_flaked_runs():
+    briefs = [_three_with_steps(), {"error": "stream died"}]
+    rec = cb.aggregate_scenario(briefs, plan_active=False,
+                                invention_rates=[0.3, None])
+    assert rec["invention_rate"] == 0.3
+    assert rec["invention_rates"] == [0.3]
 
 
 def test_estimate_scales_with_generations():

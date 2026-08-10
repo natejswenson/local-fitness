@@ -373,12 +373,28 @@ These are settled — don't redesign without a reason.
   2026-06-27 cutover. The pipeline is deterministic `brief_planner` (triggers,
   fixed priority, advisory tone → typed `BriefContext`) → ONE **toolless**
   generator (`max_turns=1`, no MCP) on the shrunk `brief_v2_*` prompt → advisory
-  `grounding.flag` (a logged invention-rate *signal*, never a gate). The V1
+  `grounding.flag` (a logged invention-rate *signal* on the LIVE save path,
+  never a save gate). The V1
   tool-driven monolith (`system_prompt`/`briefing_prompt`, `max_turns=20`) is the
   **instant rollback** — `LOCAL_FITNESS_BRIEF_V2=0` (or false/no/off). The planner
   is the tested half (`tests/test_brief_planner.py`, `test_grounding.py`); the
   generator is the eval'd half (`tests/evals/` fixtures + `baseline.json` +
-  `scripts/{capture_baseline,shadow_run}.py`). **Only the in-process composer is
+  `scripts/{capture_baseline,shadow_run}.py`). **The committed baseline is
+  version 2 (0.58.0): captured on the V2 composer** — version 1 described the
+  retired V1 monolith for six weeks after the cutover — **and it carries a
+  per-scenario `invention_rate` that `shadow_run.py` GATES on** (`rate <=
+  baseline + 0.15`; the 0.5 absolute budget applies only to scenarios the
+  baseline has no rate for — two fixtures MEASURE 0.83-0.88 baseline rate,
+  grounding's false positives concentrated, so a cap under the recorded
+  baseline would be permanently unpassable; a breach fails parity and the
+  exit code). The
+  advisory-vs-constant "Phase 4 backfill" is done; note the live-path
+  `grounding.flag` above stays advisory — the gate is the shadow-run script,
+  which is the manual pre-flight for any brief prompt/model change (like
+  `calibrate_report_card`, deliberately not in CI: it costs generations).
+  Recapture via `capture_baseline.py --run` only when intentionally resetting
+  the floor after a deliberate prompt/model change that passed its A/B —
+  never routinely. **Only the in-process composer is
   V2** — the MCP `mcp__fitness__*` tools and the MCP `_brief_prompt` (chat /
   external-agent path) still use V1's tool-driven approach (a deliberate scope
   choice; `grounding.flag` is the reusable follow-up there).
