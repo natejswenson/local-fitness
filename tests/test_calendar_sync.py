@@ -453,3 +453,24 @@ def test_removing_events_respects_the_kill_switch(wired, monkeypatch):
     got = calendar_sync.remove_plan_events(pid)
     assert got["status"] == "blocked"
     assert wired.calendar.calls == []
+
+
+def test_the_suite_never_inherits_real_calendar_credentials():
+    """The conftest guard, asserted — because its absence fails INVISIBLY.
+
+    `local_fitness.cli` calls `load_dotenv()` at module scope, so any test file
+    importing it merges the developer's real `.env` into `os.environ` for the
+    whole process. Unrelated plan-write tests then attempt a live sync. CI has
+    no `.env`, so CI stays green while the suite breaks only on machines that
+    actually have the feature configured — nothing would force anyone to notice.
+    """
+    import os
+
+    for name in ("LOCAL_FITNESS_GCAL_CLIENT_ID",
+                 "LOCAL_FITNESS_GCAL_CLIENT_SECRET",
+                 "LOCAL_FITNESS_GCAL_REFRESH_TOKEN"):
+        assert not os.environ.get(name), (
+            f"{name} leaked into the test environment — the conftest fixture "
+            "_no_ambient_calendar_credentials is missing or was reordered"
+        )
+    assert calendar_sync.blocked_reason() is not None

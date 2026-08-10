@@ -418,3 +418,77 @@ def test_a_distance_only_prescription_describes_its_distance():
     got = cr.build_description(no_pace, 4)
     assert "Target: 4.0 mi" in got
     assert "@" not in got
+
+
+# --- reminders -------------------------------------------------------------
+#
+# The calendar is deliberately SILENT. An all-day event starts at midnight, so
+# the calendar's own 30-minute default fires at 23:30 the night before — 41
+# consecutive nights of it. And a day-of reminder is not expressible at all:
+# Google accepts a negative `minutes` with HTTP 200 and clamps it to 0.
+
+def test_every_event_states_no_reminders_explicitly():
+    # Explicitly, not by omission: an event with no `reminders` key inherits
+    # the CALENDAR's default, which is the 23:30 popup this exists to stop.
+    reminders = cr.build_event(EASY, 4)["reminders"]
+    assert reminders == {"useDefault": False, "overrides": []}
+
+
+def test_the_reminder_constant_is_not_shared_between_events():
+    # A shared dict would let one caller's mutation reach every other event.
+    a, b = cr.build_event(EASY, 4), cr.build_event(EASY, 5)
+    assert a["reminders"] is not b["reminders"]
+    assert a["reminders"] is not cr.NO_REMINDERS
+
+
+def test_googles_echo_of_no_reminders_compares_equal():
+    # THE test. Google drops the empty `overrides` list on the way back, so a
+    # raw dict comparison would report a difference forever and rewrite all 41
+    # events on every single sync. Measured shape, not a guess.
+    want = cr.build_event(EASY, 4)
+    echoed = {**want, "status": "confirmed", "reminders": {"useDefault": False}}
+    assert cr._differs(echoed, want) is False
+
+
+def test_an_event_carrying_the_calendar_default_is_a_difference():
+    # This is what every event written before 0.54.0 looks like, and it is what
+    # makes the next sync repair them rather than leaving them noisy.
+    want = cr.build_event(EASY, 4)
+    inherited = {**want, "status": "confirmed", "reminders": {"useDefault": True}}
+    assert cr._differs(inherited, want) is True
+
+
+def test_a_stray_override_is_a_difference():
+    want = cr.build_event(EASY, 4)
+    noisy = {**want, "status": "confirmed",
+             "reminders": {"useDefault": False,
+                           "overrides": [{"method": "popup", "minutes": 30}]}}
+    assert cr._differs(noisy, want) is True
+
+
+def test_override_order_is_not_a_difference():
+    # Their order is the server's to choose, not ours.
+    want = {**cr.build_event(EASY, 4),
+            "reminders": {"useDefault": False, "overrides": [
+                {"method": "popup", "minutes": 30},
+                {"method": "email", "minutes": 60}]}}
+    reordered = {**want, "reminders": {"useDefault": False, "overrides": [
+        {"method": "email", "minutes": 60},
+        {"method": "popup", "minutes": 30}]}}
+    assert cr._differs(reordered, want) is False
+
+
+def test_a_missing_reminders_key_reads_as_the_calendar_default():
+    # An event Google returns with no `reminders` key at all is inheriting the
+    # default, so it must NOT compare equal to our explicit silence.
+    want = cr.build_event(EASY, 4)
+    bare = {k: v for k, v in want.items() if k != "reminders"}
+    assert cr._differs(bare, want) is True
+
+
+def test_a_reminder_change_is_seen_by_the_reconcile():
+    # End to end: the field is compared where it actually matters.
+    want = cr.build_event(EASY, 4)
+    noisy = {**want, "status": "confirmed", "reminders": {"useDefault": True}}
+    got = cr.reconcile([want], [noisy], "2026-08-01")
+    assert got["update"] == [want] and got["unchanged"] == []

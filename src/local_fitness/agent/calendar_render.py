@@ -66,6 +66,22 @@ _DIGEST_CHARS = 26
 #: else on the calendar.
 SOURCE_TAG = "local-fitness"
 
+#: No reminders, stated EXPLICITLY. Omitting the key is not the same thing —
+#: the calendar's own default applies, and on a personal calendar that default
+#: is typically a 30-minute popup. An all-day event starts at MIDNIGHT, so "30
+#: minutes before" fires at 23:30 the night before: 41 consecutive nights of
+#: late-evening notifications, which is how the whole calendar gets muted.
+#:
+#: **A reminder on the day of an all-day event is not expressible, and Google
+#: fails at this SILENTLY.** ``minutes`` is strictly *before* the start, and a
+#: negative value is accepted with HTTP 200 and then clamped to 0 — measured
+#: 2026-08-09: ``minutes: -480`` (08:00 day-of) stored as ``minutes: 0``
+#: (midnight). Nothing errors; you simply get a different reminder than the one
+#: you asked for. If a morning-of nudge is ever wanted, the events have to stop
+#: being all-day and become timed blocks — there is no third option, and no
+#: amount of arithmetic on this constant will produce one.
+NO_REMINDERS = {"useDefault": False, "overrides": []}
+
 
 def event_id(plan_id: int, date: str, seq: int) -> str:
     """A stable Google Calendar event id for one prescribed session.
@@ -196,6 +212,9 @@ def build_event(workout: dict | None, plan_id: int) -> dict | None:
         # Free, not busy. An all-day event that blocks the day would make every
         # scheduling tool think you're out.
         "transparency": "transparent",
+        # Silent by default — see NO_REMINDERS. The calendar is a reference you
+        # look at, not something that interrupts you at 23:30 every night.
+        "reminders": dict(NO_REMINDERS),
         # Values must be strings — the API rejects non-string extended
         # properties outright.
         "extendedProperties": {
@@ -267,8 +286,36 @@ def _event_date(event: dict) -> str:
     return str((event.get("start") or {}).get("date") or "")[:10]
 
 
+def _reminder_key(event: dict):
+    """Reminders reduced to something two events can be compared on.
+
+    Normalizing is not tidiness, it is the difference between a quiet sync and
+    one that rewrites all 41 events every single run. Google does not echo back
+    what you send: ``{"useDefault": false, "overrides": []}`` comes back as
+    ``{"useDefault": false}`` with the empty list dropped (measured
+    2026-08-09), so a raw dict comparison reports a difference forever and the
+    reconcile never converges. Overrides become a SET for the same reason —
+    their order is the server's to choose, not ours.
+    """
+    reminders = event.get("reminders")
+    if reminders is None:
+        # No key at all is UNKNOWN, not silence. Reading it as "no reminders"
+        # would make an event that is actually inheriting the calendar's 23:30
+        # popup compare equal to our explicit silence and never get repaired.
+        # Returning a value nothing else can equal costs at most one redundant
+        # write; the other reading costs a nightly notification forever.
+        return None
+    overrides = frozenset(
+        (o.get("method"), o.get("minutes"))
+        for o in (reminders.get("overrides") or [])
+    )
+    return bool(reminders.get("useDefault")), overrides
+
+
 def _differs(existing: dict, desired: dict) -> bool:
     if any(existing.get(f) != desired.get(f) for f in COMPARED_FIELDS):
+        return True
+    if _reminder_key(existing) != _reminder_key(desired):
         return True
     return any(
         str((existing.get(side) or {}).get("date") or "")[:10] != desired[side]["date"]

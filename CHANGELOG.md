@@ -6,6 +6,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-08-09
+
+### Changed
+- **Calendar events carry no reminders, stated explicitly.** Omitting the
+  `reminders` key is not the same as saying "none" — the calendar's own default
+  applies, and on a personal calendar that is typically a 30-minute popup. An
+  all-day event starts at **midnight**, so "30 minutes before" fires at **23:30
+  the night before**: 41 consecutive nights of late-evening notifications, which
+  is how a calendar gets muted. Every event now sets
+  `{"useDefault": false, "overrides": []}`.
+
+  **A day-of reminder on an all-day event is not expressible, and Google fails
+  at it SILENTLY.** `minutes` is strictly *before* the start, and a negative
+  value is accepted with HTTP 200 and then clamped — measured 2026-08-09,
+  `minutes: -480` (08:00 day-of) stored as `minutes: 0` (midnight). Nothing
+  errors; you simply get a different reminder than the one you asked for. A
+  morning-of nudge would require the events to stop being all-day and become
+  timed blocks; no arithmetic on the constant produces one.
+
+  **Reminders are normalized before comparison, and that is load-bearing.**
+  Google does not echo back what you send: `{"useDefault": false, "overrides":
+  []}` returns as `{"useDefault": false}` with the empty list dropped. A raw
+  dict comparison would report a difference forever and the reconcile would
+  rewrite all 41 events on every run — the same non-convergence the
+  timestamp-shaped-date normalization already guards against. Overrides compare
+  as a SET, since their order is the server's to choose. A **missing**
+  `reminders` key reads as *unknown*, never as silence: treating absence as
+  "no reminders" would leave an event that is actually inheriting the 23:30
+  popup comparing equal to our explicit silence and never repaired. That costs
+  at most one redundant write; the other reading costs a nightly notification
+  forever.
+
+### Fixed
+- **The test suite no longer inherits the developer's real Google credentials.**
+  `local_fitness.cli` calls `load_dotenv()` at module scope, so the moment any
+  test file imported it, `<repo>/.env` was merged into `os.environ` for the rest
+  of the pytest process. `calendar_sync.blocked_reason()` then returned None
+  everywhere and unrelated plan-write tests began attempting a live sync
+  (`test_commit_activates_draft` found an unexpected `calendar` key in its
+  payload). **CI has no `.env`, so CI stayed green while the suite broke on
+  every machine that actually had the feature configured** — the inverse of the
+  0.51.0 no-database bug, and strictly worse because nothing forces anyone to
+  notice. An autouse fixture now strips `LOCAL_FITNESS_GCAL_*` for every test,
+  making "not configured" the default (which is also a fresh clone's state);
+  tests that want the calendar path set them explicitly.
+  `test_the_suite_never_inherits_real_calendar_credentials` asserts the guard.
+
 ## [0.53.0] - 2026-08-08
 
 ### Changed
