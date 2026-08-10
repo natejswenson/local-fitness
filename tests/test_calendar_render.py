@@ -492,3 +492,52 @@ def test_a_reminder_change_is_seen_by_the_reconcile():
     noisy = {**want, "status": "confirmed", "reminders": {"useDefault": True}}
     got = cr.reconcile([want], [noisy], "2026-08-01")
     assert got["update"] == [want] and got["unchanged"] == []
+
+
+# --- prescribed walks ------------------------------------------------------
+#
+# `plan_workouts.type` has no walk value — CLAUDE.md prescribes walks as `easy`
+# on purpose, because that is what makes them gradeable. So the type says "run"
+# for a session the plan intends as a walk, and only the prescribed PACE knows.
+
+WALK = {**EASY, "target_pace_sec_per_km": 633.8,   # 17:00/mi
+        "target_distance_m": 5632.7,               # 3.5 mi
+        "description": "WALK 3-4 mi, easy. Back injury recovery — no running."}
+
+
+def test_a_walk_paced_easy_day_is_titled_a_walk():
+    # It read "Easy run 3.5 mi @ 17:00/mi" — a title contradicting the pace
+    # printed beside it and the description below it.
+    assert cr.build_summary(WALK) == "Walk 3.5 mi @ 17:00/mi"
+
+
+def test_a_walk_paced_long_day_keeps_its_distinction():
+    assert cr.build_summary({**WALK, "type": "long"}).startswith("Long walk ")
+
+
+def test_a_running_pace_is_still_titled_a_run():
+    assert cr.build_summary(EASY) == "Easy run 4.0 mi @ 10:28/mi"
+
+
+def test_a_paceless_prescription_keeps_its_type_label():
+    # Mode is genuinely unknown with no pace; guessing "walk" would mislabel
+    # every by-feel easy day.
+    bare = {**WALK, "target_pace_sec_per_km": None}
+    assert cr.build_summary(bare) == "Easy run 3.5 mi"
+
+
+def test_the_walk_boundary_is_the_repos_one_definition():
+    # Not a second threshold: the same constant the report card grades
+    # run-vs-walk against, so a session the card treats as a walk can never be
+    # titled a run on the calendar.
+    from local_fitness.agent import interpret
+
+    ceiling_per_km = interpret.RUN_PACE_CEILING_SEC_PER_MI / 1.609344
+    just_running = {**WALK, "target_pace_sec_per_km": ceiling_per_km - 1}
+    just_walking = {**WALK, "target_pace_sec_per_km": ceiling_per_km + 1}
+    assert cr.workout_label(just_running) == "Easy run"
+    assert cr.workout_label(just_walking) == "Walk"
+
+
+def test_an_unknown_type_at_walk_pace_still_says_walk():
+    assert cr.workout_label({**WALK, "type": "swim"}) == "Walk"

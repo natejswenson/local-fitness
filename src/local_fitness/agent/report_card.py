@@ -688,7 +688,8 @@ def distance_deviation(
 
 
 def pace_deviation(
-    actual_sec_per_km: float | None, expected_sec_per_km: float | None, cls: str
+    actual_sec_per_km: float | None, expected_sec_per_km: float | None, cls: str,
+    prescribed_walk: bool = False,
 ) -> float | None:
     """Pace deviation, direction-gated by intent. Pace is sec/km — LOWER is
     faster.
@@ -719,10 +720,27 @@ def pace_deviation(
       the grading step. Not floored — the two-sided formula already
       penalizes a walk-paced steady day relative to its own expectation, so a
       walk cannot quietly clear it.
+
+    ``prescribed_walk`` DISABLES the walk floor, and the distinction it draws
+    is the whole point: the floor exists to catch a walk *masquerading* as a
+    run, but a plan is allowed to prescribe a walk outright (injury recovery,
+    a deliberate walk-supported block) and then walking is COMPLIANCE, not
+    evasion. Measured 2026-08-09 on a prescribed 17:00/mi walk day: walking it
+    exactly scored 1.30 stars, walking it *slower* — the more
+    recovery-appropriate choice — hit the 1.00 floor, and the only way to score
+    well was to walk faster than instructed. That is the same inversion as the
+    0.40.0 load metric, where obeying an easy day's HR cap mechanically failed
+    the grade.
+
+    It is gated on the PLAN reference specifically (see ``build_card``), never
+    on "the expectation happens to be slow". A rolling-median reference that
+    lands at walking pace is not an instruction, and treating it as one would
+    re-open the documented quality-day hole above, where a 15:20/mi walk on a
+    prescribed tempo day scored A+ against a walking-pool median.
     """
     if not actual_sec_per_km or not expected_sec_per_km or expected_sec_per_km <= 0:
         return None
-    walked = max(
+    walked = 0.0 if prescribed_walk else max(
         0.0,
         (actual_sec_per_km - _RUN_PACE_CEILING_SEC_PER_KM) / _RUN_PACE_CEILING_SEC_PER_KM,
     )
@@ -1490,8 +1508,22 @@ def build_card(
     # so), it's a different activity than the one prescribed. Scoped to
     # running plan types only — "cross" is deliberately non-running and
     # "rest" has no reference to refuse (`plan_usable` already excludes it).
+    # …UNLESS the plan asked for a walk. A prescription whose own pace target
+    # is slower than the run/walk boundary IS an instruction to walk, so
+    # walking it is compliance and the plan reference is exactly the right
+    # yardstick. Without this, a plan that prescribes walks (injury recovery, a
+    # walk-supported block) has every one of its days refuse its own target and
+    # fall back to a rolling median, while the card prints a note claiming the
+    # prescription "doesn't apply" to the very effort it prescribed.
+    # Judged by the prescribed PACE, not by a new workout type: run-vs-walk is
+    # decided by measured pace everywhere in this repo, and `is_running_effort`
+    # is that one definition.
+    plan_prescribes_walk = (
+        plan_usable
+        and is_running_effort((plan_workout or {}).get("target_pace_sec_per_km")) is False
+    )
     plan_walk_mismatch = (
-        mode is False and plan_usable
+        mode is False and plan_usable and not plan_prescribes_walk
         and (plan_workout or {}).get("type") in _RUNNING_PLAN_TYPES
     )
     plan_ref_ok = plan_usable and not plan_walk_mismatch
@@ -1586,7 +1618,11 @@ def build_card(
         pace_note = "by-feel day — no pace target"
     elif plan_walk_mismatch:
         pace_note = walk_note
-    d = pace_deviation(graded_pace, expected_pace, cls)
+    # The walk floor is disabled only when the PLAN prescribed the walk and the
+    # plan is what we are grading against — never for a rolling reference that
+    # merely happens to be slow. See pace_deviation's docstring.
+    d = pace_deviation(graded_pace, expected_pace, cls,
+                       prescribed_walk=(pace_ref == "plan" and plan_prescribes_walk))
     pace = _metric(
         stars_from_deviation(d, "pace", widen),
         # `actual` stays the number the grade was measured against, so the Delta

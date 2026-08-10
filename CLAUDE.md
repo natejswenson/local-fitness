@@ -1080,6 +1080,26 @@ These are settled — don't redesign without a reason.
     the bpm ("58% … by 1.2 bpm on average — inside sensor noise"), because the
     fraction alone beside an A+ reads as the card noticing a breach and
     ignoring it.
+  - **A PRESCRIBED walk is compliance, and the rubric had no way to know**
+    (0.55.0). `plan_workouts.type` has no walk value — a walk is prescribed as
+    `easy` deliberately, since that is what makes it gradeable — so two
+    mechanisms both read a prescribed walk as evasion. `pace_deviation`'s walk
+    floor fired against the prescription itself (measured: obeying a 17:00/mi
+    walk scored 1.30 stars, walking SLOWER hit the 1.00 floor, and only walking
+    faster than an injured athlete was told scored well — the 0.40.0 load
+    inversion again), and `plan_walk_mismatch` refused the plan reference
+    outright, printing a note that the prescription "doesn't apply" to the
+    effort it prescribed. Both now key off `plan_prescribes_walk`, judged by
+    prescribed PACE via `interpret.is_running_effort` — never a new workout
+    type, because measured pace is the repo's one definition. **The floor is
+    disabled only when the PLAN reference is being graded against**, never for
+    a rolling median that merely happens to be slow: that is what keeps the
+    quality-day hole shut (a 15:20/mi walk on a prescribed tempo day scoring
+    A+ against a walking-pool median). Guarded by the
+    `prescribed_walk_obeyed` eval — and note `min_stars` does NOT catch the
+    regression on its own, because the pre-fix card is a *vacuous* 5.00 off
+    continuity alone; `test_every_scenario_actually_grades_something` is what
+    bites. A metric that abstains satisfies any lower bound.
   - **The card always names its yardstick.** Plan-prescribed (distance, pace,
     and HR when `target_hr_max` is set) or a 60-day rolling *median* of
     comparable activities. Median, not mean: the history carries real

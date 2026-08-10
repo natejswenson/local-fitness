@@ -33,6 +33,7 @@ from datetime import date as Date
 from datetime import timedelta
 
 from . import units
+from .interpret import is_running_effort
 
 #: Human labels for ``plan_workouts.type``. ``rest`` is deliberately absent —
 #: it is the one type that produces no event at all, and leaving it out of the
@@ -46,6 +47,15 @@ TYPE_LABELS = {
     "race": "RACE",
     "cross": "Cross-training",
 }
+
+#: What the same types are called when the PRESCRIBED pace says walk.
+#: ``plan_workouts.type`` has no walk value — CLAUDE.md prescribes walks as
+#: ``easy`` deliberately, because that is what makes them gradeable — so the
+#: type alone cannot tell you what the session is. Titling a 3.5 mi recovery
+#: walk "Easy run" contradicts the pace printed beside it and the description
+#: below it, which is the "never print two quantities in one column" rule
+#: showing up in words instead of numbers.
+WALK_TYPE_LABELS = {"easy": "Walk", "long": "Long walk"}
 
 #: The type that means "do nothing today". A rest day creates no event, so an
 #: entry from this job on your calendar always means go train.
@@ -117,6 +127,26 @@ def _duration_label(target_duration_sec: float | int | None) -> str | None:
     return f"{round(target_duration_sec / 60)} min"
 
 
+def workout_label(workout: dict) -> str:
+    """What to call this session — decided by prescribed PACE, not by type.
+
+    ``plan_workouts.type`` cannot answer this. A prescribed walk is stored as
+    ``easy`` on purpose (that is what makes it gradeable — see CLAUDE.md), so
+    the type says "run" for a session the plan intends as a walk. The pace does
+    know, and ``interpret.is_running_effort`` is the repo's single definition
+    of that boundary — the same one the report card grades against, so a
+    session the card treats as a walk can never be titled a run.
+
+    A paceless prescription keeps its type label: mode is genuinely unknown
+    there, and guessing "walk" would mislabel every by-feel easy day.
+    """
+    wtype = (workout.get("type") or "").strip().lower()
+    running = is_running_effort(workout.get("target_pace_sec_per_km"))
+    if running is False:
+        return WALK_TYPE_LABELS.get(wtype, "Walk")
+    return TYPE_LABELS.get(wtype) or (wtype.capitalize() if wtype else "Workout")
+
+
 def build_summary(workout: dict) -> str:
     """The calendar title, e.g. ``"Easy run 4.0 mi @ 10:28/mi"``.
 
@@ -125,10 +155,7 @@ def build_summary(workout: dict) -> str:
     ``_DURATION_TYPES`` (interval/tempo) carry seconds. An unknown type falls
     back to the raw value capitalized rather than dropping the session.
     """
-    wtype = (workout.get("type") or "").strip().lower()
-    label = TYPE_LABELS.get(wtype) or (wtype.capitalize() if wtype else "Workout")
-
-    parts = [label]
+    parts = [workout_label(workout)]
     amount = (_distance_label(workout.get("target_distance_m"))
               or _duration_label(workout.get("target_duration_sec")))
     if amount:
