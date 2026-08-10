@@ -107,6 +107,35 @@ def _no_live_smtp_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_calendar_credentials(monkeypatch):
+    """Strip `LOCAL_FITNESS_GCAL_*` from the environment for every test.
+
+    Importing ``local_fitness.cli`` runs ``load_dotenv()`` at MODULE SCOPE, so
+    the moment any test file imports it the developer's real ``<repo>/.env`` is
+    merged into ``os.environ`` for the rest of the pytest process. Once that
+    happens ``calendar_sync.blocked_reason()`` returns None everywhere, and
+    unrelated plan-write tests start attempting a live sync — observed as
+    ``test_commit_activates_draft`` finding an unexpected ``calendar`` key in
+    its payload.
+
+    The failure mode is the dangerous direction: **CI has no ``.env``, so CI
+    stays green while the suite breaks on every configured machine.** That is
+    the inverse of the 0.51.0 no-database bug (green locally, red in CI) and
+    strictly worse, because nothing forces anyone to notice.
+
+    Clearing them makes "not configured" the default, which is also the state a
+    fresh clone is in — the behavior most tests should be asserting against
+    anyway. A test that wants the calendar path sets these itself via
+    ``monkeypatch.setenv``; autouse fixtures are set up first, so an explicit
+    set always wins.
+    """
+    for name in ("LOCAL_FITNESS_GCAL_CLIENT_ID",
+                 "LOCAL_FITNESS_GCAL_CLIENT_SECRET",
+                 "LOCAL_FITNESS_GCAL_REFRESH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_calendar_calls(monkeypatch):
     """Hard-block real Google Calendar traffic for the whole suite.
 

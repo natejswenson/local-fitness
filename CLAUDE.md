@@ -690,6 +690,20 @@ These are settled — don't redesign without a reason.
   at the calendar. All-day `end.date` is **exclusive** (day+1); getting it
   wrong renders a zero-length event some clients hide, i.e. it fails by
   disappearing.
+  **Events carry NO reminders, explicitly** (0.54.0, `NO_REMINDERS`). Omitting
+  the key inherits the *calendar's* default — typically a 30-minute popup, and
+  since an all-day event starts at midnight that fires at **23:30 the night
+  before**, 41 nights running. **A day-of reminder is not expressible on an
+  all-day event and Google fails at it SILENTLY**: `minutes` is strictly
+  *before* the start and a negative is accepted with HTTP 200 then clamped
+  (measured 2026-08-09: `-480` stored as `0`). A morning-of nudge would require
+  timed events, not arithmetic. **Reminders are normalized before comparison**
+  and that is load-bearing: Google returns `{"useDefault": false}` for what we
+  sent as `{"useDefault": false, "overrides": []}`, so a raw dict compare never
+  converges and rewrites all 41 events every run — the same trap as the
+  timestamp-shaped `start.date`. Overrides compare as a SET (server chooses
+  order); a **missing** key reads as *unknown*, never silence, so an event
+  actually inheriting the popup gets repaired rather than compared equal.
   **The unit of work is a RECONCILE, and the reason is the delete side**
   (0.53.0). An upsert can only add or correct — it cannot express "this day is
   no longer a session", so a run turned into a rest day, or a plan abandoned,
@@ -743,7 +757,15 @@ These are settled — don't redesign without a reason.
   `gcal._request` is the single HTTP choke point on purpose: `tests/conftest.py`
   blocks that ONE function (fourth guard beside the SDK/Garmin/SMTP ones,
   because a live call CREATES something in a real account), and TLS
-  verification is configured in one place. Per the rule above it never passes
+  verification is configured in one place. **`conftest` also strips
+  `LOCAL_FITNESS_GCAL_*` from every test's environment** (0.54.0) — `cli.py`
+  `load_dotenv()`s at MODULE scope, so any test importing it merged the real
+  `.env` into `os.environ` for the whole process and unrelated plan-write tests
+  started attempting a live sync. **CI has no `.env`, so CI stayed green while
+  the suite broke only on configured machines** — the inverse of the 0.51.0
+  no-database bug and strictly worse, since nothing forces anyone to notice.
+  Any future credential that gates a network side effect gets the same
+  treatment: default to unconfigured, opt in per test. Per the rule above it never passes
   `verify` at all, and the test inspects the source rather than the outcome.
 - **Garmin pulls reuse a cached session token** (since the 429 fix). `daily.py`
   `_client()` passes `_tokenstore_path()` to `client.login()` instead of a

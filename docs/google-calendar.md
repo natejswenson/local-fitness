@@ -145,7 +145,17 @@ ever see or touch events it created — it lists by its own tag and its own plan
 id, and everything else on your calendar is invisible to it.
 
 Events are **all-day and marked free**, not busy — an all-day block that marked
-you busy would break every scheduling tool pointed at the calendar.
+you busy would break every scheduling tool pointed at the calendar. They also
+carry **no reminders**, deliberately: an all-day event starts at midnight, so a
+calendar's usual 30-minute default popup fires at 23:30 the night before, every
+night. If you want a nudge, set one on individual events by hand — the sync
+will treat that as a difference and overwrite it on the next run, so it isn't a
+place to customise.
+
+A reminder **on the day of** an all-day event is not possible at all: Google
+only allows reminders before the start, and it accepts a negative offset with
+HTTP 200 and then silently clamps it to midnight. A morning-of notification
+would require the events to be timed blocks rather than all-day.
 
 Two things it will not do, deliberately. It never rewrites the **past**:
 yesterday's event records what was prescribed yesterday, and the plan may have
