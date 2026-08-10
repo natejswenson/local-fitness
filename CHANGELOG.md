@@ -6,6 +6,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-08-10
+
+### Changed
+- **Compact list payloads — the raw/formatted duplication is gone.** Measured
+  across 264 recorded MCP calls: `get_training_plan_progress` was 4.6% of
+  calls but 24% of ALL returned characters (~11 KB median), and every
+  workout list row spent ~25% of its bytes shipping raw columns beside their
+  display twins (`distance_meters` + `distance_mi`, `avg_pace_sec_per_km` +
+  `pace_min_per_mi`, `duration_seconds` + `duration_formatted`). New pure
+  module `agent/workout_rows.py` owns both row shapes — `augment_workout`
+  (detail: raw + display side by side) and `display_workout` (list: display
+  only, None values omitted, `effort` kept even when null) — and retires
+  `status.py`'s documented inline byte-copy of the tools augmentation.
+  `query_workouts` and `daily_snapshot.recent_workouts` use the compact
+  shape; `get_training_plan_progress` rows drop raw-when-twinned and omit
+  nulls (a pending day shipped 4+ per row); `training_load_status` no longer
+  re-sends its static 3-line legend (the description carries the bands).
+  Km mode keeps the raw trio everywhere — it IS the display form there.
+  Measured on the live DB: plan progress 11,156 → 7,547 chars (−32%),
+  `query_workouts` −26%, `daily_snapshot` −12%.
+- **`sync_garmin_data` short-circuits when a successful pull completed in the
+  last ~10 minutes** (`status: "fresh"`, no Garmin call, no garminconnect
+  import; `force: true` bypasses, `LOCAL_FITNESS_SYNC_MIN_INTERVAL_MIN`
+  tunes). 8 of 24 recorded sync calls were pure repeats minutes apart — the
+  user re-asks, the agent re-syncs, Garmin gets hit for nothing. Keyed on
+  `ingest_runs.completed_at`; failure statuses never count as fresh, and the
+  guard fails open so a fresh clone still pulls. The scheduled CLI jobs are
+  untouched — the guard lives in the tool, not in `daily.pull`.
+- **Every sync payload now carries `latest_activity`** ({activity_id, date,
+  activity_type, distance_mi, effort}) and `workout_report_card`'s
+  description says to use it directly — the observed
+  `sync → query_workouts → workout_report_card` triple (7 recorded firings,
+  the lookup existing only to resolve "my recent run" into an id) is now two
+  calls. A success payload also no longer ships `"error": null`, which
+  pattern-matched as a failure to naive detectors.
+- **`compare_periods` accepts `days: N`** — "last N days vs the prior N"
+  without hand-computing four ISO dates (the tool had ZERO recorded calls
+  while `run_sql` hand-rolled period comparisons). Derived windows are echoed
+  as `derived_periods`; mixing `days` with explicit dates errors.
+
+### Fixed
+- **Unhandled `sqlite3.DatabaseError` now returns the standard error envelope
+  with a `remediation` field.** Observed live (2026-08-10): two tools
+  returned the bare string `database disk image is malformed` — no
+  `is_error`, no next step. The local `tool()` decorator wraps every handler
+  (zero per-tool diff; a future tool inherits the guard), and the remediation
+  names concrete actions (integrity_check, restore/rebuild — Garmin is the
+  source of truth) and says not to retry unchanged.
+- **PDF-render failures name the exception class + message and a recovery**
+  (`format='table'` for the card; the brief resource for the report) instead
+  of "see the server log" — a dead end for an agent that cannot read the log.
+  The full traceback still goes only to the log (run_sql 0.37.0 precedent:
+  render-stack detail, not secrets).
+- **`list_observations` validates `limit` like every other list surface.**
+  `limit: "abc"` escaped as a raw uncaught ValueError; `limit: -1` reached
+  SQLite as `LIMIT 0` and returned an empty page stamped `truncated: true` —
+  a false claim about rows it never fetched. Now `_validate_limit`
+  (default 100, cap 500) plus explicit columns instead of `SELECT *`.
+
 ## [0.55.1] - 2026-08-10
 
 ### Fixed

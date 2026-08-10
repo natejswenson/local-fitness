@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from claude_agent_sdk import create_sdk_mcp_server, tool
+from claude_agent_sdk import create_sdk_mcp_server
+from claude_agent_sdk import tool as _sdk_tool
 from pydantic import ValidationError
 
 from .. import config, db, notes, plans
@@ -46,6 +47,7 @@ from . import (
     report_card,
     units,
     workout_coach,
+    workout_rows,
 )
 from .schemas import Brief
 
@@ -202,6 +204,50 @@ def _err(msg: str, **extra) -> dict:
     }
 
 
+#: What a caller can actually DO about a corrupt database. Observed live
+#: (2026-08-10): two tools returned the bare sqlite3 string "database disk
+#: image is malformed" — no envelope, no tool name, no next step — and the
+#: agent had nothing to act on. The remediation names concrete actions and
+#: tells the model NOT to retry: a corrupt file does not heal between calls.
+_DB_ERROR_REMEDIATION = (
+    "the SQLite file itself is damaged or unreadable — do not retry this "
+    "call unchanged. Check it with `sqlite3 data/fitness.db 'PRAGMA "
+    "integrity_check'`; if it reports corruption, restore data/fitness.db "
+    "from a backup or rebuild it (`fitness setup` then `fitness backfill "
+    "<export.zip>` / `fitness pull`) — Garmin is the source of truth, so "
+    "nothing but manual notes/plans is lost with the file."
+)
+
+
+def tool(name: str, description: str, input_schema: Any):
+    """The SDK ``tool`` decorator plus a last-resort error envelope.
+
+    Every handler is wrapped in one try/except so an unhandled
+    ``sqlite3.DatabaseError`` (a corrupt DB file, a malformed page read —
+    failures no per-tool code anticipates) surfaces as the same enveloped
+    ``_err`` shape every anticipated failure already uses, with a
+    ``remediation`` the model can act on, instead of a bare exception string
+    with ``is_error`` unset. One wrapper, zero per-tool diff — a future tool
+    inherits the guard by using this decorator, which it must, since this
+    module shadows the SDK import.
+    """
+    sdk_decorator = _sdk_tool(name, description, input_schema)
+
+    def decorate(fn):
+        async def guarded(args: dict) -> dict:
+            try:
+                return await fn(args)
+            except sqlite3.DatabaseError as e:
+                LOG.warning("tool %s: database error", name, exc_info=True)
+                return _err(f"database error: {e}", remediation=_DB_ERROR_REMEDIATION)
+
+        guarded.__name__ = getattr(fn, "__name__", name)
+        guarded.__doc__ = fn.__doc__
+        return sdk_decorator(guarded)
+
+    return decorate
+
+
 def _validate_days(value: Any, name: str = "days", *, lo: int = 1, hi: int = 3650) -> str | None:
     """Bounds-check a user-supplied day count before it reaches timedelta().
 
@@ -260,34 +306,15 @@ def _validate_date(value: Any, name: str = "date") -> str | None:
     return None
 
 
-def _augment_workout(w: dict) -> dict:
-    """Attach mile / formatted convenience fields ALONGSIDE the raw columns.
-
-    Raw fields (distance_meters, avg_pace_sec_per_km, duration_seconds) are
-    never dropped — correlate / run_sql depend on them. A convenience field is
-    only added when units.py returns non-None (null / zero → omitted). The
-    ``distance_mi`` field is suppressed entirely when display units aren't miles.
-
-    ``effort`` is the MEASURED run-vs-walk read (interpret.is_running_effort,
-    pace only) — "run" / "walk" / null when pace is unusable. Garmin's
-    activity_type label lies (walking-desk sessions log as
-    treadmill_running — see CLAUDE.md's run-vs-walk rule), so this is
-    additive, never a replacement for activity_type, and never used to filter
-    or exclude anything here.
-    """
-    if units.display_units() == "miles":
-        distance_mi = units.to_miles(w.get("distance_meters"))
-        if distance_mi is not None:
-            w["distance_mi"] = distance_mi
-    pace = units.format_pace_min_per_mi(w.get("avg_pace_sec_per_km"))
-    if pace is not None:
-        w["pace_min_per_mi"] = pace
-    duration = units.format_duration(w.get("duration_seconds"))
-    if duration is not None:
-        w["duration_formatted"] = duration
-    mode = interpret.is_running_effort(w.get("avg_pace_sec_per_km"))
-    w["effort"] = {True: "run", False: "walk", None: None}[mode]
-    return w
+# One definition for both shapes lives in workout_rows.py (pure; shared with
+# status.py, whose inline copy of this function is retired). The DETAIL shape
+# (_augment_workout: convenience fields alongside raw columns) stays on
+# get_workout_detail / correlate / the manual-workout and plan-write echoes;
+# the LIST shape (_display_workout: display fields only, None-optionals
+# omitted) is for query_workouts and other multi-row surfaces — raw/formatted
+# pairs measured as ~25% of every list payload (2026-08-10 audit).
+_augment_workout = workout_rows.augment_workout
+_display_workout = workout_rows.display_workout
 
 
 # 0.48.0: `get_today_status` is GONE. It and `daily_snapshot` had byte-identical
@@ -928,7 +955,7 @@ async def query_workouts(args: dict) -> dict:
             (*params, limit + 1),
         ).fetchall()
     truncated = len(rows) > limit
-    workouts = [_augment_workout(dict(r)) for r in rows[:limit]]
+    workouts = [_display_workout(dict(r)) for r in rows[:limit]]
     return _text({"workouts": workouts, "count": len(workouts), "truncated": truncated})
 
 
@@ -1016,27 +1043,70 @@ def _compare_periods_sum(conn, metric: str, args: dict) -> dict:
     return {"metric": metric, "period_a": a, "period_b": b, "delta": delta, "delta_pct": delta_pct}
 
 
+_COMPARE_PERIODS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metric": {"type": "string"},
+        "days": {
+            "type": "integer",
+            "description": "Shortcut: compare the last N days against the "
+            "prior N days — no date arithmetic needed. Mutually exclusive "
+            "with the four period_* dates.",
+        },
+        "period_a_start": {"type": "string"},
+        "period_a_end": {"type": "string"},
+        "period_b_start": {"type": "string"},
+        "period_b_end": {"type": "string"},
+    },
+    "required": ["metric"],
+}
+
+_COMPARE_PERIOD_FIELDS = (
+    "period_a_start", "period_a_end", "period_b_start", "period_b_end",
+)
+
+
 @tool(
     "compare_periods",
-    "Compare a metric between two ISO date ranges. Returns mean, SD, count "
-    "for each + delta. Also accepts distance_meters (activities, SUMMED per "
-    "period — no mean/SD for a period total, but a total_mi convenience and "
-    "top-level delta/delta_pct). Use for things like 'last 30d vs prior 30d' "
-    "or 'how much did I run this week vs last'.",
-    {
-        "metric": str,
-        "period_a_start": str,
-        "period_a_end": str,
-        "period_b_start": str,
-        "period_b_end": str,
-    },
+    "Compare a metric between two windows: pass days=N for 'last N days vs "
+    "the prior N' (the common case), or two explicit ISO date ranges. "
+    "Returns mean, SD, count for each + delta. Also accepts distance_meters "
+    "(activities, SUMMED per period — no mean/SD for a period total, but a "
+    "total_mi convenience and top-level delta/delta_pct). Use for things "
+    "like 'last 30d vs prior 30d' or 'how much did I run this week vs last'.",
+    _COMPARE_PERIODS_SCHEMA,
 )
 async def compare_periods(args: dict) -> dict:
+    # days=N convenience (0.56.0): this tool had ZERO recorded calls while
+    # run_sql hand-rolled period comparisons — every "last 30d vs prior 30d"
+    # ask forced the model to compute four ISO dates. Derived windows are
+    # echoed in the payload (derived_periods) so the answer can cite them.
+    derived_periods = None
+    if args.get("days") is not None:
+        if any(args.get(f) is not None for f in _COMPARE_PERIOD_FIELDS):
+            return _err("pass either days or the four period dates, not both")
+        if err := _validate_days(args["days"]):
+            return _err(err)
+        n = args["days"]
+        today = date.today()
+        args = {
+            **args,
+            "period_a_start": (today - timedelta(days=n - 1)).isoformat(),
+            "period_a_end": today.isoformat(),
+            "period_b_start": (today - timedelta(days=2 * n - 1)).isoformat(),
+            "period_b_end": (today - timedelta(days=n)).isoformat(),
+        }
+        derived_periods = {f: args[f] for f in _COMPARE_PERIOD_FIELDS}
+    elif any(args.get(f) is None for f in _COMPARE_PERIOD_FIELDS):
+        return _err(
+            "pass either days=N (last N vs prior N) or all four period dates "
+            f"({', '.join(_COMPARE_PERIOD_FIELDS)})"
+        )
     # Validate all four dates + ordering BEFORE any query: a malformed or
     # reversed range compares as strings in SQL and returns {"n": 0} —
     # indistinguishable from a genuinely empty window, so the model reads
     # "no data" where the truth is "bad input".
-    for field in ("period_a_start", "period_a_end", "period_b_start", "period_b_end"):
+    for field in _COMPARE_PERIOD_FIELDS:
         if msg := _validate_date(args.get(field), field):
             return _err(msg)
     for label in ("a", "b"):
@@ -1048,6 +1118,8 @@ async def compare_periods(args: dict) -> dict:
     if metric in _COMPARE_SUM_METRICS:
         with db.connect() as conn:
             payload = _compare_periods_sum(conn, metric, args)
+        if derived_periods:
+            payload["derived_periods"] = derived_periods
         return _text(payload)
     if metric == "training_load":
         table = "activities"
@@ -1097,6 +1169,8 @@ async def compare_periods(args: dict) -> dict:
     for field, ndigits in (("delta_mean_a_minus_b", 2), ("delta_pct", 1), ("cohens_d", 3)):
         if payload.get(field) is not None:
             payload[field] = round(payload[field], ndigits)
+    if derived_periods:
+        payload["derived_periods"] = derived_periods
     return _text(payload)
 
 
@@ -1231,6 +1305,93 @@ def _sync_state(result: dict, *, recomputed: bool) -> str:
     return "; ".join(segments)
 
 
+def _sync_min_interval_minutes() -> int:
+    """How recently a successful pull must have completed for a new
+    `sync_garmin_data` call to short-circuit as fresh. Env-overridable per the
+    repo pattern; a bad value degrades to the default rather than erroring."""
+    try:
+        return int(os.environ.get("LOCAL_FITNESS_SYNC_MIN_INTERVAL_MIN", "10"))
+    except ValueError:
+        return 10
+
+
+def _recent_successful_sync(now: datetime) -> datetime | None:
+    """completed_at of the newest non-failed ingest run inside the freshness
+    window, else None. Failure statuses never count as fresh — a failed pull
+    ten seconds ago is a reason to retry, not to skip. Fail-open on any DB
+    problem: a fresh clone with no schema yet must fall through to the real
+    pull (which is what creates the data), never error on its guard."""
+    placeholders = ",".join("?" * len(_SYNC_FAILURE_STATUSES))
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT completed_at FROM ingest_runs "
+                f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
+                "AND status != 'in_progress' "
+                "ORDER BY completed_at DESC LIMIT 1",
+                tuple(_SYNC_FAILURE_STATUSES),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or not row["completed_at"]:
+        return None
+    try:
+        completed = datetime.fromisoformat(row["completed_at"])
+    except ValueError:
+        return None
+    if timedelta() <= now - completed <= timedelta(minutes=_sync_min_interval_minutes()):
+        return completed
+    return None
+
+
+def _latest_activity_summary() -> dict | None:
+    """The newest activity as a compact handoff row, or None on an empty DB.
+
+    Attached to every non-short-circuit sync payload so "pull my data and
+    grade my run" is TWO calls (sync -> workout_report_card), not three —
+    recorded sessions burned a query_workouts call seven times purely to
+    resolve "my recent run" into an activity_id the report card could take.
+    Fail-open (None) on any DB problem — this is garnish on the sync payload,
+    never a reason for a sync that just succeeded to report an error.
+    """
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT activity_id, date, activity_type, distance_meters, "
+                "avg_pace_sec_per_km FROM activities "
+                "ORDER BY date DESC, start_time DESC LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    w = dict(row)
+    mode = interpret.is_running_effort(w.get("avg_pace_sec_per_km"))
+    summary = {
+        "activity_id": w["activity_id"],
+        "date": w["date"],
+        "activity_type": w["activity_type"],
+        "effort": {True: "run", False: "walk", None: None}[mode],
+    }
+    distance_mi = units.to_miles(w.get("distance_meters"))
+    if distance_mi is not None:
+        summary["distance_mi"] = distance_mi
+    return summary
+
+
+_SYNC_GARMIN_DATA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "force": {
+            "type": "boolean",
+            "description": "Pull even when a successful sync completed within "
+            "the freshness window (default 10 min). Default false.",
+        },
+    },
+    "required": [],
+}
+
+
 @tool(
     "sync_garmin_data",
     "Pull the latest data from Garmin Connect into the database (gap-aware: "
@@ -1239,12 +1400,41 @@ def _sync_state(result: dict, *, recomputed: bool) -> str:
     "any new day or activity landed. Every other tool only reads what's "
     "already in the DB — call this first when the user asks to "
     "sync/refresh/pull/update their data, or when today's data looks stale or "
-    "missing. Read the returned `sync_state` line: status 'partial' is normal "
-    "when older history is still incomplete and does NOT mean this sync "
-    "failed.",
-    {},
+    "missing. A successful sync in the last ~10 minutes short-circuits as "
+    "status 'fresh' with no Garmin call — a re-ask moments later needs no "
+    "second pull; pass force:true to pull anyway. The payload's "
+    "`latest_activity` is the newest workout's id/date/type — hand it "
+    "straight to workout_report_card, no query_workouts lookup needed. Read "
+    "the returned `sync_state` line: status 'partial' is normal when older "
+    "history is still incomplete and does NOT mean this sync failed.",
+    _SYNC_GARMIN_DATA_SCHEMA,
 )
-async def sync_garmin_data(_args: dict) -> dict:
+async def sync_garmin_data(args: dict) -> dict:
+    # Freshness short-circuit (0.56.0) — at the TOOL layer, deliberately not
+    # inside daily.pull: pull's own 3-day refresh union makes every pull hit
+    # Garmin, and the launchd jobs WANT that (day-end totals overwrite partial
+    # values). What this guards is the chat-session shape measured in the
+    # audit: the user re-asks, the agent re-syncs — 8 of 24 recorded calls
+    # were pure repeats minutes apart, each a full Garmin round-trip that
+    # landed nothing. Checked before the garminconnect import so the fresh
+    # path costs one indexed SQLite read.
+    if not args.get("force"):
+        completed = _recent_successful_sync(datetime.now())
+        if completed is not None:
+            minutes_ago = max(0, int((datetime.now() - completed).total_seconds() // 60))
+            payload = {
+                "status": "fresh",
+                "synced_through": db.last_known_daily_date(),
+                "sync_state": (
+                    f"already synced {minutes_ago} min ago — nothing pulled; "
+                    "pass force:true to pull again"
+                ),
+            }
+            latest = _latest_activity_summary()
+            if latest is not None:
+                payload["latest_activity"] = latest
+            return _text(payload)
+
     # Deferred import: garminconnect drags requests (~28 ms measured) into
     # every `import tools` — every stdio session start, every server boot —
     # and this tool is its ONLY consumer. Tests patch
@@ -1268,7 +1458,15 @@ async def sync_garmin_data(_args: dict) -> dict:
             days_failed=result.get("days_failed", 0),
             last_date=result.get("last_date"),
         )
-    return _text({**result, "sync_state": _sync_state(result, recomputed=recomputed)})
+    # Drop a null `error` key rather than shipping it: a success payload
+    # carrying "error": null pattern-matches as a failure to any naive
+    # detector (it fooled the 2026-08-10 audit's first pass).
+    payload = {k: v for k, v in result.items() if k != "error" or v is not None}
+    payload["sync_state"] = _sync_state(result, recomputed=recomputed)
+    latest = _latest_activity_summary()
+    if latest is not None:
+        payload["latest_activity"] = latest
+    return _text(payload)
 
 
 @tool(
@@ -1276,7 +1474,9 @@ async def sync_garmin_data(_args: dict) -> dict:
     # Band prose is BUILT from the interpret constants so the description can
     # never drift from the classifier actually attached to the payload (the
     # identical duplication was already removed from correlate's legend once).
-    f"Current CTL/ATL/TSB plus 30-day history. TSB > {interpret.TSB_FRESH:g} fresh, "
+    "Current CTL/ATL/TSB plus 30-day history. CTL = fitness (42-day EWMA), "
+    "ATL = fatigue (7-day EWMA), TSB = form (CTL - ATL). "
+    f"TSB > {interpret.TSB_FRESH:g} fresh, "
     f"{interpret.TSB_FATIGUED:g}..{interpret.TSB_FRESH:g} neutral, "
     f"< {interpret.TSB_FATIGUED:g} fatigued, < {interpret.TSB_VERY_FATIGUED:g} very fatigued. "
     "`current` is always the last COMPLETE day (never today's own row, which "
@@ -1352,6 +1552,10 @@ async def training_load_status(_args: dict) -> dict:
             if row.get(field) is not None:
                 row[field] = round(row[field], 2)
 
+    # No static `interpretation` legend (removed 0.56.0): the three prose
+    # lines re-shipped on every call while the tool DESCRIPTION already
+    # carries the zone bands built from the interpret constants — the same
+    # duplication that was once removed from correlate's legend.
     return _text({
         "current": current,
         "history_30d": recent,
@@ -1359,11 +1563,6 @@ async def training_load_status(_args: dict) -> dict:
         "ctl_pct_change_14d": ctl_pct,
         "ctl_direction": ctl_direction,
         "projected_end_of_day": projected_end_of_day,
-        "interpretation": {
-            "ctl": "chronic training load (fitness) — 42-day EWMA of activity training_load",
-            "atl": "acute training load (fatigue) — 7-day EWMA",
-            "tsb": "training stress balance (form) = CTL - ATL",
-        },
     })
 
 
@@ -2487,12 +2686,21 @@ async def list_observations(args: dict) -> dict:
         where.append("obs_type = ?")
         params.append(args["obs_type"])
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-    limit = int(args.get("limit") or _LIST_OBSERVATIONS_DEFAULT_LIMIT)
+    # _validate_limit, like every other list surface (0.56.0). The bare
+    # int() cast it replaces let `limit: "abc"` escape as a raw ValueError
+    # and `limit: -1` reach SQLite as `LIMIT 0` — an empty page that then
+    # reported `truncated: true` about rows it never fetched.
+    limit = _validate_limit(args, default=_LIST_OBSERVATIONS_DEFAULT_LIMIT)
+    if isinstance(limit, str):
+        return _err(limit)
     with db.connect() as conn:
         # Fetch one past the cap so a full page is distinguishable from a
         # clipped larger set — same truncation-signal shape as run_sql.
+        # Explicit columns, not SELECT * — the schema owns what a payload
+        # carries, not whatever a future ALTER adds.
         rows = conn.execute(
-            f"SELECT * FROM observations {where_sql} "
+            "SELECT observation_id, observed_on, created_at, obs_type, "
+            f"value_num, value_text, activity_id FROM observations {where_sql} "
             "ORDER BY observed_on DESC, observation_id DESC LIMIT ?",
             (*params, limit + 1),
         ).fetchall()
@@ -3279,6 +3487,19 @@ def _augment_plan_workout(w: dict) -> dict:
     return w
 
 
+#: Raw plan-workout fields whose display twin (attached by
+#: _augment_plan_workout / the duration formatter) replaces them in
+#: get_training_plan_progress's compact rows. Mirrors
+#: workout_rows._RAW_DISPLAY_PAIRS for activity rows.
+_PLAN_RAW_DISPLAY_PAIRS = (
+    ("target_distance_m", "target_distance_mi"),
+    ("actual_distance_m", "actual_distance_mi"),
+    ("target_pace_sec_per_km", "target_pace_min_per_mi"),
+    ("actual_pace_sec_per_km", "actual_pace_min_per_mi"),
+    ("target_duration_sec", "target_duration_formatted"),
+)
+
+
 @tool(
     "get_training_plan_status",
     "Status of the ACTIVE training plan: goal, days to race, the most recent "
@@ -3397,33 +3618,51 @@ async def get_training_plan_progress(args: dict) -> dict:
 
     # Deliberate projection: keep the fields an agent needs to answer a
     # plan-progress question; drop identifiers / internal rollups (plan_id,
-    # status, ability_snapshot, weekly_mileage, …) that build_plan_detail spreads.
-    workouts_full = [
-        {
-            "date": w.get("date"),
-            "seq": w.get("seq", 1),
-            "week_index": w.get("week_index"),
-            "type": w.get("type"),
-            "target_distance_m": w.get("target_distance_m"),
-            "target_pace_sec_per_km": w.get("target_pace_sec_per_km"),
-            "target_duration_sec": w.get("target_duration_sec"),
-            "target_hr_max": w.get("target_hr_max"),
-            "description": w.get("description"),
-            "verdict": w.get("verdict"),
-            "actual_distance_m": w.get("actual_distance_m"),
-            "actual_pace_sec_per_km": w.get("actual_pace_sec_per_km"),
-            "actual_activity_types": w.get("actual_activity_types"),
+    # status, ability_snapshot, weekly_mileage, …) that build_plan_detail
+    # spreads. Compaction (0.56.0): this tool measured as 24% of ALL chars
+    # returned across recorded sessions (median ~11 KB/call) — the single
+    # worst context hog on the surface. Two pure cuts, applied before
+    # windowing so full=true gets them too: (1) None-valued keys are omitted
+    # AT BUILD TIME (a pending day shipped 4+ nulls per row; an absent key
+    # reads the same as null to the model — and the single-pass build is
+    # perf-gate-load-bearing: a build-then-strip second dict pass measured
+    # 15.4% over the CI benchmark floor), and (2) in miles mode a raw field
+    # is popped once its display twin landed (same rule as
+    # workout_rows.display_workout — the twin is gated, so a paceless or
+    # distance-less row keeps its raw column). Rollups untouched.
+    miles_mode = units.display_units() == "miles"
+    workouts_full = []
+    for w in detail["workouts"]:
+        row = {
+            k: v for k, v in (
+                ("date", w.get("date")),
+                ("seq", w.get("seq", 1)),
+                ("week_index", w.get("week_index")),
+                ("type", w.get("type")),
+                ("target_distance_m", w.get("target_distance_m")),
+                ("target_pace_sec_per_km", w.get("target_pace_sec_per_km")),
+                ("target_duration_sec", w.get("target_duration_sec")),
+                ("target_hr_max", w.get("target_hr_max")),
+                ("description", w.get("description")),
+                ("verdict", w.get("verdict")),
+                ("actual_distance_m", w.get("actual_distance_m")),
+                ("actual_pace_sec_per_km", w.get("actual_pace_sec_per_km")),
+                ("actual_activity_types", w.get("actual_activity_types")),
+            ) if v is not None
         }
-        for w in detail["workouts"]
-    ]
-    # 2d/2e: per-workout mile/pace convenience fields (Fix C) + a formatted
-    # target duration — pure computation over rows already fetched, applied
-    # before windowing so both full=true and the default window see it.
-    for w in workouts_full:
-        _augment_plan_workout(w)
-        duration_formatted = units.format_duration(w.get("target_duration_sec"))
+        # 2d/2e: per-workout mile/pace convenience fields (Fix C) + a
+        # formatted target duration — pure computation over rows already
+        # fetched. _augment_plan_workout only ADDS non-None fields, so the
+        # no-nulls invariant established above survives it.
+        _augment_plan_workout(row)
+        duration_formatted = units.format_duration(row.get("target_duration_sec"))
         if duration_formatted is not None:
-            w["target_duration_formatted"] = duration_formatted
+            row["target_duration_formatted"] = duration_formatted
+        if miles_mode:
+            for raw, display in _PLAN_RAW_DISPLAY_PAIRS:
+                if display in row:
+                    row.pop(raw, None)
+        workouts_full.append(row)
 
     full = bool(args.get("full", False))
     if full:
@@ -4094,12 +4333,23 @@ async def generate_brief_report(args: dict) -> dict:
                     break
                 kept = kept[:-1]
                 omitted += 1
-    except Exception:
-        # Raw WeasyPrint/cairo internals belong in the server log, not in
-        # model context — the model can't act on a cairo traceback, and it
-        # reads it out at the user.
+    except Exception as e:
+        # The full WeasyPrint/cairo traceback belongs in the server log, but
+        # the exception CLASS + message are render-stack detail, not secrets
+        # (the run_sql 0.37.0 precedent) — and "see the server log" was
+        # observed live as an unactionable dead end for an agent that cannot
+        # read the log. Name the failure and the recovery.
         LOG.warning("PDF render failed", exc_info=True)
-        return _err("PDF render failed — see the server log for the traceback")
+        return _err(
+            f"PDF render failed: {type(e).__name__}: {e}",
+            remediation=(
+                "the brief data itself is fine — this is the PDF renderer "
+                "(WeasyPrint needs native Pango/HarfBuzz libs; on macOS see "
+                "DYLD_LIBRARY_PATH in .env.example). Read the brief via "
+                "get_brief_context or the fitness://brief/latest resource "
+                "instead of retrying the render."
+            ),
+        )
     if pages != 1:
         # A single takeaway that still overflows is a content bug upstream
         # (a runaway `details` block), not something to paper over silently.
@@ -4253,8 +4503,9 @@ _REPORT_CARD_SCHEMA = {
     "executed as prescribed: it is a COMPLIANCE score, not a verdict on how "
     "good the run was, so a correctly-run easy day rates 5. Training load is "
     "reported alongside but never rated. Defaults to the most recent logged "
-    "activity; pass activity_id or "
-    "date to grade a specific one. Grades against the active training plan's "
+    "activity — after a sync, call this DIRECTLY (no query_workouts lookup "
+    "to find an id; sync_garmin_data's `latest_activity` already names it); "
+    "pass activity_id or date to grade a specific one. Grades against the active training plan's "
     "prescribed workout when one exists for that date, otherwise against a "
     "60-day rolling median of comparable activities — the card always says "
     "which. Returns a `markdown` field (render it to the user VERBATIM, it is "
@@ -4444,12 +4695,20 @@ async def workout_report_card(args: dict) -> dict:
             pdf_bytes, pages = await asyncio.to_thread(
                 visuals.render_report_card_pdf, card, split_chart
             )
-    except Exception:
-        # Raw WeasyPrint/cairo internals belong in the server log, not in
-        # model context — the model can't act on a cairo traceback, and it
-        # reads it out at the user.
+    except Exception as e:
+        # Same contract as generate_brief_report's render failure: class +
+        # message are actionable render-stack detail, and the recovery is
+        # named — the graded card exists without the PDF.
         LOG.warning("PDF render failed", exc_info=True)
-        return _err("PDF render failed — see the server log for the traceback")
+        return _err(
+            f"PDF render failed: {type(e).__name__}: {e}",
+            remediation=(
+                "the grading succeeded — only the PDF renderer failed "
+                "(WeasyPrint needs native Pango/HarfBuzz libs; on macOS see "
+                "DYLD_LIBRARY_PATH in .env.example). Retry with "
+                "format='table' to get the full markdown card with no PDF."
+            ),
+        )
     if pages != 1:
         # The card has no droppable content (unlike the brief's takeaway tail),
         # so the density ladder is the only lever and it's exhausted. Never let
