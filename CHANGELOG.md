@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.60.1] - 2026-08-10
+
+### Changed
+- **Eval baseline invention rates recaptured post-#217** (the deferred
+  follow-up from 0.60.0). 12 generations (6 scenarios × 2 runs, under the
+  16-generation hard cap, Max-subscription auth, zero flakes) on the same
+  V2 composer with the fixed grounding checker. The parser-artifact
+  inflation is gone from the floor the shadow-run gates on: sliding_fitness
+  0.834→0.5, fatigued_recovery 0.875→0.75, sparse 0.167→0.0, missed_steps
+  0.333→0.167, taper_plan 0.667→0.625; green_light moved 0.167→0.333
+  (2-run generation noise, not a checker change). The residue is the
+  checker's designed tolerance — model-computed deltas aren't pool
+  numbers — so these rates are the honest floor, not near-zero; document
+  schema stays version 2 (`captured` timestamp records the refresh).
+
 ## [0.60.0] - 2026-08-10
 
 ### Fixed

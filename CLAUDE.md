@@ -380,14 +380,19 @@ These are settled — don't redesign without a reason.
   is the tested half (`tests/test_brief_planner.py`, `test_grounding.py`); the
   generator is the eval'd half (`tests/evals/` fixtures + `baseline.json` +
   `scripts/{capture_baseline,shadow_run}.py`). **The committed baseline is
-  version 2 (0.58.0): captured on the V2 composer** — version 1 described the
-  retired V1 monolith for six weeks after the cutover — **and it carries a
-  per-scenario `invention_rate` that `shadow_run.py` GATES on** (`rate <=
-  baseline + 0.15`; the 0.5 absolute budget applies only to scenarios the
-  baseline has no rate for — two fixtures MEASURE 0.83-0.88 baseline rate,
-  grounding's false positives concentrated, so a cap under the recorded
-  baseline would be permanently unpassable; a breach fails parity and the
-  exit code). The
+  version 2 (document schema; 0.58.0): captured on the V2 composer** —
+  version 1 described the retired V1 monolith for six weeks after the
+  cutover — **and it carries a per-scenario `invention_rate` that
+  `shadow_run.py` GATES on** (`rate <= baseline + 0.15`; the 0.5 absolute
+  budget applies only to scenarios the baseline has no rate for; a breach
+  fails parity and the exit code). Rates were RE-measured at 0.60.1 after
+  the #217 unit-binding fix removed the checker's false-positive classes:
+  the two worst fixtures fell 0.875→0.75 and 0.834→0.5 (max is now
+  fatigued_recovery at 0.75, sparse sits at 0.0). The residue is the
+  checker's designed tolerance — model-computed deltas aren't pool
+  numbers — so a rate near these floors is normal, not a regression; a
+  future drop toward zero needs a pool that carries derived deltas, not a
+  tighter cap. The
   advisory-vs-constant "Phase 4 backfill" is done; note the live-path
   `grounding.flag` above stays advisory — the gate is the shadow-run script,
   which is the manual pre-flight for any brief prompt/model change (like
