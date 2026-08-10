@@ -173,10 +173,20 @@ profile file**.
 |---|---|
 | [`get_coach_personality`](get_coach_personality.md) | Active profile, effective spec, the five dials, journal size — read before editing |
 | [`update_coach_personality`](update_coach_personality.md) | ✍️ Patch the persona, the lists, per-topic intensity, or the dials |
+
+### Delivery settings
+
+The evening brief email (0.51.0) and the plan → Google Calendar sync (0.52.0).
+Same agent-owns-the-writes model: the enabled state and destinations are
+settings these tools manage; the secrets (SMTP password, OAuth credentials)
+stay in `.env`, unreadable and unwritable by any tool.
+
+| Tool | Use it for |
+|---|---|
 | [`get_brief_email_settings`](get_brief_email_settings.md) | Whether the evening brief email is on, who gets it, whether it can send |
 | [`update_brief_email_settings`](update_brief_email_settings.md) | ✍️ Stop/resume the nightly email, or change the recipients |
-| [`get_plan_calendar_settings`](get_plan_calendar_settings.md) | Whether tomorrow's session goes on Google Calendar, and to which calendar |
-| [`update_plan_calendar_settings`](update_plan_calendar_settings.md) | ✍️ Stop/resume the nightly calendar event, or change the calendar |
+| [`get_plan_calendar_settings`](get_plan_calendar_settings.md) | Whether the plan is synced to Google Calendar, and to which calendar |
+| [`update_plan_calendar_settings`](update_plan_calendar_settings.md) | ✍️ Stop/resume the nightly calendar sync, or change the calendar |
 
 ### Data and escape hatches
 

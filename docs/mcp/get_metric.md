@@ -80,7 +80,10 @@ the window, which is not necessarily today if the metric was missing yesterday.
 ```
 
 For a metric with no baseline columns, the three numeric fields are absent and
-`vs_baseline` still comes back — as `"no data"`:
+`vs_baseline` still comes back — as `"no data"`. Note the extra flag: `steps`
+is a running-tally metric, so its window anchors on **yesterday** and the
+payload says so (see the gotcha below — the flag and the anchor always travel
+together):
 
 ```json
 {
@@ -88,6 +91,7 @@ For a metric with no baseline columns, the three numeric fields are absent and
   "days_window": 7,
   "days_with_data": 7,
   "values": ["…"],
+  "partial_today_excluded": true,
   "vs_baseline": "no data"
 }
 ```
@@ -156,8 +160,18 @@ normal band. Phrase `vs_baseline`; don't re-derive it from the 54.
   it against `days_window` to see how sparse the metric was over the window
   (`vo2_max`, for instance, only updates on run days). Don't assume
   `len(values)` equals `days`.
-- **The window is `date >= today - days`, inclusive on both ends**, so a 7-day
-  ask can span the cutoff day through today.
+- **The window is `date >= anchor - days`, inclusive on both ends** — and for
+  most metrics the anchor is today, so a 7-day ask spans the cutoff day
+  through today.
+- **Running-tally metrics anchor on YESTERDAY, and say so.** `steps`,
+  `avg_stress`, `max_stress`, `active_calories`, the two intensity-minutes
+  columns and `body_battery_charged`/`drained` accumulate all day, so today's
+  row is partial until midnight — comparing it against complete days
+  manufactures a false dip. For those metrics the window ends yesterday, "the
+  last N days" means N *complete* days, and the payload carries
+  `partial_today_excluded: true` so the exclusion is visible rather than
+  silent. Point-in-time metrics (`rhr`, `sleep_seconds`, `vo2_max`, …) still
+  anchor on today and never carry the flag.
 - **CTL / ATL / TSB are not available here.** They live in the `baselines` table,
   not `daily_metrics`. Use [`training_load_status`](training_load_status.md) for
   the current values plus 30-day history, or [`chart`](chart.md) /

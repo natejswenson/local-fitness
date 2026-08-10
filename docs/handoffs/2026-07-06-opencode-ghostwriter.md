@@ -1,5 +1,12 @@
 # Handoff: LinkedIn post about opencode migration
 
+> **Historical — no longer accurate (banner added 2026-08-10).** The
+> "runs in opencode with Gemma on Ollama at zero cost" claim below describes a
+> direction that was later paused: the production brief runs Claude via
+> `CLAUDE_CODE_OAUTH_TOKEN`, and the opencode transport survives only as a
+> shadow-run diagnostic (`LOCAL_FITNESS_OPENCODE_AGENT`, `scripts/shadow_run.py`).
+> Kept as a point-in-time working note, like everything in `docs/handoffs/`.
+
 **Mode:** Continuation (draft written, card rendered, awaiting approval)
 
 ## Goal

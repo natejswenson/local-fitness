@@ -26,7 +26,7 @@ active and you only want to change one day.
                               [ ARCHIVED ] ◄───────────────────────────┘
 ```
 
-Ground the plan first: `training_load_status`, `get_today_status`, and `query_workouts` before you
+Ground the plan first: `training_load_status`, `daily_snapshot`, and `query_workouts` before you
 invent a schedule. The tool validates *structure*, not *sensibility*.
 
 ## Parameters

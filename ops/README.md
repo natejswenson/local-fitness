@@ -27,7 +27,7 @@ This resolves your `uv` binary and this repo's path, fills them into each
 (`./ops/install-launchd.sh briefmail`) to install just one. If the Mac is
 asleep at a fire time, launchd runs the missed job once at the next wake.
 
-Both are **LaunchAgents, not LaunchDaemons**, and must stay that way: the
+All three are **LaunchAgents, not LaunchDaemons**, and must stay that way: the
 bundled Claude SDK CLI reads its credential from the login keychain, which
 a user agent can reach and a system daemon cannot.
 

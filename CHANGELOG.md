@@ -6,6 +6,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.55.1] - 2026-08-10
+
+### Fixed
+- **Docs sweep — every drift item from the 2026-08-10 audit.** The docs-drift
+  gate covers tool pages and README counts; everything outside its reach had
+  quietly rotted. Verified and fixed in one pass:
+  - Three `docs/mcp/` pages still linked (one still *instructed* calling)
+    `get_today_status`, a tool removed in 0.48.0 — repointed at
+    `daily_snapshot`.
+  - `local_fitness.__version__` said `0.4.0` — 51 minor versions stale. Now
+    read from `importlib.metadata` (the `server_version()` pattern), pinned
+    against `pyproject.toml` by a test so it can never drift again.
+  - `.env.example` called `generate_chart` stdio-only (it has been on both
+    transports since 2026-07-10) and described the calendar job's retired
+    next-day-only behavior instead of the 0.53.0 full reconcile;
+    `ops/install-launchd.sh` + `ops/README.md` said "two jobs" with three
+    installed and omitted `plan-calendar` from the Linux fallback text.
+  - `docs/deployment.md` claimed `fitness.home.local` is in the default MCP
+    host allowlist (the code default is loopback-only) and under-counted the
+    compose env vars.
+  - README: no coverage at all of the 0.51.0 evening brief email or the
+    0.52.0 calendar sync (new section + Usage entries + env-var tables — the
+    Configuration table now maps every variable in `.env.example`), the DB
+    table list was missing `coach_journal`/`coach_journal_fts`/`report_cards`,
+    "CI runs all three checks" under-counted six, and seven registered tools
+    were never named.
+  - `docs/mcp/get_metric.md` showed a `steps` example the code cannot produce
+    (running-tally metrics anchor on yesterday and attach
+    `partial_today_excluded: true` — now documented on both metric pages).
+  - `docs/README.md` indexed 2 of 5 doc areas; the delivery-settings tools sat
+    under "Coach personality" in `docs/mcp/README.md`; the 2026-07-06 handoff
+    note carried a stale zero-cost-Ollama claim with no historical banner.
+
+### Added
+- **`test_intra_docs_links_resolve`** in `tests/test_docs_drift.py`: every
+  relative markdown link in `docs/**` + `README.md` must resolve to a real
+  file (fenced code blocks excluded — quoted example links are illustrations,
+  not references). This is the gate that would have caught the
+  `get_today_status` links the day the page was deleted; written first and
+  watched failing on exactly those three links.
+
 ## [0.55.0] - 2026-08-09
 
 ### Fixed
