@@ -1,6 +1,6 @@
 # `get_metric_trend`
 
-> Mean, least-squares slope, and current-vs-baseline stats for one metric over N days, with the direction classifications already computed. **Availability:** stdio + HTTP
+> Mean, least-squares slope, and current-vs-baseline stats for one metric over N days — with the direction classifications computed, and the raw daily series on request (`include_values=true`). **Availability:** stdio + HTTP
 
 ## What it does
 
@@ -11,17 +11,21 @@ deterministic interpretations from `agent/interpret.py`: `slope_direction`
 `suppressed` / `normal` / `no data`). Per the repo rule, those judgments are
 computed in tested Python — phrase them, don't re-derive them.
 
-Use [`get_metric`](get_metric.md) instead when you need the actual day-by-day
-values (including the nulls, which this tool discards). Use
-[`daily_snapshot`](daily_snapshot.md) when you want *today* against baseline
-across all metrics at once rather than one metric over a window.
+Pass `include_values=true` when you also need the actual day-by-day values
+(the former `get_metric` tool, folded in at 0.57.0): a `values` array of
+`{date, value}` rows, oldest-first, capped at the most-recent 120 rows
+(`values_truncated: true` marks a cut) — `*_seconds` rows carry a
+`value_formatted` companion like `"7h 33m"`; speak that, never raw seconds.
+Use [`daily_snapshot`](daily_snapshot.md) when you want *today* against
+baseline across all metrics at once rather than one metric over a window.
 
 ## Parameters
 
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `metric` | string | yes | — | Same 18-column whitelist as [`get_metric`](get_metric.md). |
+| `metric` | string | yes | — | One of the 18 `daily_metrics` numeric columns (an unknown name errors and echoes the whole whitelist). |
 | `days` | integer | yes | — | Integer in `[2, 3650]` — a slope is meaningless on a single sample, so the lower bound is 2, not 1. |
+| `include_values` | boolean | no | `false` | Attach the raw `{date, value}` series (most-recent 120 rows max; `values_truncated: true` past the cap). |
 
 ## Returns
 
@@ -42,6 +46,9 @@ three baseline fields appear only for the metrics that have a baseline column.
 | `baseline_60day_sd` | Its standard deviation. Same two metrics only. |
 | `current_vs_baseline_sd` | `(current - baseline_mean) / baseline_sd`, rounded to 2. Omitted when the SD is 0 or absent. |
 | `vs_baseline` | `interpret.baseline_position` — `elevated` (> +1 SD), `suppressed` (< -1 SD), `normal`, or `no data`. Always present. |
+| `values` | Only with `include_values=true`: `{date, value}` oldest-first (within the 120-row cap); `*_seconds` rows add `value_formatted`. Nulls are dropped, same as the stats. |
+| `values_truncated` | `true` only when the window held more than 120 rows — the cap keeps the most recent. |
+| `partial_today_excluded` | `true` only for running-tally metrics (`steps`, `avg_stress`, `max_stress`, `active_calories`, intensity minutes, `body_battery_charged`/`drained`), whose window anchors on **yesterday** — today's tally is partial all day, and a slope fit against it would manufacture a false dip. Absent for point-in-time metrics. |
 
 `flat` means the fitted *total* change across the window stays inside half a
 sample SD (`interpret.TREND_FLAT_SD_MULTIPLIER`), so a noisy series doesn't get
@@ -112,15 +119,14 @@ that, don't recompute it.
   Don't treat its presence as evidence a baseline exists.
 - **The baseline row is the newest one that has a value, ignoring the window.**
   It is not restricted to `days` and is not anchored to `current`'s date.
-- **`days` must be ≥ 2.** `days=1` is rejected with a bounds error, unlike
-  [`get_metric`](get_metric.md), which accepts it.
+- **`days` must be ≥ 2.** A slope is meaningless on a single sample, so
+  `days=1` is rejected with a bounds error — even with `include_values=true`.
 - **CTL / ATL / TSB are not supported** — they aren't `daily_metrics` columns.
   [`training_load_status`](training_load_status.md) carries the equivalent
   `ctl_direction` classification.
 
 ## See also
 
-- [`get_metric`](get_metric.md) — the raw series behind these stats.
 - [`daily_snapshot`](daily_snapshot.md) — today vs baseline for every metric at once.
 - [`training_load_status`](training_load_status.md) — the same treatment for CTL/ATL/TSB.
 - [`compare_periods`](compare_periods.md) — two windows against each other, with effect size.

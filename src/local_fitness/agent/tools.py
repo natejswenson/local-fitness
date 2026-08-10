@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from claude_agent_sdk import create_sdk_mcp_server, tool
+from claude_agent_sdk import create_sdk_mcp_server
+from claude_agent_sdk import tool as _sdk_tool
 from pydantic import ValidationError
 
 from .. import config, db, notes, plans
@@ -46,6 +47,7 @@ from . import (
     report_card,
     units,
     workout_coach,
+    workout_rows,
 )
 from .schemas import Brief
 
@@ -116,14 +118,6 @@ QUERYABLE_SCHEMA: dict[str, list[str]] = {
         "value_num", "value_text", "activity_id",
     ],
 }
-
-
-def _render_schema() -> str:
-    """One-line `table(col, col, ...); ...` rendering of QUERYABLE_SCHEMA, used
-    in run_sql's advertised table list so it can't drift from the source."""
-    return "; ".join(
-        f"{table}({', '.join(cols)})" for table, cols in QUERYABLE_SCHEMA.items()
-    )
 
 
 DAILY_NUMERIC_METRICS = {
@@ -202,6 +196,50 @@ def _err(msg: str, **extra) -> dict:
     }
 
 
+#: What a caller can actually DO about a corrupt database. Observed live
+#: (2026-08-10): two tools returned the bare sqlite3 string "database disk
+#: image is malformed" — no envelope, no tool name, no next step — and the
+#: agent had nothing to act on. The remediation names concrete actions and
+#: tells the model NOT to retry: a corrupt file does not heal between calls.
+_DB_ERROR_REMEDIATION = (
+    "the SQLite file itself is damaged or unreadable — do not retry this "
+    "call unchanged. Check it with `sqlite3 data/fitness.db 'PRAGMA "
+    "integrity_check'`; if it reports corruption, restore data/fitness.db "
+    "from a backup or rebuild it (`fitness setup` then `fitness backfill "
+    "<export.zip>` / `fitness pull`) — Garmin is the source of truth, so "
+    "nothing but manual notes/plans is lost with the file."
+)
+
+
+def tool(name: str, description: str, input_schema: Any):
+    """The SDK ``tool`` decorator plus a last-resort error envelope.
+
+    Every handler is wrapped in one try/except so an unhandled
+    ``sqlite3.DatabaseError`` (a corrupt DB file, a malformed page read —
+    failures no per-tool code anticipates) surfaces as the same enveloped
+    ``_err`` shape every anticipated failure already uses, with a
+    ``remediation`` the model can act on, instead of a bare exception string
+    with ``is_error`` unset. One wrapper, zero per-tool diff — a future tool
+    inherits the guard by using this decorator, which it must, since this
+    module shadows the SDK import.
+    """
+    sdk_decorator = _sdk_tool(name, description, input_schema)
+
+    def decorate(fn):
+        async def guarded(args: dict) -> dict:
+            try:
+                return await fn(args)
+            except sqlite3.DatabaseError as e:
+                LOG.warning("tool %s: database error", name, exc_info=True)
+                return _err(f"database error: {e}", remediation=_DB_ERROR_REMEDIATION)
+
+        guarded.__name__ = getattr(fn, "__name__", name)
+        guarded.__doc__ = fn.__doc__
+        return sdk_decorator(guarded)
+
+    return decorate
+
+
 def _validate_days(value: Any, name: str = "days", *, lo: int = 1, hi: int = 3650) -> str | None:
     """Bounds-check a user-supplied day count before it reaches timedelta().
 
@@ -260,34 +298,15 @@ def _validate_date(value: Any, name: str = "date") -> str | None:
     return None
 
 
-def _augment_workout(w: dict) -> dict:
-    """Attach mile / formatted convenience fields ALONGSIDE the raw columns.
-
-    Raw fields (distance_meters, avg_pace_sec_per_km, duration_seconds) are
-    never dropped — correlate / run_sql depend on them. A convenience field is
-    only added when units.py returns non-None (null / zero → omitted). The
-    ``distance_mi`` field is suppressed entirely when display units aren't miles.
-
-    ``effort`` is the MEASURED run-vs-walk read (interpret.is_running_effort,
-    pace only) — "run" / "walk" / null when pace is unusable. Garmin's
-    activity_type label lies (walking-desk sessions log as
-    treadmill_running — see CLAUDE.md's run-vs-walk rule), so this is
-    additive, never a replacement for activity_type, and never used to filter
-    or exclude anything here.
-    """
-    if units.display_units() == "miles":
-        distance_mi = units.to_miles(w.get("distance_meters"))
-        if distance_mi is not None:
-            w["distance_mi"] = distance_mi
-    pace = units.format_pace_min_per_mi(w.get("avg_pace_sec_per_km"))
-    if pace is not None:
-        w["pace_min_per_mi"] = pace
-    duration = units.format_duration(w.get("duration_seconds"))
-    if duration is not None:
-        w["duration_formatted"] = duration
-    mode = interpret.is_running_effort(w.get("avg_pace_sec_per_km"))
-    w["effort"] = {True: "run", False: "walk", None: None}[mode]
-    return w
+# One definition for both shapes lives in workout_rows.py (pure; shared with
+# status.py, whose inline copy of this function is retired). The DETAIL shape
+# (_augment_workout: convenience fields alongside raw columns) stays on
+# get_workout_detail / correlate / the manual-workout and plan-write echoes;
+# the LIST shape (_display_workout: display fields only, None-optionals
+# omitted) is for query_workouts and other multi-row surfaces — raw/formatted
+# pairs measured as ~25% of every list payload (2026-08-10 audit).
+_augment_workout = workout_rows.augment_workout
+_display_workout = workout_rows.display_workout
 
 
 # 0.48.0: `get_today_status` is GONE. It and `daily_snapshot` had byte-identical
@@ -307,96 +326,38 @@ _DAILY_SNAPSHOT_DESCRIPTION = (
 )
 
 
-@tool(
-    "get_metric",
-    "Get raw daily values for one metric over the last N days, oldest-first. "
-    "Skips days with no reading (NULL) and reports days_with_data vs the window. "
-    "*_seconds metrics carry a value_formatted (e.g. '7h 33m') alongside the raw value. "
-    "For same-day running-tally metrics (steps, avg_stress, max_stress, "
-    "active_calories, intensity minutes, body_battery_charged/drained) the "
-    "window anchors on YESTERDAY, not today — today's tally is partial all "
-    "day, so `partial_today_excluded: true` is attached and 'the last N days' "
-    "means N complete days ending yesterday, not today.",
-    {"metric": str, "days": int},
-)
-async def get_metric(args: dict) -> dict:
-    metric = args["metric"]
-    if metric not in DAILY_NUMERIC_METRICS:
-        return _err(f"unknown metric '{metric}'", allowed=sorted(DAILY_NUMERIC_METRICS))
-    err = _validate_days(args["days"])
-    if err:
-        return _err(err)
-    days = args["days"]
-    today = date.today()
-    anchor = _partial_day_anchor(metric, today)
-    cutoff = (anchor - timedelta(days=days)).isoformat()
-    # Skip NULL readings: for sparse columns (vo2_max updates only on run days)
-    # a long window is otherwise mostly {"value": null} rows — pure token cost.
-    # get_metric_trend already filters the same way; this aligns the two on what
-    # "a day with data" means. days_with_data vs days_window surfaces the gap so
-    # nothing is silently hidden.
-    with db.connect() as conn:
-        rows = conn.execute(
-            f"SELECT date, {metric} AS value FROM daily_metrics "
-            f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date",
-            (cutoff, anchor.isoformat()),
-        ).fetchall()
-        # Same latest-baseline fetch as get_metric_trend (mirrored exactly):
-        # without it, "is 52 high?" on a raw-values payload needed a second
-        # tool call — the sibling attaches the read, this one didn't (the
-        # interpret.py house rule: deterministic interpretation rides along).
-        baseline = None
-        if metric in BASELINE_METRICS:
-            baseline = conn.execute(
-                f"SELECT {metric}_60day_mean AS m, {metric}_60day_sd AS sd "
-                f"FROM baselines WHERE {metric}_60day_mean IS NOT NULL "
-                f"ORDER BY date DESC LIMIT 1"
-            ).fetchone()
-    # Formatted companion for duration-shaped metrics — the coach voice never
-    # speaks raw seconds ("25200 seconds"); attach the "7h 33m" shape at the
-    # payload boundary, same discipline get_metric_trend/compare_periods follow.
-    fmt = units.format_hm if metric.endswith("_seconds") else None
-    values = []
-    for r in rows:
-        row = dict(r)
-        if fmt is not None:
-            formatted = fmt(row["value"])
-            if formatted is not None:
-                row["value_formatted"] = formatted
-        values.append(row)
-    payload = {
-        "metric": metric,
-        "days_window": days,
-        "days_with_data": len(values),
-        "values": values,
-    }
-    if anchor != today:
-        payload["partial_today_excluded"] = True
-    current_vs_baseline_sd = None
-    if values and baseline and baseline["m"] is not None:
-        payload["baseline_60day_mean"] = baseline["m"]
-        payload["baseline_60day_sd"] = baseline["sd"]
-        if baseline["sd"]:
-            current_vs_baseline_sd = round(
-                (values[-1]["value"] - baseline["m"]) / baseline["sd"], 2)
-            payload["current_vs_baseline_sd"] = current_vs_baseline_sd
-    # ALWAYS attached, mirroring get_metric_trend: "no data" whenever the SD
-    # distance is unavailable (non-baselined metric, empty window, zero SD).
-    payload["vs_baseline"] = interpret.baseline_position(current_vs_baseline_sd)
-    return _text(payload)
+#: Cap on the raw series get_metric_trend attaches with include_values=true
+#: (0.57.0, the former `get_metric` — its unbounded dump measured 63 KB at
+#: days=3650). Most-recent rows win; values_truncated flags the cut.
+_TREND_MAX_VALUES = 120
 
 
 @tool(
     "get_metric_trend",
-    "Trend stats (mean, slope, current vs baseline) for a metric over N days. "
-    "For same-day running-tally metrics (steps, avg_stress, max_stress, "
-    "active_calories, intensity minutes, body_battery_charged/drained) the "
-    "window anchors on YESTERDAY — today's tally is partial all day and a "
-    "trend/mean computed against it is misleading (a 06:30 read of 50 "
-    "overnight stress samples is not the day's average). `current` is "
-    "therefore yesterday's value for those metrics, and "
-    "`partial_today_excluded: true` is attached.",
-    {"metric": str, "days": int},
+    # 0.57.0: `get_metric` folded in as include_values=true — identical
+    # {metric, days} schema, same anchor logic, and its unbounded raw dump
+    # (63 KB at days=3650, measured) is now capped at _TREND_MAX_VALUES rows.
+    "Trend stats (mean, slope, current vs baseline) for a metric over N "
+    "days. Pass include_values=true to also get the raw {date, value} series "
+    "(most-recent 120 rows max, values_truncated flags the cut; *_seconds "
+    "rows carry a value_formatted like '7h 33m'). For same-day running-tally "
+    "metrics (steps, avg_stress, max_stress, active_calories, intensity "
+    "minutes, body_battery_charged/drained) the window anchors on YESTERDAY "
+    "— today's tally is partial all day and a trend/mean computed against it "
+    "is misleading; `current` is therefore yesterday's value for those "
+    "metrics, and `partial_today_excluded: true` is attached.",
+    {
+        "type": "object",
+        "properties": {
+            "metric": {"type": "string"},
+            "days": {"type": "integer"},
+            "include_values": {
+                "type": "boolean",
+                "description": "Attach the raw daily series (capped). Default false.",
+            },
+        },
+        "required": ["metric", "days"],
+    },
 )
 async def get_metric_trend(args: dict) -> dict:
     metric = args["metric"]
@@ -462,6 +423,22 @@ async def get_metric_trend(args: dict) -> dict:
     }
     if anchor != today:
         payload["partial_today_excluded"] = True
+    if args.get("include_values"):
+        # The former get_metric's raw series, capped: most-recent
+        # _TREND_MAX_VALUES rows, oldest-first within the cap, with the
+        # duration-shaped value_formatted companion the coach voice speaks.
+        fmt = units.format_hm if metric.endswith("_seconds") else None
+        out = []
+        for r in rows[-_TREND_MAX_VALUES:]:
+            row = {"date": r["date"], "value": r["v"]}
+            if fmt is not None:
+                formatted = fmt(row["value"])
+                if formatted is not None:
+                    row["value_formatted"] = formatted
+            out.append(row)
+        payload["values"] = out
+        if n > _TREND_MAX_VALUES:
+            payload["values_truncated"] = True
     if baseline and baseline["m"] is not None:
         payload["baseline_60day_mean"] = baseline["m"]
         payload["baseline_60day_sd"] = baseline["sd"]
@@ -487,7 +464,7 @@ async def get_metric_trend(args: dict) -> dict:
 # training-load series from `baselines` (fitness / fatigue / freshness), and one
 # derived series — Garmin's weekly-badge "active minutes" (moderate + 2×vigorous).
 # Used as a frozen whitelist before any column name reaches an f-string, same as
-# get_metric. Derived/baseline names are mapped to safe SQL below, never f-strung
+# get_metric_trend. Derived/baseline names are mapped to safe SQL below, never f-strung
 # from user input.
 _CHART_BASELINE_METRICS = frozenset({"ctl", "atl", "tsb"})
 _CHART_DERIVED_METRICS = frozenset({"intensity_minutes_weighted"})
@@ -544,15 +521,20 @@ _CHART_SCHEMA = {
             "type": "string",
             "enum": ["calendar", "line", "bar", "combo", "spark"],
             "description": (
-                "calendar = week-stacked emoji heat-grid (default; compact and "
-                "fully visible for any window); line = smooth monochrome curve "
-                "in box-drawing glyphs with a y-axis (heavily smoothed and "
-                "down-sampled to fit the width — reads as the trend, not the "
-                "daily values); bar = emoji-color horizontal bars, one row per "
-                "day, weekly-averaged past ~3 weeks (best ≤ ~2 weeks); combo = "
-                "2D vertical bars + trend line (mono, handles negatives like "
-                "TSB), weekly-averaged on the same threshold; spark = one-line "
-                "sparkline."
+                "calendar = week-stacked emoji heat-grid (ascii default; "
+                "compact and fully visible for any window); line = value "
+                "curve; bar = per-day bars, weekly-bucketed past ~3 weeks; "
+                "combo = bars + trend line (handles negatives like TSB); "
+                "spark = one-line sparkline (ascii only). png supports "
+                "line/bar/combo, default line."
+            ),
+        },
+        "format": {
+            "type": "string",
+            "enum": ["ascii", "png"],
+            "description": (
+                "ascii (default) = terminal chart to reproduce in the reply; "
+                "png = rendered matplotlib image returned inline."
             ),
         },
     },
@@ -576,12 +558,12 @@ def _chart_value_fmt(metric: str):
 def _fetch_metric_series(
     metric: str, days: int, end: str | None = None
 ) -> tuple[list[str], list[float]]:
-    """Shared whitelisted fetch for chart()/generate_chart() — dates + values
+    """Shared whitelisted fetch for chart()'s ascii and png branches — dates
     for `metric` over the `days` days ending on `end` (default today).
 
     Validates `metric` against `_CHART_METRICS` before building any SQL —
     the check lives inside this helper, not left to each caller to remember;
-    both `chart()` and `generate_chart()` inherit it from here. Raises
+    every chart surface inherits it from here. Raises
     ValueError on an unwhitelisted metric so callers translate it into their
     own `_err()` response.
 
@@ -589,8 +571,8 @@ def _fetch_metric_series(
     ``date.today()`` with no upper bound, so re-rendering a PAST brief drew
     charts running to today and could show data the brief's prose never saw.
     ``generate_brief_report`` passes the brief's own date, matching the rule
-    ``_build_plan_section`` already follows. Live callers (``chart``,
-    ``generate_chart``) keep today's behavior via the default.
+    ``_build_plan_section`` already follows. The live caller (``chart``,
+    both formats) keeps today's behavior via the default.
     """
     if metric not in _CHART_METRICS:
         raise ValueError(f"unknown metric '{metric}'")
@@ -599,7 +581,7 @@ def _fetch_metric_series(
     end_iso = end_date.isoformat()
 
     # metric is whitelisted above; the column name interpolated here can only be
-    # a frozen-set member, never raw user input — same contract as get_metric.
+    # a frozen-set member, never raw user input — same contract as get_metric_trend.
     if metric in _CHART_BASELINE_METRICS:
         sql = (f"SELECT date, {metric} AS v FROM baselines "
                f"WHERE date >= ? AND date <= ? AND {metric} IS NOT NULL ORDER BY date")
@@ -645,7 +627,21 @@ def _bucket_weekly(
     return weeks, agg
 
 
-@tool("chart", "Render a terminal chart (ASCII/emoji) of a metric over the last N days. styles: calendar (compact week-stacked heat-grid, default — fully visible for any window), line (colored value-line, weekly-averaged for long windows), bar (emoji-color rows, weekly-bucketed past ~3wk), combo (2D bars + trend line, handles negatives, weekly-bucketed past ~3wk), spark (one-liner). Reproduce the full output in a fenced code block in your reply, then add the coach read — never leave it only in the collapsed tool call.", _CHART_SCHEMA)
+@tool(
+    "chart",
+    # One tool, two formats (0.57.0) — `generate_chart` folded in as
+    # format="png". They shared _fetch_metric_series, _CHART_METRICS and
+    # overlapping style enums: two names for one job, the exact ambiguity
+    # the get_today_status removal (0.48.0) documented.
+    "Chart a metric over the last N days. format 'ascii' (default): "
+    "terminal chart (styles: calendar heat-grid [default], line, bar, "
+    "combo, spark) — reproduce the full output in a fenced code block in "
+    "your reply, never leave it only in the collapsed tool call. format "
+    "'png': polished matplotlib image returned inline as an image content "
+    "block plus its saved file path (styles: line [default], bar, combo). "
+    "For scheduled-vs-actual plan views use plan_chart instead.",
+    _CHART_SCHEMA,
+)
 async def chart(args: dict) -> dict:
     metric = args["metric"]
     if metric not in _CHART_METRICS:
@@ -653,6 +649,11 @@ async def chart(args: dict) -> dict:
     err = _validate_days(args["days"])
     if err:
         return _err(err)
+    fmt_arg = args.get("format") or "ascii"
+    if fmt_arg not in ("ascii", "png"):
+        return _err(f"unknown format '{fmt_arg}'", allowed=["ascii", "png"])
+    if fmt_arg == "png":
+        return await _chart_png(args)
     style = args.get("style") or "calendar"
     if style not in _CHART_STYLES:
         return _err(f"unknown style '{style}'", allowed=sorted(_CHART_STYLES))
@@ -830,8 +831,10 @@ _QUERY_WORKOUTS_SCHEMA = {
     "properties": {
         "activity_type": {"type": "string", "description": "Substring match, e.g. 'running'"},
         "days": {"type": "integer", "description": "Look back this many days"},
+        # min_distance_km left the ADVERTISED schema at 0.57.0 (a deprecated
+        # alias re-shipped in every session's preamble); _min_distance_meters
+        # still accepts it silently, so an old client keeps working.
         "min_distance_mi": {"type": "number", "description": "Minimum distance in MILES (the app's display unit)"},
-        "min_distance_km": {"type": "number", "description": "(deprecated — use min_distance_mi; mi wins if both given)"},
         "min_duration_min": {"type": "integer"},
         "limit": {"type": "integer", "description": "Max rows 1-500, default 50"},
     },
@@ -928,7 +931,7 @@ async def query_workouts(args: dict) -> dict:
             (*params, limit + 1),
         ).fetchall()
     truncated = len(rows) > limit
-    workouts = [_augment_workout(dict(r)) for r in rows[:limit]]
+    workouts = [_display_workout(dict(r)) for r in rows[:limit]]
     return _text({"workouts": workouts, "count": len(workouts), "truncated": truncated})
 
 
@@ -1016,27 +1019,70 @@ def _compare_periods_sum(conn, metric: str, args: dict) -> dict:
     return {"metric": metric, "period_a": a, "period_b": b, "delta": delta, "delta_pct": delta_pct}
 
 
+_COMPARE_PERIODS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metric": {"type": "string"},
+        "days": {
+            "type": "integer",
+            "description": "Shortcut: compare the last N days against the "
+            "prior N days — no date arithmetic needed. Mutually exclusive "
+            "with the four period_* dates.",
+        },
+        "period_a_start": {"type": "string"},
+        "period_a_end": {"type": "string"},
+        "period_b_start": {"type": "string"},
+        "period_b_end": {"type": "string"},
+    },
+    "required": ["metric"],
+}
+
+_COMPARE_PERIOD_FIELDS = (
+    "period_a_start", "period_a_end", "period_b_start", "period_b_end",
+)
+
+
 @tool(
     "compare_periods",
-    "Compare a metric between two ISO date ranges. Returns mean, SD, count "
-    "for each + delta. Also accepts distance_meters (activities, SUMMED per "
-    "period — no mean/SD for a period total, but a total_mi convenience and "
-    "top-level delta/delta_pct). Use for things like 'last 30d vs prior 30d' "
-    "or 'how much did I run this week vs last'.",
-    {
-        "metric": str,
-        "period_a_start": str,
-        "period_a_end": str,
-        "period_b_start": str,
-        "period_b_end": str,
-    },
+    "Compare a metric between two windows: pass days=N for 'last N days vs "
+    "the prior N' (the common case), or two explicit ISO date ranges. "
+    "Returns mean, SD, count for each + delta. Also accepts distance_meters "
+    "(activities, SUMMED per period — no mean/SD for a period total, but a "
+    "total_mi convenience and top-level delta/delta_pct). Use for things "
+    "like 'last 30d vs prior 30d' or 'how much did I run this week vs last'.",
+    _COMPARE_PERIODS_SCHEMA,
 )
 async def compare_periods(args: dict) -> dict:
+    # days=N convenience (0.56.0): this tool had ZERO recorded calls while
+    # run_sql hand-rolled period comparisons — every "last 30d vs prior 30d"
+    # ask forced the model to compute four ISO dates. Derived windows are
+    # echoed in the payload (derived_periods) so the answer can cite them.
+    derived_periods = None
+    if args.get("days") is not None:
+        if any(args.get(f) is not None for f in _COMPARE_PERIOD_FIELDS):
+            return _err("pass either days or the four period dates, not both")
+        if err := _validate_days(args["days"]):
+            return _err(err)
+        n = args["days"]
+        today = date.today()
+        args = {
+            **args,
+            "period_a_start": (today - timedelta(days=n - 1)).isoformat(),
+            "period_a_end": today.isoformat(),
+            "period_b_start": (today - timedelta(days=2 * n - 1)).isoformat(),
+            "period_b_end": (today - timedelta(days=n)).isoformat(),
+        }
+        derived_periods = {f: args[f] for f in _COMPARE_PERIOD_FIELDS}
+    elif any(args.get(f) is None for f in _COMPARE_PERIOD_FIELDS):
+        return _err(
+            "pass either days=N (last N vs prior N) or all four period dates "
+            f"({', '.join(_COMPARE_PERIOD_FIELDS)})"
+        )
     # Validate all four dates + ordering BEFORE any query: a malformed or
     # reversed range compares as strings in SQL and returns {"n": 0} —
     # indistinguishable from a genuinely empty window, so the model reads
     # "no data" where the truth is "bad input".
-    for field in ("period_a_start", "period_a_end", "period_b_start", "period_b_end"):
+    for field in _COMPARE_PERIOD_FIELDS:
         if msg := _validate_date(args.get(field), field):
             return _err(msg)
     for label in ("a", "b"):
@@ -1048,6 +1094,8 @@ async def compare_periods(args: dict) -> dict:
     if metric in _COMPARE_SUM_METRICS:
         with db.connect() as conn:
             payload = _compare_periods_sum(conn, metric, args)
+        if derived_periods:
+            payload["derived_periods"] = derived_periods
         return _text(payload)
     if metric == "training_load":
         table = "activities"
@@ -1097,6 +1145,8 @@ async def compare_periods(args: dict) -> dict:
     for field, ndigits in (("delta_mean_a_minus_b", 2), ("delta_pct", 1), ("cohens_d", 3)):
         if payload.get(field) is not None:
             payload[field] = round(payload[field], ndigits)
+    if derived_periods:
+        payload["derived_periods"] = derived_periods
     return _text(payload)
 
 
@@ -1231,6 +1281,93 @@ def _sync_state(result: dict, *, recomputed: bool) -> str:
     return "; ".join(segments)
 
 
+def _sync_min_interval_minutes() -> int:
+    """How recently a successful pull must have completed for a new
+    `sync_garmin_data` call to short-circuit as fresh. Env-overridable per the
+    repo pattern; a bad value degrades to the default rather than erroring."""
+    try:
+        return int(os.environ.get("LOCAL_FITNESS_SYNC_MIN_INTERVAL_MIN", "10"))
+    except ValueError:
+        return 10
+
+
+def _recent_successful_sync(now: datetime) -> datetime | None:
+    """completed_at of the newest non-failed ingest run inside the freshness
+    window, else None. Failure statuses never count as fresh — a failed pull
+    ten seconds ago is a reason to retry, not to skip. Fail-open on any DB
+    problem: a fresh clone with no schema yet must fall through to the real
+    pull (which is what creates the data), never error on its guard."""
+    placeholders = ",".join("?" * len(_SYNC_FAILURE_STATUSES))
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT completed_at FROM ingest_runs "
+                f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
+                "AND status != 'in_progress' "
+                "ORDER BY completed_at DESC LIMIT 1",
+                tuple(_SYNC_FAILURE_STATUSES),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or not row["completed_at"]:
+        return None
+    try:
+        completed = datetime.fromisoformat(row["completed_at"])
+    except ValueError:
+        return None
+    if timedelta() <= now - completed <= timedelta(minutes=_sync_min_interval_minutes()):
+        return completed
+    return None
+
+
+def _latest_activity_summary() -> dict | None:
+    """The newest activity as a compact handoff row, or None on an empty DB.
+
+    Attached to every non-short-circuit sync payload so "pull my data and
+    grade my run" is TWO calls (sync -> workout_report_card), not three —
+    recorded sessions burned a query_workouts call seven times purely to
+    resolve "my recent run" into an activity_id the report card could take.
+    Fail-open (None) on any DB problem — this is garnish on the sync payload,
+    never a reason for a sync that just succeeded to report an error.
+    """
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT activity_id, date, activity_type, distance_meters, "
+                "avg_pace_sec_per_km FROM activities "
+                "ORDER BY date DESC, start_time DESC LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    w = dict(row)
+    mode = interpret.is_running_effort(w.get("avg_pace_sec_per_km"))
+    summary = {
+        "activity_id": w["activity_id"],
+        "date": w["date"],
+        "activity_type": w["activity_type"],
+        "effort": {True: "run", False: "walk", None: None}[mode],
+    }
+    distance_mi = units.to_miles(w.get("distance_meters"))
+    if distance_mi is not None:
+        summary["distance_mi"] = distance_mi
+    return summary
+
+
+_SYNC_GARMIN_DATA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "force": {
+            "type": "boolean",
+            "description": "Pull even when a successful sync completed within "
+            "the freshness window (default 10 min). Default false.",
+        },
+    },
+    "required": [],
+}
+
+
 @tool(
     "sync_garmin_data",
     "Pull the latest data from Garmin Connect into the database (gap-aware: "
@@ -1239,12 +1376,41 @@ def _sync_state(result: dict, *, recomputed: bool) -> str:
     "any new day or activity landed. Every other tool only reads what's "
     "already in the DB — call this first when the user asks to "
     "sync/refresh/pull/update their data, or when today's data looks stale or "
-    "missing. Read the returned `sync_state` line: status 'partial' is normal "
-    "when older history is still incomplete and does NOT mean this sync "
-    "failed.",
-    {},
+    "missing. A successful sync in the last ~10 minutes short-circuits as "
+    "status 'fresh' with no Garmin call — a re-ask moments later needs no "
+    "second pull; pass force:true to pull anyway. The payload's "
+    "`latest_activity` is the newest workout's id/date/type — hand it "
+    "straight to workout_report_card, no query_workouts lookup needed. Read "
+    "the returned `sync_state` line: status 'partial' is normal when older "
+    "history is still incomplete and does NOT mean this sync failed.",
+    _SYNC_GARMIN_DATA_SCHEMA,
 )
-async def sync_garmin_data(_args: dict) -> dict:
+async def sync_garmin_data(args: dict) -> dict:
+    # Freshness short-circuit (0.56.0) — at the TOOL layer, deliberately not
+    # inside daily.pull: pull's own 3-day refresh union makes every pull hit
+    # Garmin, and the launchd jobs WANT that (day-end totals overwrite partial
+    # values). What this guards is the chat-session shape measured in the
+    # audit: the user re-asks, the agent re-syncs — 8 of 24 recorded calls
+    # were pure repeats minutes apart, each a full Garmin round-trip that
+    # landed nothing. Checked before the garminconnect import so the fresh
+    # path costs one indexed SQLite read.
+    if not args.get("force"):
+        completed = _recent_successful_sync(datetime.now())
+        if completed is not None:
+            minutes_ago = max(0, int((datetime.now() - completed).total_seconds() // 60))
+            payload = {
+                "status": "fresh",
+                "synced_through": db.last_known_daily_date(),
+                "sync_state": (
+                    f"already synced {minutes_ago} min ago — nothing pulled; "
+                    "pass force:true to pull again"
+                ),
+            }
+            latest = _latest_activity_summary()
+            if latest is not None:
+                payload["latest_activity"] = latest
+            return _text(payload)
+
     # Deferred import: garminconnect drags requests (~28 ms measured) into
     # every `import tools` — every stdio session start, every server boot —
     # and this tool is its ONLY consumer. Tests patch
@@ -1268,7 +1434,15 @@ async def sync_garmin_data(_args: dict) -> dict:
             days_failed=result.get("days_failed", 0),
             last_date=result.get("last_date"),
         )
-    return _text({**result, "sync_state": _sync_state(result, recomputed=recomputed)})
+    # Drop a null `error` key rather than shipping it: a success payload
+    # carrying "error": null pattern-matches as a failure to any naive
+    # detector (it fooled the 2026-08-10 audit's first pass).
+    payload = {k: v for k, v in result.items() if k != "error" or v is not None}
+    payload["sync_state"] = _sync_state(result, recomputed=recomputed)
+    latest = _latest_activity_summary()
+    if latest is not None:
+        payload["latest_activity"] = latest
+    return _text(payload)
 
 
 @tool(
@@ -1276,7 +1450,9 @@ async def sync_garmin_data(_args: dict) -> dict:
     # Band prose is BUILT from the interpret constants so the description can
     # never drift from the classifier actually attached to the payload (the
     # identical duplication was already removed from correlate's legend once).
-    f"Current CTL/ATL/TSB plus 30-day history. TSB > {interpret.TSB_FRESH:g} fresh, "
+    "Current CTL/ATL/TSB plus 30-day history. CTL = fitness (42-day EWMA), "
+    "ATL = fatigue (7-day EWMA), TSB = form (CTL - ATL). "
+    f"TSB > {interpret.TSB_FRESH:g} fresh, "
     f"{interpret.TSB_FATIGUED:g}..{interpret.TSB_FRESH:g} neutral, "
     f"< {interpret.TSB_FATIGUED:g} fatigued, < {interpret.TSB_VERY_FATIGUED:g} very fatigued. "
     "`current` is always the last COMPLETE day (never today's own row, which "
@@ -1352,6 +1528,10 @@ async def training_load_status(_args: dict) -> dict:
             if row.get(field) is not None:
                 row[field] = round(row[field], 2)
 
+    # No static `interpretation` legend (removed 0.56.0): the three prose
+    # lines re-shipped on every call while the tool DESCRIPTION already
+    # carries the zone bands built from the interpret constants — the same
+    # duplication that was once removed from correlate's legend.
     return _text({
         "current": current,
         "history_30d": recent,
@@ -1359,11 +1539,6 @@ async def training_load_status(_args: dict) -> dict:
         "ctl_pct_change_14d": ctl_pct,
         "ctl_direction": ctl_direction,
         "projected_end_of_day": projected_end_of_day,
-        "interpretation": {
-            "ctl": "chronic training load (fitness) — 42-day EWMA of activity training_load",
-            "atl": "acute training load (fatigue) — 7-day EWMA",
-            "tsb": "training stress balance (form) = CTL - ATL",
-        },
     })
 
 
@@ -1638,8 +1813,14 @@ def _run_sql_blocking(q: str) -> list[dict]:
 
 @tool(
     "run_sql",
+    # 0.57.0: the full per-table column dump (1.6 KB re-shipped every
+    # session) is gone from this description — table names only; columns live
+    # in the fitness://schema resource, and a bad column gets a corrective
+    # error naming the valid ones (observed retries succeed first try).
     "Execute a read-only SELECT or WITH query against the fitness DB. "
-    "Tables and columns: " + _render_schema() + ". "
+    "Tables: " + ", ".join(QUERYABLE_SCHEMA) + ". "
+    "Column lists: read the fitness://schema resource, or expect a "
+    "corrective error naming the valid columns on a miss. "
     "Use this for ad-hoc analysis the other tools don't cover. "
     f"Results are capped at {_RUN_SQL_ROW_CAP} rows; when more match, the "
     "payload carries \"truncated\": true — add a LIMIT or aggregate to see the rest.",
@@ -2487,12 +2668,21 @@ async def list_observations(args: dict) -> dict:
         where.append("obs_type = ?")
         params.append(args["obs_type"])
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-    limit = int(args.get("limit") or _LIST_OBSERVATIONS_DEFAULT_LIMIT)
+    # _validate_limit, like every other list surface (0.56.0). The bare
+    # int() cast it replaces let `limit: "abc"` escape as a raw ValueError
+    # and `limit: -1` reach SQLite as `LIMIT 0` — an empty page that then
+    # reported `truncated: true` about rows it never fetched.
+    limit = _validate_limit(args, default=_LIST_OBSERVATIONS_DEFAULT_LIMIT)
+    if isinstance(limit, str):
+        return _err(limit)
     with db.connect() as conn:
         # Fetch one past the cap so a full page is distinguishable from a
         # clipped larger set — same truncation-signal shape as run_sql.
+        # Explicit columns, not SELECT * — the schema owns what a payload
+        # carries, not whatever a future ALTER adds.
         rows = conn.execute(
-            f"SELECT * FROM observations {where_sql} "
+            "SELECT observation_id, observed_on, created_at, obs_type, "
+            f"value_num, value_text, activity_id FROM observations {where_sql} "
             "ORDER BY observed_on DESC, observation_id DESC LIMIT ?",
             (*params, limit + 1),
         ).fetchall()
@@ -2825,20 +3015,16 @@ _UPDATE_WORKOUT_SCHEMA = {
         "distance_mi": {"type": "number", "description": "target distance in miles (omit for rest / by-feel)"},
         "pace_min_per_mi": {
             "type": ["string", "number"],
-            "description": 'target pace per mile as "M:SS" (e.g. "9:39" — '
-                           "preferred). A bare number is DECIMAL minutes: "
-                           "9.65 is 9:39/mi, while 9.39 is 9:23/mi — do not "
-                           "copy a display string as a number.",
+            "description": 'target pace per mile as "M:SS" (preferred). A bare '
+                           "number is DECIMAL minutes — 9.65 is 9:39/mi, 9.39 "
+                           "is 9:23/mi; never copy a display string as a number.",
         },
         "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
         "hr_max": {
             "type": "number",
-            "description": "prescribed heart-rate CEILING in bpm (e.g. 140 for "
-                           "'keep HR under 140'). The report card grades the "
-                           "run's average HR and how far above this ceiling it "
-                           "ran (in bpm) against this number, so state it here "
-                           "rather than only in the description — prose in the "
-                           "description is not readable by the grader.",
+            "description": "prescribed heart-rate CEILING in bpm. The grader "
+                           "reads THIS field only — a cap stated just in the "
+                           "prose description is invisible to it.",
         },
         "description": {"type": "string", "description": "prose prescription for the day"},
         "seq": {"type": "integer", "description": "intra-day session on a double day: 1 = first/AM (default), 2 = second/PM"},
@@ -2918,15 +3104,12 @@ def _validate_seq(seq) -> tuple[int | None, str | None]:
 
 @tool(
     "update_plan_workout",
-    "Re-prescribe ONE day on the ACTIVE training plan. Pass the date plus any "
-    "of type/distance_mi/pace_min_per_mi/duration_min/hr_max/description — use "
-    "it to move a long run, swap days, or adjust a session (tempo/interval "
-    "sessions are graded on duration_min). Pass hr_max whenever the day has a "
-    "heart-rate ceiling: the report card grades against it, and a cap stated "
-    "only in the description is invisible to the grader. type='rest' clears "
-    "distance/pace/duration/hr_max and defaults the description to 'Rest day' "
-    "unless you pass one. Edits the prescription only; it cannot re-key or "
-    "restructure the plan.",
+    "Re-prescribe ONE day on the ACTIVE training plan: date plus any of "
+    "type/distance_mi/pace_min_per_mi/duration_min/hr_max/description. "
+    "type='rest' clears distance/pace/duration/hr_max and defaults the "
+    "description to 'Rest day'. Edits the prescription only — it cannot "
+    "re-key or restructure the plan. For 2+ days use update_plan_workouts "
+    "(one atomic call), never a loop of this.",
     _UPDATE_WORKOUT_SCHEMA,
 )
 async def update_plan_workout(args: dict) -> dict:
@@ -3032,16 +3215,13 @@ _UPDATE_WORKOUTS_SCHEMA = {
 
 @tool(
     "update_plan_workouts",
-    "Re-prescribe MANY days on the ACTIVE training plan in ONE atomic call — "
-    "the batch form of update_plan_workout, and the right tool for reshaping a "
-    "week or a training block. Each entry takes the same fields as the "
-    "single-day tool. ALL-OR-NOTHING: every entry is validated and every date "
-    "checked to exist before anything is written, so a bad entry leaves the "
-    "plan untouched rather than half-rewritten. Like the single-day tool it "
-    "re-prescribes EXISTING days only — it cannot add, move or delete a day, "
-    "so a swap is two entries (rest the old day, prescribe the new one) and "
-    "the new day must already be on the plan. For a whole new structure use "
-    f"propose_training_plan instead. Max {plans.MAX_BATCH_UPDATES} entries.",
+    "Re-prescribe MANY days on the ACTIVE plan in ONE atomic all-or-nothing "
+    "call (a bad entry writes nothing) — the right tool for reshaping a week "
+    "or block; same fields per entry as update_plan_workout. Re-prescribes "
+    "EXISTING days only: a swap is two entries (rest the old day, prescribe "
+    "the new one) and the new day must already be on the plan. For a whole "
+    f"new structure use propose_training_plan. Max {plans.MAX_BATCH_UPDATES} "
+    "entries.",
     _UPDATE_WORKOUTS_SCHEMA,
 )
 async def update_plan_workouts(args: dict) -> dict:
@@ -3279,6 +3459,19 @@ def _augment_plan_workout(w: dict) -> dict:
     return w
 
 
+#: Raw plan-workout fields whose display twin (attached by
+#: _augment_plan_workout / the duration formatter) replaces them in
+#: get_training_plan_progress's compact rows. Mirrors
+#: workout_rows._RAW_DISPLAY_PAIRS for activity rows.
+_PLAN_RAW_DISPLAY_PAIRS = (
+    ("target_distance_m", "target_distance_mi"),
+    ("actual_distance_m", "actual_distance_mi"),
+    ("target_pace_sec_per_km", "target_pace_min_per_mi"),
+    ("actual_pace_sec_per_km", "actual_pace_min_per_mi"),
+    ("target_duration_sec", "target_duration_formatted"),
+)
+
+
 @tool(
     "get_training_plan_status",
     "Status of the ACTIVE training plan: goal, days to race, the most recent "
@@ -3397,33 +3590,51 @@ async def get_training_plan_progress(args: dict) -> dict:
 
     # Deliberate projection: keep the fields an agent needs to answer a
     # plan-progress question; drop identifiers / internal rollups (plan_id,
-    # status, ability_snapshot, weekly_mileage, …) that build_plan_detail spreads.
-    workouts_full = [
-        {
-            "date": w.get("date"),
-            "seq": w.get("seq", 1),
-            "week_index": w.get("week_index"),
-            "type": w.get("type"),
-            "target_distance_m": w.get("target_distance_m"),
-            "target_pace_sec_per_km": w.get("target_pace_sec_per_km"),
-            "target_duration_sec": w.get("target_duration_sec"),
-            "target_hr_max": w.get("target_hr_max"),
-            "description": w.get("description"),
-            "verdict": w.get("verdict"),
-            "actual_distance_m": w.get("actual_distance_m"),
-            "actual_pace_sec_per_km": w.get("actual_pace_sec_per_km"),
-            "actual_activity_types": w.get("actual_activity_types"),
+    # status, ability_snapshot, weekly_mileage, …) that build_plan_detail
+    # spreads. Compaction (0.56.0): this tool measured as 24% of ALL chars
+    # returned across recorded sessions (median ~11 KB/call) — the single
+    # worst context hog on the surface. Two pure cuts, applied before
+    # windowing so full=true gets them too: (1) None-valued keys are omitted
+    # AT BUILD TIME (a pending day shipped 4+ nulls per row; an absent key
+    # reads the same as null to the model — and the single-pass build is
+    # perf-gate-load-bearing: a build-then-strip second dict pass measured
+    # 15.4% over the CI benchmark floor), and (2) in miles mode a raw field
+    # is popped once its display twin landed (same rule as
+    # workout_rows.display_workout — the twin is gated, so a paceless or
+    # distance-less row keeps its raw column). Rollups untouched.
+    miles_mode = units.display_units() == "miles"
+    workouts_full = []
+    for w in detail["workouts"]:
+        row = {
+            k: v for k, v in (
+                ("date", w.get("date")),
+                ("seq", w.get("seq", 1)),
+                ("week_index", w.get("week_index")),
+                ("type", w.get("type")),
+                ("target_distance_m", w.get("target_distance_m")),
+                ("target_pace_sec_per_km", w.get("target_pace_sec_per_km")),
+                ("target_duration_sec", w.get("target_duration_sec")),
+                ("target_hr_max", w.get("target_hr_max")),
+                ("description", w.get("description")),
+                ("verdict", w.get("verdict")),
+                ("actual_distance_m", w.get("actual_distance_m")),
+                ("actual_pace_sec_per_km", w.get("actual_pace_sec_per_km")),
+                ("actual_activity_types", w.get("actual_activity_types")),
+            ) if v is not None
         }
-        for w in detail["workouts"]
-    ]
-    # 2d/2e: per-workout mile/pace convenience fields (Fix C) + a formatted
-    # target duration — pure computation over rows already fetched, applied
-    # before windowing so both full=true and the default window see it.
-    for w in workouts_full:
-        _augment_plan_workout(w)
-        duration_formatted = units.format_duration(w.get("target_duration_sec"))
+        # 2d/2e: per-workout mile/pace convenience fields (Fix C) + a
+        # formatted target duration — pure computation over rows already
+        # fetched. _augment_plan_workout only ADDS non-None fields, so the
+        # no-nulls invariant established above survives it.
+        _augment_plan_workout(row)
+        duration_formatted = units.format_duration(row.get("target_duration_sec"))
         if duration_formatted is not None:
-            w["target_duration_formatted"] = duration_formatted
+            row["target_duration_formatted"] = duration_formatted
+        if miles_mode:
+            for raw, display in _PLAN_RAW_DISPLAY_PAIRS:
+                if display in row:
+                    row.pop(raw, None)
+        workouts_full.append(row)
 
     full = bool(args.get("full", False))
     if full:
@@ -3592,7 +3803,7 @@ async def save_brief(args: dict) -> dict:
     "days-to-race, and recent-brief continuity. Prefer this over orchestrating "
     "many tools when answering 'how am I doing / what's today's read / what should "
     "I do today' — every number is pre-computed and traceable to the data. "
-    "Overkill for a single-metric question — use get_metric/get_metric_trend instead.",
+    "Overkill for a single-metric question — use get_metric_trend instead.",
     {},
 )
 async def get_brief_context(_args: dict) -> dict:
@@ -3613,10 +3824,10 @@ async def get_brief_context(_args: dict) -> dict:
 # phone-triggered call over that network transport would get back a
 # container-internal path with no way to retrieve the file; this boundary is
 # structural, not just documented (see
-# docs/plans/2026-07-07-pdf-chart-reports-design.md). generate_chart used to
-# share this boundary but no longer does (Fix A, 2026-07-10 doc) — it's now
-# in ALL_TOOLS, since its inline image content block sidesteps the
-# no-file-retrieval problem that still applies to a PDF.
+# docs/plans/2026-07-07-pdf-chart-reports-design.md). chart's png format
+# (the former generate_chart, folded in 0.57.0) does NOT share this boundary
+# — its inline image content block sidesteps the no-file-retrieval problem
+# that still applies to a PDF.
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -4094,12 +4305,23 @@ async def generate_brief_report(args: dict) -> dict:
                     break
                 kept = kept[:-1]
                 omitted += 1
-    except Exception:
-        # Raw WeasyPrint/cairo internals belong in the server log, not in
-        # model context — the model can't act on a cairo traceback, and it
-        # reads it out at the user.
+    except Exception as e:
+        # The full WeasyPrint/cairo traceback belongs in the server log, but
+        # the exception CLASS + message are render-stack detail, not secrets
+        # (the run_sql 0.37.0 precedent) — and "see the server log" was
+        # observed live as an unactionable dead end for an agent that cannot
+        # read the log. Name the failure and the recovery.
         LOG.warning("PDF render failed", exc_info=True)
-        return _err("PDF render failed — see the server log for the traceback")
+        return _err(
+            f"PDF render failed: {type(e).__name__}: {e}",
+            remediation=(
+                "the brief data itself is fine — this is the PDF renderer "
+                "(WeasyPrint needs native Pango/HarfBuzz libs; on macOS see "
+                "DYLD_LIBRARY_PATH in .env.example). Read the brief via "
+                "get_brief_context or the fitness://brief/latest resource "
+                "instead of retrying the render."
+            ),
+        )
     if pages != 1:
         # A single takeaway that still overflows is a content bug upstream
         # (a runaway `details` block), not something to paper over silently.
@@ -4127,51 +4349,20 @@ async def generate_brief_report(args: dict) -> dict:
 
 _GENERATE_CHART_TYPES = frozenset({"line", "bar", "combo"})
 
-_GENERATE_CHART_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "metric": {
-            "type": "string",
-            "description": "Any daily metric, training-load series (ctl/atl/tsb), or intensity_minutes_weighted — same whitelist as the chart tool.",
-        },
-        "days": {"type": "integer", "description": "Look back this many days"},
-        "chart_type": {
-            "type": "string",
-            "enum": sorted(_GENERATE_CHART_TYPES),
-            "description": (
-                "line = axis chart with gridlines; bar = vertical bars; "
-                "combo = bars + a least-squares trend line of the same "
-                "metric (matches the ASCII chart tool's combo style, one "
-                "metric, one axis — not a two-metric dual-axis chart)."
-            ),
-        },
-    },
-    "required": ["metric", "days", "chart_type"],
-}
-
-
-@tool(
-    "generate_chart",
-    "Render a beautiful standalone PNG chart (line/bar/combo) of a metric "
-    "over the last N days, for any ad-hoc trend question. Returns the chart "
-    "inline as an image content block (plus its saved file path as text) — "
-    "reachable over any transport, local or networked. Use the `chart` tool "
-    "instead when a text-reproducible ASCII/emoji read is what's wanted.",
-    _GENERATE_CHART_SCHEMA,
-)
-async def generate_chart(args: dict) -> dict:
+async def _chart_png(args: dict) -> dict:
+    """chart's format="png" branch — the former `generate_chart` tool body
+    (folded in 0.57.0). `style` maps onto the old `chart_type`; the ascii-only
+    styles error with the allowed list (the get_metric_trend pattern) rather
+    than silently falling back."""
     metric = args["metric"]
     days = args["days"]
-    chart_type = args["chart_type"]
+    chart_type = args.get("style") or "line"
     if chart_type not in _GENERATE_CHART_TYPES:
-        return _err(f"unknown chart_type '{chart_type}'", allowed=sorted(_GENERATE_CHART_TYPES))
-    err = _validate_days(days)
-    if err:
-        return _err(err)
-    try:
-        dates, values = _fetch_metric_series(metric, days)
-    except ValueError as e:
-        return _err(str(e), allowed=sorted(_CHART_METRICS))
+        return _err(
+            f"style '{chart_type}' is not available as png",
+            allowed=sorted(_GENERATE_CHART_TYPES),
+        )
+    dates, values = _fetch_metric_series(metric, days)
     if not values:
         return _err("no data in window", metric=metric, days=days)
 
@@ -4253,8 +4444,9 @@ _REPORT_CARD_SCHEMA = {
     "executed as prescribed: it is a COMPLIANCE score, not a verdict on how "
     "good the run was, so a correctly-run easy day rates 5. Training load is "
     "reported alongside but never rated. Defaults to the most recent logged "
-    "activity; pass activity_id or "
-    "date to grade a specific one. Grades against the active training plan's "
+    "activity — after a sync, call this DIRECTLY (no query_workouts lookup "
+    "to find an id; sync_garmin_data's `latest_activity` already names it); "
+    "pass activity_id or date to grade a specific one. Grades against the active training plan's "
     "prescribed workout when one exists for that date, otherwise against a "
     "60-day rolling median of comparable activities — the card always says "
     "which. Returns a `markdown` field (render it to the user VERBATIM, it is "
@@ -4444,12 +4636,20 @@ async def workout_report_card(args: dict) -> dict:
             pdf_bytes, pages = await asyncio.to_thread(
                 visuals.render_report_card_pdf, card, split_chart
             )
-    except Exception:
-        # Raw WeasyPrint/cairo internals belong in the server log, not in
-        # model context — the model can't act on a cairo traceback, and it
-        # reads it out at the user.
+    except Exception as e:
+        # Same contract as generate_brief_report's render failure: class +
+        # message are actionable render-stack detail, and the recovery is
+        # named — the graded card exists without the PDF.
         LOG.warning("PDF render failed", exc_info=True)
-        return _err("PDF render failed — see the server log for the traceback")
+        return _err(
+            f"PDF render failed: {type(e).__name__}: {e}",
+            remediation=(
+                "the grading succeeded — only the PDF renderer failed "
+                "(WeasyPrint needs native Pango/HarfBuzz libs; on macOS see "
+                "DYLD_LIBRARY_PATH in .env.example). Retry with "
+                "format='table' to get the full markdown card with no PDF."
+            ),
+        )
     if pages != 1:
         # The card has no droppable content (unlike the brief's takeaway tail),
         # so the density ladder is the only lever and it's exhausted. Never let
@@ -4619,7 +4819,11 @@ async def get_report_card(args: dict) -> dict:
 
 ALL_TOOLS = [
     get_brief_context,
-    get_metric,
+    # 0.57.0: get_metric and generate_chart are GONE — folded into
+    # get_metric_trend (include_values=true) and chart (format="png"). Both
+    # were near-duplicates of their survivor (identical schema/anchor logic;
+    # shared fetch + whitelist), i.e. two names for one job — the
+    # get_today_status ambiguity (0.48.0) again.
     get_metric_trend,
     chart,
     plan_chart,
@@ -4663,7 +4867,6 @@ ALL_TOOLS = [
     get_training_plan_progress,
     get_training_plan_draft,
     save_brief,
-    generate_chart,
     list_report_cards,
     get_report_card,
 ]
@@ -4673,10 +4876,10 @@ ALL_TOOLS = [
 # build_session_manager()'s HTTP /mcp/ transport. A phone-triggered call over
 # that transport would get back a container-internal path with no way to
 # retrieve the file — a real constraint for a PDF, which isn't representable
-# as MCP ImageContent. generate_chart moved OUT of this list (Fix A,
-# 2026-07-10 doc): once it returns an inline image content block, the
-# "no way to retrieve the file remotely" problem no longer applies to it, so
-# it's reachable over both stdio and the networked /mcp/ transport via
+# as MCP ImageContent. chart's png format (the former
+# generate_chart, folded in 0.57.0) is deliberately NOT here: it returns an
+# inline image content block, so the "no way to retrieve the file remotely"
+# problem does not apply and it stays reachable over both transports via
 # ALL_TOOLS above. Only the heavy `import matplotlib`/`import weasyprint`
 # statements (inside generate_brief_report's body and visuals.py's own module
 # body) are deferred, not this list.
@@ -4738,7 +4941,10 @@ _READ_ONLY_TOOL_NAMES = (
     # while both names existed; with one name left, excluding it would strip
     # the daily snapshot from the rollback path entirely.
     "daily_snapshot",
-    "get_metric",
+    # 0.57.0: "get_metric" left with its tool (folded into get_metric_trend's
+    # include_values) — a grant naming an unregistered tool would be dead
+    # weight, and briefing_prompt never named it (verified against
+    # tests/test_tools.py's grant-matching test).
     "get_metric_trend",
     "query_workouts",
     "get_workout_detail",

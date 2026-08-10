@@ -54,11 +54,13 @@ services:
       # REQUIRED when binding 0.0.0.0
       - LOCAL_FITNESS_API_TOKEN=${LOCAL_FITNESS_API_TOKEN}
       # MCP server host allowlist — MUST include the served host or every
-      # /mcp/ request 421s (DNS-rebinding guard). Default includes
-      # fitness.home.local; set explicitly if you serve at a different host.
+      # /mcp/ request 421s (DNS-rebinding guard). The code default is
+      # loopback only ("127.0.0.1,localhost"), so a deployment serving at a
+      # real hostname must set this — the value below is that override.
       - LOCAL_FITNESS_MCP_ALLOWED_HOSTS=${LOCAL_FITNESS_MCP_ALLOWED_HOSTS:-fitness.home.local,127.0.0.1,localhost}
-      # Display units for runner-facing output (mi, min/mi). Raw meters/sec-per-km
-      # are always present; non-"miles" only suppresses the *_mi fields. Default miles.
+      # Display units for runner-facing output (mi, min/mi). List payloads
+      # carry the display form for the configured units (raw meters/sec-per-km
+      # stay on detail surfaces and in km mode). Default miles.
       - LOCAL_FITNESS_DISPLAY_UNITS=${LOCAL_FITNESS_DISPLAY_UNITS:-miles}
     volumes:
       - ./data:/data
@@ -71,8 +73,10 @@ services:
 ```
 
 The compose-side `.env` file (sibling of `docker-compose.yml`, same
-shape as this repo's `.env.example`) supplies the four uppercase
-variables. Generate the API token once with:
+shape as this repo's `.env.example`) supplies the interpolated
+variables above (`LOCAL_FITNESS_TZ`, the two Garmin credentials,
+`CLAUDE_CODE_OAUTH_TOKEN`, `LOCAL_FITNESS_API_TOKEN`,
+`LOCAL_FITNESS_MCP_ALLOWED_HOSTS`, `LOCAL_FITNESS_DISPLAY_UNITS`). Generate the API token once with:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"

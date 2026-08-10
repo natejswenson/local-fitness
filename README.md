@@ -71,7 +71,8 @@ of metrics the agent reads when you ask it something or it writes a brief.
   analysis tools attach those fields to their payloads. The model phrases a
   judgment; it never derives one code can compute.
 - **Runner-facing units:** distances and pace render in miles / min-per-mile by
-  default (`LOCAL_FITNESS_DISPLAY_UNITS`); raw metric values are always present.
+  default (`LOCAL_FITNESS_DISPLAY_UNITS`); detail views keep raw metric values
+  alongside, while list payloads carry just the display form.
 - **Privacy by default:** the database, briefings, and logs stay on your
   machine and are gitignored.
 
@@ -146,7 +147,10 @@ uv run fitness recompute-baselines
 # 7. Generate today's briefing
 uv run fitness brief
 
-# 8. (macOS, optional) install the daily 6:30 AM job
+# 8. (macOS, optional) install the scheduled jobs — the 6:30 AM brief,
+#    plus the 19:00 brief email and 19:05 calendar sync if you've configured
+#    SMTP / Google OAuth in .env (the installer warns, not fails, without them).
+#    Pass a job name to install just one: ./ops/install-launchd.sh brief
 ./ops/install-launchd.sh
 
 # 9. (Optional) run the MCP server over HTTP instead of stdio
@@ -157,8 +161,15 @@ uv run fitness serve   # http://127.0.0.1:8765/mcp/
 
 ```bash
 fitness pull                  # pull since last success
+fitness backfill <zip>        # one-time full-history load from a Garmin export ZIP
+fitness recompute-baselines   # rebuild 60-day baselines + CTL/ATL/TSB
+fitness recompute-body-battery  # re-derive body-battery aggregates from samples
 fitness brief                 # pull + recompute + briefing → briefings/YYYY-MM-DD.json
 fitness brief --opus          # use the larger Opus model for one run
+fitness brief-email           # regenerate today's brief and email it (see below)
+fitness plan-calendar         # reconcile Google Calendar to the active plan
+fitness calendar-auth         # one-time Google OAuth flow (prints the refresh token)
+fitness config set|get <key>  # read/write a settings-table key (e.g. user_name)
 fitness serve                 # MCP over HTTP at http://127.0.0.1:8765/mcp/
 fitness mcp-stdio             # serve the tools to an MCP client over stdio
 fitness status                # DB row counts + last ingest run info
@@ -225,7 +236,7 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **50 tools over stdio** (48 over HTTP — two are
+Once connected you get **48 tools over stdio** (46 over HTTP — two are
 local-only, see below), **2 prompts**, and **2 resources**.
 
 📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool
@@ -241,24 +252,29 @@ is a map; that directory is the documentation.
     snapshot and persists it via `save_brief`.
 - **Status** — `daily_snapshot` (one-call "how am I doing"),
   `get_brief_context` (the deterministic planner's full typed output).
-- **Metrics & analysis** — `get_metric` / `get_metric_trend`,
+- **Metrics & analysis** — `get_metric_trend` (trend stats, with the raw
+  series via `include_values`),
   `training_load_status`, `compare_periods`, `correlate`, `find_anomalies`,
   `recovery_pattern`. Each attaches deterministic interpretation (`tsb_zone`,
   `trend_direction`, `effect_size`, …) computed in `agent/interpret.py`, rather
   than leaving the model to apply a legend by hand.
-- **Workouts** — `query_workouts`, `get_workout_detail`, and
+- **Workouts** — `query_workouts`, `get_workout_detail`,
+  `log_manual_workout` / `delete_manual_workout` (sessions Garmin never saw —
+  a treadmill run on a dead watch, a pickup game), and
   `workout_report_card`, which *rates* one session — distance, pace, HR and
   continuity each get a 1-5 star score from one shared curve, plus an
   intent-weighted overall. Every render is stored, so `list_report_cards` /
   `get_report_card` read the rated history back (JSON, so both transports)
   without re-rating anything.
-- **Charts** — `chart` (inline ASCII/emoji), `generate_chart` (matplotlib PNG
-  returned as an inline image block), `plan_chart` (**the** scheduled-vs-actual
-  view — don't hand-roll it).
+- **Charts** — `chart` (inline ASCII/emoji by default; `format="png"` renders
+  a matplotlib image returned as an inline image block) and `plan_chart`
+  (**the** scheduled-vs-actual view — don't hand-roll it).
 - **Training plans** — the agent owns the whole lifecycle, because there is no
   UI: `propose_training_plan` / `revise_training_plan` (draft),
   `commit_training_plan` / `discard_training_plan_draft` (activate or drop),
-  `update_plan_workout` (re-prescribe one day on the active plan),
+  `update_plan_workout` (re-prescribe one day on the active plan) /
+  `update_plan_workouts` (re-prescribe many days in ONE atomic call — the
+  "move the long run" two-step belongs here, never in a loop),
   `abandon_active_plan` (**no undo**), `get_training_plan_status` /
   `get_training_plan_progress` (the active plan), and
   `get_training_plan_draft` (the one way to see a pending draft so it can
@@ -277,6 +293,12 @@ is a map; that directory is the documentation.
   tune the voice conversationally (persona prose, signature lines, per-topic
   intensity, five numeric dials). There is no UI; the agent owns the writes,
   same as training plans.
+- **Delivery settings** — `get_brief_email_settings` /
+  `update_brief_email_settings` (the evening brief email: enabled state +
+  recipients) and `get_plan_calendar_settings` /
+  `update_plan_calendar_settings` (the calendar sync: enabled state + target
+  calendar). Same agent-owns-the-writes pattern as plans; secrets stay in
+  `.env`, unreadable by any tool.
 - **Data & escape hatches** — `sync_garmin_data` (a capped Garmin pull +
   baseline recompute, so an MCP-only client can freshen the DB without the CLI)
   and `run_sql` (**read-only**, enforced at the SQLite engine — any write/DDL
@@ -288,8 +310,8 @@ is a map; that directory is the documentation.
 **Two tools are stdio-only:** `generate_brief_report` and
 `workout_report_card`. The rule is that a tool handing back a *filesystem path*
 can't work over the network — a remote caller gets a container-internal path it
-cannot retrieve. `generate_chart` is networked precisely because it returns the
-image inline instead.
+cannot retrieve. `chart`'s png format is networked precisely because it
+returns the image inline instead.
 
 The DNS-rebinding guard on the HTTP transport requires the served host to be in
 `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` (defaults to common local hosts; set it to
@@ -302,21 +324,96 @@ your host or every request 421s).
 > under `launchd`). The web server and the MCP endpoint don't need it. See
 > [`ops/`](ops/) and [`docs/deployment.md`](docs/deployment.md).
 
+## Evening delivery — email + calendar
+
+Two optional scheduled jobs carry the plan to where you already look:
+
+- **Brief email** (`fitness brief-email`, launchd 19:00 with a 20:00
+  backstop) — pulls fresh Garmin data, **regenerates** the brief against the
+  full day (by evening the morning brief describes a day that hadn't happened
+  yet), and sends it as a styled HTML email with the chart PNGs inline. Pure
+  `smtplib` — no model, no connector — with TLS certificate verification
+  enforced on both the implicit-TLS (465) and STARTTLS paths. Configure the
+  SMTP credentials in `.env`; the enabled state and recipients are managed
+  conversationally via `get_brief_email_settings` / `update_brief_email_settings`.
+- **Calendar sync** (`fitness plan-calendar`, launchd 19:05 with a 20:05
+  backstop) — makes Google Calendar **equal** the active training plan from
+  today through its last day: creates, updates, and deletes the app's own
+  all-day (free, not busy) events, keyed on plan identity so re-runs are
+  idempotent and a manually-deleted event stays deleted. The four plan-write
+  MCP tools run the same reconcile after each edit, so a "move my long run"
+  lands on the calendar in the same turn. One-time OAuth setup:
+  `fitness calendar-auth` + [`docs/google-calendar.md`](docs/google-calendar.md).
+
+Both fail soft: an unconfigured clone gets no noise, and a delivery failure
+never corrupts the data it was delivering.
+
 ## Configuration
 
 Every variable is optional; defaults are project-relative and work in a fresh
-clone. Copy `.env.example` to `.env` and set only what you need.
+clone. Copy `.env.example` to `.env` and set only what you need — that file
+carries a commented explanation for every variable; the tables below are the
+map.
+
+**Core — paths, server, identity**
 
 | Variable | Purpose | Default |
 |---|---|---|
 | `GARMIN_EMAIL` / `GARMIN_PASSWORD` | Garmin credentials via env (required where the system Keychain isn't reachable, e.g. containers). When both are set they win over the Keychain. | unset → use Keychain (`fitness setup`) |
+| `GARMINTOKENS` | Cached Garmin session-token store (avoids repeated SSO logins → 429s) | `~/.garminconnect/garmin_tokens.json` |
 | `LOCAL_FITNESS_DATA_DIR` | Where the SQLite DB + notes live | `./data` |
 | `LOCAL_FITNESS_BRIEFINGS_DIR` | Where daily briefings are written | `./briefings` |
 | `LOCAL_FITNESS_NOTES_PATH` | The agent's durable user-notes file | `./data/user_notes.md` |
+| `LOCAL_FITNESS_REPORTS_DIR` | Persistent PDF/PNG output dir for the file-writing tools | ephemeral per-process tmp dir |
 | `LOCAL_FITNESS_HOST` | Bind host for `fitness serve` | `127.0.0.1` |
 | `LOCAL_FITNESS_API_TOKEN` | Bearer token gating `/mcp/` (required for non-loopback binds) | unset |
-| `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` | Host allowlist for the MCP transport's DNS-rebinding guard | common local hosts |
-| `LOCAL_FITNESS_DISPLAY_UNITS` | Runner-facing display units; non-`miles` suppresses the `*_mi` convenience fields (raw values always present) | `miles` |
+| `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` | Host allowlist for the MCP transport's DNS-rebinding guard | `127.0.0.1,localhost` |
+| `LOCAL_FITNESS_DISPLAY_UNITS` | Runner-facing display units. List payloads carry the display form for the configured units; detail views keep raw values alongside | `miles` |
+| `LOCAL_FITNESS_USER_NAME` | Fallback display name when the `user_name` setting is unset | `the user` |
+| `LOCAL_FITNESS_TZ` | Container timezone (compose interpolates it into `TZ` — a UTC container reads the wrong "today" all evening) | host zone |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude subscription token for the headless brief jobs | unset |
+| `DYLD_LIBRARY_PATH` | macOS-only: Homebrew's lib dir so WeasyPrint finds Pango | unset |
+
+**Brief generation**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `LOCAL_FITNESS_BRIEF_V2` | Set `0` to fall back to the V1 tool-driven composer | V2 on |
+| `LOCAL_FITNESS_BRIEF_EFFORT` | Reasoning-effort override for the brief model | model default |
+| `LOCAL_FITNESS_BRIEF_IDLE_TIMEOUT_S` / `_MAX_ATTEMPTS` / `_RETRY_DELAY_S` | The SDK-stream watchdog: per-message idle kill, retry count, backoff | `120` / `3` / `20` |
+| `LOCAL_FITNESS_OPENCODE_AGENT` | Alt-model shadow-run diagnostic transport | unset |
+| `LOCAL_FITNESS_BRAND_FILE` | JSON brand-theme override for every PDF/PNG | built-in PRESS theme |
+
+**Coach voice & memory**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `LOCAL_FITNESS_COACH_PROFILE` | Base tone profile (`supportive` / `neutral` / `hardass` / `adaptive`) | `hardass` |
+| `LOCAL_FITNESS_COACH_HARSHNESS` / `_WARMTH` / `_PUSH` / `_ROAST_THRESHOLD` / `_PRAISE_THRESHOLD` | The five numeric tone dials (DB settings win over env) | profile values |
+| `LOCAL_FITNESS_COACH_SPEC` | Set `0` to ignore (never delete) the conversational personality spec | on |
+| `LOCAL_FITNESS_COACH_MEMORY` | Set `0` to disable memory injection + auto-reflection (journal data survives) | on |
+
+**Email delivery (0.51.0)**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `LOCAL_FITNESS_SMTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` | SMTP server + credentials; 465 = implicit TLS, else STARTTLS. Password is the one value with no default and no tool access. | Gmail host/465 |
+| `LOCAL_FITNESS_BRIEF_EMAIL_ENABLED` / `_TO` / `_FROM` | Kill switch + addresses (DB settings win over env) | disabled |
+
+**Calendar sync (0.52.0)**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `LOCAL_FITNESS_GCAL_CLIENT_ID` / `_CLIENT_SECRET` / `_REFRESH_TOKEN` | Google OAuth credentials (mint the token with `fitness calendar-auth`) | unset |
+| `LOCAL_FITNESS_PLAN_CALENDAR_ENABLED` / `_ID` | Kill switch + target calendar (DB settings win over env) | disabled / `primary` |
+
+**Grading & plan tuning**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `LOCAL_FITNESS_COUNT_WALKS_EASY` / `_MILEAGE` | Whether measured walks count toward easy-day verdicts / weekly mileage | `true` / `false` |
+| `LOCAL_FITNESS_GRADE_DONE_FRACTION` / `_PARTIAL_FRACTION` | Plan-verdict thresholds (done / partial vs prescribed) | `0.80` / `0.40` |
+| `LOCAL_FITNESS_RIEGEL_LOOKBACK_DAYS` | Window for the best-effort Riegel race projection | `120` |
 
 ## Cross-platform & Docker
 
@@ -337,8 +434,11 @@ SQLite at `./data/fitness.db` (override with `LOCAL_FITNESS_DATA_DIR`). Tables:
 `activity_hr_zones`, `activity_splits`, `activity_hr_samples` (per-sample HR
 traces, fetched on demand for a report card and cached forever — never
 backfilled), `baselines`, `ingest_runs`, `settings`, `observations` (manual
-logs: RPE, soreness, weight, mood…), and `training_plans` / `plan_workouts`
-(goal-driven plans, single-active enforced by a partial unique index). Raw
+logs: RPE, soreness, weight, mood…), `training_plans` / `plan_workouts`
+(goal-driven plans, single-active enforced by a partial unique index),
+`coach_journal` + its `coach_journal_fts` FTS5 index (the coach's own memory —
+60 hot entries, archived-not-deleted, BM25-searchable), and `report_cards`
+(every rendered workout report card, stored as graded). Raw
 Garmin JSON is preserved on every wellness/activity row, so new fields can be
 derived later without re-pulling.
 
@@ -380,7 +480,7 @@ src/local_fitness/
 ├── web/server.py          # FastAPI app: /mcp/ mount + /health (no Claude inference)
 ├── web/mcp_server.py      # MCP prompts/tools/resources wiring
 └── cli.py                 # `fitness` Click entry point
-ops/                       # macOS launchd plist + installer for the scheduled brief
+ops/                       # macOS launchd plists + installer: brief, brief-email, plan-calendar
 scripts/score_prompt.py    # eval that scores agent/prompts.py (gates CI)
 tests/                     # pytest suite (run: uv run pytest)
 docs/mcp/                  # per-tool MCP reference (one page per tool)
@@ -414,10 +514,12 @@ blocking both `claude_agent_sdk.query` and Garmin's activity-details endpoint,
 so a new generator or ingest path can't silently start making real calls.
 
 Work flows `feature/* → dev → main`; both `dev` and `main` are protected
-(CI green + a PR required). CI runs all three checks on every push/PR to
-`main`/`dev`; a `dev → main` promotion that bumps the version in
-`pyproject.toml` auto-cuts a GitHub Release for it. See
-[`CHANGELOG.md`](CHANGELOG.md).
+(CI green + a PR required). CI runs six gates on every push/PR to
+`main`/`dev`: the PRESS brand-token check, `ruff`, `pytest` with the 85%
+coverage floor, the perf-benchmark regression gate, the prompt scorer
+(`scripts/score_prompt.py`), and the Docker image build. A `dev → main`
+promotion that bumps the version in `pyproject.toml` auto-cuts a GitHub
+Release for it. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Contributing
 

@@ -16,13 +16,13 @@ worked examples, and gotchas.
 
 ## Connecting
 
-**Local, over stdio** — all 50 tools, no token:
+**Local, over stdio** — all 48 tools, no token:
 
 ```bash
 claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
 ```
 
-**Over the running server** — 48 tools, bearer-gated:
+**Over the running server** — 46 tools, bearer-gated:
 
 ```bash
 claude mcp add --transport http fitness \
@@ -39,15 +39,16 @@ unreachable over the networked `/mcp/` transport:
 
 | | stdio (`fitness mcp-stdio`) | HTTP (`/mcp/`) |
 |---|---|---|
-| Tool count | **50** | **48** |
+| Tool count | **48** | **46** |
 | [`generate_brief_report`](generate_brief_report.md) | ✅ | ❌ |
 | [`workout_report_card`](workout_report_card.md) | ✅ | ❌ |
 
 **The rule that decides membership:** a tool that hands back a *filesystem path*
 is local-only, because a remote caller receives a container-internal path it
-cannot retrieve. [`generate_chart`](generate_chart.md) is networked precisely
-because it returns the PNG as an inline MCP image content block — the client no
-longer needs the path.
+cannot retrieve. [`chart`](chart.md)'s png format (the former
+`generate_chart`, folded in at 0.57.0) is networked precisely because it
+returns the PNG as an inline MCP image content block — the client never needs
+the path.
 
 ## Tools by area
 
@@ -65,8 +66,7 @@ Three tools overlap here; the distinction is on each page.
 
 | Tool | Use it for |
 |---|---|
-| [`get_metric`](get_metric.md) | Raw daily values for one metric over N days |
-| [`get_metric_trend`](get_metric_trend.md) | The same series with a computed direction and slope |
+| [`get_metric_trend`](get_metric_trend.md) | Trend + slope for one metric; `include_values=true` adds the raw daily series |
 | [`training_load_status`](training_load_status.md) | CTL / ATL / TSB — fitness, fatigue, freshness — with a zone read |
 
 ### Workouts
@@ -130,8 +130,7 @@ propose_training_plan ──> DRAFT ──> commit_training_plan ──> ACTIVE
 
 | Tool | Use it for |
 |---|---|
-| [`chart`](chart.md) | ASCII/emoji chart, inline in the reply |
-| [`generate_chart`](generate_chart.md) | Standalone matplotlib PNG, returned inline |
+| [`chart`](chart.md) | ASCII/emoji chart inline in the reply, or `format="png"` for a matplotlib image |
 | [`plan_chart`](plan_chart.md) | **The** tool for scheduled-vs-actual — never hand-roll this |
 | [`generate_brief_report`](generate_brief_report.md) | 📄 Render a saved brief to a PRESS-themed PDF |
 | [`workout_report_card`](workout_report_card.md) | 📄 Graded single-workout card, markdown + PDF |
@@ -173,10 +172,20 @@ profile file**.
 |---|---|
 | [`get_coach_personality`](get_coach_personality.md) | Active profile, effective spec, the five dials, journal size — read before editing |
 | [`update_coach_personality`](update_coach_personality.md) | ✍️ Patch the persona, the lists, per-topic intensity, or the dials |
+
+### Delivery settings
+
+The evening brief email (0.51.0) and the plan → Google Calendar sync (0.52.0).
+Same agent-owns-the-writes model: the enabled state and destinations are
+settings these tools manage; the secrets (SMTP password, OAuth credentials)
+stay in `.env`, unreadable and unwritable by any tool.
+
+| Tool | Use it for |
+|---|---|
 | [`get_brief_email_settings`](get_brief_email_settings.md) | Whether the evening brief email is on, who gets it, whether it can send |
 | [`update_brief_email_settings`](update_brief_email_settings.md) | ✍️ Stop/resume the nightly email, or change the recipients |
-| [`get_plan_calendar_settings`](get_plan_calendar_settings.md) | Whether tomorrow's session goes on Google Calendar, and to which calendar |
-| [`update_plan_calendar_settings`](update_plan_calendar_settings.md) | ✍️ Stop/resume the nightly calendar event, or change the calendar |
+| [`get_plan_calendar_settings`](get_plan_calendar_settings.md) | Whether the plan is synced to Google Calendar, and to which calendar |
+| [`update_plan_calendar_settings`](update_plan_calendar_settings.md) | ✍️ Stop/resume the nightly calendar sync, or change the calendar |
 
 ### Data and escape hatches
 

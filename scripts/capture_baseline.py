@@ -7,11 +7,14 @@ across the golden fixtures (`eval_fixtures.SCENARIOS`). Phase-3's shadow-run the
 diffs the new toolless generator against this committed baseline and only flips
 ``LOCAL_FITNESS_BRIEF_V2`` when structural parity holds.
 
-The baseline is **structure only** (via `ab_brief.extract_features`) — takeaway
-count, tones, the mandated steps takeaway, plan-folding, charted metrics, schema
-validity, and a flake rate. It is text-free and judge-free (the LLM-judge is
-deferred/nightly per the design). The invention-rate column is intentionally
-absent here: it needs `grounding.flag`, which lands in Phase 4 and backfills it.
+The baseline is **structure plus grounding** (via `ab_brief.extract_features`
+and `grounding.invention_rate`) — takeaway count, tones, the mandated steps
+takeaway, plan-folding, charted metrics, schema validity, a flake rate, and the
+per-scenario invention rate scored against the same `BriefContext` the composer
+saw. It is text-free and judge-free (the LLM-judge is deferred/nightly per the
+design). Version 2 of the document (0.58.0) is captured on the **V2 composer**
+(the live default since 2026-06-27) — version 1 described the retired V1
+monolith and predates the invention-rate column.
 
 Cost discipline (the project's "quote spend + hard cap" rule):
   * Dry-run by DEFAULT — prints the plan + estimate and exits, no model calls.
@@ -75,11 +78,14 @@ def _schema_valid(brief: dict) -> bool:
         return False
 
 
-def aggregate_scenario(results: list[dict], plan_active: bool) -> dict:
+def aggregate_scenario(results: list[dict], plan_active: bool,
+                       invention_rates: list[float] | None = None) -> dict:
     """Reduce a scenario's per-run outputs to its baseline record.
 
     ``results`` is a list where each item is either a brief dict or an error
-    marker ``{"error": "..."}`` (a generation that failed to parse). Pure +
+    marker ``{"error": "..."}`` (a generation that failed to parse).
+    ``invention_rates`` carries the per-successful-run grounding rates (None /
+    absent on the mock path, which has no context to score against). Pure +
     deterministic so it is unit-tested without a model.
     """
     fingerprints: list[dict] = []
@@ -107,6 +113,7 @@ def aggregate_scenario(results: list[dict], plan_active: bool) -> dict:
         if feats_by_label
         else {"consistent": False, "divergences": ["no successful generations"], "failures": {}}
     )
+    rates = [r for r in (invention_rates or []) if r is not None]
     return {
         "plan_active": plan_active,
         "runs": len(results),
@@ -114,6 +121,11 @@ def aggregate_scenario(results: list[dict], plan_active: bool) -> dict:
         "schema_invalid": schema_invalid,
         "flakes": flakes,
         "fingerprints": fingerprints,
+        # Mean + per-run rates (None when unscored, e.g. the mock path):
+        # shadow_run gates each scenario against `invention_rate + margin`,
+        # so the committed baseline must carry the number it gates on.
+        "invention_rate": round(sum(rates) / len(rates), 3) if rates else None,
+        "invention_rates": rates,
         "consistency": {
             "consistent": consistency["consistent"],
             "divergences": consistency["divergences"],
@@ -130,15 +142,20 @@ def estimate(scenarios: list[str], runs: int) -> dict:
     }
 
 
-async def _generate_one(model: str) -> dict:
-    """Drain one live brief generation into a dict, or an error marker."""
-    from local_fitness.agent import briefing
+async def _generate_one(model: str, context) -> tuple[dict, float | None]:
+    """Drain one live brief generation into ``(dict, invention_rate)``, or an
+    error marker with ``None``. ``context`` is the scenario's assembled
+    ``BriefContext`` — the same pool the composer saw, so the rate is scored
+    against the numbers the brief was allowed to cite (the shadow_run.py
+    pattern; version-1 baselines discarded the context here, which is why the
+    invention-rate column stayed "Phase 4" for six weeks)."""
+    from local_fitness.agent import briefing, grounding
 
     try:
         brief = await briefing._generate(model=model, save=False)
-        return brief.model_dump()
+        return brief.model_dump(), grounding.invention_rate(brief, context)
     except Exception as e:  # noqa: BLE001 — one bad generation must not abort the capture
-        return {"error": str(e)}
+        return {"error": str(e)}, None
 
 
 def _capture_live(scenarios: list[str], model: str, runs: int) -> dict[str, dict]:
@@ -170,14 +187,26 @@ def _capture_live(scenarios: list[str], model: str, runs: int) -> dict[str, dict
                     scenario, tmp_root / scenario / "fitness.db"
                 )
                 db.DEFAULT_DB_PATH = fixture
-                results = [asyncio.run(_generate_one(model)) for _ in range(runs)]
+                # Same context the V2 generator assembles internally (same DB
+                # + today) — the invention rate must be scored against the
+                # pool the composer was actually allowed to cite.
+                from local_fitness.agent import brief_planner
+                context = brief_planner.assemble_brief_context()
+                results: list[dict] = []
+                rates: list[float | None] = []
+                for _ in range(runs):
+                    result, rate = asyncio.run(_generate_one(model, context))
+                    results.append(result)
+                    rates.append(rate)
                 out[scenario] = aggregate_scenario(
-                    results, plan_active=scenario in _PLAN_ACTIVE_SCENARIOS
+                    results, plan_active=scenario in _PLAN_ACTIVE_SCENARIOS,
+                    invention_rates=rates,
                 )
                 rec = out[scenario]
                 print(
                     f"  {scenario}: {rec['schema_valid']}/{rec['runs']} valid, "
                     f"{len(rec['flakes'])} flake(s), "
+                    f"inv_rate={rec['invention_rate']}, "
                     f"consistent={rec['consistency']['consistent']}"
                 )
     finally:
@@ -209,15 +238,15 @@ def build_baseline(scenarios: dict[str, dict], *, model: str, runs: int,
                    captured_at: str) -> dict:
     """Assemble the committed baseline document from per-scenario records."""
     return {
-        "version": 1,
+        "version": 2,
         "captured_at": captured_at,
         "model": model,
         "runs_per_scenario": runs,
         "note": (
-            "Structural baseline of the CURRENT (pre-shrink) brief prompt. "
-            "Phase-3 shadow-run must hold structural parity vs this before the "
-            "LOCAL_FITNESS_BRIEF_V2 cutover. Invention-rate is backfilled in "
-            "Phase 4 (needs grounding.flag)."
+            "Structural + grounding baseline of the V2 composer (the live "
+            "default). shadow_run.py gates prompt/model changes against it: "
+            "structural parity, plus per-scenario invention_rate within "
+            "margin of the values recorded here."
         ),
         "scenarios": scenarios,
     }

@@ -6,6 +6,174 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-08-10
+
+### Changed
+- **The brief eval baseline now describes the composer that actually runs.**
+  `tests/evals/baseline.json` was captured 2026-07-05 on the V1 tool-driven
+  monolith; `LOCAL_FITNESS_BRIEF_V2` has defaulted ON since 2026-06-27, so
+  every shadow-run compared the live generator against a retired one.
+  Recaptured (version 2) on the V2 composer — 6 scenarios × 2 runs, under the
+  existing `MAX_GENERATIONS` hard cap, fabricated fixtures only — and the
+  document now carries a per-scenario `invention_rate` scored against the
+  same `BriefContext` the composer saw.
+- **Invention-rate is a GATE, not an advisory line.** The "Phase 4 backfill"
+  deferral had outlived the feature it deferred: `grounding.invention_rate`
+  shipped, `shadow_run.py` computed it live, and then compared it against a
+  loose constant (0.5) and printed "advisory" — a worse-inventing prompt
+  change could ship on a green structural report, and
+  `test_build_baseline_shape` literally pinned the deferral sentence.
+  Now: per scenario, `rate <= baseline_rate + 0.15` — the margin absorbs
+  run-to-run noise, the recorded baseline absorbs grounding's known
+  per-scenario false positives — and a breach fails parity and the exit code
+  like any structural mismatch. The 0.5 absolute budget survives ONLY for
+  scenarios the baseline has no rate for: the capture itself settled this
+  (two fixtures measure 0.83-0.88 baseline invention rate, where grounding's
+  false positives concentrate — an absolute cap under the recorded baseline
+  would have made them permanently unpassable, and the gate's first draft
+  did exactly that). Measured capture: 12/12 schema-valid, 0 flakes,
+  per-scenario rates 0.167-0.875. An unscored rate (the mock path) passes
+  with an explicit "not scored" warning, never silently.
+  `capture_baseline._generate_one` now assembles the scenario's context and
+  scores each generation (the shadow_run pattern — version-1 captures
+  discarded the context, which is why the column stayed "deferred" for six
+  weeks).
+
+## [0.57.0] - 2026-08-10
+
+### Changed
+- **Two tool merges — 48 tools become 46, and two coin-flips disappear.** The
+  0.48.0 `get_today_status` removal named the rule ("two tools for one job is
+  exactly the ambiguity that causes an agent to pick the weaker one"); the
+  2026-08-10 session audit found two more pairs matching it:
+  - **`generate_chart` → `chart format="png"`.** The two shared
+    `_fetch_metric_series`, `_CHART_METRICS`, and overlapping style enums —
+    same chart, two names (4 + 1 recorded calls between them). png supports
+    `line` (default) / `bar` / `combo`; an ascii-only style with png errors
+    with the allowed list rather than silently falling back. The png branch
+    is the old body verbatim: inline image content block + content-addressed
+    saved path, reachable over both transports.
+  - **`get_metric` → `get_metric_trend include_values=true`.** Identical
+    `{metric, days}` schema and yesterday-anchor logic; 1 recorded call ever
+    vs 6 — and its raw dump was unbounded (measured 63 KB at `days=3650`).
+    The raw series is now capped at the most-recent 120 rows
+    (`values_truncated` flags a cut), `value_formatted` still rides on
+    `*_seconds` rows, and one description replaces two that duplicated the
+    same partial-day paragraph verbatim.
+  `daily_snapshot`/`get_brief_context` were evaluated and deliberately NOT
+  merged — `daily_snapshot` is named in the V1 brief grant, where a mismatch
+  fails silently (it did once, for three weeks).
+- **Description/schema diet.** `run_sql` no longer inlines the full per-table
+  column dump (1.6 KB re-shipped in every session's preamble) — table names
+  only; columns live in the `fitness://schema` resource and the corrective
+  error already names valid columns on a miss (observed retries succeed
+  first try). The two plan-write tools' descriptions compress to their
+  decision rules (every trap kept: the M:SS-vs-decimal pace note, the
+  hr_max-is-the-graded-field note — shared by both schemas, so the cut lands
+  twice). `query_workouts` stops advertising the deprecated
+  `min_distance_km` (still silently accepted, zero-risk backcompat).
+  Net: −2 tools, ~−2.4 KB fixed per-session preamble.
+
+## [0.56.0] - 2026-08-10
+
+### Changed
+- **Compact list payloads — the raw/formatted duplication is gone.** Measured
+  across 264 recorded MCP calls: `get_training_plan_progress` was 4.6% of
+  calls but 24% of ALL returned characters (~11 KB median), and every
+  workout list row spent ~25% of its bytes shipping raw columns beside their
+  display twins (`distance_meters` + `distance_mi`, `avg_pace_sec_per_km` +
+  `pace_min_per_mi`, `duration_seconds` + `duration_formatted`). New pure
+  module `agent/workout_rows.py` owns both row shapes — `augment_workout`
+  (detail: raw + display side by side) and `display_workout` (list: display
+  only, None values omitted, `effort` kept even when null) — and retires
+  `status.py`'s documented inline byte-copy of the tools augmentation.
+  `query_workouts` and `daily_snapshot.recent_workouts` use the compact
+  shape; `get_training_plan_progress` rows drop raw-when-twinned and omit
+  nulls (a pending day shipped 4+ per row); `training_load_status` no longer
+  re-sends its static 3-line legend (the description carries the bands).
+  Km mode keeps the raw trio everywhere — it IS the display form there.
+  Measured on the live DB: plan progress 11,156 → 7,547 chars (−32%),
+  `query_workouts` −26%, `daily_snapshot` −12%.
+- **`sync_garmin_data` short-circuits when a successful pull completed in the
+  last ~10 minutes** (`status: "fresh"`, no Garmin call, no garminconnect
+  import; `force: true` bypasses, `LOCAL_FITNESS_SYNC_MIN_INTERVAL_MIN`
+  tunes). 8 of 24 recorded sync calls were pure repeats minutes apart — the
+  user re-asks, the agent re-syncs, Garmin gets hit for nothing. Keyed on
+  `ingest_runs.completed_at`; failure statuses never count as fresh, and the
+  guard fails open so a fresh clone still pulls. The scheduled CLI jobs are
+  untouched — the guard lives in the tool, not in `daily.pull`.
+- **Every sync payload now carries `latest_activity`** ({activity_id, date,
+  activity_type, distance_mi, effort}) and `workout_report_card`'s
+  description says to use it directly — the observed
+  `sync → query_workouts → workout_report_card` triple (7 recorded firings,
+  the lookup existing only to resolve "my recent run" into an id) is now two
+  calls. A success payload also no longer ships `"error": null`, which
+  pattern-matched as a failure to naive detectors.
+- **`compare_periods` accepts `days: N`** — "last N days vs the prior N"
+  without hand-computing four ISO dates (the tool had ZERO recorded calls
+  while `run_sql` hand-rolled period comparisons). Derived windows are echoed
+  as `derived_periods`; mixing `days` with explicit dates errors.
+
+### Fixed
+- **Unhandled `sqlite3.DatabaseError` now returns the standard error envelope
+  with a `remediation` field.** Observed live (2026-08-10): two tools
+  returned the bare string `database disk image is malformed` — no
+  `is_error`, no next step. The local `tool()` decorator wraps every handler
+  (zero per-tool diff; a future tool inherits the guard), and the remediation
+  names concrete actions (integrity_check, restore/rebuild — Garmin is the
+  source of truth) and says not to retry unchanged.
+- **PDF-render failures name the exception class + message and a recovery**
+  (`format='table'` for the card; the brief resource for the report) instead
+  of "see the server log" — a dead end for an agent that cannot read the log.
+  The full traceback still goes only to the log (run_sql 0.37.0 precedent:
+  render-stack detail, not secrets).
+- **`list_observations` validates `limit` like every other list surface.**
+  `limit: "abc"` escaped as a raw uncaught ValueError; `limit: -1` reached
+  SQLite as `LIMIT 0` and returned an empty page stamped `truncated: true` —
+  a false claim about rows it never fetched. Now `_validate_limit`
+  (default 100, cap 500) plus explicit columns instead of `SELECT *`.
+
+## [0.55.1] - 2026-08-10
+
+### Fixed
+- **Docs sweep — every drift item from the 2026-08-10 audit.** The docs-drift
+  gate covers tool pages and README counts; everything outside its reach had
+  quietly rotted. Verified and fixed in one pass:
+  - Three `docs/mcp/` pages still linked (one still *instructed* calling)
+    `get_today_status`, a tool removed in 0.48.0 — repointed at
+    `daily_snapshot`.
+  - `local_fitness.__version__` said `0.4.0` — 51 minor versions stale. Now
+    read from `importlib.metadata` (the `server_version()` pattern), pinned
+    against `pyproject.toml` by a test so it can never drift again.
+  - `.env.example` called `generate_chart` stdio-only (it has been on both
+    transports since 2026-07-10) and described the calendar job's retired
+    next-day-only behavior instead of the 0.53.0 full reconcile;
+    `ops/install-launchd.sh` + `ops/README.md` said "two jobs" with three
+    installed and omitted `plan-calendar` from the Linux fallback text.
+  - `docs/deployment.md` claimed `fitness.home.local` is in the default MCP
+    host allowlist (the code default is loopback-only) and under-counted the
+    compose env vars.
+  - README: no coverage at all of the 0.51.0 evening brief email or the
+    0.52.0 calendar sync (new section + Usage entries + env-var tables — the
+    Configuration table now maps every variable in `.env.example`), the DB
+    table list was missing `coach_journal`/`coach_journal_fts`/`report_cards`,
+    "CI runs all three checks" under-counted six, and seven registered tools
+    were never named.
+  - `docs/mcp/get_metric.md` showed a `steps` example the code cannot produce
+    (running-tally metrics anchor on yesterday and attach
+    `partial_today_excluded: true` — now documented on both metric pages).
+  - `docs/README.md` indexed 2 of 5 doc areas; the delivery-settings tools sat
+    under "Coach personality" in `docs/mcp/README.md`; the 2026-07-06 handoff
+    note carried a stale zero-cost-Ollama claim with no historical banner.
+
+### Added
+- **`test_intra_docs_links_resolve`** in `tests/test_docs_drift.py`: every
+  relative markdown link in `docs/**` + `README.md` must resolve to a real
+  file (fenced code blocks excluded — quoted example links are illustrations,
+  not references). This is the gate that would have caught the
+  `get_today_status` links the day the page was deleted; written first and
+  watched failing on exactly those three links.
+
 ## [0.55.0] - 2026-08-09
 
 ### Fixed

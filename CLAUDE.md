@@ -373,12 +373,28 @@ These are settled — don't redesign without a reason.
   2026-06-27 cutover. The pipeline is deterministic `brief_planner` (triggers,
   fixed priority, advisory tone → typed `BriefContext`) → ONE **toolless**
   generator (`max_turns=1`, no MCP) on the shrunk `brief_v2_*` prompt → advisory
-  `grounding.flag` (a logged invention-rate *signal*, never a gate). The V1
+  `grounding.flag` (a logged invention-rate *signal* on the LIVE save path,
+  never a save gate). The V1
   tool-driven monolith (`system_prompt`/`briefing_prompt`, `max_turns=20`) is the
   **instant rollback** — `LOCAL_FITNESS_BRIEF_V2=0` (or false/no/off). The planner
   is the tested half (`tests/test_brief_planner.py`, `test_grounding.py`); the
   generator is the eval'd half (`tests/evals/` fixtures + `baseline.json` +
-  `scripts/{capture_baseline,shadow_run}.py`). **Only the in-process composer is
+  `scripts/{capture_baseline,shadow_run}.py`). **The committed baseline is
+  version 2 (0.58.0): captured on the V2 composer** — version 1 described the
+  retired V1 monolith for six weeks after the cutover — **and it carries a
+  per-scenario `invention_rate` that `shadow_run.py` GATES on** (`rate <=
+  baseline + 0.15`; the 0.5 absolute budget applies only to scenarios the
+  baseline has no rate for — two fixtures MEASURE 0.83-0.88 baseline rate,
+  grounding's false positives concentrated, so a cap under the recorded
+  baseline would be permanently unpassable; a breach fails parity and the
+  exit code). The
+  advisory-vs-constant "Phase 4 backfill" is done; note the live-path
+  `grounding.flag` above stays advisory — the gate is the shadow-run script,
+  which is the manual pre-flight for any brief prompt/model change (like
+  `calibrate_report_card`, deliberately not in CI: it costs generations).
+  Recapture via `capture_baseline.py --run` only when intentionally resetting
+  the floor after a deliberate prompt/model change that passed its A/B —
+  never routinely. **Only the in-process composer is
   V2** — the MCP `mcp__fitness__*` tools and the MCP `_brief_prompt` (chat /
   external-agent path) still use V1's tool-driven approach (a deliberate scope
   choice; `grounding.flag` is the reusable follow-up there).
@@ -846,15 +862,40 @@ These are settled — don't redesign without a reason.
   access to the DB but no way to freshen it — only the CLI (`fitness pull`)
   could. `run_stdio()` in `web/mcp_server.py` serves `ALL_TOOLS`
   as-is, so a new tool here needs no separate wiring to reach `mcp-stdio`.
+  **A successful sync inside the last ~10 min short-circuits as `status:
+  "fresh"` with no Garmin call** (0.56.0) — measured across recorded
+  sessions, 8 of 24 sync calls were pure repeats minutes apart (the user
+  re-asks, the agent re-syncs). The guard lives at the TOOL layer keyed on
+  `ingest_runs.completed_at` (failure statuses never count as fresh; fail-open
+  on any DB problem so a fresh clone still pulls), deliberately NOT inside
+  `daily.pull` — the scheduled jobs want every pull to refresh day-end
+  totals. `force: true` bypasses per call;
+  `LOCAL_FITNESS_SYNC_MIN_INTERVAL_MIN` tunes the window. Every
+  non-short-circuit success (and the fresh payload too) carries
+  `latest_activity` `{activity_id, date, activity_type, distance_mi, effort}`
+  so "pull and grade my run" is sync → `workout_report_card`, never a
+  `query_workouts` id-lookup in between — that triple fired 7× in recorded
+  sessions. **Every tool handler is wrapped in a guarded decorator** (0.56.0,
+  the local `tool()` in `tools.py`): an unanticipated `sqlite3.DatabaseError`
+  returns the standard `_err` envelope with a `remediation` field instead of
+  a bare exception string (observed live: `database disk image is malformed`
+  with `is_error` unset). PDF-render failures now name the exception class +
+  message plus a recovery (`format='table'` / read the brief via resource) —
+  "see the server log" is a dead end for an agent that can't read the log.
 - **The two PDF-writing tools are stdio-only — `generate_brief_report` and
-  `workout_report_card` (0.25.0); `generate_chart` moved into `ALL_TOOLS`
-  (2026-07-13, MCP-speed-and-UX-01 fold-in Fix A).** The rule that decides
+  `workout_report_card` (0.25.0); the PNG chart renderer lives in `ALL_TOOLS`
+  as `chart`'s `format="png"` (0.57.0 — the former `generate_chart` tool,
+  which had moved into `ALL_TOOLS` 2026-07-13, folded into `chart` because
+  the two shared fetch/whitelist/styles: two names for one job, the
+  get_today_status ambiguity again; `get_metric` folded into
+  `get_metric_trend`'s `include_values=true` the same release, raw series
+  capped at 120 rows).** The rule that decides
   membership: a tool that hands back a *filesystem path* is local-only,
   because a remote `/mcp/` caller gets a container-internal path it cannot
-  retrieve. `generate_chart` renders a standalone matplotlib PNG on
-  demand and now returns it as an inline MCP image content block (alongside
+  retrieve. The png chart renders a standalone matplotlib PNG on
+  demand and returns it as an inline MCP image content block (alongside
   the saved file path as text) — reachable over both `fitness mcp-stdio` and
-  the networked `/mcp/` transport, since a client no longer needs the local
+  the networked `/mcp/` transport, since a client never needs the local
   file path to see the chart. `generate_brief_report` (`agent/tools.py`'s
   `LOCAL_ONLY_TOOLS`) renders a saved daily brief
   into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline, reusing the
@@ -881,7 +922,7 @@ These are settled — don't redesign without a reason.
   diverged on ~50% of paired Linux renders, measured 2026-07-23; macOS's
   allocator usually masks it), so the "identical content reuses one filename"
   half of the contract failed at random and its CI test was a coin flip.
-  `generate_chart`'s PNG still uses `_content_tag()` (bytes) — matplotlib's
+  The png chart still uses `_content_tag()` (bytes) — matplotlib's
   PNG writer IS reproducible. This is not cosmetic — macOS `open`
   RE-FOCUSES an already-open Preview window for a path it has seen rather than
   reloading the bytes, so the old deterministic `brief-<date>.pdf` showed a

@@ -18,11 +18,12 @@ Which one do I call?
   the read". You want judgment already applied: which signals fired, what
   matters first, what the plan says. This is also the sole input to the V2 brief
   generator, so what you see here is exactly what the daily brief saw.
-- **[`daily_snapshot`](daily_snapshot.md)** / **[`get_today_status`](get_today_status.md)**
+- **[`daily_snapshot`](daily_snapshot.md)**
   — you just want today's numbers, the last five workouts, and the user notes.
   Smaller, and it's the *only* one of the three that carries `user_notes`.
-- **[`get_metric`](get_metric.md)** / **[`get_metric_trend`](get_metric_trend.md)**
-  — a single-metric question. This tool is overkill for "how did I sleep".
+- **[`get_metric_trend`](get_metric_trend.md)**
+  — a single-metric question (add `include_values=true` for the raw series).
+  This tool is overkill for "how did I sleep".
 - **[`get_training_plan_progress`](get_training_plan_progress.md)** — you want the
   plan day-by-day. `plan_today` here is a rollup, not a schedule.
 
@@ -297,7 +298,6 @@ prescribed easy 5 is the ceiling, not the floor. Answer from `display` strings �
 ## See also
 
 - [`daily_snapshot`](daily_snapshot.md) — today's numbers + user notes, smaller payload.
-- [`get_today_status`](get_today_status.md) — the same as `daily_snapshot`.
 - [`training_load_status`](training_load_status.md) — CTL/ATL/TSB with 30-day history.
 - [`get_metric_trend`](get_metric_trend.md) — an actual slope over any window.
 - [`save_brief`](save_brief.md) — persist the brief you compose from this context.

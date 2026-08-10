@@ -14,7 +14,7 @@ Reach for this over [`daily_snapshot`](daily_snapshot.md) when the question is
 specifically about load — `daily_snapshot` carries today's CTL/ATL/TSB and the
 same zone string, but no history and no 14-day CTL delta. Reach for
 [`chart`](chart.md) with `metric="ctl"` (or `atl` / `tsb`) when the ask is
-visual; [`get_metric`](get_metric.md) cannot serve these series at all.
+visual; [`get_metric_trend`](get_metric_trend.md) cannot serve these series at all.
 
 ### The three numbers, in plain English
 
@@ -112,7 +112,7 @@ neutral, not dug in. Phrase the zone; don't re-derive it from the -6.5.
 
 ## Gotchas
 
-- **`history_30d` is newest-first.** [`get_metric`](get_metric.md) is
+- **`history_30d` is newest-first.** [`get_metric_trend`](get_metric_trend.md)'s `values` list is
   oldest-first. Don't chart one assuming the other's order.
 - **`current` is `history_30d[0]` — the same dict object, and it is the newest
   row that has a CTL, which may not be today.** If the Garmin pull is behind,
@@ -130,7 +130,7 @@ neutral, not dug in. Phrase the zone; don't re-derive it from the -6.5.
   TSB is included, and `tsb_zone` then reports `"no training-load data yet"` —
   a sentence, not a zone label. Handle that string.
 - **Only 30 days of history.** For a longer view use [`chart`](chart.md) or
-  [`generate_chart`](generate_chart.md) with `metric="ctl"`.
+  [`chart`](chart.md) with `metric="ctl"` (`format="png"` for an image).
 - **Load comes from Garmin's per-activity `training_load`.** Activities without
   it (most manual entries) contribute nothing, so a hand-logged week can look
   like a rest week.

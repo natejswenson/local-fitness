@@ -28,6 +28,13 @@ def _baseline(**scen_fps):
     return {"scenarios": {n: {"fingerprints": fps} for n, fps in scen_fps.items()}}
 
 
+def _baseline_with_rates(rates: dict, **scen_fps):
+    doc = _baseline(**scen_fps)
+    for name, rate in rates.items():
+        doc["scenarios"].setdefault(name, {})["invention_rate"] = rate
+    return doc
+
+
 # --- _median_count --------------------------------------------------------
 
 def test_median_count_edges():
@@ -106,28 +113,66 @@ def test_scenario_absent_from_baseline_cannot_prove_parity():
     assert report["overall_parity"] is False
 
 
-def test_invention_rate_not_computed_without_a_rate():
-    # Structural-only records (no invention_rate) → the gate reports not-computed
-    # and never adds an invention check.
+def test_unscored_invention_rate_passes_with_a_warning():
+    # The mock path has no context to score against — the check passes so
+    # structural parity can still gate, but the report says it wasn't scored
+    # (an unscored rate must read as unknown, never as clean).
     report = sr.parity_report(_baseline(green_light=[_fp()]),
                               {"green_light": _rec([_fp()])})
-    assert "not computed" in report["invention_rate_gate"]
-    assert "invention_rate" not in report["scenarios"]["green_light"]["checks"]
+    assert "not scored" in report["invention_rate_gate"]
+    assert report["scenarios"]["green_light"]["checks"]["invention_rate"] is True
+    assert any("not scored" in w for w in report["scenarios"]["green_light"]["warnings"])
 
 
-def test_invention_rate_is_advisory_not_a_parity_gate():
-    # Invention is ADVISORY: within budget → no warning; over budget → a warning,
-    # but structural parity is UNAFFECTED either way.
-    base = _baseline(green_light=[_fp(), _fp()])
-    low = sr.parity_report(base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.0)})
-    assert low["overall_parity"] is True
-    assert not low["scenarios"]["green_light"]["warnings"]
-    assert "advisory" in low["invention_rate_gate"]
+def test_invention_rate_within_margin_of_baseline_passes():
+    base = _baseline_with_rates({"green_light": 0.2}, green_light=[_fp(), _fp()])
+    report = sr.parity_report(
+        base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.3)})
+    # 0.3 <= 0.2 + 0.15 → passes, and parity is intact.
+    assert report["scenarios"]["green_light"]["checks"]["invention_rate"] is True
+    assert report["overall_parity"] is True
+    assert "GATED" in report["invention_rate_gate"]
 
-    high = sr.parity_report(base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.8)})
-    assert high["overall_parity"] is True       # NOT broken by high invention
-    assert "invention_rate" not in high["scenarios"]["green_light"]["checks"]
-    assert any("invention_rate 0.8" in w for w in high["scenarios"]["green_light"]["warnings"])
+
+def test_invention_rate_over_margin_fails_parity():
+    """0.58.0: the gate is REAL — was advisory-vs-constant while the baseline
+    predated grounding, so a worse-inventing prompt change could ship on a
+    green structural report."""
+    base = _baseline_with_rates({"green_light": 0.2}, green_light=[_fp(), _fp()])
+    report = sr.parity_report(
+        base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.4)})
+    rec = report["scenarios"]["green_light"]
+    assert rec["checks"]["invention_rate"] is False
+    assert report["overall_parity"] is False
+    assert any("ceiling 0.35" in w for w in rec["warnings"])
+
+
+def test_invention_rate_missing_from_baseline_uses_the_absolute_budget():
+    base = _baseline(green_light=[_fp(), _fp()])  # fingerprints, no rate
+    under = sr.parity_report(
+        base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.4)})
+    assert under["scenarios"]["green_light"]["checks"]["invention_rate"] is True
+    over = sr.parity_report(
+        base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.6)})
+    assert over["scenarios"]["green_light"]["checks"]["invention_rate"] is False
+    assert over["overall_parity"] is False
+
+
+def test_budget_never_caps_under_a_recorded_baseline():
+    """Measured on the 2026-08-10 v2 capture: two fixtures baseline at
+    0.83-0.88 invention rate (grounding's known false positives concentrate
+    there), ABOVE the 0.5 budget — an absolute cap under the recorded
+    baseline would make those scenarios permanently unpassable. The budget
+    is for missing-baseline scenarios only; a recorded baseline + margin is
+    always the ceiling."""
+    base = _baseline_with_rates({"green_light": 0.8}, green_light=[_fp(), _fp()])
+    ok = sr.parity_report(
+        base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.9)})
+    assert ok["scenarios"]["green_light"]["checks"]["invention_rate"] is True
+    worse = sr.parity_report(
+        base, {"green_light": _rec([_fp(), _fp()], invention_rate=0.96)})
+    assert worse["scenarios"]["green_light"]["checks"]["invention_rate"] is False
+    assert worse["overall_parity"] is False
 
 
 # --- CLI guards -----------------------------------------------------------

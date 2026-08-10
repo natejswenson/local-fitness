@@ -166,7 +166,7 @@ Baselines were recomputed (new data landed), so a follow-up `daily_snapshot` /
 
 ## See also
 
-- [`daily_snapshot`](daily_snapshot.md) / [`get_today_status`](get_today_status.md) — read the data this tool just landed; they also carry `latest_brief_date` / `brief_stale_days`
+- [`daily_snapshot`](daily_snapshot.md) — read the data this tool just landed; it also carries `latest_brief_date` / `brief_stale_days`
 - [`training_load_status`](training_load_status.md) — CTL/ATL/TSB, which only move after the baseline recompute this tool triggers
 - [`query_workouts`](query_workouts.md) — confirm newly-pulled activities
 - [`log_manual_workout`](log_manual_workout.md) — for workouts Garmin never captured; a sync will not create them
