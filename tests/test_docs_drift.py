@@ -189,3 +189,47 @@ def test_mcp_readme_links_every_tool_page():
         f"docs/mcp/README.md has no link to these tool pages: {unlinked} — "
         "add a row to the matching 'Tools by area' table"
     )
+
+
+# --- intra-docs links -------------------------------------------------------
+#
+# The 0.48.0 tool removal deleted docs/mcp/get_today_status.md, and three pages
+# kept linking to it for seven releases — one of them (propose_training_plan)
+# INSTRUCTING the reader to call the removed tool. The per-tool checks above
+# can't see that: they read each page in isolation, never the links between
+# pages. This one resolves every relative link target to a real file.
+
+_FENCED_CODE = re.compile(r"```.*?```", re.DOTALL)
+_MD_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+
+
+def _relative_link_targets(path: Path):
+    """Yield (target, resolved_path) for every relative link on the page.
+
+    Fenced code blocks are stripped first — a page quoting example markdown
+    must not fail the gate for links that are illustrations, not references.
+    External schemes and pure-fragment links have no file to resolve.
+    """
+    text = _FENCED_CODE.sub("", path.read_text(encoding="utf-8"))
+    for target in _MD_LINK.findall(text):
+        if target.startswith(("http://", "https://", "mailto:", "#")):
+            continue
+        bare = target.split("#", 1)[0]
+        if not bare:
+            continue
+        yield target, (path.parent / bare).resolve()
+
+
+def test_intra_docs_links_resolve():
+    pages = sorted((REPO_ROOT / "docs").rglob("*.md")) + [ROOT_README]
+    broken = [
+        f"{page.relative_to(REPO_ROOT)} -> {target}"
+        for page in pages
+        for target, resolved in _relative_link_targets(page)
+        if not resolved.exists()
+    ]
+    assert not broken, (
+        "relative links pointing at files that don't exist:\n  "
+        + "\n  ".join(broken)
+        + "\nfix the link (or delete it with the page it pointed at)"
+    )

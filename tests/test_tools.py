@@ -1390,6 +1390,24 @@ def test_server_version_tracks_pyproject():
     assert tools.make_server()["instance"].version == declared
 
 
+def test_package_dunder_version_tracks_pyproject():
+    """`local_fitness.__version__` is the same trap server_version() escaped:
+    it sat at a literal "0.4.0" while pyproject reached 0.55.0, because nothing
+    imported it and nothing tested it. Same fix (importlib.metadata), same
+    non-tautological check — compare against pyproject.toml, the declared
+    source, not against the metadata call the code itself makes."""
+    import tomllib
+    from pathlib import Path
+
+    import local_fitness
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+
+    assert local_fitness.__version__ == declared
+    assert local_fitness.__version__ != "0.4.0", "the old hardcoded literal is back"
+
+
 # --- W4-T2: observation + manual-workout round-trip -----------------------
 
 def _obs_rows(db_path):

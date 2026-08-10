@@ -42,6 +42,7 @@ three baseline fields appear only for the metrics that have a baseline column.
 | `baseline_60day_sd` | Its standard deviation. Same two metrics only. |
 | `current_vs_baseline_sd` | `(current - baseline_mean) / baseline_sd`, rounded to 2. Omitted when the SD is 0 or absent. |
 | `vs_baseline` | `interpret.baseline_position` — `elevated` (> +1 SD), `suppressed` (< -1 SD), `normal`, or `no data`. Always present. |
+| `partial_today_excluded` | `true` only for running-tally metrics (`steps`, `avg_stress`, `max_stress`, `active_calories`, intensity minutes, `body_battery_charged`/`drained`), whose window anchors on **yesterday** — today's tally is partial all day, and a slope fit against it would manufacture a false dip. Absent for point-in-time metrics. |
 
 `flat` means the fitted *total* change across the window stays inside half a
 sample SD (`interpret.TREND_FLAT_SD_MULTIPLIER`), so a noisy series doesn't get

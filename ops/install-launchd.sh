@@ -7,7 +7,7 @@
 # ~/Library/LaunchAgents/, and (re)loads them. Idempotent: re-running
 # unloads any existing job first.
 #
-# Two jobs:
+# Three jobs:
 #   com.localfitness.brief      06:30 (+09:30 backstop) — `fitness brief
 #                               --if-missing`, generates and saves the day's
 #                               brief. Needs a Claude credential.
@@ -17,8 +17,9 @@
 #                               it, and emails it. Needs a Claude credential
 #                               AND SMTP settings in <repo>/.env.
 #   com.localfitness.plancal    19:05 (+20:05 backstop) — `fitness
-#                               plan-calendar`, writes tomorrow's prescribed
-#                               session to Google Calendar. Needs OAuth
+#                               plan-calendar`, reconciles Google Calendar to
+#                               equal the active plan from today through its
+#                               last day (create/update/delete). Needs OAuth
 #                               credentials in <repo>/.env; no Claude, no
 #                               Garmin.
 #
@@ -37,8 +38,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if [[ "$(uname)" != "Darwin" ]]; then
   echo "This installer is macOS-only (launchd). On Linux, schedule" >&2
-  echo "'uv run fitness brief' and 'uv run fitness brief-email' with" >&2
-  echo "cron/systemd instead." >&2
+  echo "'uv run fitness brief', 'uv run fitness brief-email' and" >&2
+  echo "'uv run fitness plan-calendar' with cron/systemd instead." >&2
   exit 1
 fi
 
