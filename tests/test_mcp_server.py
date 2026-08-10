@@ -426,7 +426,7 @@ def test_all_tools_exposed_and_list_serializes():
     # The F1 regression: raw-Python-type shorthand schemas must serialize.
     dumped = res.root.model_dump_json()
     assert '"inputSchema"' in dumped
-    gm = next(t for t in res.root.tools if t.name == "get_metric")
+    gm = next(t for t in res.root.tools if t.name == "get_metric_trend")
     assert gm.inputSchema["properties"]["metric"] == {"type": "string"}
     assert gm.inputSchema["properties"]["days"] == {"type": "integer"}
 
@@ -557,9 +557,9 @@ def test_mcp_http_transport_excludes_local_only_tools():
     # over the real /mcp/ HTTP transport must exclude generate_brief_report
     # (a PDF isn't representable as MCP ImageContent, and a phone-triggered
     # call over this transport would get back a container-internal path with
-    # no way to retrieve the file) but now MUST include generate_chart — its
-    # inline image content block sidesteps that problem, so it's reachable
-    # over the network transport too.
+    # no way to retrieve the file) but MUST include chart — its png format
+    # (the former generate_chart, folded in 0.57.0) returns an inline image
+    # content block, so it's reachable over the network transport too.
     from starlette.testclient import TestClient
     app = _make_app(token="secret", hosts=["fitness.home.local", "testserver"])
     auth = {**_HDRS, "Authorization": "Bearer secret"}
@@ -573,7 +573,7 @@ def test_mcp_http_transport_excludes_local_only_tools():
         names = {t["name"] for t in payload["result"]["tools"]}
         assert names == {t.name for t in agent_tools.ALL_TOOLS}
         assert "generate_brief_report" not in names
-        assert "generate_chart" in names
+        assert "chart" in names
 
 
 def test_build_server_with_local_only_tools_serves_both():

@@ -1,17 +1,16 @@
 # `chart`
 
-> Terminal chart (ASCII/emoji) of one daily metric over the last N days, in five styles. **Availability:** stdio + HTTP
+> Chart one daily metric over the last N days — terminal ASCII/emoji (default) or a rendered PNG returned inline (`format="png"`). **Availability:** stdio + HTTP
 
 ## What it does
 
-Answers "show me my resting HR for the last month" with something you can paste
-straight into a reply. It plots ONE metric from `daily_metrics`, one of the
-three training-load series from `baselines` (`ctl`/`atl`/`tsb`), or the derived
-`intensity_minutes_weighted`. Reach for this instead of
-[`generate_chart`](generate_chart.md) whenever the answer should be *text* —
-reproducible in a code block, diffable, no file to open; reach for
-`generate_chart` when a real PNG is wanted. For "scheduled vs actual" /
-"am I hitting my plan", neither of those is right — that is
+Answers "show me my resting HR for the last month". It plots ONE metric from
+`daily_metrics`, one of the three training-load series from `baselines`
+(`ctl`/`atl`/`tsb`), or the derived `intensity_minutes_weighted` — as terminal
+text you paste straight into a reply (the default), or as a polished matplotlib
+PNG returned inline (`format="png"`; the former `generate_chart` tool, folded
+in at 0.57.0 — same whitelist, same window semantics). For "scheduled vs
+actual" / "am I hitting my plan", neither format is right — that is
 [`plan_chart`](plan_chart.md), which is a two-series view these single-series
 renderers cannot express.
 
@@ -21,7 +20,8 @@ renderers cannot express.
 |---|---|---|---|---|
 | `metric` | string | yes | — | Whitelisted against `_CHART_METRICS`: every column in `DAILY_NUMERIC_METRICS`, plus `ctl` / `atl` / `tsb` (read from `baselines`, not `daily_metrics`), plus `intensity_minutes_weighted` (derived: `moderate + 2 × vigorous`). An unknown name errors and echoes the allowed list. |
 | `days` | integer | yes | — | Trailing window ending today. The cutoff is `today - days` **inclusive**, so a full-data 28-day ask reports `n=29`. Bounds-checked to `1..3650`; a non-int (including `bool`) or an out-of-range value errors rather than being clamped. |
-| `style` | string | no | `calendar` | One of `calendar` / `line` / `bar` / `combo` / `spark`. Anything else errors with the allowed list. |
+| `style` | string | no | `calendar` (ascii) / `line` (png) | ascii: `calendar` / `line` / `bar` / `combo` / `spark`. png: `line` / `bar` / `combo` only — an ascii-only style with `format="png"` errors with the allowed list. |
+| `format` | string | no | `ascii` | `ascii` = terminal chart in a text block. `png` = matplotlib image returned as an inline image content block, plus the saved file path as text (content-addressed filename `chart-{metric}-{style}-{N}d-<sha8>.png`, auto-opened locally). |
 
 ### Which style
 
@@ -88,9 +88,20 @@ Then paste the full block into the reply (see the first gotcha) and add the
 coach read on top of it: *"You spent the first three weeks bouncing 50–52 and
 the last four days at 47–48. That's the taper showing up."*
 
+### The png format
+
+`format="png"` renders the same series with matplotlib: `line` (axis chart with
+gridlines, default), `bar` (vertical bars), or `combo` (bars + a least-squares
+trend line of the same metric — one metric, one axis, never a dual-axis chart).
+The response carries TWO content blocks — the saved file path as text, then the
+PNG as an inline image — so a networked `/mcp/` client sees the chart without
+needing the path. Filenames are content-addressed (changed data lands on a new
+file so macOS `open` shows fresh bytes instead of refocusing a stale window;
+identical data reuses one file).
+
 ## Gotchas
 
-- **Reproduce the chart in your reply, in a fenced code block.** A chart left
+- **Reproduce an ascii chart in your reply, in a fenced code block.** A chart left
   only in the tool call renders collapsed in the Claude Code UI and forces a
   Ctrl-O to see it — Nate flagged this as "very unfriendly". This is a standing
   requirement in CLAUDE.md, not a preference: paste the output, *then* add the
@@ -119,6 +130,5 @@ the last four days at 47–48. That's the taper showing up."*
 
 ## See also
 
-- [`generate_chart`](generate_chart.md) — the same metrics as a PNG.
 - [`plan_chart`](plan_chart.md) — scheduled vs actual; the only two-series view.
 - [`get_metric_trend`](get_metric_trend.md) — the numbers behind the shape.

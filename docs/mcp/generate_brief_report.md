@@ -12,7 +12,7 @@ there is no saved brief for that date this tool errors, and generating one is
 `fitness brief` / the `brief` prompt + [`save_brief`](save_brief.md). For a
 single graded workout rather than a whole day, use
 [`workout_report_card`](workout_report_card.md); for one ad-hoc metric picture,
-[`generate_chart`](generate_chart.md).
+[`chart`](chart.md)'s png format.
 
 ### Why this one is local-only
 
@@ -87,7 +87,7 @@ Mac automatically. Report the path; don't paste the JSON.
   DYLD_LIBRARY_PATH="$(brew --prefix)/lib"` (or set it in `.env`, which the CLI
   loads at startup) so `uv run fitness mcp-stdio` and pytest both see it.
   Without it this tool fails at import/render time while
-  [`generate_chart`](generate_chart.md), which is matplotlib-only, keeps working.
+  [`chart`](chart.md)'s png format, which is matplotlib-only, keeps working.
 - **Output location.** Default is a per-process ephemeral `tempfile.mkdtemp()`
   directory cleaned up at process exit — a fresh `mcp-stdio` subprocess per
   session is the natural boundary, and a best-effort sweep reaps a prior
@@ -130,5 +130,5 @@ Mac automatically. Report the path; don't paste the JSON.
   is composed from.
 - [`workout_report_card`](workout_report_card.md) — the other PDF tool, and the
   other member of `LOCAL_ONLY_TOOLS`.
-- [`generate_chart`](generate_chart.md) — the chart renderer this shares
+- [`chart`](chart.md) — `format="png"` is the chart renderer this shares
   (`visuals.render_chart_png`).

@@ -21,8 +21,9 @@ Which one do I call?
 - **[`daily_snapshot`](daily_snapshot.md)**
   — you just want today's numbers, the last five workouts, and the user notes.
   Smaller, and it's the *only* one of the three that carries `user_notes`.
-- **[`get_metric`](get_metric.md)** / **[`get_metric_trend`](get_metric_trend.md)**
-  — a single-metric question. This tool is overkill for "how did I sleep".
+- **[`get_metric_trend`](get_metric_trend.md)**
+  — a single-metric question (add `include_values=true` for the raw series).
+  This tool is overkill for "how did I sleep".
 - **[`get_training_plan_progress`](get_training_plan_progress.md)** — you want the
   plan day-by-day. `plan_today` here is a rollup, not a schedule.
 

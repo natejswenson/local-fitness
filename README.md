@@ -236,7 +236,7 @@ claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
 ```
 
-Once connected you get **50 tools over stdio** (48 over HTTP — two are
+Once connected you get **48 tools over stdio** (46 over HTTP — two are
 local-only, see below), **2 prompts**, and **2 resources**.
 
 📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool
@@ -252,7 +252,8 @@ is a map; that directory is the documentation.
     snapshot and persists it via `save_brief`.
 - **Status** — `daily_snapshot` (one-call "how am I doing"),
   `get_brief_context` (the deterministic planner's full typed output).
-- **Metrics & analysis** — `get_metric` / `get_metric_trend`,
+- **Metrics & analysis** — `get_metric_trend` (trend stats, with the raw
+  series via `include_values`),
   `training_load_status`, `compare_periods`, `correlate`, `find_anomalies`,
   `recovery_pattern`. Each attaches deterministic interpretation (`tsb_zone`,
   `trend_direction`, `effect_size`, …) computed in `agent/interpret.py`, rather
@@ -265,9 +266,9 @@ is a map; that directory is the documentation.
   intent-weighted overall. Every render is stored, so `list_report_cards` /
   `get_report_card` read the rated history back (JSON, so both transports)
   without re-rating anything.
-- **Charts** — `chart` (inline ASCII/emoji), `generate_chart` (matplotlib PNG
-  returned as an inline image block), `plan_chart` (**the** scheduled-vs-actual
-  view — don't hand-roll it).
+- **Charts** — `chart` (inline ASCII/emoji by default; `format="png"` renders
+  a matplotlib image returned as an inline image block) and `plan_chart`
+  (**the** scheduled-vs-actual view — don't hand-roll it).
 - **Training plans** — the agent owns the whole lifecycle, because there is no
   UI: `propose_training_plan` / `revise_training_plan` (draft),
   `commit_training_plan` / `discard_training_plan_draft` (activate or drop),
@@ -309,8 +310,8 @@ is a map; that directory is the documentation.
 **Two tools are stdio-only:** `generate_brief_report` and
 `workout_report_card`. The rule is that a tool handing back a *filesystem path*
 can't work over the network — a remote caller gets a container-internal path it
-cannot retrieve. `generate_chart` is networked precisely because it returns the
-image inline instead.
+cannot retrieve. `chart`'s png format is networked precisely because it
+returns the image inline instead.
 
 The DNS-rebinding guard on the HTTP transport requires the served host to be in
 `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` (defaults to common local hosts; set it to

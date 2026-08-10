@@ -144,31 +144,56 @@ def test_the_v1_brief_grant_still_matches_its_prompt(seeded):
             f"V1 prompt instructs {name} but the loop is not granted it")
 
 
-def test_get_metric_valid(seeded):
-    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 14})
+# 0.57.0: `get_metric` folded into `get_metric_trend` as include_values=true.
+# These tests cover what the raw-series branch uniquely did: the rows, the
+# *_seconds formatting, and the partial-day anchoring of the values list.
+
+
+def test_trend_include_values_returns_the_raw_series(seeded):
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "rhr", "days": 14, "include_values": True})
     assert not err
     assert payload["metric"] == "rhr"
-    assert payload["days_window"] == 14
-    assert payload["days_with_data"] == len(payload["values"])
+    assert payload["n_samples"] == len(payload["values"])
     assert all("value" in row and row["value"] is not None for row in payload["values"])
+    # The trend stats still ride along — one call answers both questions.
+    assert "slope_direction" in payload and "mean" in payload
 
 
-def test_get_metric_skips_null_rows(seeded):
-    # The fixture inserts rhr/sleep_seconds but never vo2_max, so every
-    # daily_metrics row has a NULL vo2_max. Pre-fix, get_metric returned a
-    # row-per-day of {"value": null}; now those days are dropped and
-    # days_with_data reports the gap instead of hiding it.
-    payload, err = call(tools.get_metric, {"metric": "vo2_max", "days": 30})
+def test_trend_without_include_values_has_no_series(seeded):
+    payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": 14})
     assert not err
-    assert payload["values"] == []
-    assert payload["days_with_data"] == 0
-    assert payload["days_window"] == 30
+    assert "values" not in payload
 
 
-def test_get_metric_formats_seconds_metrics(seeded):
+def test_trend_values_cap_and_truncation_flag(seeded):
+    # seeded has 40 daily rhr rows; a wide window with a tiny cap must keep
+    # the MOST RECENT rows and say it cut the rest.
+    real_cap = tools._TREND_MAX_VALUES
+    try:
+        tools._TREND_MAX_VALUES = 5
+        payload, err = call(tools.get_metric_trend,
+                            {"metric": "rhr", "days": 60, "include_values": True})
+    finally:
+        tools._TREND_MAX_VALUES = real_cap
+    assert not err
+    assert len(payload["values"]) == 5
+    assert payload["values_truncated"] is True
+    assert payload["values"][-1]["date"] == date.today().isoformat()
+
+
+def test_trend_values_under_cap_carry_no_truncation_flag(seeded):
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "rhr", "days": 14, "include_values": True})
+    assert not err
+    assert "values_truncated" not in payload
+
+
+def test_trend_values_format_seconds_metrics(seeded):
     # sleep_seconds must carry the "7h 33m" companion the coach voice speaks —
     # the model is explicitly forbidden from showing raw seconds.
-    payload, err = call(tools.get_metric, {"metric": "sleep_seconds", "days": 5})
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "sleep_seconds", "days": 5, "include_values": True})
     assert not err
     assert payload["values"]
     for row in payload["values"]:
@@ -176,16 +201,21 @@ def test_get_metric_formats_seconds_metrics(seeded):
         assert row["value_formatted"].endswith("m")
 
 
-def test_get_metric_non_seconds_metric_has_no_formatted_field(seeded):
-    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 5})
+def test_trend_values_non_seconds_metric_has_no_formatted_field(seeded):
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "rhr", "days": 5, "include_values": True})
     assert not err
     assert all("value_formatted" not in row for row in payload["values"])
 
 
-def test_get_metric_unknown(seeded):
-    payload, err = call(tools.get_metric, {"metric": "bogus", "days": 14})
-    assert err
-    assert "unknown metric" in payload["error"]
+def test_get_metric_is_gone(seeded):
+    """0.57.0 removed it — identical {metric, days} schema and anchor logic to
+    get_metric_trend, 1 recorded call ever, and an unbounded raw dump (63 KB
+    at days=3650). Pinned so it can't drift back in (the get_today_status
+    pattern)."""
+    assert not hasattr(tools, "get_metric")
+    assert "get_metric" not in {t.name for t in tools.ALL_TOOLS}
+    assert "get_metric" not in tools._READ_ONLY_TOOL_NAMES
 
 
 def test_get_metric_trend(seeded):
@@ -251,7 +281,7 @@ def test_get_metric_trend_non_partial_metric_unaffected(seeded):
     assert "partial_today_excluded" not in payload
 
 
-def test_get_metric_excludes_todays_partial_reading_for_steps(tmp_path, monkeypatch):
+def test_trend_values_exclude_todays_partial_reading_for_steps(tmp_path, monkeypatch):
     p = tmp_path / "fitness.db"
     monkeypatch.setattr(db, "DEFAULT_DB_PATH", p)
     monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "user_notes.md"))
@@ -263,22 +293,18 @@ def test_get_metric_excludes_todays_partial_reading_for_steps(tmp_path, monkeypa
         conn.execute(
             "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)", (today.isoformat(), 400)
         )
-        conn.execute(
-            "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)",
-            ((today - timedelta(days=1)).isoformat(), 11000),
-        )
-    payload, err = call(tools.get_metric, {"metric": "steps", "days": 5})
+        for i, steps in enumerate((10500, 11000)):
+            conn.execute(
+                "INSERT INTO daily_metrics (date, steps) VALUES (?, ?)",
+                ((today - timedelta(days=2 - i)).isoformat(), steps),
+            )
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "steps", "days": 5, "include_values": True})
     assert not err
     assert payload["partial_today_excluded"] is True
     dates = [v["date"] for v in payload["values"]]
     assert today.isoformat() not in dates  # today's partial 400 never listed
     assert payload["values"][-1]["value"] == 11000
-
-
-def test_get_metric_non_partial_metric_unaffected(seeded):
-    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 5})
-    assert not err
-    assert "partial_today_excluded" not in payload
 
 
 def test_chart_default_is_compact_calendar(seeded):
@@ -1238,12 +1264,6 @@ def test_run_sql_exactly_at_cap_is_not_flagged_truncated(seeded):
 _BIG = 10**9  # timedelta(days=N) raises OverflowError around here
 
 
-def test_get_metric_rejects_huge_days(seeded):
-    payload, err = call(tools.get_metric, {"metric": "rhr", "days": _BIG})
-    assert err
-    assert "days must be between" in payload["error"]
-
-
 def test_get_metric_trend_rejects_huge_days(seeded):
     payload, err = call(tools.get_metric_trend, {"metric": "rhr", "days": _BIG})
     assert err
@@ -2049,14 +2069,15 @@ def test_sync_garmin_data_is_in_full_tool_set():
     assert f"mcp__{tools.SERVER_NAME}__sync_garmin_data" in tools.allowed_tool_names()
 
 
-# --- PDF/chart tools: generate_brief_report / generate_chart ---------------
+# --- PDF/chart tools: generate_brief_report / chart's png format -----------
 # NB: LOCAL_ONLY_TOOLS is generate_brief_report + workout_report_card; since
-# Fix A (2026-07-13) generate_chart lives in ALL_TOOLS (it returns an inline
+# Fix A (2026-07-13; folded into chart as format="png" at 0.57.0) — the png
+# render lives in ALL_TOOLS (it returns an inline
 # image block, so a remote caller no longer needs the local file path).
 
 
 def test_fetch_metric_series_matches_chart_tool_output(seeded):
-    # Regression guard for the chart()/generate_chart() extraction: the shared
+    # Regression guard for the shared-fetch extraction: the shared
     # helper's fetched values must be the exact same numbers chart()'s ASCII
     # rendering displays for the same (metric, days) window.
     dates, values = tools._fetch_metric_series("rhr", 14)
@@ -2168,7 +2189,7 @@ def test_brief_pdf_filename_is_content_addressed(seeded, reports_tmp, monkeypatc
 @pytest.fixture(autouse=True)
 def no_real_open(monkeypatch):
     """Stub subprocess.run and asyncio.sleep so generate_brief_report/
-    generate_chart's auto-open never pops a real Preview window or incurs
+    the chart png auto-open never pops a real Preview window or incurs
     the real 1.5s grace-period sleep during tests. subprocess.run is a
     fresh Mock() per test -- tests that care about its call args just
     inspect tools.subprocess.run directly, no re-patching needed.
@@ -2215,7 +2236,7 @@ def fake_tempdir(tmp_path, monkeypatch):
 @pytest.fixture
 def reports_tmp(tmp_path, monkeypatch):
     """Point _default_reports_dir and DEFAULT_BRIEFINGS_DIR at tmp dirs so
-    generate_brief_report/generate_chart tests never touch the real
+    generate_brief_report / chart-png tests never touch the real
     reports/ or briefings/ directories."""
     from local_fitness.agent import briefs as briefs_mod
 
@@ -2456,41 +2477,58 @@ def test_generate_brief_report_happy_path_embeds_chart(seeded, reports_tmp):
     assert total_images == 1
 
 
-def test_generate_chart_unknown_metric_no_sql(seeded, monkeypatch):
+def test_chart_png_unknown_metric_no_sql(seeded, monkeypatch):
     # INV-T3: an unwhitelisted metric is rejected before any SQL executes.
     def boom(*_a, **_k):
         raise AssertionError("must not query DB for an unwhitelisted metric")
 
     monkeypatch.setattr(db, "connect", boom)
     payload, err = call(
-        tools.generate_chart, {"metric": "bogus", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "bogus", "days": 14, "format": "png", "style": "line"}
     )
     assert err
     assert "unknown metric" in payload["error"]
     assert not tools.subprocess.run.called
 
 
-def test_generate_chart_unknown_chart_type(seeded):
-    payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "pie"}
-    )
-    assert err
-    assert "unknown chart_type" in payload["error"]
+def test_chart_png_rejects_ascii_only_styles(seeded):
+    # calendar/spark (and anything else) are not png-renderable — the error
+    # names the allowed set (the get_metric_trend pattern) instead of
+    # silently falling back to a different chart.
+    for style in ("pie", "calendar", "spark"):
+        payload, err = call(
+            tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": style}
+        )
+        assert err
+        assert f"style '{style}' is not available as png" in payload["error"]
+        assert payload["allowed"] == ["bar", "combo", "line"]
     assert not tools.subprocess.run.called
 
 
-def test_generate_chart_rejects_huge_days(seeded):
+def test_chart_png_defaults_to_line_style(seeded, reports_tmp):
+    payload, err = call(tools.chart, {"metric": "rhr", "days": 14, "format": "png"})
+    assert not err
+    assert Path(payload["path"]).name.startswith("chart-rhr-line-14d-")
+
+
+def test_chart_unknown_format_is_an_error(seeded):
+    payload, err = call(tools.chart, {"metric": "rhr", "days": 14, "format": "svg"})
+    assert err
+    assert payload["allowed"] == ["ascii", "png"]
+
+
+def test_chart_png_rejects_huge_days(seeded):
     payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": _BIG, "chart_type": "line"}
+        tools.chart, {"metric": "rhr", "days": _BIG, "format": "png", "style": "line"}
     )
     assert err
     assert "days must be between" in payload["error"]
     assert not tools.subprocess.run.called
 
 
-def test_generate_chart_no_data_in_window(seeded):
+def test_chart_png_no_data_in_window(seeded):
     payload, err = call(
-        tools.generate_chart, {"metric": "vo2_max", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "vo2_max", "days": 14, "format": "png", "style": "line"}
     )
     assert err
     assert "no data in window" in payload["error"]
@@ -2535,21 +2573,21 @@ def test_generate_brief_report_path_escape_is_error(seeded, reports_tmp, monkeyp
     assert not tools.subprocess.run.called
 
 
-def test_generate_chart_path_escape_is_error(seeded, reports_tmp, monkeypatch):
+def test_chart_png_path_escape_is_error(seeded, reports_tmp, monkeypatch):
     def boom(*_a, **_k):
         raise ValueError("escaped")
 
     monkeypatch.setattr(tools, "_write_atomic", boom)
     payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
     )
     assert err
     assert "escaped reports directory" in payload["error"]
     assert not tools.subprocess.run.called
 
 
-def test_generate_chart_render_failure_is_error(seeded, monkeypatch):
-    # Unlike generate_brief_report, generate_chart has no takeaway to fall
+def test_chart_png_render_failure_is_error(seeded, monkeypatch):
+    # Unlike generate_brief_report, a png chart has no takeaway to fall
     # back to -- a render failure is a hard error, not a graceful skip.
     from local_fitness.agent import visuals
 
@@ -2558,19 +2596,19 @@ def test_generate_chart_render_failure_is_error(seeded, monkeypatch):
 
     monkeypatch.setattr(visuals, "render_chart_png", boom)
     payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
     )
     assert err
     assert "chart render failed" in payload["error"]
     assert not tools.subprocess.run.called
 
 
-def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
+def test_chart_png_happy_path_writes_expected_png(seeded, reports_tmp):
     # INV-T8 + INV-9: valid PNG at the content-addressed filename format
     # chart-metric-chart_type-Nd-<sha8>.png.
     reports_dir, _briefs_dir = reports_tmp
     payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
     )
     assert not err
     path = Path(payload["path"])
@@ -2579,15 +2617,15 @@ def test_generate_chart_happy_path_writes_expected_png(seeded, reports_tmp):
     assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_generate_chart_filename_is_content_addressed(seeded, reports_tmp):
+def test_chart_png_filename_is_content_addressed(seeded, reports_tmp):
     # Same stale-Preview-refocus fix the PDFs got in 0.28.2: identical chart
     # bytes reuse ONE filename (idempotent — refocus is correct), but changed
     # bytes must land on a NEW filename so macOS `open` shows the fresh render
     # instead of refocusing a stale window. A day-stamped name could not do
     # this (it was constant across an intra-day re-render).
-    args = {"metric": "rhr", "days": 14, "chart_type": "line"}
-    p1, err1 = call(tools.generate_chart, args)
-    p2, err2 = call(tools.generate_chart, args)
+    args = {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
+    p1, err1 = call(tools.chart, args)
+    p2, err2 = call(tools.chart, args)
     assert not err1 and not err2
     # Identical data twice -> identical content-addressed filename.
     assert p1["path"] == p2["path"]
@@ -2597,19 +2635,19 @@ def test_generate_chart_filename_is_content_addressed(seeded, reports_tmp):
     with db.connect() as conn:
         conn.execute("UPDATE daily_metrics SET rhr = rhr + 7")
         conn.commit()
-    p3, err3 = call(tools.generate_chart, args)
+    p3, err3 = call(tools.chart, args)
     assert not err3
     assert p3["path"] != p1["path"]
     assert Path(p3["path"]).name.startswith("chart-rhr-line-14d-")
 
 
-def test_generate_chart_response_carries_inline_image_block(seeded, reports_tmp):
+def test_chart_png_response_carries_inline_image_block(seeded, reports_tmp):
     # Fix A (2026-07-10 doc): the response gains a SECOND content block —
     # an image, base64-decodable, matching the same PNG bytes written to disk.
     import base64
 
     result = asyncio.run(
-        tools.generate_chart.handler({"metric": "rhr", "days": 14, "chart_type": "line"})
+        tools.chart.handler({"metric": "rhr", "days": 14, "format": "png", "style": "line"})
     )
     assert result.get("is_error") is not True
     content = result["content"]
@@ -2624,11 +2662,16 @@ def test_generate_chart_response_carries_inline_image_block(seeded, reports_tmp)
     assert decoded == path.read_bytes()
 
 
-def test_generate_chart_description_no_longer_local_only(seeded):
-    # generate_chart's registered description must no longer claim it's
-    # unreachable over the network — Fix A falsifies that claim outright.
-    tool = next(t for t in tools.ALL_TOOLS if t.name == "generate_chart")
+def test_generate_chart_is_gone_and_chart_owns_both_formats(seeded):
+    """0.57.0: generate_chart folded into chart as format="png" — the two
+    shared _fetch_metric_series, _CHART_METRICS and overlapping style enums,
+    i.e. two names for one job (the get_today_status ambiguity again).
+    Pinned so it can't drift back in."""
+    assert not hasattr(tools, "generate_chart")
+    assert "generate_chart" not in {t.name for t in tools.ALL_TOOLS}
+    tool = next(t for t in tools.ALL_TOOLS if t.name == "chart")
     lowered = tool.description.lower()
+    assert "png" in lowered and "ascii" in lowered
     assert "local-only" not in lowered
     assert "never over the network" not in lowered
 
@@ -2667,14 +2710,14 @@ def test_generate_brief_report_auto_opens_and_dispatches_via_to_thread(
     assert tools._default_reports_dir in recorded
 
 
-def test_generate_chart_auto_opens_and_dispatches_via_to_thread(
+def test_chart_png_auto_opens_and_dispatches_via_to_thread(
     seeded, reports_tmp, monkeypatch
 ):
     recorded = []
     _spy_to_thread(monkeypatch, recorded)
 
     payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
     )
     assert not err
     final_path = Path(payload["path"])
@@ -2702,10 +2745,10 @@ def test_generate_brief_report_auto_open_failure_does_not_fail_tool(
     assert Path(payload["path"]).exists()
 
 
-def test_generate_chart_auto_open_failure_does_not_fail_tool(seeded, reports_tmp, monkeypatch):
+def test_chart_png_auto_open_failure_does_not_fail_tool(seeded, reports_tmp, monkeypatch):
     monkeypatch.setattr(tools.subprocess, "run", Mock(side_effect=OSError("no open binary")))
     payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
     )
     assert not err
     assert Path(payload["path"]).exists()
@@ -2728,31 +2771,31 @@ def test_generate_brief_report_reports_dir_error_is_clean(seeded, reports_tmp, m
     assert not tools.subprocess.run.called
 
 
-def test_generate_chart_reports_dir_error_is_clean(seeded, monkeypatch):
+def test_chart_png_reports_dir_error_is_clean(seeded, monkeypatch):
     def boom():
         raise OSError("disk full")
 
     monkeypatch.setattr(tools, "_default_reports_dir", boom)
     payload, err = call(
-        tools.generate_chart, {"metric": "rhr", "days": 14, "chart_type": "line"}
+        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
     )
     assert err
     assert "could not prepare reports directory" in payload["error"]
     assert not tools.subprocess.run.called
 
 
-def test_pdf_writing_tools_are_local_only_generate_chart_is_not():
+def test_pdf_writing_tools_are_local_only_chart_is_not():
     # INV-4 (rewritten per Fix A, 2026-07-10 doc; extended for
     # workout_report_card): a tool that hands back a *filesystem path* is
     # local-only, because a remote /mcp/ caller gets a container-internal path
-    # with no way to retrieve the file. Both PDF writers qualify. generate_chart
-    # does NOT — its inline ImageContent block sidesteps the retrieval problem,
-    # which is exactly why it moved into ALL_TOOLS.
+    # with no way to retrieve the file. Both PDF writers qualify. chart —
+    # including its png format, the former generate_chart — does NOT: the
+    # inline ImageContent block sidesteps the retrieval problem.
     all_names = {t.name for t in tools.ALL_TOOLS}
     local_only_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
     assert local_only_names == {"generate_brief_report", "workout_report_card"}
     assert all_names.isdisjoint(local_only_names)
-    assert "generate_chart" in all_names
+    assert "chart" in all_names
 
 
 # --- 2026-07-09: Training Plan section (_build_plan_section + wiring) ------
@@ -3717,7 +3760,7 @@ def test_report_card_no_matching_activity_is_an_error(rc_seeded, reports_tmp):
 
 
 def test_report_card_malformed_date_never_touches_the_db(rc_seeded, monkeypatch):
-    """Validation happens before any query, mirroring generate_chart's
+    """Validation happens before any query, mirroring the chart tool's
     unknown-metric guard."""
     def boom(*_a, **_k):
         raise AssertionError("must not open the DB on a malformed date")
@@ -4098,7 +4141,7 @@ def test_fetch_metric_series_window_starts_days_before_end(seeded):
 
 
 def test_fetch_metric_series_defaults_to_today_for_live_callers(seeded):
-    """chart()/generate_chart() must keep their existing behavior."""
+    """chart() (both formats) must keep its existing behavior."""
     dated = tools._fetch_metric_series("rhr", 3650, end=date.today().isoformat())
     default = tools._fetch_metric_series("rhr", 3650)
     assert dated == default
@@ -4940,8 +4983,11 @@ def test_report_card_pdf_failure_returns_stable_reason_and_logs(rc_seeded, repor
     assert any(r.exc_info for r in caplog.records)  # the traceback IS in the log
 
 
-def test_get_metric_attaches_vs_baseline_for_baselined_metrics(seeded):
-    payload, err = call(tools.get_metric, {"metric": "rhr", "days": 14})
+def test_trend_include_values_still_attaches_vs_baseline(seeded):
+    """The baseline block the former get_metric attached (0.37.0) survives the
+    fold-in: same numbers whether or not the raw series is requested."""
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "rhr", "days": 14, "include_values": True})
     assert not err
     # seeded: baseline mean 52.0 sd 2.0; newest value 50 → exactly -1.0 SD.
     assert payload["baseline_60day_mean"] == 52.0
@@ -4949,8 +4995,9 @@ def test_get_metric_attaches_vs_baseline_for_baselined_metrics(seeded):
     assert payload["vs_baseline"] == "normal"
 
 
-def test_get_metric_vs_baseline_no_data_for_non_baselined(seeded):
-    payload, err = call(tools.get_metric, {"metric": "steps", "days": 14})
+def test_trend_include_values_vs_baseline_no_data_for_non_baselined(seeded):
+    payload, err = call(tools.get_metric_trend,
+                        {"metric": "steps", "days": 14, "include_values": True})
     assert not err
     assert "current_vs_baseline_sd" not in payload
     assert payload["vs_baseline"] == "no data"

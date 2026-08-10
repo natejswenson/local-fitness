@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-08-10
+
+### Changed
+- **Two tool merges — 48 tools become 46, and two coin-flips disappear.** The
+  0.48.0 `get_today_status` removal named the rule ("two tools for one job is
+  exactly the ambiguity that causes an agent to pick the weaker one"); the
+  2026-08-10 session audit found two more pairs matching it:
+  - **`generate_chart` → `chart format="png"`.** The two shared
+    `_fetch_metric_series`, `_CHART_METRICS`, and overlapping style enums —
+    same chart, two names (4 + 1 recorded calls between them). png supports
+    `line` (default) / `bar` / `combo`; an ascii-only style with png errors
+    with the allowed list rather than silently falling back. The png branch
+    is the old body verbatim: inline image content block + content-addressed
+    saved path, reachable over both transports.
+  - **`get_metric` → `get_metric_trend include_values=true`.** Identical
+    `{metric, days}` schema and yesterday-anchor logic; 1 recorded call ever
+    vs 6 — and its raw dump was unbounded (measured 63 KB at `days=3650`).
+    The raw series is now capped at the most-recent 120 rows
+    (`values_truncated` flags a cut), `value_formatted` still rides on
+    `*_seconds` rows, and one description replaces two that duplicated the
+    same partial-day paragraph verbatim.
+  `daily_snapshot`/`get_brief_context` were evaluated and deliberately NOT
+  merged — `daily_snapshot` is named in the V1 brief grant, where a mismatch
+  fails silently (it did once, for three weeks).
+- **Description/schema diet.** `run_sql` no longer inlines the full per-table
+  column dump (1.6 KB re-shipped in every session's preamble) — table names
+  only; columns live in the `fitness://schema` resource and the corrective
+  error already names valid columns on a miss (observed retries succeed
+  first try). The two plan-write tools' descriptions compress to their
+  decision rules (every trap kept: the M:SS-vs-decimal pace note, the
+  hr_max-is-the-graded-field note — shared by both schemas, so the cut lands
+  twice). `query_workouts` stops advertising the deprecated
+  `min_distance_km` (still silently accepted, zero-risk backcompat).
+  Net: −2 tools, ~−2.4 KB fixed per-session preamble.
+
 ## [0.56.0] - 2026-08-10
 
 ### Changed

@@ -69,7 +69,9 @@ def test_tool_schemas_well_formed():
     # Google Calendar sync — enabled state and target calendar by MCP call, the
     # OAuth client secret and refresh token deliberately absent for the same
     # network-reachability reason as the SMTP password)
-    assert len(agent_tools.ALL_TOOLS) == 48
+    # 46 at 0.57.0: -get_metric (folded into get_metric_trend's
+    # include_values) and -generate_chart (folded into chart's format="png").
+    assert len(agent_tools.ALL_TOOLS) == 46
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description
