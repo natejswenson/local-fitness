@@ -145,6 +145,12 @@ One day, 3.3 SDs high — about 9 bpm above normal.
 - **`sleep_seconds` values are seconds.** 19 800 is 5h 30m; never print the raw
   number.
 - **Windows are anchored to `date.today()`**, not the data frontier.
+- **Today never scans** (0.59.0). Both supported metrics settle through the
+  morning — Garmin revises them as the night is processed — so a provisional
+  same-day value is not a confirmed anomaly (a mid-sleep pull's rhr 54,
+  revised to 50 post-wake, would have scanned as a +2 SD spike). For today's
+  read use [`get_metric_trend`](get_metric_trend.md), which labels
+  provisional values.
 
 ## See also
 

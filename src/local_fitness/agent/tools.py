@@ -321,6 +321,10 @@ _DAILY_SNAPSHOT_DESCRIPTION = (
     "fields, plus a measured `effort` \"run\"/\"walk\"/null since Garmin's own "
     "activity_type label can misreport a walk as a run), and saved user "
     "notes. The same payload the brief and coach prompt share. Pure read. "
+    "Settling metrics (rhr, sleep_*, body battery max/min — Garmin revises "
+    "them through the day) anchor to yesterday with "
+    "`provisional_today_excluded` when no sync covering today is fresh "
+    "(~10 min); call sync_garmin_data first for a settled same-day read. "
     "No plan/anomalies/candidates in this payload — "
     "use get_brief_context for the full read or anything plan-/trend-related."
 )
@@ -345,7 +349,13 @@ _TREND_MAX_VALUES = 120
     "minutes, body_battery_charged/drained) the window anchors on YESTERDAY "
     "— today's tally is partial all day and a trend/mean computed against it "
     "is misleading; `current` is therefore yesterday's value for those "
-    "metrics, and `partial_today_excluded: true` is attached.",
+    "metrics, and `partial_today_excluded: true` is attached. For SETTLING "
+    "metrics (rhr, sleep_*, body_battery_max/min — values Garmin revises "
+    "through the day), today's row counts only when a sync covering today "
+    "completed within ~10 min: fresh attaches `current_provisional` + "
+    "`data_as_of`; stale excludes today from every stat (raw reading kept in "
+    "`provisional_today_value`) — call sync_garmin_data first for a settled "
+    "same-day read.",
     {
         "type": "object",
         "properties": {
@@ -384,7 +394,29 @@ async def get_metric_trend(args: dict) -> dict:
                 f"FROM baselines WHERE {metric}_60day_mean IS NOT NULL "
                 f"ORDER BY date DESC LIMIT 1"
             ).fetchone()
+        # 0.59.0: today's row of a SETTLING metric is a snapshot Garmin may
+        # have revised since the last pull. Staleness is resolved on this same
+        # connection (no extra open) while it's still in scope.
+        provisional = None
+        if metric in SETTLING_METRICS and rows and rows[-1]["date"] == today.isoformat():
+            provisional = settling_staleness(conn, today.isoformat(), datetime.now())
+    provisional_value = None
+    if provisional is not None and provisional["stale"]:
+        # Stale ⇒ today's number may not drive ANY judgment — current, mean,
+        # slope, or the vs_baseline verdict (this served a mid-sleep rhr 54,
+        # later revised to 50, as "elevated +1.93 SD"). It drops out exactly
+        # like a PARTIAL_DAY anchor, but stays visible as a labeled raw
+        # reading so "what does it say right now" still has an answer.
+        provisional_value = rows[-1]["v"]
+        rows = rows[:-1]
     if not rows:
+        if provisional_value is not None:
+            return _err(
+                "no settled data in window — today's value is a provisional "
+                "snapshot; call sync_garmin_data, then retry",
+                metric=metric, days=days,
+                provisional_today_value=provisional_value,
+            )
         return _err("no data in window", metric=metric, days=days)
     values = [r["v"] for r in rows]
     n = len(values)
@@ -448,6 +480,23 @@ async def get_metric_trend(args: dict) -> dict:
     # vs_baseline is ALWAYS attached — "no data" whenever current_vs_baseline_sd
     # is absent/None (every metric outside rhr/sleep_seconds, or a zero SD).
     payload["vs_baseline"] = interpret.baseline_position(current_vs_baseline_sd)
+    if provisional is not None:
+        if provisional["data_as_of"]:
+            payload["data_as_of"] = provisional["data_as_of"]
+        if provisional["stale"]:
+            payload["provisional_today_excluded"] = True
+            payload["provisional_today_value"] = provisional_value
+            payload["note"] = (
+                f"today's {metric} is a snapshot from a pull old enough that "
+                "Garmin may have revised it since (rhr/sleep settle through "
+                "the morning) — it is excluded from current/mean/slope/"
+                "vs_baseline; call sync_garmin_data for the settled reading"
+            )
+        else:
+            # Fresh (a pull covering today completed within the sync window):
+            # the value is as current as it can get, but Garmin can still
+            # revise it until the day settles — included in the stats, labeled.
+            payload["current_provisional"] = True
 
     # Round at the payload boundary; None passes through unrounded.
     for field, ndigits in (
@@ -503,6 +552,73 @@ def _partial_day_anchor(metric: str, today: date) -> date:
     observe). Every other metric anchors on `today`, unchanged.
     """
     return today - timedelta(days=1) if metric in PARTIAL_DAY_METRICS else today
+
+
+# 0.59.0: metrics Garmin REVISES during the day rather than accumulates.
+# PARTIAL_DAY_METRICS are running tallies — partial ALL day by construction.
+# These are different: today's stored value is a point-in-time snapshot that
+# Garmin itself rewrites as the day is processed — rhr and the sleep_* fields
+# settle once the full night is scored (measured live 2026-08-10: a 06:30
+# mid-sleep pull stored rhr 54; the 10:09 post-wake pull revised it to 50 —
+# and the stale 54 was served as "elevated, +1.93 SD"), and body battery's
+# min/max keep moving until the day ends. The contract these power: a SETTLED
+# VERDICT (SD position, anomaly, slope) must never be derived from an
+# UNSETTLED number. vo2_max is deliberately out — it only moves after an
+# activity sync and drifts slowly, so its staleness is harmless.
+SETTLING_METRICS = frozenset({
+    "rhr", "sleep_seconds", "sleep_score", "sleep_deep_seconds",
+    "sleep_light_seconds", "sleep_rem_seconds", "sleep_awake_seconds",
+    "body_battery_max", "body_battery_min",
+})
+
+
+def data_as_of_today(conn, today_iso: str) -> str | None:
+    """``completed_at`` of the newest successful ingest run whose pull REACHED
+    ``today`` — the honest freshness stamp for today's daily_metrics row.
+
+    Coverage-filtered on ``last_date_fetched``: a ZIP backfill or historical
+    pull that completed seconds ago never touched today's row, and counting it
+    would stamp a stale snapshot "fresh" — the exact direction of lie this
+    field exists to prevent. Fail-open ``None`` on any DB problem (fresh
+    clone, no runs yet). Takes the caller's connection — daily_snapshot is on
+    the perf gate's ``db.connect()`` open-count, so this must never open one.
+    """
+    placeholders = ",".join("?" * len(_SYNC_FAILURE_STATUSES))
+    try:
+        row = conn.execute(
+            "SELECT completed_at FROM ingest_runs "
+            f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
+            "AND status != 'in_progress' AND last_date_fetched >= ? "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (*tuple(_SYNC_FAILURE_STATUSES), today_iso),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row["completed_at"] if row and row["completed_at"] else None
+
+
+def settling_staleness(conn, today_iso: str, now: datetime) -> dict:
+    """``{"data_as_of": iso|None, "stale": bool}`` for today's settling rows.
+
+    Stale = no successful pull covering today completed inside the sync
+    freshness window (``_sync_min_interval_minutes``, default 10) — the same
+    bar ``sync_garmin_data``'s short-circuit uses, so "not stale" and "a sync
+    right now would short-circuit as fresh" are the same fact, and the
+    deterministic remedy for stale is always one ``sync_garmin_data`` call.
+    A future-dated ``completed_at`` (clock skew) reads as stale, mirroring
+    ``_recent_successful_sync``.
+    """
+    as_of = data_as_of_today(conn, today_iso)
+    if as_of is None:
+        return {"data_as_of": None, "stale": True}
+    try:
+        completed = datetime.fromisoformat(as_of)
+    except ValueError:
+        return {"data_as_of": as_of, "stale": True}
+    fresh = timedelta() <= now - completed <= timedelta(
+        minutes=_sync_min_interval_minutes())
+    return {"data_as_of": as_of, "stale": not fresh}
+
 
 _CHART_SCHEMA = {
     "type": "object",
@@ -1163,7 +1279,11 @@ _FIND_ANOMALIES_SCHEMA = {
 
 @tool(
     "find_anomalies",
-    "Days where a metric was more than N standard deviations from its 60-day baseline. Currently supports rhr and sleep_seconds.",
+    "Days where a metric was more than N standard deviations from its 60-day "
+    "baseline. Currently supports rhr and sleep_seconds. Today is always "
+    "excluded: both metrics settle through the morning (Garmin revises them "
+    "as the night is processed), so a provisional same-day value is not a "
+    "confirmed anomaly — use get_metric_trend for today's read.",
     _FIND_ANOMALIES_SCHEMA,
 )
 async def find_anomalies(args: dict) -> dict:
@@ -1186,6 +1306,10 @@ async def find_anomalies(args: dict) -> dict:
     if not (0.5 <= threshold <= 10):
         return _err("sd_threshold must be between 0.5 and 10")
     cutoff = (date.today() - timedelta(days=days)).isoformat()
+    # 0.59.0: `dm.date < today` — both supported metrics are SETTLING_METRICS
+    # (Garmin revises them through the morning), and an anomaly is a settled
+    # fact. Measured live 2026-08-10: a mid-sleep pull's rhr 54 (revised to 50
+    # post-wake) would have scanned as a +2 SD spike.
     with db.connect() as conn:
         rows = conn.execute(
             f"""SELECT dm.date, dm.{metric} AS value,
@@ -1193,12 +1317,12 @@ async def find_anomalies(args: dict) -> dict:
                        b.{metric}_60day_sd AS baseline_sd
                 FROM daily_metrics dm
                 LEFT JOIN baselines b ON b.date = dm.date
-                WHERE dm.date >= ? AND dm.{metric} IS NOT NULL
+                WHERE dm.date >= ? AND dm.date < ? AND dm.{metric} IS NOT NULL
                   AND b.{metric}_60day_mean IS NOT NULL
                   AND b.{metric}_60day_sd > 0
                   AND ABS(dm.{metric} - b.{metric}_60day_mean) > b.{metric}_60day_sd * ?
                 ORDER BY dm.date DESC""",
-            (cutoff, threshold),
+            (cutoff, date.today().isoformat(), threshold),
         ).fetchall()
     # sleep_seconds baselines are raw AVG()/SD floats (~10 significant digits)
     # and the value is raw seconds — attach the "7h 33m" companion the coach
@@ -2551,7 +2675,9 @@ async def daily_snapshot(_args: dict) -> dict:
     # Lazy import: status.py imports DAILY_NUMERIC_METRICS from this module, so
     # a top-level import here would be circular.
     from .status import assemble_status
-    return _text(assemble_status())
+    # settling_guard: this tool serves ad-hoc reads with no pull in front of
+    # them — the one surface where today's rhr/sleep can be a stale snapshot.
+    return _text(assemble_status(settling_guard=True))
 
 
 _LOG_OBSERVATION_SCHEMA = {

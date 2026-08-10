@@ -23,12 +23,17 @@ Design notes:
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from .. import db, notes
 from . import briefs, interpret, units, workout_rows
-from .tools import DAILY_NUMERIC_METRICS, PARTIAL_DAY_METRICS
+from .tools import (
+    DAILY_NUMERIC_METRICS,
+    PARTIAL_DAY_METRICS,
+    SETTLING_METRICS,
+    settling_staleness,
+)
 
 # Explicit metric → (baseline mean column, baseline sd column | None). Do NOT
 # derive these from the metric name: avg_stress → stress_60day_mean breaks the
@@ -127,7 +132,12 @@ def _tsb_interpretation(tsb: float | None) -> str:
     return interpret.tsb_zone(tsb)
 
 
-def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _metric_rows(
+    conn,
+    today: str,
+    baseline: dict[str, Any] | None,
+    staleness: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Build the per-metric rows: baseline_delta for the five baselined
     metrics, trend_arrow for the trend set, raw for everything else.
 
@@ -148,7 +158,21 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
     week ran 24-32. Raw-treatment metrics (no comparison to get wrong) keep
     today's live number — a mid-day "how are my steps so far" answer must not
     silently become yesterday's — but carry ``partial_today: true`` so a
-    caller knows it's still accumulating."""
+    caller knows it's still accumulating.
+
+    ``staleness`` (0.59.0, ``tools.settling_staleness``'s dict or None) is the
+    opt-in settling guard: when present and stale, a SETTLING metric's derived
+    comparisons anchor on yesterday exactly like the partial-day treatment —
+    today's snapshot may have been revised by Garmin since the last pull, so
+    a settled verdict must not be derived from it (measured live 2026-08-10:
+    a mid-sleep pull's rhr 54, revised to 50 post-wake, would read "+6.7% vs
+    baseline"). The raw reading stays visible as ``provisional_today_value``.
+    When present and fresh, today's value is used and labeled
+    ``provisional_today`` (Garmin can still revise it until the day settles).
+    ``None`` (the default) is byte-identical to pre-0.59.0 behavior — the
+    brief pipeline pulls immediately before reading, so its snapshot is fresh
+    by construction and deliberately unguarded (a guard there would change
+    the eval'd grounding pool and the planner fixtures)."""
     # Window is relative to the passed `today`, NOT wall-clock — so an
     # injected `today` (fixtures / brief_planner) is reproducible.
     cutoff = (date.fromisoformat(today) - timedelta(days=_TREND_WINDOW_DAYS)).isoformat()
@@ -163,15 +187,21 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
     yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
     yesterday_row = next((r for r in window_rows if r["date"] == yesterday), {})
 
+    stale_settling = bool(staleness and staleness.get("stale"))
     rows: list[dict[str, Any]] = []
     for metric in sorted(DAILY_NUMERIC_METRICS):
         is_partial = metric in PARTIAL_DAY_METRICS
+        # Settling guard active for this metric at all (opt-in), and whether
+        # today's snapshot is old enough that its comparisons must not be
+        # trusted. A settling metric is never also a partial tally.
+        is_settling = staleness is not None and metric in SETTLING_METRICS
+        exclude_today = is_partial or (is_settling and stale_settling)
         value = today_row.get(metric)
 
         if metric in _BASELINE_DELTA_MAP:
             mean_col, _sd_col = _BASELINE_DELTA_MAP[metric]
             base_val = baseline.get(mean_col) if baseline else None
-            cmp_value = yesterday_row.get(metric) if is_partial else value
+            cmp_value = yesterday_row.get(metric) if exclude_today else value
             delta_pct: float | None = None
             arrow: str | None = None
             if cmp_value is not None and base_val:
@@ -187,6 +217,12 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
             }
             if is_partial:
                 row["partial_today_excluded"] = True
+            elif is_settling and stale_settling:
+                row["provisional_today_excluded"] = True
+                if value is not None:
+                    row["provisional_today_value"] = value
+            elif is_settling and value is not None:
+                row["provisional_today"] = True
             if metric == "sleep_seconds":
                 # Sleep renders as "7h 33m", not raw seconds or format_duration's
                 # "7:33:00" run-duration shape — units.format_hm is the single
@@ -198,10 +234,11 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
             continue
 
         if metric in _TREND_METRICS:
-            cmp_value = yesterday_row.get(metric) if is_partial else value
+            cmp_value = yesterday_row.get(metric) if exclude_today else value
             series = [
                 r[metric] for r in window_rows
-                if r.get(metric) is not None and (not is_partial or r["date"] != today)
+                if r.get(metric) is not None
+                and (not exclude_today or r["date"] != today)
             ]
             row = {
                 "metric": metric,
@@ -211,12 +248,23 @@ def _metric_rows(conn, today: str, baseline: dict[str, Any] | None) -> list[dict
             }
             if is_partial:
                 row["partial_today_excluded"] = True
+            elif is_settling and stale_settling:
+                row["provisional_today_excluded"] = True
+                if value is not None:
+                    row["provisional_today_value"] = value
+            elif is_settling and value is not None:
+                row["provisional_today"] = True
             rows.append(row)
             continue
 
         row = {"metric": metric, "value": value, "treatment": "raw"}
+        # Raw settling metrics (the sleep-stage seconds) keep today's live
+        # number either way — there is no derived comparison to get wrong —
+        # but carry the provisional label, mirroring partial_today.
         if is_partial and value is not None:
             row["partial_today"] = True
+        elif is_settling and value is not None:
+            row["provisional_today"] = True
         rows.append(row)
 
     return rows
@@ -344,12 +392,24 @@ def _latest_brief_freshness(today: str) -> tuple[str | None, int | None]:
         return None, None
 
 
-def assemble_status(today: str | None = None) -> dict[str, Any]:
+def assemble_status(
+    today: str | None = None, *, settling_guard: bool = False
+) -> dict[str, Any]:
     """Assemble the daily snapshot. Pure read; never raises on an empty DB.
 
     ``today`` (ISO ``YYYY-MM-DD``) is injectable so callers (fixtures, the brief
     planner) get reproducible output; it defaults to ``date.today()`` so existing
     bare callers are unchanged.
+
+    ``settling_guard`` (0.59.0) applies the settling-metric staleness guard to
+    the metric rows (see ``_metric_rows``) and attaches top-level
+    ``data_as_of`` (the completed_at of the newest successful pull covering
+    ``today``, omitted when there is none). Default OFF so every existing
+    caller — the brief pipeline, which pulls immediately before reading, and
+    the planner fixtures — is byte-identical; only the ``daily_snapshot`` MCP
+    tool opts in, because it serves ad-hoc reads with no pull in front of
+    them. The staleness read rides this function's existing connection —
+    daily_snapshot is on the perf gate's ``db.connect()`` open-count.
 
     Returns a dict with keys: ``date``, ``metrics``, ``training_load``,
     ``recent_workouts``, ``user_notes``, ``latest_brief_date``,
@@ -369,18 +429,21 @@ def assemble_status(today: str | None = None) -> dict[str, Any]:
     ``projected_end_of_day`` rather than being reported as current.
     """
     today = today or date.today().isoformat()
+    staleness = None
     with db.connect() as conn:
         baseline = _baseline_row(conn, today)
         current_form = _baseline_row_before(conn, today)
         today_row = baseline if (baseline and baseline.get("date") == today) else None
-        metrics = _metric_rows(conn, today, baseline)
+        if settling_guard:
+            staleness = settling_staleness(conn, today, datetime.now())
+        metrics = _metric_rows(conn, today, baseline, staleness)
         training_load = _training_load(baseline, today, current_form, today_row)
         recent_workouts = _recent_workouts(conn)
 
     user_notes = [n.text for n in notes.read_notes() if n.text]
     latest_brief_date, brief_stale_days = _latest_brief_freshness(today)
 
-    return {
+    payload = {
         "date": today,
         "metrics": metrics,
         "training_load": training_load,
@@ -389,3 +452,6 @@ def assemble_status(today: str | None = None) -> dict[str, Any]:
         "latest_brief_date": latest_brief_date,
         "brief_stale_days": brief_stale_days,
     }
+    if staleness is not None and staleness.get("data_as_of"):
+        payload["data_as_of"] = staleness["data_as_of"]
+    return payload
