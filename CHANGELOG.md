@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.60.2] - 2026-08-10
+
+### Fixed
+- **Grounding: two more false-positive classes from the second live audit**
+  (same-day follow-up to #217; the 13:48 regeneration read
+  `invention_rate=1.000` again from prose the first fix didn't cover).
+  - **The typographic minus is a minus.** The generator's markdown renders
+    negatives with U+2212 ("−7.5", "−1.2%"), which the ASCII-only tokenizer
+    read as bare positives — "−7.5" sign-flagged against tsb=-7.5. Both
+    tokenizing entry points now normalize U+2212 → "-" (one-char,
+    offset-safe, so every positional lookaround stays valid). The en dash
+    is deliberately NOT mapped — it is a range mark, not a minus.
+  - **A number after a month name is a date.** "Aug 7" sign-flagged against
+    tsb=-7.5 three times and "Sept 18" value-flagged against a workout's
+    training load. `_MONTH_BEFORE` is the mirror of `_WINDOW_AFTER`:
+    directly-preceding month word (abbreviated, dotted, or full) vetoes the
+    token. Sensitivity is positional — a bare "7" not after a month still
+    flags (pinned by test).
+  Both applied to `numeric_tokens` too, so `plan_coach`'s grounding
+  inherits them. The 13:48 sentences are frozen as a regression fixture.
+  Known residue, accepted as designed tolerance: a bare unitless number
+  near a metric ("streak alive by 45" vs rhr=50) is indistinguishable from
+  a mis-stated metric without semantic context.
+
 ## [0.60.1] - 2026-08-10
 
 ### Changed

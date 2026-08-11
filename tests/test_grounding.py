@@ -415,3 +415,76 @@ def test_prose_positive_vs_pool_negative_still_flags_sign_inversion():
     flags = g.flag(_brief("TSB is +22, you're rested"), _ctx())
     assert [f.kind for f in flags] == ["sign"]
     assert flags[0].nearest_metric == "tsb"
+
+
+# --------------------------------------------------------------------------- #
+# Second live audit (2026-08-10 13:48 brief): two more false-positive
+# classes. The generator's markdown renders negatives with the typographic
+# MINUS SIGN (U+2212), which the ASCII tokenizer read as a positive ("−7.5"
+# sign-flagged against tsb=-7.5), and calendar dates ("Aug 7", "Sept 18")
+# matched metric magnitudes. Fixed by offset-safe U+2212 normalization and
+# a month-name-before-token veto (the mirror of _WINDOW_AFTER).
+# --------------------------------------------------------------------------- #
+def test_unicode_minus_reads_as_a_negative_citation():
+    # "TSB is −7.5" (U+2212) must parse negative and match tsb=-7.5 as
+    # faithful — it was tokenizing as +7.5 and sign-flagging.
+    ctx = _ctx(training_load=[
+        GroundedValue(name="tsb", value=-7.5, unit="none", display="-7.5"),
+    ])
+    assert g.flag(_brief("TSB is −7.5 (neutral)"), ctx) == []
+
+
+def test_unicode_minus_percent_delta_is_not_an_inversion():
+    ctx = _ctx(snapshot=[
+        GroundedValue(name="frac_of_goal", value=2.0, unit="pct", display="200%"),
+    ], training_load=[])
+    assert g.flag(_brief("| RHR | −1.2% | ↓ |"), ctx) == []
+
+
+def test_a_date_after_a_month_name_is_never_a_metric_claim():
+    ctx = _ctx(training_load=[
+        GroundedValue(name="tsb", value=-7.5, unit="none", display="-7.5"),
+    ])
+    # "Aug 7" sat at rel 0.067 of |tsb| and sign-flagged three times live.
+    assert g.flag(_brief("The Aug 7 long run arrested the slide"), ctx) == []
+    # Full and dotted forms too.
+    assert g.flag(_brief("Back on August 7 you ran long"), ctx) == []
+    assert g.flag(_brief("race day is Sept. 18"), _ctx(snapshot=[
+        GroundedValue(name="load", value=17.5, unit="none", display="17.5"),
+    ], training_load=[])) == []
+
+
+def test_a_bare_number_not_after_a_month_keeps_sensitivity():
+    # The same magnitude WITHOUT a month word still sign-flags against a
+    # negative pool metric — the veto is positional, not a blanket skip.
+    ctx = _ctx(training_load=[
+        GroundedValue(name="tsb", value=-7.5, unit="none", display="-7.5"),
+    ])
+    flags = g.flag(_brief("freshness is sitting at 7 today"), ctx)
+    assert [f.kind for f in flags] == ["sign"]
+
+
+def test_numeric_tokens_applies_the_same_normalization_and_date_veto():
+    toks = g.numeric_tokens("TSB −22 after the Aug 7 run, 3 easy miles")
+    assert [t.strip() for t in toks] == ["-22", "3"]
+
+
+def test_second_live_audit_brief_carries_no_false_positives():
+    # Frozen from the 2026-08-10 13:48 generation — the sentences that
+    # produced [tsb:7.5], [tsb:7]x2 (later x3), [workouts_14d.training_load:18].
+    ctx = _ctx(
+        snapshot=[
+            GroundedValue(name="rhr", value=50, unit="bpm", display="50 bpm"),
+        ],
+        training_load=[
+            GroundedValue(name="tsb", value=-7.5, unit="none", display="-7.5"),
+        ],
+        workouts_14d=[{"distance_mi": 9.0, "avg_hr": 148, "training_load": 16.9}],
+    )
+    b = _brief(
+        "Two consecutive misses. TSB is −7.5 (neutral — moderate fatigue).",
+        "The Aug 7 long run is what's keeping the number from sliding.",
+        "39 days to race Sept 18 is a problem you can see on paper.",
+    )
+    assert g.flag(b, ctx) == []
+    assert g.invention_rate(b, ctx) == 0.0
