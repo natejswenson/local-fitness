@@ -1,6 +1,9 @@
 """Tests for notes.py — the durable user-preference store."""
 from __future__ import annotations
 
+import stat
+import threading
+
 import pytest
 
 from local_fitness import notes
@@ -137,6 +140,107 @@ def test_rotation_to_archive(notes_path):
     archive = notes._archive_path(notes_path)
     assert archive.exists()
     assert archive.read_text(encoding="utf-8").strip()
+
+
+def test_locked_rewrite_no_lost_write_across_concurrent_append(notes_path):
+    # A second writer, forced to overlap this held lock via the test
+    # seam, must not be lost: it can only acquire the sidecar lock once
+    # this critical section releases it, so it reads the file this
+    # write just produced rather than a stale snapshot.
+    notes.append_note("first", path=notes_path)
+    thread_box: dict[str, threading.Thread] = {}
+
+    def hook():
+        t = threading.Thread(
+            target=notes.append_note,
+            args=("second, concurrent",),
+            kwargs={"path": notes_path},
+        )
+        t.start()
+        thread_box["thread"] = t
+
+    with notes._locked_rewrite(notes_path, _after_read_hook=hook) as ctx:
+        note = ctx.resolve(0)
+        assert note is not None
+        lines = ctx.lines
+        lines[0] = "- 2026-01-01T00:00:00 — first, updated\n"
+        ctx.text = "".join(lines)
+
+    thread_box["thread"].join(timeout=5)
+    assert not thread_box["thread"].is_alive()
+
+    remaining = {n.text for n in notes.read_notes(notes_path)}
+    assert remaining == {"first, updated", "second, concurrent"}
+
+
+def test_locked_rewrite_loses_a_write_when_the_lock_is_a_no_op(notes_path, monkeypatch):
+    # Two-sided: stub the lock acquisition to a no-op and force the exact
+    # same interleaving — the second writer now runs to completion
+    # (nothing blocks it) before this write lands, and gets clobbered.
+    # Proves the lock above is load-bearing, not incidental timing.
+    notes.append_note("first", path=notes_path)
+    monkeypatch.setattr(notes.fcntl, "flock", lambda *a, **k: None)
+
+    def hook():
+        t = threading.Thread(
+            target=notes.append_note,
+            args=("second, concurrent",),
+            kwargs={"path": notes_path},
+        )
+        t.start()
+        # No real lock blocks it, so this completes fast and
+        # deterministically — no sleep needed to force the race.
+        t.join(timeout=5)
+
+    with notes._locked_rewrite(notes_path, _after_read_hook=hook) as ctx:
+        note = ctx.resolve(0)
+        assert note is not None
+        lines = ctx.lines
+        lines[0] = "- 2026-01-01T00:00:00 — first, updated\n"
+        ctx.text = "".join(lines)
+
+    remaining = {n.text for n in notes.read_notes(notes_path)}
+    assert remaining == {"first, updated"}
+    assert "second, concurrent" not in remaining
+
+
+def test_read_notes_never_sees_a_partial_file(notes_path):
+    # On dev (truncate-then-write through one handle) this observes 0
+    # notes on a meaningful fraction of reads. Atomic replace closes
+    # that window: every read sees the full file or the file before it.
+    for i in range(20):
+        notes.append_note(f"seed note {i}", path=notes_path)
+
+    stop = threading.Event()
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            notes.update_note(0, f"updated {i}", path=notes_path)
+            i += 1
+
+    t = threading.Thread(target=writer)
+    t.start()
+    try:
+        counts = [len(notes.read_notes(notes_path)) for _ in range(1000)]
+    finally:
+        stop.set()
+        t.join(timeout=5)
+
+    assert all(c == 20 for c in counts)
+
+
+def test_atomic_replace_preserves_file_mode(notes_path):
+    notes.append_note("first", path=notes_path)
+    notes_path.chmod(0o644)
+    notes.append_note("second", path=notes_path)
+    assert stat.S_IMODE(notes_path.stat().st_mode) == 0o644
+
+
+def test_atomic_replace_default_mode_for_a_new_file(notes_path, monkeypatch):
+    monkeypatch.setattr(notes, "_current_umask", lambda: 0o022)
+    notes.append_note("first", path=notes_path)
+    assert stat.S_IMODE(notes_path.stat().st_mode) == 0o644
 
 
 def test_default_notes_path_env(tmp_path, monkeypatch):
