@@ -139,19 +139,44 @@ def _write_atomic(path: Path, text: str, mode: int) -> None:
         raise
 
 
+def _ensure_trailing_newline(text: str) -> str:
+    """Return ``text`` with a trailing newline, unless it's empty.
+
+    This is the line-boundary invariant every writer in this module
+    depends on: text that already satisfies it can be concatenated onto
+    (another line appended, or more text written after it) without the
+    last existing line welding into what follows. An empty string stays
+    empty — there's no line to terminate, and turning "no file" or "no
+    notes left" into a lone blank line would be its own corruption.
+    """
+    if not text:
+        return text
+    return text if text.endswith("\n") else text + "\n"
+
+
 class _RewriteContext:
     """Handle for one locked read -> resolve -> rewrite cycle.
 
     ``existing_text``/``lines`` are the file as read *inside* the lock —
-    the only state ``resolve`` may use. Assign ``.text`` before the
-    ``with`` block exits; that whole-file text is what gets written.
-    Leaving ``.text`` as ``None`` (the target wasn't found, or nothing
-    needs to change) writes nothing — the file is left untouched.
+    the only state ``resolve`` may use. ``existing_text`` is normalised
+    to end in a trailing newline (if it holds any content at all) before
+    ``lines`` is derived from it, so every line in ``lines`` is properly
+    terminated even when the file on disk was hand-edited or otherwise
+    left without one. That is what lets a writer concatenate new content
+    directly onto ``existing_text`` (or onto ``"".join(lines)``) without
+    re-deriving the boundary itself — ``_rotate_to_fit`` in particular
+    relies on this rather than re-implementing it.
+
+    Assign ``.text`` before the ``with`` block exits; that whole-file
+    text is what gets written (also normalised to end in a trailing
+    newline, on the way out — see ``_locked_rewrite``). Leaving ``.text``
+    as ``None`` (the target wasn't found, or nothing needs to change)
+    writes nothing — the file is left untouched.
     """
 
     def __init__(self, existing_text: str):
-        self.existing_text = existing_text
-        self.lines: list[str] = existing_text.splitlines(keepends=True)
+        self.existing_text = _ensure_trailing_newline(existing_text)
+        self.lines: list[str] = self.existing_text.splitlines(keepends=True)
         self.text: str | None = None
 
     def resolve(self, line_index: int) -> Note | None:
@@ -175,13 +200,19 @@ def _locked_rewrite(path: Path, *, _after_read_hook=None):
     Reads and parses the live file *inside* the lock and yields a
     ``_RewriteContext`` built from that read — every writer resolves its
     target and assembles its new content against that same read, never
-    against a separately-read copy. On exit (still holding the lock), if
-    ``ctx.text`` was assigned, it is written atomically: a
-    same-directory temp file, chmod'd to the original file's mode (or
-    ``0o666 & ~umask`` if the file is being created), fsynced, then
-    ``os.replace``'d over the original. A reader — ``read_notes``, or a
-    text editor with the file open — therefore never observes a partial
-    file: only the whole old one or the whole new one.
+    against a separately-read copy. The read is normalised to end in a
+    trailing newline before it reaches the context (see
+    ``_RewriteContext``), and ``ctx.text`` is normalised the same way on
+    the way out — so a whole-file text a writer assembles by
+    concatenating onto ``ctx.existing_text`` can never weld its last
+    existing line into what got appended, on either side of the round
+    trip. On exit (still holding the lock), if ``ctx.text`` was assigned,
+    it is written atomically: a same-directory temp file, chmod'd to the
+    original file's mode (or ``0o666 & ~umask`` if the file is being
+    created), fsynced, then ``os.replace``'d over the original. A
+    reader — ``read_notes``, or a text editor with the file open —
+    therefore never observes a partial file: only the whole old one or
+    the whole new one.
 
     ``_after_read_hook``, if given, fires once the read has happened but
     before control returns to the ``with`` block — a seam for tests that
@@ -203,7 +234,7 @@ def _locked_rewrite(path: Path, *, _after_read_hook=None):
         ctx = _RewriteContext(existing_text)
         yield ctx
         if ctx.text is not None:
-            _write_atomic(path, ctx.text, mode)
+            _write_atomic(path, _ensure_trailing_newline(ctx.text), mode)
     finally:
         lock_handle.close()
 
@@ -281,8 +312,11 @@ def append_note(text: str, path: Path | None = None) -> Note:
     new_line = f"- {ts} — {text}\n"
 
     with _locked_rewrite(p) as ctx:
+        # ctx.existing_text is already newline-normalised (see
+        # _RewriteContext), so appending new_line directly can never
+        # weld it into a bare-last-line file.
         existing = ctx.existing_text
-        candidate = existing + (new_line if existing.endswith("\n") or not existing else "\n" + new_line)
+        candidate = existing + new_line
         if len(candidate.encode("utf-8")) > LIVE_FILE_MAX_BYTES:
             kept, rotated = _rotate_to_fit(existing, new_line)
             if rotated:
@@ -308,6 +342,13 @@ def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
     """Drop oldest lines from ``existing`` until ``existing + new_line``
     fits the cap. Returns (kept_text, rotated_text) where rotated_text
     contains the dropped lines (in original order) for archiving.
+
+    Relies on ``existing`` already ending in a trailing newline (or
+    being empty) — every caller passes ``ctx.existing_text``, which
+    ``_RewriteContext`` guarantees. That's what lets ``"".join(lines) +
+    new_line`` below join cleanly instead of welding the last kept line
+    into ``new_line``: this function establishes no boundary of its own
+    because ``_locked_rewrite`` already established one for it.
     """
     lines = existing.splitlines(keepends=True)
     rotated: list[str] = []
@@ -322,13 +363,27 @@ def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
 
 def _append_archive(text: str, archive_path: Path) -> None:
     """Append rotated content to the archive file. Best-effort — failures
-    are logged but don't block the live write."""
+    are logged but don't block the live write.
+
+    Establishes the line boundary on *both* sides of the join: the text
+    being appended (via ``_ensure_trailing_newline``, same as before),
+    and — the file it appends *to*. Unlike the live file, the archive is
+    never rewritten through ``_locked_rewrite``, so nothing upstream
+    normalises what's already on disk; a previous run that welded a line
+    (or a hand-edited archive with no trailing newline) would otherwise
+    weld the very first archived line of *this* rotation onto it too.
+    """
     try:
         archive_path.parent.mkdir(parents=True, exist_ok=True)
         with _open_locked(archive_path, "a") as h:
-            h.write(text)
-            if not text.endswith("\n"):
+            needs_boundary = False
+            if archive_path.exists() and archive_path.stat().st_size > 0:
+                with open(archive_path, "rb") as rf:
+                    rf.seek(-1, os.SEEK_END)
+                    needs_boundary = rf.read(1) != b"\n"
+            if needs_boundary:
                 h.write("\n")
+            h.write(_ensure_trailing_newline(text))
     except OSError as e:
         LOG.warning("Failed to write archive %s: %s", archive_path, e)
 

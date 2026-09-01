@@ -142,6 +142,69 @@ def test_rotation_to_archive(notes_path):
     assert archive.read_text(encoding="utf-8").strip()
 
 
+def test_append_after_rotation_repairs_missing_trailing_newline(notes_path):
+    # Simulate a hand-edited live file with no trailing newline — the
+    # module docstring explicitly invites hand-editing — sized so the
+    # next append crosses the 4 KB cap and rotation fires. On dev,
+    # _rotate_to_fit's "".join(lines) + new_line welds the previously-last
+    # (no-newline) line directly into the incoming bullet instead of
+    # keeping them as two distinct notes (Repro 4).
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(60)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets), encoding="utf-8")  # no trailing newline
+
+    new_note = notes.append_note("Never comment on my weekend sleep.", path=notes_path)
+    assert new_note.text == "Never comment on my weekend sleep."
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()  # rotation must actually have fired, or this proves nothing
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    archived_texts = [
+        parsed.text
+        for parsed in (notes._parse_line(ln) for ln in archive.read_text(encoding="utf-8").splitlines())
+        if parsed is not None
+    ]
+    all_texts = archived_texts + live_texts
+
+    # Every original note, plus the new one, must survive as its own
+    # distinct entry -- none merged with its neighbour, none lost.
+    assert all_texts.count("Never comment on my weekend sleep.") == 1
+    for text in original_texts:
+        assert all_texts.count(text) == 1
+    assert len(all_texts) == len(original_texts) + 1
+
+
+def test_append_archive_repairs_missing_trailing_newline_in_existing_archive(notes_path):
+    # Same defect, second location: _append_archive guarded the newline of
+    # the text it *writes* but not of the file it appends *to*. A
+    # hand-edited (or previously-welded) archive with no trailing newline
+    # would weld the first newly-rotated note onto its last existing line.
+    archive = notes._archive_path(notes_path)
+    archive.write_text("- 2025-01-01T00:00:00 — an old archived preference", encoding="utf-8")
+
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(60)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+
+    notes.append_note("a rotated preference", path=notes_path)
+
+    archived_texts = [
+        parsed.text
+        for parsed in (notes._parse_line(ln) for ln in archive.read_text(encoding="utf-8").splitlines())
+        if parsed is not None
+    ]
+    assert "an old archived preference" in archived_texts
+    assert len(archived_texts) >= 2
+    # The pre-existing entry must be its own note, not a prefix glued to
+    # whatever rotated in behind it.
+    assert archived_texts.count("an old archived preference") == 1
+
+
 def test_locked_rewrite_no_lost_write_across_concurrent_append(notes_path):
     # A second writer, forced to overlap this held lock via the test
     # seam, must not be lost: it can only acquire the sidecar lock once
