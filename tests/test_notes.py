@@ -142,29 +142,63 @@ def test_rotation_to_archive(notes_path):
     assert archive.read_text(encoding="utf-8").strip()
 
 
-def test_locked_rewrite_no_lost_write_across_concurrent_append(notes_path):
-    # A second writer, forced to overlap this held lock via the test
-    # seam, must not be lost: it can only acquire the sidecar lock once
-    # this critical section releases it, so it reads the file this
-    # write just produced rather than a stale snapshot.
+def test_locked_rewrite_no_lost_write_across_concurrent_append(notes_path, monkeypatch):
+    # Proof 9 (positive half). Per the design, this guards the refactor
+    # rather than reproducing a live failure: a literal revert of
+    # notes.py cannot show this red, because pre-fix update_note already
+    # holds one flock across its own read+write, so it is ALSO safe from
+    # this exact race — the design says as much ("passes on dev today").
+    # The real regression this guards is a future rewrite of update_note
+    # or delete_note that splits reading from writing without going
+    # through _locked_rewrite; its two-sidedness is the paired no-op-lock
+    # variant below, not a pre/post-fix comparison.
+    #
+    # The held side is a PRODUCTION writer (update_note), not a
+    # hand-rolled _locked_rewrite block — a hand-rolled block can go
+    # green forever even if update_note itself later stops using the
+    # lock. The seam: update_note calls the module-global
+    # notes._locked_rewrite, so wrapping that global injects the hook
+    # into the one call this test needs to observe, and delegates every
+    # other call (including the concurrent append's own) straight
+    # through unchanged.
     notes.append_note("first", path=notes_path)
     thread_box: dict[str, threading.Thread] = {}
+    real_locked_rewrite = notes._locked_rewrite
+    real_flock = notes.fcntl.flock
+    reached_lock = threading.Event()
+    hooked = {"fired": False}
 
-    def hook():
-        t = threading.Thread(
-            target=notes.append_note,
-            args=("second, concurrent",),
-            kwargs={"path": notes_path},
-        )
-        t.start()
-        thread_box["thread"] = t
+    def flock_signalling(*a, **k):
+        # Fires only for the concurrent writer's own lock attempt (see
+        # below: only installed once the held writer already has the
+        # lock). Proves genuine overlap — the second call really is
+        # contending for the same lock, not just running afterward.
+        reached_lock.set()
+        return real_flock(*a, **k)
 
-    with notes._locked_rewrite(notes_path, _after_read_hook=hook) as ctx:
-        note = ctx.resolve(0)
-        assert note is not None
-        lines = ctx.lines
-        lines[0] = "- 2026-01-01T00:00:00 — first, updated\n"
-        ctx.text = "".join(lines)
+    def wrapped(path, *, _after_read_hook=None):
+        if hooked["fired"]:
+            return real_locked_rewrite(path, _after_read_hook=_after_read_hook)
+        hooked["fired"] = True
+
+        def hook():
+            monkeypatch.setattr(notes.fcntl, "flock", flock_signalling)
+            t = threading.Thread(
+                target=notes.append_note,
+                args=("second, concurrent",),
+                kwargs={"path": notes_path},
+            )
+            t.start()
+            thread_box["thread"] = t
+            assert reached_lock.wait(timeout=5), (
+                "the concurrent append never reached its own flock() call"
+            )
+
+        return real_locked_rewrite(path, _after_read_hook=hook)
+
+    monkeypatch.setattr(notes, "_locked_rewrite", wrapped)
+
+    notes.update_note(0, "first, updated", path=notes_path)
 
     thread_box["thread"].join(timeout=5)
     assert not thread_box["thread"].is_alive()
@@ -174,30 +208,50 @@ def test_locked_rewrite_no_lost_write_across_concurrent_append(notes_path):
 
 
 def test_locked_rewrite_loses_a_write_when_the_lock_is_a_no_op(notes_path, monkeypatch):
-    # Two-sided: stub the lock acquisition to a no-op and force the exact
-    # same interleaving — the second writer now runs to completion
-    # (nothing blocks it) before this write lands, and gets clobbered.
-    # Proves the lock above is load-bearing, not incidental timing.
+    # Two-sided pair for the test above: stub the lock acquisition to a
+    # no-op and force the identical interleaving — the second writer now
+    # runs to completion (nothing blocks it) before the held write
+    # lands, and gets clobbered. Proves the lock above is load-bearing,
+    # not incidental timing. Same production-writer seam as above:
+    # update_note is the held side, append_note is the concurrent side.
     notes.append_note("first", path=notes_path)
     monkeypatch.setattr(notes.fcntl, "flock", lambda *a, **k: None)
+    real_locked_rewrite = notes._locked_rewrite
+    hooked = {"fired": False}
+    errors: list[BaseException] = []
+    landed = threading.Event()
 
-    def hook():
-        t = threading.Thread(
-            target=notes.append_note,
-            args=("second, concurrent",),
-            kwargs={"path": notes_path},
-        )
-        t.start()
-        # No real lock blocks it, so this completes fast and
-        # deterministically — no sleep needed to force the race.
-        t.join(timeout=5)
+    def append_second():
+        try:
+            notes.append_note("second, concurrent", path=notes_path)
+        except BaseException as exc:  # noqa: BLE001 - must be observed, not swallowed
+            errors.append(exc)
+        finally:
+            landed.set()
 
-    with notes._locked_rewrite(notes_path, _after_read_hook=hook) as ctx:
-        note = ctx.resolve(0)
-        assert note is not None
-        lines = ctx.lines
-        lines[0] = "- 2026-01-01T00:00:00 — first, updated\n"
-        ctx.text = "".join(lines)
+    def wrapped(path, *, _after_read_hook=None):
+        if hooked["fired"]:
+            return real_locked_rewrite(path, _after_read_hook=_after_read_hook)
+        hooked["fired"] = True
+
+        def hook():
+            t = threading.Thread(target=append_second)
+            t.start()
+            # No real lock blocks it, so this completes fast and
+            # deterministically — no sleep needed to force the race.
+            t.join(timeout=5)
+
+        return real_locked_rewrite(path, _after_read_hook=hook)
+
+    monkeypatch.setattr(notes, "_locked_rewrite", wrapped)
+
+    notes.update_note(0, "first, updated", path=notes_path)
+
+    # The concurrent append must have actually completed (not crashed
+    # silently) for its disappearance below to demonstrate real data
+    # loss rather than a write that never happened.
+    assert landed.wait(timeout=5), "the concurrent append never completed"
+    assert not errors, f"the concurrent append raised: {errors}"
 
     remaining = {n.text for n in notes.read_notes(notes_path)}
     assert remaining == {"first, updated"}
@@ -212,11 +266,16 @@ def test_read_notes_never_sees_a_partial_file(notes_path):
         notes.append_note(f"seed note {i}", path=notes_path)
 
     stop = threading.Event()
+    errors: list[BaseException] = []
 
     def writer():
         i = 0
         while not stop.is_set():
-            notes.update_note(0, f"updated {i}", path=notes_path)
+            try:
+                notes.update_note(0, f"updated {i}", path=notes_path)
+            except BaseException as exc:  # noqa: BLE001 - must be observed, not swallowed
+                errors.append(exc)
+                return
             i += 1
 
     t = threading.Thread(target=writer)
@@ -227,20 +286,79 @@ def test_read_notes_never_sees_a_partial_file(notes_path):
         stop.set()
         t.join(timeout=5)
 
+    # A silently-dead writer thread would leave every read at a constant
+    # 20 too — but over zero real concurrency, proving nothing.
+    assert not errors, f"writer thread raised: {errors}"
     assert all(c == 20 for c in counts)
 
 
-def test_atomic_replace_preserves_file_mode(notes_path):
+def test_atomic_replace_preserves_file_mode(notes_path, monkeypatch):
+    # Guards _write_atomic's own chmod step (Proof 11), not the
+    # pre/post-fix boundary: a literal revert of notes.py cannot show
+    # this red, because pre-fix code rewrites through the SAME file
+    # descriptor (open, truncate, write — never a new inode), so mode
+    # survives by construction whether or not the write goes through a
+    # new inode at all. Two-sided instead against a deliberately broken
+    # _write_atomic that skips the chmod call onto the new inode —
+    # exactly the behaviour this test exists to pin — which surfaces as
+    # mkstemp's own fixed 0600 default.
     notes.append_note("first", path=notes_path)
     notes_path.chmod(0o644)
-    notes.append_note("second", path=notes_path)
+
+    monkeypatch.setattr(notes.os, "chmod", lambda *a, **k: None)
+    notes.append_note("second, chmod disabled", path=notes_path)
+    assert stat.S_IMODE(notes_path.stat().st_mode) == 0o600, (
+        "the no-chmod shim should leave mkstemp's fixed default mode"
+    )
+
+    monkeypatch.undo()
+    notes_path.chmod(0o644)
+    notes.append_note("third, chmod restored", path=notes_path)
     assert stat.S_IMODE(notes_path.stat().st_mode) == 0o644
 
 
 def test_atomic_replace_default_mode_for_a_new_file(notes_path, monkeypatch):
-    monkeypatch.setattr(notes, "_current_umask", lambda: 0o022)
+    # Same guard as above, for the brand-new-file path. A literal
+    # pre-fix revert doesn't discriminate here either: old code creates
+    # the file via a plain open(path, "a+"), which already gets the
+    # umask-derived mode — identical to what _default_create_mode()
+    # computes today. Two-sided against the same broken-chmod shim.
+    monkeypatch.setattr(notes.os, "chmod", lambda *a, **k: None)
+    notes.append_note("first, chmod disabled", path=notes_path)
+    assert stat.S_IMODE(notes_path.stat().st_mode) == 0o600, (
+        "the no-chmod shim should leave mkstemp's fixed default mode"
+    )
+
+    monkeypatch.undo()
+    notes_path.unlink()
+    notes.append_note("second, chmod restored", path=notes_path)
+    expected = 0o666 & ~notes._current_umask()
+    assert stat.S_IMODE(notes_path.stat().st_mode) == expected
+
+
+def test_write_atomic_cleans_up_temp_file_on_failure(notes_path, monkeypatch):
+    # The one branch of the new code this layer otherwise leaves
+    # uncovered: if the replace itself fails, the temp file must not be
+    # left behind in data/, and the original file must be untouched —
+    # the "a reader never sees a partial file" contract would still be
+    # breakable by a stray half-written temp file otherwise.
     notes.append_note("first", path=notes_path)
-    assert stat.S_IMODE(notes_path.stat().st_mode) == 0o644
+    original = notes_path.read_text(encoding="utf-8")
+
+    def boom(*a, **k):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(notes.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        notes.append_note("second", path=notes_path)
+
+    assert notes_path.read_text(encoding="utf-8") == original
+    leftovers = [
+        p for p in notes_path.parent.iterdir()
+        if p.name.startswith(notes_path.name + ".") and p.name != notes_path.name + ".lock"
+    ]
+    assert leftovers == []
 
 
 def test_default_notes_path_env(tmp_path, monkeypatch):
