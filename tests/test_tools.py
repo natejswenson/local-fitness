@@ -1338,11 +1338,13 @@ def test_save_and_list_user_notes(seeded):
     saved, err = call(tools.save_user_note, {"note": "lead with the workout card"})
     assert not err and saved["saved"]
     assert len(saved["handle"]) == 8
+    assert "line" not in saved  # the old index field must not ride along the new one
     listed, err = call(tools.list_user_notes, {})
     assert not err
     assert listed["count"] == 1
     assert listed["notes"][0]["text"] == "lead with the workout card"
     assert listed["notes"][0]["handle"] == saved["handle"]
+    assert "line" not in listed["notes"][0]
 
 
 def test_save_user_note_empty(seeded):
@@ -1418,14 +1420,17 @@ def test_a_delete_no_longer_redirects_a_later_update(seeded):
     assert texts == {"zero", "REWRITTEN", "three"}
 
 
-def test_update_user_note_stale_handle_is_a_loud_error_not_a_silent_edit(seeded):
+def test_update_user_note_stale_handle_is_a_loud_error_not_a_silent_edit(seeded, tmp_path):
     """Two-sided half of the above: a good handle writes, a dead one
-    refuses — and the file is untouched by the refusal."""
+    refuses — and the file is untouched by the refusal, byte for byte."""
     saved, _ = call(tools.save_user_note, {"note": "original"})
     call(tools.update_user_note, {"handle": saved["handle"], "note": "rewritten"})
+    notes_path = tmp_path / "user_notes.md"
+    before = notes_path.read_bytes()
     payload, err = call(tools.update_user_note, {"handle": saved["handle"], "note": "should not land"})
     assert err
     assert saved["handle"] in payload["error"]
+    assert notes_path.read_bytes() == before  # the refusal must not touch the file at all
     listed, _ = call(tools.list_user_notes, {})
     assert listed["notes"][0]["text"] == "rewritten"
 
@@ -4295,15 +4300,20 @@ def test_fetch_metric_series_window_ends_on_the_given_date(seeded):
     """Regression: the window was anchored to date.today() with NO upper
     bound, so re-rendering an OLD brief drew charts running to today and could
     show data the brief's own prose never saw."""
-    dates, _values = tools._fetch_metric_series("rhr", 3650, end="2026-07-10")
+    # The end date is derived from today because the fixture seeds the 40 days
+    # ending today — a hard-coded date died the day it aged out of that window.
+    end = (date.today() - timedelta(days=5)).isoformat()
+    dates, _values = tools._fetch_metric_series("rhr", 3650, end=end)
     assert dates, "fixture should have rhr rows in range"
-    assert max(dates) <= "2026-07-10"
+    assert max(dates) <= end
 
 
 def test_fetch_metric_series_window_starts_days_before_end(seeded):
-    dates, _values = tools._fetch_metric_series("rhr", 7, end="2026-07-10")
-    assert min(dates) >= "2026-07-03"
-    assert max(dates) <= "2026-07-10"
+    end = (date.today() - timedelta(days=5)).isoformat()
+    start = (date.today() - timedelta(days=12)).isoformat()
+    dates, _values = tools._fetch_metric_series("rhr", 7, end=end)
+    assert min(dates) >= start
+    assert max(dates) <= end
 
 
 def test_fetch_metric_series_defaults_to_today_for_live_callers(seeded):
