@@ -484,7 +484,7 @@ def append_note(text: str, path: Path | None = None) -> Note:
         existing = ctx.existing_text
         candidate = existing + new_line
         if len(candidate.encode("utf-8")) > LIVE_FILE_MAX_BYTES:
-            kept, rotated = _rotate_to_fit(existing, new_line)
+            kept, rotated, _protected = _rotate_to_fit(existing, new_line)
             if rotated:
                 # Archive before the live replace: if the process dies
                 # between the two, the rotated note exists twice (archive
@@ -505,11 +505,17 @@ def append_note(text: str, path: Path | None = None) -> Note:
     return Note(handle=_handle(ts, text), position=new_position, timestamp=ts, text=text)
 
 
-def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
+def _rotate_to_fit(
+    existing: str, new_line: str = "", protected_index: int | None = None,
+) -> tuple[str, str, int | None]:
     """Drop bullets from ``existing``, oldest by timestamp, until
     ``existing + new_line`` fits the cap. Returns (kept_text,
-    rotated_text) where rotated_text contains the dropped lines, in the
-    order they were evicted, for archiving.
+    rotated_text, final_protected_index) where rotated_text contains the
+    dropped lines, in the order they were evicted, for archiving, and
+    final_protected_index is ``protected_index`` adjusted for every
+    eviction that shifted it (or ``None`` if ``protected_index`` was
+    ``None``) — the caller's cheap way to keep addressing the same line
+    across a rotation without re-deriving its position by content.
 
     Eviction ranks by ``recent_first`` and pops from the tail (oldest)
     end, not by file position — a position-based eviction (the old
@@ -524,9 +530,31 @@ def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
     the write proceeds over budget rather than spinning forever or
     discarding content that isn't a note at all.
 
+    ``new_line`` defaults to empty: ``append_note`` calls this with the
+    incoming bullet split out as ``new_line`` (it isn't part of ``lines``
+    yet), while ``update_note`` calls it with the *already-assembled*
+    whole-file text as ``existing`` and no separate ``new_line`` — the
+    just-refreshed bullet is already one of ``lines`` in that case.
+
+    ``protected_index`` names a line in ``existing`` (by its index at
+    call time) that is never a candidate for eviction, no matter what
+    ``recent_first`` would otherwise rank it. ``update_note`` passes the
+    index of the bullet it just rewrote: that bullet's brand-new
+    timestamp *usually* keeps ``recent_first`` from picking it as
+    oldest, but ``_recency_key`` tie-breaks equal timestamps by
+    position, and a same-wall-clock-second update racing another note's
+    write — or a hand-edited bullet carrying a future timestamp — can
+    still make the just-rewritten line the tail of that ordering.
+    Excluding it from the candidate set is what makes "never evicted by
+    its own update" true in every case rather than true only when no
+    other note ties its timestamp. ``append_note`` passes ``None``: the
+    bullet it is adding is carried in ``new_line``, not in ``lines``, so
+    it never needs protecting from this same loop.
+
     Relies on ``existing`` already ending in a trailing newline (or
-    being empty) — every caller passes ``ctx.existing_text``, which
-    ``_RewriteContext`` guarantees. That's what lets the joins below
+    being empty) — every caller passes either ``ctx.existing_text`` or a
+    whole-file text built from it, both of which ``_RewriteContext``
+    guarantees are newline-terminated. That's what lets the joins below
     happen cleanly instead of welding the last kept line into
     ``new_line``: this function establishes no boundary of its own
     because ``_locked_rewrite`` already established one for it.
@@ -541,7 +569,7 @@ def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
             Note(handle=parsed.handle, position=i,
                  timestamp=parsed.timestamp, text=parsed.text)
             for i, ln in enumerate(lines)
-            if (parsed := _parse_line(ln)) is not None
+            if i != protected_index and (parsed := _parse_line(ln)) is not None
         ]
         if not bullets:
             LOG.warning(
@@ -552,9 +580,14 @@ def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
             )
             break
         oldest = recent_first(bullets)[-1]
-        rotated.append(lines.pop(oldest.position))
+        popped_index = oldest.position
+        rotated.append(lines.pop(popped_index))
+        if protected_index is not None and popped_index < protected_index:
+            # Everything after the popped line shifted left by one — keep
+            # pointing at the same (still-unevicted) protected line.
+            protected_index -= 1
     kept = "".join(lines) + new_line
-    return kept, "".join(rotated)
+    return kept, "".join(rotated), protected_index
 
 
 def _append_archive(text: str, archive_path: Path) -> None:
@@ -599,6 +632,25 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
     rewrite, normally 1; see ``_Match``/``_RewriteContext.resolve`` for
     the >1 case. Used for in-place updates so a refined preference
     doesn't pile a duplicate onto the file.
+
+    Rewriting a short note into a much longer one can push the live file
+    past ``LIVE_FILE_MAX_BYTES`` — unlike ``append_note``, this rewrites a
+    line in place rather than adding one, so nothing about the write
+    itself would ever trip a size check unless this function makes one.
+    So, still inside the same held lock this rewrite happened in, the
+    result is size-checked the same way ``append_note`` checks a
+    candidate append: if it's over budget, the oldest bullets *by
+    timestamp* are rotated to the archive until it fits. The just-updated
+    note is stamped with ``now()`` moments before this check, which keeps
+    ``recent_first`` from ranking it oldest in the ordinary case — but a
+    second update landing in the same wall-clock second, or a hand-edited
+    bullet carrying a future timestamp, ties that ranking, and
+    ``_recency_key`` breaks ties by position, which does not favour the
+    just-rewritten line. So the rewritten line's index is passed to
+    ``_rotate_to_fit`` as ``protected_index``, which excludes it from the
+    eviction candidates outright: the just-updated note is never the
+    thing evicted by its own update, in every case, not only the case
+    where no other note's timestamp ties it.
     """
     new_text = " ".join(new_text.split())
     if not new_text:
@@ -622,8 +674,26 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
         # file shape stays consistent.
         had_newline = lines[match.index].endswith("\n")
         lines[match.index] = f"- {ts} — {new_text}" + ("\n" if had_newline else "")
-        ctx.text = "".join(lines)
-        new_note = Note(handle=_handle(ts, new_text), position=match.index,
+        candidate = "".join(lines)
+        new_position = match.index
+
+        if len(candidate.encode("utf-8")) > LIVE_FILE_MAX_BYTES:
+            kept, rotated, protected_after = _rotate_to_fit(
+                candidate, protected_index=new_position,
+            )
+            if rotated:
+                # Archive before the live replace — see append_note for
+                # why (duplication on a crash recovers, loss doesn't).
+                _append_archive(rotated, _archive_path(p))
+            ctx.text = kept
+            # protected_index was passed as an int (new_position), so
+            # _rotate_to_fit always returns an int back here too.
+            assert protected_after is not None
+            new_position = protected_after
+        else:
+            ctx.text = candidate
+
+        new_note = Note(handle=_handle(ts, new_text), position=new_position,
                          timestamp=ts, text=new_text)
         result = (new_note, match.duplicates)
     return result

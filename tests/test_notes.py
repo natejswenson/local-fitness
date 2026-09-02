@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import stat
 import threading
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -12,6 +13,29 @@ from local_fitness import notes
 @pytest.fixture
 def notes_path(tmp_path):
     return tmp_path / "user_notes.md"
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    """Patches notes.datetime.now() to return a strictly increasing
+    sequence of timestamps, one second apart, starting at a fixed
+    instant. Every call anywhere inside notes.py -- append_note's stamp,
+    update_note's stamp -- draws from this same sequence, so no two
+    calls in a test using this fixture can ever land in the same
+    wall-clock second. That removes the real flakiness a same-second
+    tie can cause (an update racing another note's write, or a test
+    straddling a second boundary) without touching any product code."""
+    state = {"t": datetime(2026, 1, 1, 0, 0, 0)}
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = state["t"]
+            state["t"] = current + timedelta(seconds=1)
+            return current
+
+    monkeypatch.setattr(notes, "datetime", _FrozenDatetime)
+    return state
 
 
 def test_empty_when_missing(notes_path):
@@ -111,6 +135,200 @@ def test_update_note_empty_raises(notes_path):
     n0 = notes.append_note("a", path=notes_path)
     with pytest.raises(ValueError):
         notes.update_note(n0.handle, "   ", path=notes_path)
+
+
+def test_update_note_enforces_the_cap(notes_path, frozen_clock):
+    # Repro 3: only append_note called _rotate_to_fit, so replacing a
+    # short note with a much longer one could leave the live file over
+    # LIVE_FILE_MAX_BYTES until the next append -- measured at 4962 bytes
+    # against a 4096 cap in the investigation. update_note must enforce
+    # the cap itself, inside the same held lock as the rewrite that
+    # caused it, after EVERY update -- not just eventually.
+    #
+    # Each note is updated immediately after it is appended (not: append
+    # all six, then update all six). Appending all six up front and only
+    # then updating them left the not-yet-updated originals sitting at
+    # the OLDEST timestamps in the file for the whole loop -- once
+    # rotation started firing, those still-untouched originals were
+    # exactly what got evicted ahead of their own turn, so a later call
+    # to update_note() on that now-archived handle correctly returned
+    # None and `assert result is not None` failed on unmodified code.
+    # That isn't a bug (a handle whose note rotated away is supposed to
+    # refuse), it was a test-design flaw producing a wall-clock-shaped
+    # failure (found in review). Interleaving means every handle this
+    # test still holds has *just* been updated -- and update_note's own
+    # protected_index always excludes the line it just rewrote from that
+    # same call's rotation -- so no handle this loop still cares about is
+    # ever a legitimate eviction target of a later iteration; only
+    # already-completed, no-longer-tracked updates are.
+    #
+    # frozen_clock pins every timestamp to its own distinct, strictly
+    # increasing second regardless, so ordering never depends on how
+    # fast the real clock ticks during the run.
+    seen_texts: list[str] = []
+    for i in range(6):
+        appended = notes.append_note(f"note {i}", path=notes_path)
+        # Unique text per iteration (not a shared "x" * 800 for all six)
+        # so the identity check below is real: six identical strings
+        # would pass even if rotation archived one note twice and
+        # dropped a different one -- exactly the wrong-note-hit failure
+        # mode this issue exists to close (found in review).
+        text = f"{i:02d}-" + "x" * 797
+        result = notes.update_note(appended.handle, text, path=notes_path)
+        assert result is not None
+        updated, _ = result
+        seen_texts.append(updated.text)
+        live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+        assert len(live_bytes) <= notes.LIVE_FILE_MAX_BYTES
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()  # rotation must actually have fired
+    archived_texts = [n.text for n in notes.read_notes(archive)]
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    # Every one of the six updated notes survives as its own distinct
+    # note -- either still live or safely archived, never lost. Now a
+    # real identity check: each of the six texts is unique, so this
+    # multiset comparison would fail if rotation duplicated or dropped
+    # one, not just if the count were wrong.
+    assert sorted(archived_texts + live_texts) == sorted(seen_texts)
+
+
+def test_update_note_never_evicts_its_own_just_refreshed_note(notes_path):
+    # The cap check runs after update_note stamps its own fresh "now"
+    # timestamp -- that must not make the note it just refreshed the
+    # thing recent_first picks as oldest. Fill near the cap, then replace
+    # the note that is genuinely oldest (both by position and by
+    # timestamp) with a much longer one: it must survive, and whichever
+    # note is now the true oldest by timestamp (note 1) is what's
+    # archived instead.
+    bullets = [
+        f"- 2026-01-01T00:00:{i:02d} — preference number {i} with some padding text here"
+        for i in range(48)
+    ]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    oldest = notes.read_notes(notes_path)[0]
+
+    result = notes.update_note(oldest.handle, "x" * 800, path=notes_path)
+    assert result is not None
+    updated_note, _ = result
+
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) <= notes.LIVE_FILE_MAX_BYTES
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert updated_note.text in live_texts
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()
+    archived_texts = [n.text for n in notes.read_notes(archive)]
+    assert "preference number 1 with some padding text here" in archived_texts
+
+
+def test_update_note_never_evicts_its_own_note_even_when_everyone_else_outranks_it(notes_path):
+    # Round-1 review finding: the previous guard only worked because the
+    # just-refreshed note's brand-new "now" timestamp usually IS the
+    # newest in the file. It breaks the moment something else in the
+    # file outranks that fresh timestamp -- a hand-edited bullet with a
+    # FUTURE date is the deterministic way to construct that without
+    # depending on real wall-clock ties between two calls. Every other
+    # live bullet here is dated in 2099, so after the rewrite the
+    # just-updated line (timestamp = real "now") is the single oldest
+    # thing in the file by `_recency_key` -- exactly what used to make
+    # `_rotate_to_fit` archive it, silently orphaning the handle
+    # `update_user_note` had just told the caller was live.
+    fillers = [
+        f"- 2099-01-01T00:00:{i:02d} — future filler note number {i:02d} "
+        "with some padding text here to take up room"
+        for i in range(45)
+    ]
+    target_line = "- 2020-01-01T00:00:00 — old target note to be replaced"
+    notes_path.write_text("\n".join([target_line, *fillers]) + "\n", encoding="utf-8")
+    target = notes.read_notes(notes_path)[0]
+
+    result = notes.update_note(target.handle, "x" * 800, path=notes_path)
+    assert result is not None
+    updated_note, _ = result
+
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) <= notes.LIVE_FILE_MAX_BYTES
+
+    # The just-updated note survives live, under its NEW handle...
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert updated_note.text in live_texts
+    # ...and that handle keeps resolving on the very next call, which is
+    # exactly what a caller checks to confirm the write actually landed.
+    assert notes.update_note(updated_note.handle, "y", path=notes_path) is not None
+
+    # Rotation still fired, and it took one of the future-dated fillers
+    # instead -- eviction happened, it just didn't pick the wrong note.
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()
+    archived_texts = {n.text for n in notes.read_notes(archive)}
+    assert any(t.startswith("future filler note number") for t in archived_texts)
+
+
+def test_update_note_protected_index_tracks_the_target_across_multiple_evictions(notes_path):
+    # The two tests above both protect a target sitting at file position
+    # 0 -- _rotate_to_fit never pops anything *before* it, so the
+    # `protected_index -= 1` shift-adjustment in _rotate_to_fit is never
+    # exercised: with that single line deleted (no other change),
+    # every test in this file still passes (confirmed directly:
+    # 3/3 green with the line removed, per review). This test puts the
+    # target at position 5, behind five bullets that are evicted first,
+    # so protecting it correctly *requires* protected_index to track the
+    # target's shifting position across five separate eviction rounds,
+    # not just guard a fixed index.
+    #
+    # Five ancient bullets (year 2000) are older than everything else,
+    # so they are evicted first regardless of protection -- that part of
+    # the ordering doesn't depend on the fix under test. The target
+    # starts at position 5, older than the ancients' *contents* don't
+    # matter, only that they sort before it. Forty-five future-dated
+    # (2099) fillers follow: once the five ancients are gone, the
+    # just-updated target (stamped with the real "now", which is older
+    # than 2099) becomes the true oldest of everything left -- so if
+    # protected_index has gone stale (not decremented across those five
+    # prior evictions), it now points at whatever shifted into the
+    # target's old slot, the target is left unprotected, and -- being
+    # the genuine oldest survivor -- it is exactly what gets evicted
+    # next, silently orphaning the handle update_note just returned.
+    ancients = [
+        f"- 2000-01-01T00:00:{i:02d} — ancient filler {i:02d} with some padding text here"
+        for i in range(5)
+    ]
+    target_line = "- 2020-01-01T00:00:00 — old target note to be replaced"
+    fillers = [
+        f"- 2099-01-01T00:00:{i:02d} — future filler note number {i:02d} "
+        "with some padding text here to take up room"
+        for i in range(45)
+    ]
+    notes_path.write_text(
+        "\n".join([*ancients, target_line, *fillers]) + "\n", encoding="utf-8",
+    )
+    target = notes.read_notes(notes_path)[5]
+    assert target.text == "old target note to be replaced"
+
+    result = notes.update_note(target.handle, "x" * 800, path=notes_path)
+    assert result is not None
+    updated_note, _ = result
+
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) <= notes.LIVE_FILE_MAX_BYTES
+
+    # The just-updated note survives live -- this is the assertion that
+    # fails when protected_index is not adjusted for the five prior
+    # evictions in front of it.
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert updated_note.text in live_texts
+    assert notes.update_note(updated_note.handle, "y", path=notes_path) is not None
+
+    # Rotation fired well past the five ancients -- some future filler
+    # was evicted too, confirming the cap check kept going after the
+    # ancients ran out rather than stopping short.
+    archive = notes._archive_path(notes_path)
+    archived_texts = {n.text for n in notes.read_notes(archive)}
+    assert any(t.startswith("ancient filler") for t in archived_texts)
+    assert any(t.startswith("future filler note number") for t in archived_texts)
 
 
 def test_delete_note(notes_path):
