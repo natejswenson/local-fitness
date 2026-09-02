@@ -214,11 +214,16 @@ UI. The notes section above is the authoritative list. A durable preference
 ("I wish you were kinder", "stop telling me my fitness is dropping") →
 ``save_user_note`` with a one-sentence paraphrase, after scanning the section
 above: if it overlaps an existing note, ask whether to replace it
-(``update_user_note(line=N, …)``) or keep both rather than silently
-duplicating. "Forget that" → ``delete_user_note(line=N)``, asking which line
-when ambiguous. ``list_user_notes`` re-reads from disk if the section looks
-stale. Don't save questions ("what was my RHR last week?") or transients
-("today felt off"). At most one note call per turn unless he asks for several.
+(``update_user_note(handle="a1b2c3d4", note=…)``) or keep both rather than
+silently duplicating. "Forget that" → ``delete_user_note(handle="a1b2c3d4")``,
+asking which note when ambiguous. Copy the ``handle`` exactly as shown in the
+``[brackets]`` above — it addresses a note by content, not position, so it
+still finds the right one even if something else was deleted or rotated
+first. If a handle comes back as an error, that means the note changed or is
+gone since this was rendered — call ``list_user_notes`` to re-read rather
+than guessing. Don't save questions ("what was my RHR last week?") or
+transients ("today felt off"). At most one note call per turn unless he asks
+for several.
 
 # Managing the training plan
 You own the plan — there is no UI, and {user_name} sees only what you tell him.

@@ -28,13 +28,14 @@ keeps prompt context bounded — older bullets overflow to
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import logging
 import os
 import stat
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 LOG = logging.getLogger(__name__)
@@ -64,9 +65,48 @@ def _archive_path(live_path: Path) -> Path:
 
 @dataclass(frozen=True)
 class Note:
-    line: int  # 0-indexed position in the live file (stable until next write)
+    handle: str  # 8 lowercase hex chars of sha256(timestamp + "\n" + text) —
+                 # the address a caller uses to target this note. Derived on
+                 # every read, never stored; survives an unrelated delete or
+                 # rotation because it carries no position. See _handle().
+    position: int  # 0-indexed offset in the live file AT READ TIME. Not an
+                    # identity — a write elsewhere renumbers it — so this is
+                    # a hint for the writer only and never reaches a tool
+                    # payload. (Was `line`; renamed so the distinction from
+                    # `handle` is visible at every call site.)
     timestamp: str  # ISO-8601 second-precision
     text: str
+
+
+def _handle(timestamp: str, text: str) -> str:
+    """The content address for a note: 8 lowercase hex characters of
+    sha256(timestamp + "\\n" + text).
+
+    Position-independent by construction — the only thing that changes it
+    is the note's own timestamp or text changing, which is exactly the
+    case (an update, or a hand-edit) where re-addressing is correct
+    behaviour rather than a bug. Two live notes collide only if they are
+    byte-for-byte identical in both fields; see _RewriteContext.resolve
+    for how a collision is tolerated rather than treated as ambiguous.
+    Short, not cryptographically strong: the only adversary here is a
+    stale value, and the model has to transcribe it verbatim.
+    """
+    digest = hashlib.sha256(f"{timestamp}\n{text}".encode()).hexdigest()
+    return digest[:8]
+
+
+def _normalize_handle(raw: str) -> str:
+    """Normalise a caller-supplied handle before matching against one.
+
+    The model reads `[a1b2c3d4] 2026-04-28 — ...` off the rendered prompt
+    and will often echo the brackets back. Strip whitespace, drop one
+    layer of surrounding `[ ]` if present, and lowercase. Matching is
+    exact 8-character equality only — there is no prefix matching.
+    """
+    h = raw.strip()
+    if len(h) > 2 and h.startswith("[") and h.endswith("]"):
+        h = h[1:-1].strip()
+    return h.lower()
 
 
 @contextmanager
@@ -139,33 +179,92 @@ def _write_atomic(path: Path, text: str, mode: int) -> None:
         raise
 
 
+def _ensure_trailing_newline(text: str) -> str:
+    """Return ``text`` with a trailing newline, unless it's empty.
+
+    This is the line-boundary invariant every writer in this module
+    depends on: text that already satisfies it can be concatenated onto
+    (another line appended, or more text written after it) without the
+    last existing line welding into what follows. An empty string stays
+    empty — there's no line to terminate, and turning "no file" or "no
+    notes left" into a lone blank line would be its own corruption.
+    """
+    if not text:
+        return text
+    return text if text.endswith("\n") else text + "\n"
+
+
+@dataclass(frozen=True)
+class _Match:
+    """One resolved handle lookup: which live line it points at, the
+    parsed note there, and how many live lines matched in total.
+
+    ``duplicates`` is normally 1. It is only >1 for a hand-edited pair of
+    bullets sharing an identical timestamp AND text — those parse to the
+    identical handle, and the module invites hand-editing, so this is a
+    real shape rather than a defect to refuse against. The caller acts on
+    the first match in file order and reports the count; after the write
+    the acted-on note's text or timestamp has changed, so its handle
+    changes too and the pair is unique again.
+    """
+
+    index: int
+    note: Note
+    duplicates: int
+
+
 class _RewriteContext:
     """Handle for one locked read -> resolve -> rewrite cycle.
 
     ``existing_text``/``lines`` are the file as read *inside* the lock —
-    the only state ``resolve`` may use. Assign ``.text`` before the
-    ``with`` block exits; that whole-file text is what gets written.
-    Leaving ``.text`` as ``None`` (the target wasn't found, or nothing
-    needs to change) writes nothing — the file is left untouched.
+    the only state ``resolve`` may use. ``existing_text`` is normalised
+    to end in a trailing newline (if it holds any content at all) before
+    ``lines`` is derived from it, so every line in ``lines`` is properly
+    terminated even when the file on disk was hand-edited or otherwise
+    left without one. That is what lets a writer concatenate new content
+    directly onto ``existing_text`` (or onto ``"".join(lines)``) without
+    re-deriving the boundary itself — ``_rotate_to_fit`` in particular
+    relies on this rather than re-implementing it.
+
+    Assign ``.text`` before the ``with`` block exits; that whole-file
+    text is what gets written (also normalised to end in a trailing
+    newline, on the way out — see ``_locked_rewrite``). Leaving ``.text``
+    as ``None`` (the target wasn't found, or nothing needs to change)
+    writes nothing — the file is left untouched.
     """
 
     def __init__(self, existing_text: str):
-        self.existing_text = existing_text
-        self.lines: list[str] = existing_text.splitlines(keepends=True)
+        self.existing_text = _ensure_trailing_newline(existing_text)
+        self.lines: list[str] = self.existing_text.splitlines(keepends=True)
         self.text: str | None = None
 
-    def resolve(self, line_index: int) -> Note | None:
-        """Validate ``line_index`` against the lines read inside this
-        lock and return the parsed note there, or None if the index is
-        out of range or no longer points at a bullet.
+    def resolve(self, handle: str) -> _Match | None:
+        """Find the first live line whose content handle equals
+        ``handle`` (already normalised by the caller — see
+        ``_normalize_handle``), among the lines read inside this lock.
 
-        This is the only supported way to target a line for update or
+        Returns a ``_Match`` naming the first line found plus how many
+        lines matched in total, or ``None`` if no live line carries this
+        handle — whether because it was never live, was already deleted,
+        was rewritten (an update changes the text and/or timestamp, so
+        it changes the handle too), or was rotated to the archive. This
+        is the compare-and-swap: a caller holding a stale handle is
+        refused loudly instead of silently landing on whatever now
+        occupies its old position.
+
+        This is the only supported way to target a note for update or
         delete — there is no free function that resolves against a list
         read outside the lock.
         """
-        if line_index < 0 or line_index >= len(self.lines):
+        matches = [
+            (i, parsed)
+            for i, ln in enumerate(self.lines)
+            if (parsed := _parse_line(ln)) is not None and parsed.handle == handle
+        ]
+        if not matches:
             return None
-        return _parse_line(self.lines[line_index])
+        index, note = matches[0]
+        return _Match(index=index, note=note, duplicates=len(matches))
 
 
 @contextmanager
@@ -175,13 +274,19 @@ def _locked_rewrite(path: Path, *, _after_read_hook=None):
     Reads and parses the live file *inside* the lock and yields a
     ``_RewriteContext`` built from that read — every writer resolves its
     target and assembles its new content against that same read, never
-    against a separately-read copy. On exit (still holding the lock), if
-    ``ctx.text`` was assigned, it is written atomically: a
-    same-directory temp file, chmod'd to the original file's mode (or
-    ``0o666 & ~umask`` if the file is being created), fsynced, then
-    ``os.replace``'d over the original. A reader — ``read_notes``, or a
-    text editor with the file open — therefore never observes a partial
-    file: only the whole old one or the whole new one.
+    against a separately-read copy. The read is normalised to end in a
+    trailing newline before it reaches the context (see
+    ``_RewriteContext``), and ``ctx.text`` is normalised the same way on
+    the way out — so a whole-file text a writer assembles by
+    concatenating onto ``ctx.existing_text`` can never weld its last
+    existing line into what got appended, on either side of the round
+    trip. On exit (still holding the lock), if ``ctx.text`` was assigned,
+    it is written atomically: a same-directory temp file, chmod'd to the
+    original file's mode (or ``0o666 & ~umask`` if the file is being
+    created), fsynced, then ``os.replace``'d over the original. A
+    reader — ``read_notes``, or a text editor with the file open —
+    therefore never observes a partial file: only the whole old one or
+    the whole new one.
 
     ``_after_read_hook``, if given, fires once the read has happened but
     before control returns to the ``with`` block — a seam for tests that
@@ -203,14 +308,20 @@ def _locked_rewrite(path: Path, *, _after_read_hook=None):
         ctx = _RewriteContext(existing_text)
         yield ctx
         if ctx.text is not None:
-            _write_atomic(path, ctx.text, mode)
+            _write_atomic(path, _ensure_trailing_newline(ctx.text), mode)
     finally:
         lock_handle.close()
 
 
 def _parse_line(line: str) -> Note | None:
     """Parse one bullet. Returns None for blank/non-bullet lines so the
-    file can hold human-edited prose without breaking the read path."""
+    file can hold human-edited prose without breaking the read path.
+
+    ``position`` is always -1 here — this function has no idea where in
+    the file it was called from; callers that know the offset (``read_notes``,
+    ``_RewriteContext.resolve``) fill it in themselves. ``handle`` is always
+    correct, since it is derived purely from ``timestamp``/``text``.
+    """
     raw = line.rstrip("\n")
     if not raw.startswith("- "):
         return None
@@ -222,9 +333,10 @@ def _parse_line(line: str) -> Note | None:
         if idx > 0:
             ts = body[:idx].strip()
             text = body[idx + len(sep):].strip()
-            return Note(line=-1, timestamp=ts, text=text)
+            return Note(handle=_handle(ts, text), position=-1, timestamp=ts, text=text)
     # No separator — treat the whole thing as undated text.
-    return Note(line=-1, timestamp="", text=body.strip())
+    text = body.strip()
+    return Note(handle=_handle("", text), position=-1, timestamp="", text=text)
 
 
 def read_notes(path: Path | None = None) -> list[Note]:
@@ -242,7 +354,8 @@ def read_notes(path: Path | None = None) -> list[Note]:
     for idx, raw_line in enumerate(text.splitlines()):
         parsed = _parse_line(raw_line)
         if parsed is not None:
-            notes.append(Note(line=idx, timestamp=parsed.timestamp, text=parsed.text))
+            notes.append(Note(handle=parsed.handle, position=idx,
+                               timestamp=parsed.timestamp, text=parsed.text))
     return notes
 
 
@@ -250,16 +363,29 @@ def render_for_prompt(path: Path | None = None) -> str:
     """Render the notes for inclusion in a system prompt.
 
     Returns an empty string when there are no notes (caller can skip the
-    section heading). Otherwise returns one bullet per line, newest-first.
-    Includes the on-disk line index as a prefix so the model can reference
-    a specific note by number when the user asks to update or remove one
-    ("delete note 2", "replace the kindness note") — this is what powers
-    the conversational management flow.
+    section heading). Otherwise returns one bullet per line, newest-first
+    by on-disk position (recency-by-timestamp ranking is a later change —
+    see ``notes-recency-ordering``).
+
+    Each line carries the note's content ``handle`` as a ``[prefix]``, not
+    a raw file line index — a line's position is not a stable identity
+    (see ``Note.position``), so ``update_user_note`` / ``delete_user_note``
+    address a note by this handle instead, and it keeps resolving
+    correctly even after an unrelated note is deleted or the file is
+    rotated. The date rides alongside the handle so the model can apply
+    the "prefer the newer note" rule from evidence it can see, rather than
+    trusting an ordering it has no way to verify.
     """
-    notes = list(reversed(read_notes(path)))  # newest first
+    notes = list(reversed(read_notes(path)))  # newest-by-position first
     if not notes:
         return ""
-    return "\n".join(f"[{n.line}] {n.text}" for n in notes if n.text)
+    lines = []
+    for n in notes:
+        if not n.text:
+            continue
+        date_part = n.timestamp[:10] if n.timestamp else "undated"
+        lines.append(f"[{n.handle}] {date_part} — {n.text}")
+    return "\n".join(lines)
 
 
 def append_note(text: str, path: Path | None = None) -> Note:
@@ -277,12 +403,32 @@ def append_note(text: str, path: Path | None = None) -> Note:
         text = text[:800].rstrip() + "…"
 
     p = path or _default_notes_path()
-    ts = datetime.now().replace(microsecond=0).isoformat()
-    new_line = f"- {ts} — {text}\n"
 
     with _locked_rewrite(p) as ctx:
+        # Never manufacture a handle collision. Two notes with an
+        # identical (timestamp, text) pair parse to the identical
+        # handle — the shape update_note/delete_note tolerate as a
+        # hand-edited duplicate, not one this tool should create on its
+        # own. Re-stamp a second later instead; the only in-app path to
+        # this is two save_user_note calls with identical text inside
+        # the same wall-clock second.
+        existing_handles = {
+            parsed.handle
+            for ln in ctx.lines
+            if (parsed := _parse_line(ln)) is not None
+        }
+        ts_dt = datetime.now().replace(microsecond=0)
+        ts = ts_dt.isoformat()
+        while _handle(ts, text) in existing_handles:
+            ts_dt += timedelta(seconds=1)
+            ts = ts_dt.isoformat()
+        new_line = f"- {ts} — {text}\n"
+
+        # ctx.existing_text is already newline-normalised (see
+        # _RewriteContext), so appending new_line directly can never
+        # weld it into a bare-last-line file.
         existing = ctx.existing_text
-        candidate = existing + (new_line if existing.endswith("\n") or not existing else "\n" + new_line)
+        candidate = existing + new_line
         if len(candidate.encode("utf-8")) > LIVE_FILE_MAX_BYTES:
             kept, rotated = _rotate_to_fit(existing, new_line)
             if rotated:
@@ -297,17 +443,25 @@ def append_note(text: str, path: Path | None = None) -> Note:
             ctx.text = candidate
             final_text = candidate
     LOG.info("Saved user note (%d chars)", len(text))
-    # The appended bullet is the last line of the file; its raw line index
+    # The appended bullet is the last line of the file; its position
     # (matching how read_notes/update_note/delete_note count via
-    # splitlines()) is the count of file lines minus one.
-    new_line_index = len(final_text.splitlines()) - 1
-    return Note(line=new_line_index, timestamp=ts, text=text)
+    # splitlines()) is the count of file lines minus one. Position is a
+    # hint only — the handle is what a caller actually addresses it by.
+    new_position = len(final_text.splitlines()) - 1
+    return Note(handle=_handle(ts, text), position=new_position, timestamp=ts, text=text)
 
 
 def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
     """Drop oldest lines from ``existing`` until ``existing + new_line``
     fits the cap. Returns (kept_text, rotated_text) where rotated_text
     contains the dropped lines (in original order) for archiving.
+
+    Relies on ``existing`` already ending in a trailing newline (or
+    being empty) — every caller passes ``ctx.existing_text``, which
+    ``_RewriteContext`` guarantees. That's what lets ``"".join(lines) +
+    new_line`` below join cleanly instead of welding the last kept line
+    into ``new_line``: this function establishes no boundary of its own
+    because ``_locked_rewrite`` already established one for it.
     """
     lines = existing.splitlines(keepends=True)
     rotated: list[str] = []
@@ -322,22 +476,46 @@ def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
 
 def _append_archive(text: str, archive_path: Path) -> None:
     """Append rotated content to the archive file. Best-effort — failures
-    are logged but don't block the live write."""
+    are logged but don't block the live write.
+
+    Establishes the line boundary on *both* sides of the join: the text
+    being appended (via ``_ensure_trailing_newline``, same as before),
+    and — the file it appends *to*. Unlike the live file, the archive is
+    never rewritten through ``_locked_rewrite``, so nothing upstream
+    normalises what's already on disk; a previous run that welded a line
+    (or a hand-edited archive with no trailing newline) would otherwise
+    weld the very first archived line of *this* rotation onto it too.
+    """
     try:
         archive_path.parent.mkdir(parents=True, exist_ok=True)
         with _open_locked(archive_path, "a") as h:
-            h.write(text)
-            if not text.endswith("\n"):
+            needs_boundary = False
+            if archive_path.exists() and archive_path.stat().st_size > 0:
+                with open(archive_path, "rb") as rf:
+                    rf.seek(-1, os.SEEK_END)
+                    needs_boundary = rf.read(1) != b"\n"
+            if needs_boundary:
                 h.write("\n")
+            h.write(_ensure_trailing_newline(text))
     except OSError as e:
         LOG.warning("Failed to write archive %s: %s", archive_path, e)
 
 
-def update_note(line_index: int, new_text: str, path: Path | None = None) -> Note | None:
-    """Replace the bullet at ``line_index`` with ``new_text`` (timestamp
-    refreshed to now). Returns the new ``Note`` or None if the index
-    doesn't point at a bullet. Used for in-place updates so a refined
-    preference doesn't pile a duplicate onto the file.
+def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[Note, int] | None:
+    """Replace the bullet whose content handle is ``handle`` with
+    ``new_text`` (timestamp refreshed to now). Returns ``(new_note,
+    duplicates)`` or ``None`` if no live line's handle matches — a stale
+    handle (the target was itself updated, deleted, or rotated to the
+    archive since the caller read it) is the loud failure the index bug
+    never gave: nothing is written, and the caller is told to re-read
+    rather than being silently pointed at a different note. ``handle`` is
+    normalised (stripped, debracketed, lowercased) before matching, and
+    matched by exact value only — no prefix matching.
+
+    ``duplicates`` is the number of live lines that matched before the
+    rewrite, normally 1; see ``_Match``/``_RewriteContext.resolve`` for
+    the >1 case. Used for in-place updates so a refined preference
+    doesn't pile a duplicate onto the file.
     """
     new_text = " ".join(new_text.split())
     if not new_text:
@@ -349,38 +527,46 @@ def update_note(line_index: int, new_text: str, path: Path | None = None) -> Not
     if not p.exists():
         return None
 
+    handle = _normalize_handle(handle)
     ts = datetime.now().replace(microsecond=0).isoformat()
-    result: Note | None = None
+    result: tuple[Note, int] | None = None
     with _locked_rewrite(p) as ctx:
-        if ctx.resolve(line_index) is None:
+        match = ctx.resolve(handle)
+        if match is None:
             return None
         lines = ctx.lines
         # Preserve trailing newline character of the original line so the
         # file shape stays consistent.
-        had_newline = lines[line_index].endswith("\n")
-        lines[line_index] = f"- {ts} — {new_text}" + ("\n" if had_newline else "")
+        had_newline = lines[match.index].endswith("\n")
+        lines[match.index] = f"- {ts} — {new_text}" + ("\n" if had_newline else "")
         ctx.text = "".join(lines)
-        result = Note(line=line_index, timestamp=ts, text=new_text)
+        new_note = Note(handle=_handle(ts, new_text), position=match.index,
+                         timestamp=ts, text=new_text)
+        result = (new_note, match.duplicates)
     return result
 
 
-def delete_note(line_index: int, path: Path | None = None) -> bool:
-    """Remove the bullet at ``line_index`` (0-indexed against the live
-    file's lines, matching ``Note.line``). Returns True if a line was
-    removed, False if the index doesn't point at a bullet.
+def delete_note(handle: str, path: Path | None = None) -> int | None:
+    """Remove the first live bullet whose content handle is ``handle``.
+
+    Returns the number of live lines that matched *before* the removal
+    (normally 1; see ``_Match`` for the duplicate case), or ``None`` if
+    no live line's handle matches — whether because it never existed,
+    was already deleted, was rewritten by an update, or was rotated to
+    the archive. ``handle`` is normalised the same way as ``update_note``.
     """
     p = path or _default_notes_path()
     if not p.exists():
-        return False
+        return None
 
-    removed = False
+    handle = _normalize_handle(handle)
+    result: int | None = None
     with _locked_rewrite(p) as ctx:
-        if ctx.resolve(line_index) is None:
-            # Out of range, or no longer a bullet — don't let callers
-            # delete arbitrary non-bullet lines.
-            return False
+        match = ctx.resolve(handle)
+        if match is None:
+            return None
         lines = ctx.lines
-        del lines[line_index]
+        del lines[match.index]
         ctx.text = "".join(lines)
-        removed = True
-    return removed
+        result = match.duplicates
+    return result

@@ -2014,7 +2014,7 @@ async def save_user_note(args: dict) -> dict:
         n = notes.append_note(text)
     except ValueError as e:
         return _err(str(e))
-    return _text({"saved": True, "line": n.line, "timestamp": n.timestamp, "text": n.text})
+    return _text({"saved": True, "handle": n.handle, "timestamp": n.timestamp, "text": n.text})
 
 
 @tool(
@@ -2022,15 +2022,16 @@ async def save_user_note(args: dict) -> dict:
     "Read the current list of saved user-preference notes from disk. "
     "Use this when the user asks 'what notes do you have', 'show me my "
     "settings', or before deciding whether a new preference overlaps an "
-    "existing note. Returns notes with their line indices so subsequent "
-    "update_user_note / delete_user_note calls can target a specific one.",
+    "existing note. Returns each note's handle — a content address, not a "
+    "position — so subsequent update_user_note / delete_user_note calls "
+    "can target a specific one.",
     {},
 )
 async def list_user_notes(_args: dict) -> dict:
     items = notes.read_notes()
     return _text({
         "notes": [
-            {"line": n.line, "timestamp": n.timestamp, "text": n.text}
+            {"handle": n.handle, "timestamp": n.timestamp, "text": n.text}
             for n in items
         ],
         "count": len(items),
@@ -2039,44 +2040,63 @@ async def list_user_notes(_args: dict) -> dict:
 
 @tool(
     "update_user_note",
-    "Replace the note at the given line index with new text (e.g. when the "
+    "Replace the note with the given handle with new text (e.g. when the "
     "user wants to refine an existing preference instead of adding a new "
-    "one). The line index comes from list_user_notes or the system "
-    "prompt's notes section. Always confirm with the user before "
-    "overwriting — don't silently replace.",
-    {"line": int, "note": str},
+    "one). The handle comes from list_user_notes or the system prompt's "
+    "notes section — it addresses a note by content, not position, so it "
+    "still resolves correctly even after some other note was deleted or "
+    "rotated. A handle that no longer matches any live note is an error "
+    "to re-read from (call list_user_notes), never a reason to guess. "
+    "Always confirm with the user before overwriting — don't silently "
+    "replace.",
+    {"handle": str, "note": str},
 )
 async def update_user_note(args: dict) -> dict:
-    line = args.get("line")
+    handle = (args.get("handle") or "").strip()
     text = (args.get("note") or "").strip()
-    if line is None or not isinstance(line, int):
-        return _err("line index is required")
+    if not handle:
+        return _err("handle is required")
     if not text:
         return _err("new note text is required")
     try:
-        n = notes.update_note(line, text)
+        result = notes.update_note(handle, text)
     except ValueError as e:
         return _err(str(e))
-    if n is None:
-        return _err(f"no note at line {line}")
-    return _text({"updated": True, "line": n.line, "timestamp": n.timestamp, "text": n.text})
+    if result is None:
+        return _err(
+            f"no note with handle '{handle}' — it may have been updated, "
+            "deleted, or rotated to the archive since you read it; call "
+            "list_user_notes to re-read"
+        )
+    n, duplicates = result
+    return _text({
+        "updated": True, "handle": n.handle, "timestamp": n.timestamp,
+        "text": n.text, "duplicates": duplicates,
+    })
 
 
 @tool(
     "delete_user_note",
-    "Remove the note at the given line index. Use when the user asks to "
-    "forget or drop a saved preference. Confirm with the user first if the "
-    "intent is ambiguous.",
-    {"line": int},
+    "Remove the note with the given handle. Use when the user asks to "
+    "forget or drop a saved preference. The handle comes from "
+    "list_user_notes or the system prompt's notes section; a handle that "
+    "no longer matches any live note is an error to re-read from, never a "
+    "reason to guess. Confirm with the user first if the intent is "
+    "ambiguous.",
+    {"handle": str},
 )
 async def delete_user_note(args: dict) -> dict:
-    line = args.get("line")
-    if line is None or not isinstance(line, int):
-        return _err("line index is required")
-    ok = notes.delete_note(line)
-    if not ok:
-        return _err(f"no note at line {line}")
-    return _text({"deleted": True, "line": line})
+    handle = (args.get("handle") or "").strip()
+    if not handle:
+        return _err("handle is required")
+    duplicates = notes.delete_note(handle)
+    if duplicates is None:
+        return _err(
+            f"no note with handle '{handle}' — it may have already been "
+            "deleted, updated, or rotated to the archive; call "
+            "list_user_notes to re-read"
+        )
+    return _text({"deleted": True, "handle": handle, "duplicates": duplicates})
 
 
 @tool(
