@@ -113,6 +113,63 @@ def test_update_note_empty_raises(notes_path):
         notes.update_note(n0.handle, "   ", path=notes_path)
 
 
+def test_update_note_enforces_the_cap(notes_path):
+    # Repro 3: only append_note called _rotate_to_fit, so replacing a
+    # short note with a much longer one could leave the live file over
+    # LIVE_FILE_MAX_BYTES until the next append -- measured at 4962 bytes
+    # against a 4096 cap in the investigation. update_note must enforce
+    # the cap itself, inside the same held lock as the rewrite that
+    # caused it, after EVERY update -- not just eventually.
+    handles = [notes.append_note(f"note {i}", path=notes_path).handle for i in range(6)]
+    seen_texts: list[str] = []
+    for h in handles:
+        result = notes.update_note(h, "x" * 800, path=notes_path)
+        assert result is not None
+        updated, _ = result
+        seen_texts.append(updated.text)
+        live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+        assert len(live_bytes) <= notes.LIVE_FILE_MAX_BYTES
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()  # rotation must actually have fired
+    archived_texts = [n.text for n in notes.read_notes(archive)]
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    # Every one of the six updated notes survives as its own distinct
+    # note -- either still live or safely archived, never lost.
+    assert sorted(archived_texts + live_texts) == sorted(seen_texts)
+
+
+def test_update_note_never_evicts_its_own_just_refreshed_note(notes_path):
+    # The cap check runs after update_note stamps its own fresh "now"
+    # timestamp -- that must not make the note it just refreshed the
+    # thing recent_first picks as oldest. Fill near the cap, then replace
+    # the note that is genuinely oldest (both by position and by
+    # timestamp) with a much longer one: it must survive, and whichever
+    # note is now the true oldest by timestamp (note 1) is what's
+    # archived instead.
+    bullets = [
+        f"- 2026-01-01T00:00:{i:02d} — preference number {i} with some padding text here"
+        for i in range(48)
+    ]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    oldest = notes.read_notes(notes_path)[0]
+
+    result = notes.update_note(oldest.handle, "x" * 800, path=notes_path)
+    assert result is not None
+    updated_note, _ = result
+
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) <= notes.LIVE_FILE_MAX_BYTES
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert updated_note.text in live_texts
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()
+    archived_texts = [n.text for n in notes.read_notes(archive)]
+    assert "preference number 1 with some padding text here" in archived_texts
+
+
 def test_delete_note(notes_path):
     n0 = notes.append_note("a", path=notes_path)
     notes.append_note("b", path=notes_path)

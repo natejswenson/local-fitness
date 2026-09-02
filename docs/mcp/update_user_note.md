@@ -93,10 +93,16 @@ Read first, then target the handle exactly as shown:
 - **Fails closed on non-bullet lines.** A handle can only ever match a parsed
   bullet, so hand-written prose in the file is never a valid target, and a
   missing notes file returns the same no-match error rather than creating one.
-- Unlike [`save_user_note`](save_user_note.md), this never rotates to the
-  archive — it rewrites a line in place, so a much longer replacement can push
-  the live file past the 4 KB cap without triggering the rotation that only
-  `append_note` performs.
+- **Also enforces the 4 KB live cap, same as [`save_user_note`](save_user_note.md).**
+  Replacing a short note with a much longer one can push the live file past
+  `LIVE_FILE_MAX_BYTES` on its own — this rewrites a line in place rather than
+  appending one, so nothing about the write would trip a size check unless
+  this tool makes one itself. If the rewrite lands over budget, the oldest
+  bullets **by timestamp** are rotated to `user_notes.archive.md`, same as
+  `save_user_note`'s rotation. The note just rewritten is stamped with the
+  refresh timestamp moments before this check, so it is never the thing
+  evicted by its own update. The tool result does not tell you rotation
+  happened.
 - Not reachable from the brief loop — `_READ_ONLY_TOOL_NAMES` excludes every
   note-write tool so brief generation cannot mutate preferences.
 

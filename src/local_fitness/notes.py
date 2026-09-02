@@ -505,7 +505,7 @@ def append_note(text: str, path: Path | None = None) -> Note:
     return Note(handle=_handle(ts, text), position=new_position, timestamp=ts, text=text)
 
 
-def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
+def _rotate_to_fit(existing: str, new_line: str = "") -> tuple[str, str]:
     """Drop bullets from ``existing``, oldest by timestamp, until
     ``existing + new_line`` fits the cap. Returns (kept_text,
     rotated_text) where rotated_text contains the dropped lines, in the
@@ -524,9 +524,18 @@ def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
     the write proceeds over budget rather than spinning forever or
     discarding content that isn't a note at all.
 
+    ``new_line`` defaults to empty: ``append_note`` calls this with the
+    incoming bullet split out as ``new_line`` (it isn't part of ``lines``
+    yet), while ``update_note`` calls it with the *already-assembled*
+    whole-file text as ``existing`` and no separate ``new_line`` — the
+    just-refreshed bullet is already one of ``lines`` in that case, and
+    its own newly-stamped timestamp keeps ``recent_first`` from picking
+    it as the oldest, so it is never the thing evicted by its own update.
+
     Relies on ``existing`` already ending in a trailing newline (or
-    being empty) — every caller passes ``ctx.existing_text``, which
-    ``_RewriteContext`` guarantees. That's what lets the joins below
+    being empty) — every caller passes either ``ctx.existing_text`` or a
+    whole-file text built from it, both of which ``_RewriteContext``
+    guarantees are newline-terminated. That's what lets the joins below
     happen cleanly instead of welding the last kept line into
     ``new_line``: this function establishes no boundary of its own
     because ``_locked_rewrite`` already established one for it.
@@ -599,6 +608,18 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
     rewrite, normally 1; see ``_Match``/``_RewriteContext.resolve`` for
     the >1 case. Used for in-place updates so a refined preference
     doesn't pile a duplicate onto the file.
+
+    Rewriting a short note into a much longer one can push the live file
+    past ``LIVE_FILE_MAX_BYTES`` — unlike ``append_note``, this rewrites a
+    line in place rather than adding one, so nothing about the write
+    itself would ever trip a size check unless this function makes one.
+    So, still inside the same held lock this rewrite happened in, the
+    result is size-checked the same way ``append_note`` checks a
+    candidate append: if it's over budget, the oldest bullets *by
+    timestamp* are rotated to the archive until it fits. The just-updated
+    note is stamped with `now()` moments before this check, so
+    ``recent_first`` ranks it newest and it is never the one evicted by
+    its own update.
     """
     new_text = " ".join(new_text.split())
     if not new_text:
@@ -622,8 +643,20 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
         # file shape stays consistent.
         had_newline = lines[match.index].endswith("\n")
         lines[match.index] = f"- {ts} — {new_text}" + ("\n" if had_newline else "")
-        ctx.text = "".join(lines)
-        new_note = Note(handle=_handle(ts, new_text), position=match.index,
+        candidate = "".join(lines)
+        new_position = match.index
+
+        if len(candidate.encode("utf-8")) > LIVE_FILE_MAX_BYTES:
+            kept, rotated = _rotate_to_fit(candidate)
+            if rotated:
+                # Archive before the live replace — see append_note for
+                # why (duplication on a crash recovers, loss doesn't).
+                _append_archive(rotated, _archive_path(p))
+            ctx.text = kept
+        else:
+            ctx.text = candidate
+
+        new_note = Note(handle=_handle(ts, new_text), position=new_position,
                          timestamp=ts, text=new_text)
         result = (new_note, match.duplicates)
     return result
