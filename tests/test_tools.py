@@ -1456,6 +1456,48 @@ def test_duplicate_handle_converges_over_the_real_tools(seeded, tmp_path):
     assert texts.count("now distinct") == 1
 
 
+def test_list_user_notes_ranks_a_refreshed_note_first(seeded, tmp_path):
+    # Repro 6, over the real tool handlers: refining an older note must
+    # not leave it stuck behind a newer, untouched one just because it
+    # sits earlier in the file. The refreshed note is the MIDDLE bullet on
+    # disk (file position 1 of 3), deliberately not position 0: at position
+    # 0, on-disk (oldest-first) order and the newest-first ranking agree by
+    # coincidence, so the test cannot tell a real ranking fix from a
+    # reversion to a bare `notes.read_notes()` (round-1 review finding —
+    # this exact fixture passed unchanged against that mutant). All three
+    # bullets start with a real past timestamp so the update's now()
+    # unambiguously outranks them, rather than depending on timing.
+    notes_path = tmp_path / "user_notes.md"
+    notes_path.write_text(
+        "- 2026-01-01T08:00:00 — OLDEST note, untouched\n"
+        "- 2026-01-15T08:00:00 — MIDDLE note, will be refreshed\n"
+        "- 2026-02-01T08:00:00 — NEWEST conflicting note, untouched\n",
+        encoding="utf-8",
+    )
+    listed, _ = call(tools.list_user_notes, {})
+    middle_handle = next(
+        n["handle"]
+        for n in listed["notes"]
+        if n["text"] == "MIDDLE note, will be refreshed"
+    )
+    updated, err = call(
+        tools.update_user_note,
+        {"handle": middle_handle, "note": "MIDDLE note, but just refreshed today"},
+    )
+    assert not err
+    listed, _ = call(tools.list_user_notes, {})
+    assert listed["notes"][0]["text"] == "MIDDLE note, but just refreshed today"
+    assert listed["notes"][0]["handle"] == updated["handle"]
+    # On-disk order still has the refreshed note in the middle — only the
+    # returned ranking changed. A bare `notes.read_notes()` reversion would
+    # return "OLDEST note, untouched" first instead.
+    texts = [n["text"] for n in listed["notes"]]
+    assert texts[1:] == [
+        "NEWEST conflicting note, untouched",
+        "OLDEST note, untouched",
+    ]
+
+
 def test_render_for_prompt_handles_resolve_through_the_real_tools(seeded):
     """Correction 2: the prompt path is a second live entry point — every
     handle rendered into the prompt must be one the tools can act on."""

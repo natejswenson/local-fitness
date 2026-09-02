@@ -2019,16 +2019,16 @@ async def save_user_note(args: dict) -> dict:
 
 @tool(
     "list_user_notes",
-    "Read the current list of saved user-preference notes from disk. "
-    "Use this when the user asks 'what notes do you have', 'show me my "
-    "settings', or before deciding whether a new preference overlaps an "
-    "existing note. Returns each note's handle — a content address, not a "
-    "position — so subsequent update_user_note / delete_user_note calls "
-    "can target a specific one.",
+    "Read the current list of saved user-preference notes from disk, "
+    "newest-first. Use this when the user asks 'what notes do you have', "
+    "'show me my settings', or before deciding whether a new preference "
+    "overlaps an existing note. Returns each note's handle — a content "
+    "address, not a position — so subsequent update_user_note / "
+    "delete_user_note calls can target a specific one.",
     {},
 )
 async def list_user_notes(_args: dict) -> dict:
-    items = notes.read_notes()
+    items = notes.recent_first(notes.read_notes())
     return _text({
         "notes": [
             {"handle": n.handle, "timestamp": n.timestamp, "text": n.text}

@@ -92,6 +92,39 @@ def test_assemble_status_empty_db_well_formed(empty_db):
     assert status["user_notes"] == []
 
 
+def test_assemble_status_user_notes_ranks_a_refreshed_note_first(empty_db, tmp_path):
+    # Repro 6, the third model-facing surface: daily_snapshot's user_notes
+    # must agree with render_for_prompt / list_user_notes about which note
+    # is newest, not just report on-disk order. The refreshed note is the
+    # MIDDLE bullet on disk (file position 1 of 3), deliberately not
+    # position 0: at position 0, on-disk (oldest-first) order and the
+    # newest-first ranking agree by coincidence, so the test cannot tell a
+    # real ranking fix from a reversion to a bare `notes.read_notes()`
+    # (round-1 review finding — this exact fixture passed unchanged against
+    # that mutant). All three bullets start with a real past timestamp so
+    # the update's now() unambiguously outranks them, rather than depending
+    # on timing.
+    from local_fitness import notes as notes_mod
+
+    notes_path = tmp_path / "user_notes.md"
+    notes_path.write_text(
+        "- 2026-01-01T08:00:00 — OLDEST note, untouched\n"
+        "- 2026-01-15T08:00:00 — MIDDLE note, will be refreshed\n"
+        "- 2026-02-01T08:00:00 — NEWEST conflicting note, untouched\n",
+        encoding="utf-8",
+    )
+    middle = next(
+        n for n in notes_mod.read_notes() if n.text == "MIDDLE note, will be refreshed"
+    )
+    result = notes_mod.update_note(middle.handle, "MIDDLE note, but just refreshed today")
+    assert result is not None
+
+    status = assemble_status()
+    assert status["user_notes"][0] == "MIDDLE note, but just refreshed today"
+    assert status["user_notes"][1] == "NEWEST conflicting note, untouched"
+    assert status["user_notes"][2] == "OLDEST note, untouched"
+
+
 def test_daily_snapshot_tool_empty_db(empty_db):
     result = asyncio.run(tools.daily_snapshot.handler({}))
     assert not result.get("is_error")
