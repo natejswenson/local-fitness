@@ -12,16 +12,27 @@ Format on disk (``data/user_notes.md``)::
     - 2026-04-26T08:30:01 — Marathon training starts in May; CTL trajectory matters more than the absolute number.
 
 Hand-editable; rewrite or delete lines directly with any text editor and
-the next prompt build picks up the change. Concurrent writers are
-serialised by ``fcntl.flock`` so two chat sessions can't corrupt the
-file. A 4 KB live cap keeps prompt context bounded — older bullets
-overflow to ``user_notes.archive.md`` rather than getting lost.
+the next prompt build picks up the change. Every write reads the file,
+decides the new content, and rewrites it inside one held critical
+section: an exclusive lock on a sidecar ``<name>.lock`` file — never on
+the note file itself, since that file is about to be replaced out from
+under any lock held on its own descriptor — serialises writers, and the
+new content lands via a same-directory temp file that is
+``os.replace``'d over the original. A reader, including a text editor
+with the file open, therefore never observes a partial file: only the
+whole old one or the whole new one — the zero-byte window a plain
+truncate-then-write leaves is closed by construction. A 4 KB live cap
+keeps prompt context bounded — older bullets overflow to
+``user_notes.archive.md`` rather than getting lost.
 """
 from __future__ import annotations
 
 import fcntl
 import logging
 import os
+import stat
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -58,22 +69,143 @@ class Note:
     text: str
 
 
+@contextmanager
 def _open_locked(path: Path, mode: str):
-    """Open ``path`` with an exclusive lock held for the lifetime of the
-    file handle. Caller is responsible for closing.
+    """Open ``path`` for I/O in ``mode``, serialised by an exclusive lock
+    held on a sidecar ``<name>.lock`` file — never on ``path`` itself.
+
+    Locking the target file directly breaks the moment a writer replaces
+    that file out from under an open descriptor (see ``_locked_rewrite``,
+    which every live-file writer uses instead of this function). The
+    archive file is only ever appended to, never replaced, but it goes
+    through the same sidecar scheme so the two locking paths can't
+    disagree, and so a lock on the archive never collides with a lock on
+    a same-named live file.
 
     The lock is process-level via ``fcntl.flock`` — sufficient for the
     single-host deployment. If we ever go multi-host, swap for a DB row
     or a coordination service.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, mode)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_handle = open(lock_path, "a+")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        handle.close()
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        content_handle = open(path, mode)
+        try:
+            yield content_handle
+        finally:
+            content_handle.close()
+    finally:
+        lock_handle.close()
+
+
+def _current_umask() -> int:
+    """Read the process umask without leaving it changed. ``os.umask``
+    has no read-only form — you have to set it to read the old value."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _default_create_mode() -> int:
+    """Permission bits for a notes file that doesn't exist yet: the
+    conventional non-executable default minus the process umask — what
+    a plain ``open(path, "w")`` would have produced."""
+    return 0o666 & ~_current_umask()
+
+
+def _write_atomic(path: Path, text: str, mode: int) -> None:
+    """Write ``text`` to ``path`` atomically: a same-directory temp file,
+    chmod'd to ``mode``, fsynced, then ``os.replace``'d over ``path``.
+
+    Called only from ``_locked_rewrite``'s exit — every writer assembles
+    its new whole-file content inside that held lock and hands it here;
+    nothing calls this with text assembled outside the lock.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
         raise
-    return handle
+
+
+class _RewriteContext:
+    """Handle for one locked read -> resolve -> rewrite cycle.
+
+    ``existing_text``/``lines`` are the file as read *inside* the lock —
+    the only state ``resolve`` may use. Assign ``.text`` before the
+    ``with`` block exits; that whole-file text is what gets written.
+    Leaving ``.text`` as ``None`` (the target wasn't found, or nothing
+    needs to change) writes nothing — the file is left untouched.
+    """
+
+    def __init__(self, existing_text: str):
+        self.existing_text = existing_text
+        self.lines: list[str] = existing_text.splitlines(keepends=True)
+        self.text: str | None = None
+
+    def resolve(self, line_index: int) -> Note | None:
+        """Validate ``line_index`` against the lines read inside this
+        lock and return the parsed note there, or None if the index is
+        out of range or no longer points at a bullet.
+
+        This is the only supported way to target a line for update or
+        delete — there is no free function that resolves against a list
+        read outside the lock.
+        """
+        if line_index < 0 or line_index >= len(self.lines):
+            return None
+        return _parse_line(self.lines[line_index])
+
+
+@contextmanager
+def _locked_rewrite(path: Path, *, _after_read_hook=None):
+    """Hold the sidecar lock for one read -> resolve -> rewrite cycle.
+
+    Reads and parses the live file *inside* the lock and yields a
+    ``_RewriteContext`` built from that read — every writer resolves its
+    target and assembles its new content against that same read, never
+    against a separately-read copy. On exit (still holding the lock), if
+    ``ctx.text`` was assigned, it is written atomically: a
+    same-directory temp file, chmod'd to the original file's mode (or
+    ``0o666 & ~umask`` if the file is being created), fsynced, then
+    ``os.replace``'d over the original. A reader — ``read_notes``, or a
+    text editor with the file open — therefore never observes a partial
+    file: only the whole old one or the whole new one.
+
+    ``_after_read_hook``, if given, fires once the read has happened but
+    before control returns to the ``with`` block — a seam for tests that
+    need to force a concurrent writer to overlap this held lock.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        mode = (
+            stat.S_IMODE(path.stat().st_mode)
+            if path.exists()
+            else _default_create_mode()
+        )
+        if _after_read_hook is not None:
+            _after_read_hook()
+        ctx = _RewriteContext(existing_text)
+        yield ctx
+        if ctx.text is not None:
+            _write_atomic(path, ctx.text, mode)
+    finally:
+        lock_handle.close()
 
 
 def _parse_line(line: str) -> Note | None:
@@ -148,28 +280,22 @@ def append_note(text: str, path: Path | None = None) -> Note:
     ts = datetime.now().replace(microsecond=0).isoformat()
     new_line = f"- {ts} — {text}\n"
 
-    handle = _open_locked(p, "a+")
-    try:
-        handle.seek(0)
-        existing = handle.read()
+    with _locked_rewrite(p) as ctx:
+        existing = ctx.existing_text
         candidate = existing + (new_line if existing.endswith("\n") or not existing else "\n" + new_line)
         if len(candidate.encode("utf-8")) > LIVE_FILE_MAX_BYTES:
             kept, rotated = _rotate_to_fit(existing, new_line)
             if rotated:
+                # Archive before the live replace: if the process dies
+                # between the two, the rotated note exists twice (archive
+                # + live) rather than zero times — duplication recovers,
+                # loss doesn't.
                 _append_archive(rotated, _archive_path(p))
-            handle.seek(0)
-            handle.truncate()
-            handle.write(kept)
+            ctx.text = kept
             final_text = kept
         else:
-            if existing and not existing.endswith("\n"):
-                handle.write("\n")
-            handle.write(new_line)
+            ctx.text = candidate
             final_text = candidate
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
-        handle.close()
     LOG.info("Saved user note (%d chars)", len(text))
     # The appended bullet is the last line of the file; its raw line index
     # (matching how read_notes/update_note/delete_note count via
@@ -222,27 +348,20 @@ def update_note(line_index: int, new_text: str, path: Path | None = None) -> Not
     p = path or _default_notes_path()
     if not p.exists():
         return None
-    handle = _open_locked(p, "r+")
-    try:
-        text = handle.read()
-        lines = text.splitlines(keepends=True)
-        if line_index < 0 or line_index >= len(lines):
+
+    ts = datetime.now().replace(microsecond=0).isoformat()
+    result: Note | None = None
+    with _locked_rewrite(p) as ctx:
+        if ctx.resolve(line_index) is None:
             return None
-        if _parse_line(lines[line_index]) is None:
-            return None
-        ts = datetime.now().replace(microsecond=0).isoformat()
+        lines = ctx.lines
         # Preserve trailing newline character of the original line so the
         # file shape stays consistent.
         had_newline = lines[line_index].endswith("\n")
         lines[line_index] = f"- {ts} — {new_text}" + ("\n" if had_newline else "")
-        handle.seek(0)
-        handle.truncate()
-        handle.write("".join(lines))
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
-        handle.close()
-    return Note(line=line_index, timestamp=ts, text=new_text)
+        ctx.text = "".join(lines)
+        result = Note(line=line_index, timestamp=ts, text=new_text)
+    return result
 
 
 def delete_note(line_index: int, path: Path | None = None) -> bool:
@@ -253,21 +372,15 @@ def delete_note(line_index: int, path: Path | None = None) -> bool:
     p = path or _default_notes_path()
     if not p.exists():
         return False
-    handle = _open_locked(p, "r+")
-    try:
-        text = handle.read()
-        lines = text.splitlines(keepends=True)
-        if line_index < 0 or line_index >= len(lines):
+
+    removed = False
+    with _locked_rewrite(p) as ctx:
+        if ctx.resolve(line_index) is None:
+            # Out of range, or no longer a bullet — don't let callers
+            # delete arbitrary non-bullet lines.
             return False
-        if _parse_line(lines[line_index]) is None:
-            # Don't let callers delete arbitrary non-bullet lines.
-            return False
+        lines = ctx.lines
         del lines[line_index]
-        handle.seek(0)
-        handle.truncate()
-        handle.write("".join(lines))
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
-        handle.close()
-    return True
+        ctx.text = "".join(lines)
+        removed = True
+    return removed

@@ -87,8 +87,11 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
   reconciles conflicting notes. `render_for_prompt()` orders them newest-first
   and the system prompt says "prefer the newer note when two conflict" — that
   is the whole contract. Two contradictory notes both stay in the prompt.
-- **Writes are `fcntl.flock`-serialised** across processes, so two chat sessions
-  can't corrupt the file — but this is process-local locking, single-host only.
+- **Writes are serialised by a sidecar lock file** (`user_notes.md.lock`) and
+  land via a same-directory temp file that's atomically renamed over the
+  original — so two chat sessions can't corrupt the file, and no reader
+  (this server, or a text editor with the file open) ever sees a partial
+  write. Process-local locking, single-host only.
 - The brief loop can't call this. `_READ_ONLY_TOOL_NAMES` in `agent/tools.py`
   excludes every note-write tool, so brief generation can read notes (via the
   prompt) but never writes one.
