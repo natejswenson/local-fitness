@@ -37,14 +37,14 @@ the live file and the handler returns the resulting `Note`:
 ```json
 {
   "saved": true,
-  "line": 7,
+  "handle": "d70a5c19",
   "timestamp": "2026-07-21T09:14:02",
   "text": "Stop roasting my step count — I care about running volume, not steps."
 }
 ```
 
-`line` is the 0-indexed **raw file line number** after the write (post-rotation,
-see Gotchas). It is the handle you pass to
+`handle` is an 8-character lowercase hex content address derived from the note's
+own `timestamp` and `text` — not a file position. It is what you pass to
 [`update_user_note`](update_user_note.md) / [`delete_user_note`](delete_user_note.md).
 
 On failure (empty note text): `{"error": "..."}` with `is_error: true`.
@@ -58,7 +58,7 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
 ```
 
 ```json
-{"saved": true, "line": 4, "timestamp": "2026-07-21T09:14:02",
+{"saved": true, "handle": "c19de402", "timestamp": "2026-07-21T09:14:02",
  "text": "Don't comment on weekend sleep — it's a known, accepted gap."}
 ```
 
@@ -73,10 +73,13 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
   discards the invented top-level fields. **A note that tries to restructure
   brief output is a bug, not a feature.** Notes may change tone, emphasis, and
   what gets called out. They may not add fields.
-- **Line indices are not stable identifiers.** They are raw file line numbers.
-  Deleting note 2 shifts every later note down by one, and an append that
-  triggers rotation (below) renumbers everything. Always re-read with
-  [`list_user_notes`](list_user_notes.md) immediately before an update or delete.
+- **The returned `handle` is a content address, not a position.** It's derived
+  from this note's own timestamp and text, so it keeps resolving correctly
+  through an unrelated `delete_user_note` or a rotation that renumbers the
+  file — that no longer redirects a later `update_user_note` /
+  `delete_user_note` call onto the wrong preference. It stops resolving only
+  once *this* note itself is updated, deleted, or rotated to the archive; at
+  that point `list_user_notes` is how you get a live handle again.
 - **4 KB live cap with silent rotation.** If the append would push the file past
   `LIVE_FILE_MAX_BYTES` (4096), the oldest bullets are dropped from the live
   file and appended to `user_notes.archive.md` *before* the write. Archived
@@ -98,7 +101,7 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
 
 ## See also
 
-- [`list_user_notes`](list_user_notes.md) — read notes back with their line indices
+- [`list_user_notes`](list_user_notes.md) — read notes back with their handles
 - [`update_user_note`](update_user_note.md) — refine an existing preference in place
 - [`delete_user_note`](delete_user_note.md) — drop a preference
 - [`log_observation`](log_observation.md) — the *other* family: timestamped subjective data, not preferences

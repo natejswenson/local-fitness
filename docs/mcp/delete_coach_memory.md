@@ -59,10 +59,11 @@ Failure returns `is_error: true` with `{"error": ...}`:
 - **Confirm when the target is ambiguous.** "Forget that" over a conversation
   that touched four memories is not an id. List or search first, name the exact
   line back to the user, then delete.
-- **`entry_id` is stable; positions are not.** Unlike
-  [`delete_user_note`](delete_user_note.md), which takes a *line index* that
-  shifts under you, this takes a primary key. Deleting several entries in any
-  order is safe — no re-read needed between calls.
+- **`entry_id` is stable; positions are not.** This takes a primary key, so
+  deleting several entries in any order is safe — no re-read needed between
+  calls. [`delete_user_note`](delete_user_note.md) used to be the exception
+  (a raw line index that shifted under you); it now takes a content handle
+  that's likewise safe to hold across calls.
 - **Deleting a hot entry does not promote an archived one.** `archive_overflow`
   only ever runs on write, and it only ever archives; it never un-archives. So
   the prompt block simply gets one line shorter until the next

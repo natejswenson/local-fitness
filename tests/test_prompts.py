@@ -353,6 +353,27 @@ def test_user_notes_block_is_empty_without_notes():
     assert prompts.user_notes_block("Alex", "") == ""
 
 
+def test_notes_prompt_section_matches_the_live_tool_schema():
+    """The 'Managing preferences conversationally' section teaches the
+    model a call shape by example — it must match what the registered
+    tools actually accept, read straight off their input_schema rather
+    than hardcoded, so a half-done rename ships silently and every
+    model-initiated write errors. On dev this section still teaches
+    update_user_note(line=N, ...) / delete_user_note(line=N) against
+    tools that no longer take `line` at all."""
+    from local_fitness.agent import tools
+
+    p = prompts.system_prompt("Dana")
+    section = p.split("# Managing preferences conversationally", 1)[1]
+    section = section.split("\n#", 1)[0]  # up to the next section heading
+
+    for param in tools.update_user_note.input_schema:
+        assert param in section, f"{param} (update_user_note) not taught in the prompt"
+    for param in tools.delete_user_note.input_schema:
+        assert param in section, f"{param} (delete_user_note) not taught in the prompt"
+    assert "line=" not in section
+
+
 # --- coach memory on the voice surfaces (0.30.0) ----------------------------
 
 _MEMORY = "- Plan: 3 missed sessions in the last 14 days (last: Jul 19 interval)."
