@@ -1337,10 +1337,12 @@ def test_correlate_allows_negative_lag(seeded):
 def test_save_and_list_user_notes(seeded):
     saved, err = call(tools.save_user_note, {"note": "lead with the workout card"})
     assert not err and saved["saved"]
+    assert len(saved["handle"]) == 8
     listed, err = call(tools.list_user_notes, {})
     assert not err
     assert listed["count"] == 1
     assert listed["notes"][0]["text"] == "lead with the workout card"
+    assert listed["notes"][0]["handle"] == saved["handle"]
 
 
 def test_save_user_note_empty(seeded):
@@ -1350,40 +1352,120 @@ def test_save_user_note_empty(seeded):
 
 
 def test_update_user_note(seeded):
-    call(tools.save_user_note, {"note": "old"})
-    updated, err = call(tools.update_user_note, {"line": 0, "note": "new"})
+    saved, _ = call(tools.save_user_note, {"note": "old"})
+    updated, err = call(tools.update_user_note, {"handle": saved["handle"], "note": "new"})
+    assert not err
+    assert updated["text"] == "new"
+    assert updated["duplicates"] == 1
+    # The handle changes with the content — the caller's old handle is stale.
+    assert updated["handle"] != saved["handle"]
+
+
+def test_update_user_note_handle_is_normalised(seeded):
+    saved, _ = call(tools.save_user_note, {"note": "old"})
+    bracketed = f"  [{saved['handle'].upper()}]  "
+    updated, err = call(tools.update_user_note, {"handle": bracketed, "note": "new"})
     assert not err
     assert updated["text"] == "new"
 
 
-def test_update_user_note_bad_line(seeded):
+def test_update_user_note_bad_handle(seeded):
     """Three DIFFERENT rejections. Asserting only `assert err` three times
     could not tell them apart — nor tell any of them from an
     update_user_note that refused everything."""
-    payload, err = call(tools.update_user_note, {"line": None, "note": "x"})
+    payload, err = call(tools.update_user_note, {"handle": "", "note": "x"})
     assert err
-    assert "line index is required" in payload["error"]
-    payload, err = call(tools.update_user_note, {"line": 0, "note": ""})
+    assert "handle is required" in payload["error"]
+    saved, _ = call(tools.save_user_note, {"note": "old"})
+    payload, err = call(tools.update_user_note, {"handle": saved["handle"], "note": ""})
     assert err
-    assert "new note text is required" in payload["error"]   # the TEXT, not the line
-    payload, err = call(tools.update_user_note, {"line": 99, "note": "x"})
+    assert "new note text is required" in payload["error"]   # the TEXT, not the handle
+    payload, err = call(tools.update_user_note, {"handle": "deadbeef", "note": "x"})
     assert err
-    assert "no note at line 99" in payload["error"]           # the LINE, not the text
+    assert "no note with handle 'deadbeef'" in payload["error"]  # the HANDLE, not the text
 
 
 def test_delete_user_note(seeded):
-    call(tools.save_user_note, {"note": "drop me"})
-    deleted, err = call(tools.delete_user_note, {"line": 0})
+    saved, _ = call(tools.save_user_note, {"note": "drop me"})
+    deleted, err = call(tools.delete_user_note, {"handle": saved["handle"]})
     assert not err and deleted["deleted"]
+    assert deleted["duplicates"] == 1
 
 
-def test_delete_user_note_bad_line(seeded):
-    payload, err = call(tools.delete_user_note, {"line": None})
+def test_delete_user_note_bad_handle(seeded):
+    payload, err = call(tools.delete_user_note, {"handle": ""})
     assert err
-    assert "line index is required" in payload["error"]      # missing argument
-    payload, err = call(tools.delete_user_note, {"line": 42})
+    assert "handle is required" in payload["error"]      # missing argument
+    payload, err = call(tools.delete_user_note, {"handle": "deadbeef"})
     assert err
-    assert "no note at line 42" in payload["error"]          # argument fine, row absent
+    assert "no note with handle 'deadbeef'" in payload["error"]  # argument fine, row absent
+
+
+def test_a_delete_no_longer_redirects_a_later_update(seeded):
+    """The issue's headline, exercised over the real tool handlers rather
+    than notes.py directly. On dev this silently rewrote the fourth note
+    when the caller's stale line index shifted after the delete."""
+    handles = []
+    for t in ("zero", "one", "two", "three"):
+        saved, _ = call(tools.save_user_note, {"note": t})
+        handles.append(saved["handle"])
+    deleted, err = call(tools.delete_user_note, {"handle": handles[1]})
+    assert not err and deleted["deleted"]
+    updated, err = call(tools.update_user_note, {"handle": handles[2], "note": "REWRITTEN"})
+    assert not err
+    listed, _ = call(tools.list_user_notes, {})
+    texts = {n["text"] for n in listed["notes"]}
+    assert texts == {"zero", "REWRITTEN", "three"}
+
+
+def test_update_user_note_stale_handle_is_a_loud_error_not_a_silent_edit(seeded):
+    """Two-sided half of the above: a good handle writes, a dead one
+    refuses — and the file is untouched by the refusal."""
+    saved, _ = call(tools.save_user_note, {"note": "original"})
+    call(tools.update_user_note, {"handle": saved["handle"], "note": "rewritten"})
+    payload, err = call(tools.update_user_note, {"handle": saved["handle"], "note": "should not land"})
+    assert err
+    assert saved["handle"] in payload["error"]
+    listed, _ = call(tools.list_user_notes, {})
+    assert listed["notes"][0]["text"] == "rewritten"
+
+
+def test_duplicate_handle_converges_over_the_real_tools(seeded, tmp_path):
+    """A hand-edited pair sharing timestamp and text — the tool reports
+    the duplicate count and rewrites the first, and the surviving pair is
+    uniquely addressable again right after."""
+    notes_path = tmp_path / "user_notes.md"
+    notes_path.write_text(
+        "- 2026-01-01T00:00:00 — same text twice\n"
+        "- 2026-01-01T00:00:00 — same text twice\n",
+        encoding="utf-8",
+    )
+    listed, _ = call(tools.list_user_notes, {})
+    dup_handle = listed["notes"][0]["handle"]
+    updated, err = call(tools.update_user_note, {"handle": dup_handle, "note": "now distinct"})
+    assert not err
+    assert updated["duplicates"] == 2
+    listed, _ = call(tools.list_user_notes, {})
+    texts = [n["text"] for n in listed["notes"]]
+    assert texts.count("same text twice") == 1
+    assert texts.count("now distinct") == 1
+
+
+def test_render_for_prompt_handles_resolve_through_the_real_tools(seeded):
+    """Correction 2: the prompt path is a second live entry point — every
+    handle rendered into the prompt must be one the tools can act on."""
+    from local_fitness import notes as notes_mod
+    for t in ("alpha", "beta", "gamma"):
+        call(tools.save_user_note, {"note": t})
+    rendered_handles = {
+        line.split("]", 1)[0].lstrip("[")
+        for line in notes_mod.render_for_prompt().splitlines()
+    }
+    listed, _ = call(tools.list_user_notes, {})
+    assert rendered_handles == {n["handle"] for n in listed["notes"]}
+    for h in rendered_handles:
+        _, err = call(tools.update_user_note, {"handle": h, "note": "touched"})
+        assert not err
 
 
 def test_server_and_tool_names():
