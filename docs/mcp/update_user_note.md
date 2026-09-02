@@ -99,10 +99,10 @@ Read first, then target the handle exactly as shown:
   appending one, so nothing about the write would trip a size check unless
   this tool makes one itself. If the rewrite lands over budget, the oldest
   bullets **by timestamp** are rotated to `user_notes.archive.md`, same as
-  `save_user_note`'s rotation. The note just rewritten is stamped with the
-  refresh timestamp moments before this check, so it is never the thing
-  evicted by its own update. The tool result does not tell you rotation
-  happened.
+  `save_user_note`'s rotation. The note just rewritten is excluded from
+  eviction outright, so it is never the thing evicted by its own update —
+  including when another note's timestamp ties it to the same second. The
+  tool result does not tell you rotation happened.
 - Not reachable from the brief loop — `_READ_ONLY_TOOL_NAMES` excludes every
   note-write tool so brief generation cannot mutate preferences.
 

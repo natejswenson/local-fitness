@@ -170,6 +170,49 @@ def test_update_note_never_evicts_its_own_just_refreshed_note(notes_path):
     assert "preference number 1 with some padding text here" in archived_texts
 
 
+def test_update_note_never_evicts_its_own_note_even_when_everyone_else_outranks_it(notes_path):
+    # Round-1 review finding: the previous guard only worked because the
+    # just-refreshed note's brand-new "now" timestamp usually IS the
+    # newest in the file. It breaks the moment something else in the
+    # file outranks that fresh timestamp -- a hand-edited bullet with a
+    # FUTURE date is the deterministic way to construct that without
+    # depending on real wall-clock ties between two calls. Every other
+    # live bullet here is dated in 2099, so after the rewrite the
+    # just-updated line (timestamp = real "now") is the single oldest
+    # thing in the file by `_recency_key` -- exactly what used to make
+    # `_rotate_to_fit` archive it, silently orphaning the handle
+    # `update_user_note` had just told the caller was live.
+    fillers = [
+        f"- 2099-01-01T00:00:{i:02d} — future filler note number {i:02d} "
+        "with some padding text here to take up room"
+        for i in range(45)
+    ]
+    target_line = "- 2020-01-01T00:00:00 — old target note to be replaced"
+    notes_path.write_text("\n".join([target_line, *fillers]) + "\n", encoding="utf-8")
+    target = notes.read_notes(notes_path)[0]
+
+    result = notes.update_note(target.handle, "x" * 800, path=notes_path)
+    assert result is not None
+    updated_note, _ = result
+
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) <= notes.LIVE_FILE_MAX_BYTES
+
+    # The just-updated note survives live, under its NEW handle...
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert updated_note.text in live_texts
+    # ...and that handle keeps resolving on the very next call, which is
+    # exactly what a caller checks to confirm the write actually landed.
+    assert notes.update_note(updated_note.handle, "y", path=notes_path) is not None
+
+    # Rotation still fired, and it took one of the future-dated fillers
+    # instead -- eviction happened, it just didn't pick the wrong note.
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()
+    archived_texts = {n.text for n in notes.read_notes(archive)}
+    assert any(t.startswith("future filler note number") for t in archived_texts)
+
+
 def test_delete_note(notes_path):
     n0 = notes.append_note("a", path=notes_path)
     notes.append_note("b", path=notes_path)
