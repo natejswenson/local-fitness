@@ -52,11 +52,12 @@ issuing the `DELETE`, so a bad id is a clean error rather than a silent no-op.
 ## Gotchas
 
 - **No undo.** The row is gone; nothing is archived.
-- **IDs are stable, unlike note line indices.** `observation_id` is an
-  autoincrement primary key, so an id you read earlier in the conversation still
-  points at the same row after other deletes. This is the opposite of
-  `delete_user_note`, where indices shift on every write — do not carry the
-  habit across.
+- **IDs are stable, and so is `delete_user_note`'s handle now.**
+  `observation_id` is an autoincrement primary key, so an id you read earlier
+  in the conversation still points at the same row after other deletes.
+  `delete_user_note` used to be the opposite (a raw line index that shifted on
+  every write); it now takes a content handle that survives the same way an
+  id does — the two tools no longer need different habits.
 - **Deletes one row, not a day.** "Delete today's observations" is several
   calls; list first and confirm the set.
 - **Missing `observation_id` raises rather than returning a clean error** — the

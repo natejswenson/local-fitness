@@ -1,6 +1,6 @@
 # `list_user_notes`
 
-> Read the saved durable coaching preferences off disk, with the line indices that `update_user_note` / `delete_user_note` target. **Availability:** stdio + HTTP
+> Read the saved durable coaching preferences off disk, with the content handles that `update_user_note` / `delete_user_note` target. **Availability:** stdio + HTTP
 
 ## What it does
 
@@ -10,9 +10,10 @@ injected into every system prompt. Read-only; it never writes.
 
 Two reasons to call it: the user asked what's saved ("what notes do you have",
 "show me my settings"), or you are about to save a preference and need to check
-whether it overlaps an existing one. It is also the only way to get a
-trustworthy `line` index before an update or delete — indices shift, so never
-reuse one from an earlier turn.
+whether it overlaps an existing one. It is also the way to get the `handle`
+you'll pass to an update or delete — a content address, so it keeps resolving
+correctly even if something else changes first, and errors loudly if the note
+it named has itself changed since.
 
 This lists *preferences*, not data. For timestamped subjective readings about a
 specific day — RPE, soreness, weight, mood, how a run felt — use
@@ -33,18 +34,21 @@ One entry per parsed bullet, plus a count:
 ```json
 {
   "notes": [
-    {"line": 0, "timestamp": "2026-04-26T08:30:01",
+    {"handle": "4f1a09cd", "timestamp": "2026-04-26T08:30:01",
      "text": "Marathon training starts in May; CTL trajectory matters more than the absolute number."},
-    {"line": 1, "timestamp": "2026-04-28T11:32:14",
+    {"handle": "9b3e21aa", "timestamp": "2026-04-28T11:32:14",
      "text": "Roast me when I'm slipping; encouragement softens motivation."}
   ],
   "count": 2
 }
 ```
 
-`line` is the 0-indexed **raw file line number**, not a position in the `notes`
-array — a hand-added prose line in the file consumes an index without producing
-a note entry. A missing or unreadable notes file returns `{"notes": [], "count": 0}`
+`handle` is an 8-character lowercase hex content address — derived from the
+note's own timestamp and text, not a file position — so it survives an
+unrelated note being added, deleted, or rotated to the archive. Two live
+notes only ever share a handle if they are byte-for-byte identical in both
+fields (see [`update_user_note`](update_user_note.md)'s Gotchas for how that's
+handled). A missing or unreadable notes file returns `{"notes": [], "count": 0}`
 rather than erroring.
 
 ## Example
@@ -56,9 +60,9 @@ rather than erroring.
 ```
 
 ```json
-{"notes": [{"line": 0, "timestamp": "2026-04-28T11:32:14",
+{"notes": [{"handle": "9b3e21aa", "timestamp": "2026-04-28T11:32:14",
             "text": "Roast me when I'm slipping."},
-           {"line": 1, "timestamp": "2026-07-02T06:11:40",
+           {"handle": "c19de402", "timestamp": "2026-07-02T06:11:40",
             "text": "Don't comment on weekend sleep."}],
  "count": 2}
 ```
@@ -82,13 +86,19 @@ rather than erroring.
 - **The file is hand-editable.** Lines not starting with `- ` are skipped by the
   parser (so free prose in the file is tolerated), and a bullet with no ` — `
   separator comes back with an empty `timestamp`.
+- **A hand-typed duplicate bullet gets the same handle.** The handle is derived
+  purely from timestamp + text, so copy-pasting a bullet by hand produces two
+  live notes this tool can't tell apart by handle alone — they read back with
+  identical `handle` values. `update_user_note` / `delete_user_note` tolerate
+  this (they act on the first and report how many matched); this tool just
+  lists them as they are.
 - Not available to the brief generator — `_READ_ONLY_TOOL_NAMES` excludes it;
   the brief already sees notes through the prompt injection.
 
 ## See also
 
 - [`save_user_note`](save_user_note.md) — add a new preference (write)
-- [`update_user_note`](update_user_note.md) — replace one by line index (write)
-- [`delete_user_note`](delete_user_note.md) — remove one by line index (write)
+- [`update_user_note`](update_user_note.md) — replace one by handle (write)
+- [`delete_user_note`](delete_user_note.md) — remove one by handle (write)
 - [`list_observations`](list_observations.md) — the *other* family: subjective data points, not preferences
 - [`daily_snapshot`](daily_snapshot.md) — bundles `user_notes` into the daily payload
