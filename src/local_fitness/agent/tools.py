@@ -2783,7 +2783,10 @@ _LIST_OBSERVATIONS_SCHEMA = {
     "type": "object",
     "properties": {
         "days": {"type": "integer", "description": "Only observations from the last N days."},
-        "obs_type": {"type": "string", "description": "Filter to one obs_type."},
+        "obs_type": {
+            "type": "string",
+            "description": "Filter to one of: " + ", ".join(sorted(OBS_TYPES)) + ".",
+        },
         "limit": {
             "type": "integer",
             "description": f"Max rows, most recent first (default {_LIST_OBSERVATIONS_DEFAULT_LIMIT}).",
@@ -2811,8 +2814,14 @@ async def list_observations(args: dict) -> dict:
         where.append("observed_on >= ?")
         params.append((date.today() - timedelta(days=args["days"])).isoformat())
     if args.get("obs_type"):
+        obs_type = args["obs_type"]
+        # Same enum log_observation already enforces (:2730-2731) — a typo or
+        # a wrong case used to fall through to a case-sensitive SQL `=` and
+        # return an empty list indistinguishable from "nothing logged".
+        if obs_type not in OBS_TYPES:
+            return _err(f"unknown obs_type '{obs_type}'", allowed=sorted(OBS_TYPES))
         where.append("obs_type = ?")
-        params.append(args["obs_type"])
+        params.append(obs_type)
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     # _validate_limit, like every other list surface (0.56.0). The bare
     # int() cast it replaces let `limit: "abc"` escape as a raw ValueError
@@ -2847,7 +2856,14 @@ async def list_observations(args: dict) -> dict:
     {"observation_id": int},
 )
 async def delete_observation(args: dict) -> dict:
-    obs_id = int(args["observation_id"])
+    # .get() + a validation branch, not args["observation_id"] straight into
+    # int() — matches delete_coach_memory (:2193-2195). A missing or
+    # non-numeric argument used to raise KeyError/ValueError out of the
+    # handler instead of returning the clean _err shape every neighbouring
+    # tool uses.
+    obs_id = args.get("observation_id")
+    if obs_id is None or not isinstance(obs_id, int):
+        return _err("observation_id is required")
     with db.connect() as conn:
         row = conn.execute(
             "SELECT 1 FROM observations WHERE observation_id = ?", (obs_id,)

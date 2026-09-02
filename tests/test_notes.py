@@ -136,6 +136,8 @@ def test_update_note_empty_raises(notes_path):
     n0 = notes.append_note("a", path=notes_path)
     with pytest.raises(ValueError):
         notes.update_note(n0.handle, "   ", path=notes_path)
+
+
 def test_update_note_enforces_the_cap(notes_path, frozen_clock):
     # Repro 3: only append_note called _rotate_to_fit, so replacing a
     # short note with a much longer one could leave the live file over
