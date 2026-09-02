@@ -92,6 +92,30 @@ def test_assemble_status_empty_db_well_formed(empty_db):
     assert status["user_notes"] == []
 
 
+def test_assemble_status_user_notes_ranks_a_refreshed_note_first(empty_db, tmp_path):
+    # Repro 6, the third model-facing surface: daily_snapshot's user_notes
+    # must agree with render_for_prompt / list_user_notes about which note
+    # is newest, not just report on-disk order. Both bullets start with a
+    # real past timestamp so the update's now() unambiguously outranks
+    # them, rather than depending on both appends and the update landing
+    # in the same wall-clock second.
+    from local_fitness import notes as notes_mod
+
+    notes_path = tmp_path / "user_notes.md"
+    notes_path.write_text(
+        "- 2026-01-01T08:00:00 — OLD note, superseded\n"
+        "- 2026-02-01T08:00:00 — NEWER conflicting note\n",
+        encoding="utf-8",
+    )
+    old = next(n for n in notes_mod.read_notes() if n.text == "OLD note, superseded")
+    result = notes_mod.update_note(old.handle, "OLD note, but just refreshed today")
+    assert result is not None
+
+    status = assemble_status()
+    assert status["user_notes"][0] == "OLD note, but just refreshed today"
+    assert status["user_notes"][1] == "NEWER conflicting note"
+
+
 def test_daily_snapshot_tool_empty_db(empty_db):
     result = asyncio.run(tools.daily_snapshot.handler({}))
     assert not result.get("is_error")

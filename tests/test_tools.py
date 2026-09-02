@@ -1451,6 +1451,33 @@ def test_duplicate_handle_converges_over_the_real_tools(seeded, tmp_path):
     assert texts.count("now distinct") == 1
 
 
+def test_list_user_notes_ranks_a_refreshed_note_first(seeded, tmp_path):
+    # Repro 6, over the real tool handlers: refining an older note must
+    # not leave it stuck behind a newer, untouched one just because it
+    # sits earlier in the file. Both bullets start with a real past
+    # timestamp so the update's now() unambiguously outranks them, rather
+    # than depending on both save calls and the update landing in the
+    # same wall-clock second.
+    notes_path = tmp_path / "user_notes.md"
+    notes_path.write_text(
+        "- 2026-01-01T08:00:00 — OLD note, superseded\n"
+        "- 2026-02-01T08:00:00 — NEWER conflicting note\n",
+        encoding="utf-8",
+    )
+    listed, _ = call(tools.list_user_notes, {})
+    old_handle = next(
+        n["handle"] for n in listed["notes"] if n["text"] == "OLD note, superseded"
+    )
+    updated, err = call(
+        tools.update_user_note,
+        {"handle": old_handle, "note": "OLD note, but just refreshed today"},
+    )
+    assert not err
+    listed, _ = call(tools.list_user_notes, {})
+    assert listed["notes"][0]["text"] == "OLD note, but just refreshed today"
+    assert listed["notes"][0]["handle"] == updated["handle"]
+
+
 def test_render_for_prompt_handles_resolve_through_the_real_tools(seeded):
     """Correction 2: the prompt path is a second live entry point — every
     handle rendered into the prompt must be one the tools can act on."""

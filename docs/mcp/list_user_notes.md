@@ -29,15 +29,15 @@ None. The tool takes an empty object.
 
 ## Returns
 
-One entry per parsed bullet, plus a count:
+One entry per parsed bullet, newest-first, plus a count:
 
 ```json
 {
   "notes": [
-    {"handle": "4f1a09cd", "timestamp": "2026-04-26T08:30:01",
-     "text": "Marathon training starts in May; CTL trajectory matters more than the absolute number."},
     {"handle": "9b3e21aa", "timestamp": "2026-04-28T11:32:14",
-     "text": "Roast me when I'm slipping; encouragement softens motivation."}
+     "text": "Roast me when I'm slipping; encouragement softens motivation."},
+    {"handle": "4f1a09cd", "timestamp": "2026-04-26T08:30:01",
+     "text": "Marathon training starts in May; CTL trajectory matters more than the absolute number."}
   ],
   "count": 2
 }
@@ -60,22 +60,26 @@ rather than erroring.
 ```
 
 ```json
-{"notes": [{"handle": "9b3e21aa", "timestamp": "2026-04-28T11:32:14",
-            "text": "Roast me when I'm slipping."},
-           {"handle": "c19de402", "timestamp": "2026-07-02T06:11:40",
-            "text": "Don't comment on weekend sleep."}],
+{"notes": [{"handle": "c19de402", "timestamp": "2026-07-02T06:11:40",
+            "text": "Don't comment on weekend sleep."},
+           {"handle": "9b3e21aa", "timestamp": "2026-04-28T11:32:14",
+            "text": "Roast me when I'm slipping."}],
  "count": 2}
 ```
 
 ## Gotchas
 
-- **Ordering is oldest-first here, newest-first in the prompt.** `read_notes()`
-  returns bullets in on-disk order and the file is append-only, so the *last*
-  entry is the newest. `render_for_prompt()` reverses that for the system-prompt
-  injection. If you present the list to the user, say which order you're using
-  — the two surfaces disagree. (The `read_notes` docstring claims "newest-first
-  ordering matching the on-disk order"; the docstring is wrong, the behavior is
-  oldest-first.)
+- **Ordering is newest-first by timestamp, and every surface agrees.** This
+  tool, the system prompt's notes section, and `daily_snapshot`'s `user_notes`
+  all rank through the same `recent_first()`: timestamp descending, tie-broken
+  by on-disk position. That's not the same thing as file order — `update_user_note`
+  refreshes a note's timestamp in place *without moving its line*, so on-disk
+  order stops being a recency order the moment any note is refined. (An earlier
+  version of this tool returned raw on-disk order — oldest-first — which
+  disagreed with the prompt's own newest-first claim the first time a note was
+  updated; both surfaces now derive from the same ranking, so that can't happen
+  again. `read_notes()` itself is still plain on-disk/arrival order, oldest
+  first — it's the ranking on top of it that changed, not the reader.)
 - **Archived notes are invisible.** When the live file exceeds the 4 KB cap,
   the oldest bullets rotate out to `user_notes.archive.md`. This tool reads only
   the live file, so rotated-out preferences will not appear — and are no longer

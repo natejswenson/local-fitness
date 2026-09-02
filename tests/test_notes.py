@@ -440,6 +440,108 @@ def test_atomic_replace_default_mode_for_a_new_file(notes_path, monkeypatch):
     assert stat.S_IMODE(notes_path.stat().st_mode) == 0o644
 
 
+def test_recent_first_ranks_a_refreshed_note_first(notes_path):
+    # Repro 6: update_note refreshes a note's timestamp in place WITHOUT
+    # moving its line. A plain reversed(file order) then leaves the
+    # older, unrefreshed note first; recent_first must rank by the
+    # timestamp itself, not by position.
+    notes_path.write_text(
+        "- 2026-01-01T08:00:00 — OLD note, superseded.\n"
+        "- 2026-02-01T08:00:00 — NEWER conflicting note.\n",
+        encoding="utf-8",
+    )
+    old = next(n for n in notes.read_notes(notes_path) if "OLD" in n.text)
+    result = notes.update_note(
+        old.handle, "OLD note, but just refreshed today.", path=notes_path
+    )
+    assert result is not None
+
+    ranked = notes.recent_first(notes.read_notes(notes_path))
+    assert [n.text for n in ranked] == [
+        "OLD note, but just refreshed today.",
+        "NEWER conflicting note.",
+    ]
+
+    rendered = notes.render_for_prompt(notes_path)
+    assert rendered.splitlines()[0].endswith("OLD note, but just refreshed today.")
+
+
+def test_rotation_evicts_oldest_by_timestamp_not_position(notes_path):
+    # Repro 7: a note refreshed today but still sitting at file position 0
+    # (the oldest POSITION) must survive rotation, and whichever note is
+    # actually oldest BY TIMESTAMP is what gets archived instead. On dev,
+    # position-based eviction (lines.pop(0)) archived the just-refreshed
+    # note first.
+    bullets = [
+        f"- 2026-01-01T00:00:{i:02d} — preference number {i} with some padding text here"
+        for i in range(60)
+    ]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+
+    refreshed_handle = notes.read_notes(notes_path)[0].handle
+    result = notes.update_note(
+        refreshed_handle,
+        "JUST REFRESHED TODAY, lead with the workout card",
+        path=notes_path,
+    )
+    assert result is not None
+    refreshed_note, _ = result
+
+    notes.append_note("one more ordinary preference with padding text", path=notes_path)
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert refreshed_note.text in live_texts
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()  # rotation must actually have fired
+    archived_texts = [
+        parsed.text
+        for parsed in (notes._parse_line(ln) for ln in archive.read_text(encoding="utf-8").splitlines())
+        if parsed is not None
+    ]
+    assert refreshed_note.text not in archived_texts
+    # Note 0 was refreshed to today, so note 1 (2026-01-01T00:00:01) is
+    # now the oldest live timestamp and must be what's evicted first.
+    assert "preference number 1 with some padding text here" in archived_texts
+
+
+def test_recent_first_sorts_undated_and_malformed_timestamps_last(notes_path):
+    # A naive (timestamp, position) key sorts an empty/malformed string
+    # FIRST (it compares less than any real ISO timestamp) — which would
+    # promote a hand-edited undated bullet to the very front of the
+    # prompt. recent_first must fall back to putting it last instead.
+    notes_path.write_text(
+        "- not-a-valid-timestamp — malformed date\n"
+        "- just text no separator\n"
+        "- 2026-01-01T00:00:00 — dated note\n",
+        encoding="utf-8",
+    )
+    ranked = notes.recent_first(notes.read_notes(notes_path))
+    assert ranked[0].text == "dated note"
+    assert {ranked[1].text, ranked[2].text} == {"malformed date", "just text no separator"}
+    # And it must not raise — a hand-edited file is exactly the case this
+    # module is designed to tolerate.
+
+
+def test_rotation_terminates_on_pure_prose_over_cap(notes_path):
+    # A file with no evictable bullet at all — pure hand-edited prose,
+    # over the cap on its own — must not spin forever looking for a
+    # bullet to evict. The loop terminates and the write proceeds over
+    # budget rather than discarding content that isn't a note.
+    prose = "# just a heading, no bullets at all\n" * 200
+    assert len(prose.encode("utf-8")) > notes.LIVE_FILE_MAX_BYTES
+    notes_path.write_text(prose, encoding="utf-8")
+
+    new_note = notes.append_note("a real note finally", path=notes_path)
+    assert new_note.text == "a real note finally"
+
+    live_text = notes_path.read_text(encoding="utf-8")
+    assert "# just a heading" in live_text
+    assert "a real note finally" in live_text
+    archive = notes._archive_path(notes_path)
+    assert not archive.exists()  # nothing was ever evictable, so nothing rotated
+
+
 def test_default_notes_path_env(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_FITNESS_NOTES_PATH", str(tmp_path / "custom.md"))
     assert notes._default_notes_path() == tmp_path / "custom.md"

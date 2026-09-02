@@ -36,7 +36,7 @@ Seven top-level keys:
 | `metrics` | One row per metric in `DAILY_NUMERIC_METRICS` (18 rows), sorted alphabetically. Always all 18 — `value` is `null` when the day has no reading. |
 | `training_load` | `ctl` / `atl` / `tsb` from the latest `baselines` row on or before `date`, plus a plain-English `interpretation`. |
 | `recent_workouts` | The last 5 activities (`date DESC, start_time DESC`), raw columns plus mile/formatted convenience fields. |
-| `user_notes` | The saved coaching notes as a list of strings (`data/user_notes.md`). |
+| `user_notes` | The saved coaching notes as a list of strings (`data/user_notes.md`), newest-first — same ranking as [`list_user_notes`](list_user_notes.md) and the system prompt's notes section, so no two of the three model-facing surfaces disagree about which note is newest. |
 | `latest_brief_date` | ISO date of the newest file in the briefings dir, or `null` when none exist. |
 | `brief_stale_days` | Days between `date` and `latest_brief_date`, floored at 0. `0` = today's brief exists; `> 0` = nightly generation has been failing; `null` = no briefs on disk. |
 

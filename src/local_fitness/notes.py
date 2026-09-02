@@ -340,8 +340,18 @@ def _parse_line(line: str) -> Note | None:
 
 
 def read_notes(path: Path | None = None) -> list[Note]:
-    """Return all parsed notes from the live file, newest-first ordering
-    matching the on-disk order. Missing file = empty list."""
+    """Return all parsed notes from the live file, in on-disk (arrival)
+    order — oldest first. Missing file = empty list.
+
+    This is NOT a recency order. ``update_note`` rewrites a note's
+    timestamp in place without moving its line, so file position and
+    recency agree only until the first refinement — after that, the
+    newest note by timestamp can sit anywhere in this list. A caller that
+    wants newest-first should rank the result with ``recent_first()``,
+    which is what ``render_for_prompt``, ``list_user_notes``, and
+    ``daily_snapshot``'s ``user_notes`` all do, so the three model-facing
+    surfaces cannot disagree about which note is newest.
+    """
     p = path or _default_notes_path()
     if not p.exists():
         return []
@@ -359,13 +369,57 @@ def read_notes(path: Path | None = None) -> list[Note]:
     return notes
 
 
+def _recency_key(n: Note) -> tuple[int, str, int]:
+    """Sort key for ``recent_first``, meant to be used with ``reverse=True``.
+
+    ``parsed_ok`` is 1 for a timestamp that actually parses as ISO-8601,
+    0 for blank or malformed. With ``reverse=True`` that puts every
+    validly-timestamped note ahead of every undated/malformed one — a
+    naive ``(timestamp, position)`` key would instead sort an empty
+    string *first* (empty < any real timestamp), promoting a hand-edited
+    undated bullet to the very front of the prompt. Within each group,
+    ``timestamp`` breaks ties by recency and ``position`` (the file
+    offset at read time) breaks ties between identical timestamps by
+    which was written later — the same signal ``reversed(file order)``
+    used before this ranking existed.
+    """
+    parsed_ok = 0
+    if n.timestamp:
+        try:
+            datetime.fromisoformat(n.timestamp)
+            parsed_ok = 1
+        except ValueError:
+            parsed_ok = 0
+    return (parsed_ok, n.timestamp, n.position)
+
+
+def recent_first(items: list[Note]) -> list[Note]:
+    """Rank notes newest-first by timestamp, tie-broken by file position.
+
+    The one ranking shared by ``render_for_prompt``, ``list_user_notes``,
+    and ``daily_snapshot``'s ``user_notes`` — before this, all three
+    derived "recent" from on-disk position, which stops being true the
+    moment ``update_note`` refreshes a note's timestamp in place without
+    moving its line (an in-place refinement leaves file order and
+    recency order disagreeing, and a 4 KB rotation that evicts by
+    position then archives the freshest note first). A blank or
+    unparseable timestamp sorts LAST — see ``_recency_key``.
+    """
+    return sorted(items, key=_recency_key, reverse=True)
+
+
 def render_for_prompt(path: Path | None = None) -> str:
     """Render the notes for inclusion in a system prompt.
 
     Returns an empty string when there are no notes (caller can skip the
-    section heading). Otherwise returns one bullet per line, newest-first
-    by on-disk position (recency-by-timestamp ranking is a later change —
-    see ``notes-recency-ordering``).
+    section heading). Otherwise returns one bullet per line, ranked
+    newest-first by ``recent_first`` — timestamp descending, tie-broken
+    by on-disk position — so the order shown here, the order
+    ``list_user_notes`` returns, and the order ``daily_snapshot``'s
+    ``user_notes`` carries all agree. (Before this ranking existed,
+    "newest first" meant reversed file order, which broke the moment any
+    note was refined — the header's "prefer the newer note" rule then
+    resolved backwards.)
 
     Each line carries the note's content ``handle`` as a ``[prefix]``, not
     a raw file line index — a line's position is not a stable identity
@@ -376,7 +430,7 @@ def render_for_prompt(path: Path | None = None) -> str:
     the "prefer the newer note" rule from evidence it can see, rather than
     trusting an ordering it has no way to verify.
     """
-    notes = list(reversed(read_notes(path)))  # newest-by-position first
+    notes = recent_first(read_notes(path))
     if not notes:
         return ""
     lines = []
@@ -452,24 +506,53 @@ def append_note(text: str, path: Path | None = None) -> Note:
 
 
 def _rotate_to_fit(existing: str, new_line: str) -> tuple[str, str]:
-    """Drop oldest lines from ``existing`` until ``existing + new_line``
-    fits the cap. Returns (kept_text, rotated_text) where rotated_text
-    contains the dropped lines (in original order) for archiving.
+    """Drop bullets from ``existing``, oldest by timestamp, until
+    ``existing + new_line`` fits the cap. Returns (kept_text,
+    rotated_text) where rotated_text contains the dropped lines, in the
+    order they were evicted, for archiving.
+
+    Eviction ranks by ``recent_first`` and pops from the tail (oldest)
+    end, not by file position — a position-based eviction (the old
+    ``lines.pop(0)``) archives the *freshest* note first the moment any
+    note has been refreshed out of file order (Repro 7): ``update_note``
+    rewrites a timestamp in place without moving the line, so "oldest
+    line" and "oldest note" stop being the same question after the first
+    refinement. A non-bullet line (free prose the file's own docstring
+    invites) carries no timestamp and is never a candidate — only parsed
+    bullets are evicted. If every bullet is gone and the file (now pure
+    prose, or already minimal) still exceeds the cap, the loop stops and
+    the write proceeds over budget rather than spinning forever or
+    discarding content that isn't a note at all.
 
     Relies on ``existing`` already ending in a trailing newline (or
     being empty) — every caller passes ``ctx.existing_text``, which
-    ``_RewriteContext`` guarantees. That's what lets ``"".join(lines) +
-    new_line`` below join cleanly instead of welding the last kept line
-    into ``new_line``: this function establishes no boundary of its own
+    ``_RewriteContext`` guarantees. That's what lets the joins below
+    happen cleanly instead of welding the last kept line into
+    ``new_line``: this function establishes no boundary of its own
     because ``_locked_rewrite`` already established one for it.
     """
     lines = existing.splitlines(keepends=True)
     rotated: list[str] = []
-    while lines:
+    while True:
         candidate = "".join(lines) + new_line
         if len(candidate.encode("utf-8")) <= LIVE_FILE_MAX_BYTES:
             break
-        rotated.append(lines.pop(0))
+        bullets = [
+            Note(handle=parsed.handle, position=i,
+                 timestamp=parsed.timestamp, text=parsed.text)
+            for i, ln in enumerate(lines)
+            if (parsed := _parse_line(ln)) is not None
+        ]
+        if not bullets:
+            LOG.warning(
+                "Notes file still exceeds %d bytes with no evictable "
+                "bullet remaining (%d bytes of non-bullet content); "
+                "writing over budget rather than discarding it.",
+                LIVE_FILE_MAX_BYTES, len(candidate.encode("utf-8")),
+            )
+            break
+        oldest = recent_first(bullets)[-1]
+        rotated.append(lines.pop(oldest.position))
     kept = "".join(lines) + new_line
     return kept, "".join(rotated)
 

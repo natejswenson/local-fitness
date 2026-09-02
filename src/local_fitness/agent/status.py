@@ -440,7 +440,10 @@ def assemble_status(
         training_load = _training_load(baseline, today, current_form, today_row)
         recent_workouts = _recent_workouts(conn)
 
-    user_notes = [n.text for n in notes.read_notes() if n.text]
+    # Newest-first, same ranking as render_for_prompt/list_user_notes — a
+    # plain read_notes() would be oldest-first and disagree with the other
+    # two model-facing surfaces the moment any note is refined in place.
+    user_notes = [n.text for n in notes.recent_first(notes.read_notes()) if n.text]
     latest_brief_date, brief_stale_days = _latest_brief_freshness(today)
 
     payload = {
