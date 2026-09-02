@@ -4137,15 +4137,20 @@ def test_fetch_metric_series_window_ends_on_the_given_date(seeded):
     """Regression: the window was anchored to date.today() with NO upper
     bound, so re-rendering an OLD brief drew charts running to today and could
     show data the brief's own prose never saw."""
-    dates, _values = tools._fetch_metric_series("rhr", 3650, end="2026-07-10")
+    # The end date is derived from today because the fixture seeds the 40 days
+    # ending today — a hard-coded date died the day it aged out of that window.
+    end = (date.today() - timedelta(days=5)).isoformat()
+    dates, _values = tools._fetch_metric_series("rhr", 3650, end=end)
     assert dates, "fixture should have rhr rows in range"
-    assert max(dates) <= "2026-07-10"
+    assert max(dates) <= end
 
 
 def test_fetch_metric_series_window_starts_days_before_end(seeded):
-    dates, _values = tools._fetch_metric_series("rhr", 7, end="2026-07-10")
-    assert min(dates) >= "2026-07-03"
-    assert max(dates) <= "2026-07-10"
+    end = (date.today() - timedelta(days=5)).isoformat()
+    start = (date.today() - timedelta(days=12)).isoformat()
+    dates, _values = tools._fetch_metric_series("rhr", 7, end=end)
+    assert min(dates) >= start
+    assert max(dates) <= end
 
 
 def test_fetch_metric_series_defaults_to_today_for_live_callers(seeded):
