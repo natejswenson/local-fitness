@@ -81,11 +81,13 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
   once *this* note itself is updated, deleted, or rotated to the archive; at
   that point `list_user_notes` is how you get a live handle again.
 - **4 KB live cap with silent rotation.** If the append would push the file past
-  `LIVE_FILE_MAX_BYTES` (4096), the oldest bullets are dropped from the live
-  file and appended to `user_notes.archive.md` *before* the write. Archived
-  notes are no longer injected into the prompt and no longer appear in
-  `list_user_notes` — they are effectively forgotten. The tool result does not
-  tell you rotation happened.
+  `LIVE_FILE_MAX_BYTES` (4096), the oldest bullets **by timestamp** — not by
+  file position — are dropped from the live file and appended to
+  `user_notes.archive.md` *before* the write. A note refreshed today via
+  `update_user_note` is never the first thing evicted just because it sits
+  early in the file. Archived notes are no longer injected into the prompt and
+  no longer appear in `list_user_notes` — they are effectively forgotten. The
+  tool result does not tell you rotation happened.
 - **Recency is a prompt instruction, not enforced code.** Nothing dedupes or
   reconciles conflicting notes. `render_for_prompt()` orders them newest-first
   and the system prompt says "prefer the newer note when two conflict" — that
