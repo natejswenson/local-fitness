@@ -6,6 +6,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-09-01
+
+### Fixed
+- **`update_user_note` / `delete_user_note` can no longer silently hit the
+  wrong preference** (#132). Both used to address a note by its raw file line
+  index — not stable, since a delete shifted every later index down by one
+  and the 4 KB rotation renumbered the whole file — so a write could land on
+  a different note than the one the caller read, and report success either
+  way. Notes are now addressed by an 8-character content handle derived from
+  `(timestamp, text)`: `list_user_notes` and the system prompt's notes
+  section hand it out, `update_user_note`/`delete_user_note` take it in place
+  of `line`, and a handle that no longer resolves is a loud error naming it,
+  not a silent redirect to a neighbour. A duplicated note (identical
+  timestamp and text) is acted on by its first occurrence and reports
+  `duplicates`, converging to unique handles again after one call.
+- **Every write to `data/user_notes.md` now happens inside one held lock,
+  exiting through a temp file + atomic replace.** The prior code truncated
+  the file before writing its replacement, leaving a window where a
+  concurrent reader — including the coach-persona build — could observe an
+  empty file (measured at 22% of reads in a two-thread loop). The
+  replacement preserves the original file's permissions.
+- **A hand-edited notes file missing its trailing newline can no longer weld
+  two notes into one.** `_rotate_to_fit`'s reassembly and `_append_archive`'s
+  append onto an existing archive both now establish the line boundary
+  themselves rather than assuming the prior content already ended in a
+  newline; the old code merged the newest surviving note into the incoming
+  one, unarchived and unrecoverable.
+- **Recency is now the note's timestamp, not its position in the file.**
+  `update_user_note` refreshes a note's timestamp in place, so file order
+  stopped being a recency order the moment any note was refined — and the 4
+  KB rotation, which evicted by position, archived the freshest note first.
+  `render_for_prompt`, `list_user_notes`, and `daily_snapshot`'s
+  `user_notes` now share one ranking by parsed timestamp (descending), with
+  an absent or malformed timestamp sorting last, not first.
+- **`update_user_note` now enforces the 4 KB live-file cap after its own
+  rewrite**, the same as `append_note` always has — replacing a short note
+  with a long one no longer leaves the file over budget (and therefore over
+  the prompt-injection budget) until the next append. The rotation this can
+  trigger never evicts the note that was just rewritten, even when another
+  note's timestamp ties it to the same second or carries a future date.
+- **`list_observations`'s `obs_type` filter is validated** against the same
+  enum `log_observation` already writes with. A typo or wrong case (`"RPE"`)
+  used to fall through to a case-sensitive SQL `=` and return an empty list
+  indistinguishable from "nothing logged"; it now returns an error naming
+  the allowed types.
+- **`delete_observation` returns a clean error for a missing or non-numeric
+  `observation_id`**, instead of raising `KeyError`/`ValueError` out of the
+  handler, matching every neighbouring delete tool (`delete_coach_memory` is
+  the same shape). Over the real MCP transport both were already rejected by
+  input-schema validation; this buys handler-level consistency for
+  in-process and test callers.
+
+### Changed
+- `notes.py`'s module docstring, and `docs/mcp/save_user_note.md`,
+  `update_user_note.md`, `delete_user_note.md`, `list_user_notes.md`,
+  `daily_snapshot.md`, `list_observations.md`, `delete_observation.md`, and
+  `delete_coach_memory.md`, rewritten to describe the lock/handle/recency/
+  validation contracts this release replaces the old ones with.
+
 ## [0.60.2] - 2026-08-10
 
 ### Fixed

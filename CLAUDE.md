@@ -1634,6 +1634,22 @@ These are settled — don't redesign without a reason.
   check + a PR, squash-only, linear history, `enforce_admins: false`
   (admin break-glass). Repo settings: auto-merge + delete-branch-on-merge
   on. See *Branching & release strategy*.
+- **A record's position in a file is not its identity** (0.61.0, issue #132).
+  `update_user_note`/`delete_user_note` used to address a note by its raw
+  file line index, recomputed on every read — a delete shifted every later
+  index, a rotation renumbered the whole file, and neither write path
+  noticed, so a caller could silently overwrite or delete a different
+  preference than the one it had just read. `notes.py` now addresses a note
+  by a content handle and resolves it *inside* the same held lock it writes
+  under, refusing loudly when the target no longer matches instead of
+  redirecting to whatever now sits at that offset. Any tool that addresses a
+  file-backed record gets the same treatment: address it by content or id,
+  never by a recomputed position; refuse loudly when the target has moved or
+  changed; and resolve-then-rewrite inside one held lock so the read the
+  decision is based on can't go stale before the write lands. The write
+  itself is atomic (temp file + `os.replace`) so a reader — including a
+  human's text editor, which this file is designed to be hand-edited by —
+  never observes a partial file.
 
 ## File-layout reference
 

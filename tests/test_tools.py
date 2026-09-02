@@ -1628,6 +1628,25 @@ def test_list_observations_under_cap_is_not_flagged(seeded):
     assert "truncated" not in listed
 
 
+def test_list_observations_rejects_unknown_obs_type(seeded):
+    # Same enum log_observation already enforces — a typo or wrong case used
+    # to fall through to a case-sensitive SQL `=` and come back as an empty
+    # list indistinguishable from "nothing logged" (issue #132).
+    call(tools.log_observation, {"obs_type": "rpe", "value": 8})
+
+    payload, err = call(tools.list_observations, {"obs_type": "RPE"})
+    assert err
+    assert payload["allowed"] == sorted(tools.OBS_TYPES)
+
+    payload, err = call(tools.list_observations, {"obs_type": "soreness_level"})
+    assert err
+    assert payload["allowed"] == sorted(tools.OBS_TYPES)
+
+    ok, err = call(tools.list_observations, {"obs_type": "rpe"})
+    assert not err
+    assert ok["count"] == 1
+
+
 def test_log_observation_invalid_obs_type(seeded):
     _payload, err = call(tools.log_observation, {"obs_type": "bogus", "value": 1})
     assert err
@@ -1699,6 +1718,21 @@ def test_delete_observation_absent_and_present(seeded):
     obs_id = saved["observation"]["observation_id"]
     deleted, err = call(tools.delete_observation, {"observation_id": obs_id})
     assert not err and deleted["deleted"]
+    assert not _obs_rows(seeded)
+
+
+def test_delete_observation_missing_or_non_numeric_id_is_a_clean_error(seeded):
+    # args.get() + a validation branch, matching delete_coach_memory's shape —
+    # not args["observation_id"] straight into int(). A missing or non-numeric
+    # argument used to raise KeyError/ValueError out of the handler instead of
+    # the clean _err shape every neighbouring tool uses (issue #132). Called
+    # directly against the handler: over the real MCP transport both are
+    # already rejected by input-schema validation before this code ever runs.
+    _payload, err = call(tools.delete_observation, {})
+    assert err
+
+    _payload, err = call(tools.delete_observation, {"observation_id": "abc"})
+    assert err
     assert not _obs_rows(seeded)
 
 

@@ -21,7 +21,7 @@ To correct rather than remove a reading, delete and re-log — there is no
 
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `observation_id` | integer | yes | — | The `observation_id` from [`log_observation`](log_observation.md)'s result or [`list_observations`](list_observations.md). Coerced with `int()`. |
+| `observation_id` | integer | yes | — | The `observation_id` from [`log_observation`](log_observation.md)'s result or [`list_observations`](list_observations.md). Missing or non-integer returns a clean error. |
 
 ## Returns
 
@@ -60,8 +60,11 @@ issuing the `DELETE`, so a bad id is a clean error rather than a silent no-op.
   id does — the two tools no longer need different habits.
 - **Deletes one row, not a day.** "Delete today's observations" is several
   calls; list first and confirm the set.
-- **Missing `observation_id` raises rather than returning a clean error** — the
-  handler reads `args["observation_id"]` directly. Always send the parameter.
+- **Missing or non-numeric `observation_id` returns a clean error**, matching
+  every neighbouring tool (`delete_coach_memory` is the same shape) — the
+  handler validates before it queries. Over the real MCP transport this is
+  already rejected by input-schema validation before the handler runs; the
+  handler-level check matters for in-process and test callers.
 - Deleting an observation never touches the linked activity. The reverse
   direction is also non-destructive: `delete_manual_workout` sets
   `observations.activity_id = NULL` instead of removing referencing rows.
