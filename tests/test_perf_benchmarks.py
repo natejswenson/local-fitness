@@ -18,7 +18,14 @@ Three axes are asserted:
     equivalence oracles beside it proving the work that went away changed no
     answer. The first two axes both missed a real +13.86% regression for five
     weeks: it opened no extra connection, and the latency reading it produced
-    was read as runner drift and re-run to green.
+    was read as runner drift and re-run to green. Unlike the latency axis,
+    this one has no `benchmark` fixture, so it is the INVERSE of that axis'
+    skip rule: it runs in the ordinary `uv run pytest` job (this file's
+    `--benchmark-skip` default does not skip it, only the timed benchmarks)
+    and is itself skipped under `--benchmark-only`, the CI invocation that
+    runs the latency axis — so a red work-count assertion shows up in the
+    "Run tests with coverage gate" step, not the "Perf-benchmark regression
+    gate" step.
 
 # pre-fix baseline (measured 2026-07-09, before Part A fixes #1-#3, against
 # this file's synthetic 3-year/active-plan fixture):
@@ -37,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tomllib
 from datetime import date, timedelta
 from enum import IntEnum
 from pathlib import Path
@@ -276,25 +284,50 @@ def test_workout_actuals_evaluates_ran_once_per_on_foot_activity(monkeypatch):
     assert counts["n"] == 2
 
 
+def _freeze_progress_clock(monkeypatch, today):
+    """Move the clock `get_training_plan_progress`'s window frontier reads.
+    `_ran`'s count is immune to date (proof: 87 at every date probed, from
+    `_TODAY` through `_TODAY` + 5000d — `build_plan_detail` grades the full
+    plan, not the windowed one), but `_round_floats`'s count is not: the
+    handler's default window is `max(frontier, today) + 7d`, so every extra
+    day of wall clock sweeps another prescribed workout into the serialized
+    payload and the call count grows with it (25 at `_TODAY`, 83 at
+    `_TODAY` + 58d, plateauing at 115 from `_TODAY` + 100d on — #232)."""
+    class _FakeDate(date):
+        @classmethod
+        def today(cls):
+            return today
+
+    monkeypatch.setattr(tools, "date", _FakeDate)
+
+
 def test_get_training_plan_progress_does_not_double_classify(default_db, monkeypatch):
     """The handler-level twin of the assertion above — proof 1 alone is
-    satisfied by a folded helper nobody calls. 123 before the fold, 87 after."""
+    satisfied by a folded helper nobody calls. 123 before the fold, 87 after,
+    pinned exactly rather than as an upper bound so an early-return handler
+    (0 calls) cannot pass over unclassified work (#232)."""
+    _freeze_progress_clock(monkeypatch, _TODAY + timedelta(days=58))
     counts = _count_calls(monkeypatch, plans, "_ran")
     _run(tools.get_training_plan_progress.handler({}))
-    assert counts["n"] <= 90
+    assert counts["n"] == 87
 
 
 def test_get_training_plan_progress_rounds_without_a_call_per_node(default_db, monkeypatch):
     """`_round_floats` recursed into every leaf, so serializing this payload
     cost one Python call per node: 470 for 10 KB. The container branches now
-    handle their own scalar children, leaving one call per dict/list (83 here).
+    handle their own scalar children, leaving one call per dict/list (83 here,
+    with the clock pinned to `_TODAY` + 58d — see `_freeze_progress_clock` for
+    why an unpinned clock makes this count grow with wall-clock date).
 
     This is the assertion that binds the `_round_floats` change to a real
     reduction in work — an output-correct rewrite that is no faster fails it,
-    which the equivalence oracle below cannot detect."""
+    which the equivalence oracle below cannot detect. Pinned exactly rather
+    than as an upper bound so an early-return handler (1 call) cannot pass
+    over the reduction this test exists to prove (#232)."""
+    _freeze_progress_clock(monkeypatch, _TODAY + timedelta(days=58))
     counts = _count_calls(monkeypatch, tools, "_round_floats")
     _run(tools.get_training_plan_progress.handler({}))
-    assert counts["n"] <= 100
+    assert counts["n"] == 83
 
 
 # --- equivalence oracles: the work went away, the answers did not -----------
@@ -353,14 +386,23 @@ _WORKOUT_ACTUALS_EDGE_CASES = [
       "duration_seconds": 1800, "avg_pace_sec_per_km": 300.0}],
     [{"activity_type": "walking", "distance_meters": None,
       "duration_seconds": 1800, "avg_pace_sec_per_km": None}],
+    # Mixed day (#232): a non-foot ride FIRST, then two on-foot activities
+    # (one run, one walk), then a typeless non-foot row. Exercises the exact
+    # combination the fold changed — `classes.add("other")` now runs INSIDE
+    # the loop that accumulates on-foot distance/duration and must `continue`
+    # rather than stop, or the on-foot activities after the ride would be
+    # silently dropped from the accumulation. A 548-day corpus that is one
+    # activity per day, always `running`, never exercises that ordering.
+    [_RIDE, _PACED_RUN, _PACED_WALK,
+     {"activity_type": None, "distance_meters": 100.0}],
 ]
 
 
 def test_workout_actuals_still_answers_exactly_what_it_answered_before(perf_db):
     """The fold removed a pass, not a classification. Every activity-day in the
-    fixture plus six edge cases must produce a five-tuple identical to the
-    pre-fold implementation — otherwise the call-count assertions above could
-    be satisfied by simply not classifying."""
+    fixture plus the edge cases below must produce a five-tuple identical to
+    the pre-fold implementation — otherwise the call-count assertions above
+    could be satisfied by simply not classifying."""
     with db.connect(perf_db) as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM activities ORDER BY date, activity_id")]
@@ -371,6 +413,11 @@ def test_workout_actuals_still_answers_exactly_what_it_answered_before(perf_db):
     # a multi-year history. A query that quietly matched nothing must fail here,
     # not pass over an empty loop.
     assert len(by_date) > 500
+    # Anti-vacuity, same rule applied to the edge-case list itself (#232): the
+    # 548-day corpus above is measurably one input shape (one activity/day,
+    # always `running`) repeated 548 times, so the differential coverage this
+    # oracle actually relies on lives here, not in the day count.
+    assert len(_WORKOUT_ACTUALS_EDGE_CASES) >= 7
 
     for day, activities in by_date.items():
         assert plans._workout_actuals(activities) == \
@@ -459,6 +506,16 @@ def test_round_floats_output_is_identical_to_the_pre_inline_implementation(
     for case in _ROUND_FLOATS_CASES:
         assert _dumped(tools._round_floats(case)) == _dumped(_round_floats_reference(case)), case
 
+    # `_dumped`'s json.dumps comparison is type-blind — json.dumps((1, 2)) ==
+    # json.dumps([1, 2]) — so it cannot see the tuple-to-list conversion Proof
+    # 5 requires. Assert the type directly, on both the bare-tuple case and
+    # the list-of-single-element-tuples case already in _ROUND_FLOATS_CASES
+    # (#232).
+    assert isinstance(tools._round_floats((1.23456789, 2.3456789)), list)
+    converted = tools._round_floats([(1.23456789,), (2.3456789,)])
+    assert isinstance(converted, list)
+    assert all(isinstance(item, list) for item in converted)
+
 
 def test_the_round_floats_oracle_can_actually_fail(default_db, monkeypatch):
     """An equality test that passes against any implementation the author
@@ -512,7 +569,9 @@ def test_the_latency_gate_is_still_armed():
     root = Path(__file__).resolve().parents[1]
     assert "--benchmark-compare-fail=min:15%" in (
         root / ".github/workflows/ci.yml").read_text()
-    assert "--benchmark-skip" in (root / "pyproject.toml").read_text()
+    addopts = tomllib.loads((root / "pyproject.toml").read_text())[
+        "tool"]["pytest"]["ini_options"]["addopts"]
+    assert "--benchmark-skip" in addopts
 
 
 # --- fix #3 regression: bounded activities lookback -------------------------
