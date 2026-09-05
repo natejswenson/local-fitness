@@ -100,6 +100,16 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
   early in the file. Archived notes are no longer injected into the prompt and
   no longer appear in `list_user_notes` — they are effectively forgotten. The
   tool result does not tell you rotation happened.
+- **If the archive can't be written, nothing is evicted.** The rotation writes
+  the archive first and only truncates the live file once that write lands. If
+  it fails — the archive path is read-only, is a directory, the disk is full —
+  the would-be-evicted bullets stay live and the file is written *over* the
+  4 KB budget instead, with a `WARNING` naming the archive path. The cap
+  bounds prompt size; it is not a licence to destroy a preference that has
+  nowhere else to go, so a degraded archive costs you a fat prompt rather than
+  a lost note. Nothing recovers on its own: while the archive stays broken the
+  live file keeps growing at whatever rate notes are written, so the WARNING is
+  the thing to act on.
 - **Recency is a prompt instruction, not enforced code.** Nothing dedupes or
   reconciles conflicting notes. `render_for_prompt()` orders them newest-first
   and the system prompt says "prefer the newer note when two conflict" — that

@@ -116,8 +116,12 @@ Read first, then target the handle exactly as shown:
   bullets **by timestamp** are rotated to `user_notes.archive.md`, same as
   `save_user_note`'s rotation. The note just rewritten is excluded from
   eviction outright, so it is never the thing evicted by its own update —
-  including when another note's timestamp ties it to the same second. The
-  tool result does not tell you rotation happened.
+  including when another note's timestamp ties it to the same second. If the
+  archive cannot be written, nothing is evicted and the file goes over budget
+  instead — see
+  [`save_user_note`](save_user_note.md)'s gotcha of the same name; it matters
+  more here, since one capacity-tripping update rotates as many bullets as the
+  new text costs. The tool result does not tell you rotation happened.
 - Not reachable from the brief loop — `_READ_ONLY_TOOL_NAMES` excludes every
   note-write tool so brief generation cannot mutate preferences.
 

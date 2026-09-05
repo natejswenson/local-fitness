@@ -494,7 +494,10 @@ def append_note(text: str, path: Path | None = None) -> Note:
     """Append a single note to the live file. Newline-folds the input so a
     multi-line message doesn't break the bullet structure. If appending
     would push the file past LIVE_FILE_MAX_BYTES, oldest bullets are
-    rotated to the archive file first.
+    rotated to the archive file first — and if that archive write fails,
+    nothing is evicted and the file is written over budget instead. The
+    cap bounds prompt size; it is not a licence to destroy a preference
+    that has nowhere else to go.
     """
     text = " ".join(text.split())  # collapse all whitespace to single spaces
     if not text:
@@ -520,14 +523,26 @@ def append_note(text: str, path: Path | None = None) -> Note:
         candidate = existing + new_line
         if len(candidate.encode("utf-8")) > LIVE_FILE_MAX_BYTES:
             kept, rotated, _protected = _rotate_to_fit(existing, new_line)
-            if rotated:
-                # Archive before the live replace: if the process dies
-                # between the two, the rotated note exists twice (archive
-                # + live) rather than zero times — duplication recovers,
-                # loss doesn't.
-                _append_archive(rotated, _archive_path(p))
-            ctx.text = kept
-            final_text = kept
+            # Archive before the live replace: if the process dies
+            # between the two, the rotated note exists twice (archive
+            # + live) rather than zero times — duplication recovers,
+            # loss doesn't. And if the archive can't be written at all,
+            # keep the evicted bullets live: the cap bounds prompt size,
+            # it doesn't license deletion, and _rotate_to_fit already
+            # takes exactly this way out for unevictable prose.
+            if rotated and not _append_archive(rotated, _archive_path(p)):
+                LOG.warning(
+                    "Archive write failed — keeping %d rotated byte(s) live "
+                    "and writing %d bytes over budget (cap %d) rather than "
+                    "destroying them.",
+                    len(rotated.encode("utf-8")),
+                    len(candidate.encode("utf-8")), LIVE_FILE_MAX_BYTES,
+                )
+                ctx.text = candidate
+                final_text = candidate
+            else:
+                ctx.text = kept
+                final_text = kept
         else:
             ctx.text = candidate
             final_text = candidate
@@ -625,9 +640,18 @@ def _rotate_to_fit(
     return kept, "".join(rotated), protected_index
 
 
-def _append_archive(text: str, archive_path: Path) -> None:
-    """Append rotated content to the archive file. Best-effort — failures
-    are logged but don't block the live write.
+def _append_archive(text: str, archive_path: Path) -> bool:
+    """Append rotated content to the archive file. Returns whether the
+    append landed — ``False`` means the rotated content now exists nowhere
+    but in the caller's hands, and the caller must keep it live.
+
+    Failures are logged rather than raised: an unwritable archive is a
+    degraded state, not a reason for every note write to start failing,
+    and the casualty of raising here would be the user's brand-new
+    preference, which had nothing to do with the failure. What the
+    ``None`` this used to return could not tell a caller is *which* of the
+    two happened — so both callers truncated the live file either way, and
+    a read-only archive destroyed the evicted preferences outright.
 
     Establishes the line boundary on *both* sides of the join: the text
     being appended (via ``_ensure_trailing_newline``, same as before),
@@ -650,6 +674,8 @@ def _append_archive(text: str, archive_path: Path) -> None:
             h.write(_ensure_trailing_newline(text))
     except OSError as e:
         LOG.warning("Failed to write archive %s: %s", archive_path, e)
+        return False
+    return True
 
 
 def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[Note, int] | None:
@@ -694,6 +720,12 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
     eviction candidates outright: the just-updated note is never the
     thing evicted by its own update, in every case, not only the case
     where no other note's timestamp ties it.
+
+    If the archive write fails, nothing is evicted and the over-budget
+    text is written as-is — same as ``append_note``, and it matters more
+    here: one capacity-tripping update rotates as many bullets as the new
+    text costs. The returned ``position`` then still points at the
+    rewritten line, because no line ahead of it moved.
     """
     new_text = " ".join(new_text.split())
     if not new_text:
@@ -727,15 +759,27 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
             kept, rotated, protected_after = _rotate_to_fit(
                 candidate, protected_index=new_position,
             )
-            if rotated:
-                # Archive before the live replace — see append_note for
-                # why (duplication on a crash recovers, loss doesn't).
-                _append_archive(rotated, _archive_path(p))
-            ctx.text = kept
-            # protected_index was passed as an int (new_position), so
-            # _rotate_to_fit always returns an int back here too.
-            assert protected_after is not None
-            new_position = protected_after
+            # Archive before the live replace, and keep the evicted
+            # bullets live if the archive can't be written — see
+            # append_note for both halves of why.
+            if rotated and not _append_archive(rotated, _archive_path(p)):
+                LOG.warning(
+                    "Archive write failed — keeping %d rotated byte(s) live "
+                    "and writing %d bytes over budget (cap %d) rather than "
+                    "destroying them.",
+                    len(rotated.encode("utf-8")),
+                    len(candidate.encode("utf-8")), LIVE_FILE_MAX_BYTES,
+                )
+                ctx.text = candidate
+                # Nothing was popped on this path, so new_position stays
+                # match.index — protected_after is short by however many
+                # lines the rotation WOULD have removed ahead of it.
+            else:
+                ctx.text = kept
+                # protected_index was passed as an int (new_position), so
+                # _rotate_to_fit always returns an int back here too.
+                assert protected_after is not None
+                new_position = protected_after
         else:
             ctx.text = candidate
 
