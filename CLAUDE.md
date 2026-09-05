@@ -196,6 +196,29 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   shows a double-digit margin. Confirm both, then recapture via the
   workflow dispatched on `main` (pre-PR code = the honest floor) and
   hand-promote the artifact to the committed `0001_*.json`.
+  **(3) Apply the tell PER BENCHMARK, not to the run.** A clock deficit is
+  fleet-wide: it moves all five together. One benchmark out of line with its
+  four siblings is a code regression however slow the runner was — and the
+  corroborating question to ask next is *how much of the regressed work does
+  each benchmark actually do*. Worked example (2026-09-02, #232): run
+  `33652312669` passed on the baseline's own CPU (EPYC 7763 @ 3.2407 GHz vs
+  the baseline's 3.2410) with `assemble_brief_context` at **−0.34%** and
+  `get_training_plan_progress` at **+13.86%** — same silicon, same clock, one
+  benchmark faster and one 14% slower, which no clock deficit can produce.
+  Counting the work answered why: 470 `_round_floats` calls and 123 `_ran`
+  evaluations in the regressed target against 22 and 15 in the next one.
+  Bisected to **`b28c74e` (PR #162, 2026-07-27)** — one day after the baseline
+  was captured — with every later commit flat, so the "gate is flaky" reading
+  was wrong in the direction that matters: the gate was the only thing
+  reporting a real regression, and rebaselining would have baked it into the
+  floor. **Open, and worth knowing before the next rebaseline:** the committed
+  baseline was captured on CPython **3.12.13** and current runners are on
+  **3.12.14**, which has no macOS-aarch64 build to A/B against locally. The
+  −0.34% sibling bounds it (3.12.14 is not broadly slower here), but a
+  *targeted* 3.12.14 change to comprehensions or small-object allocation would
+  land almost entirely on `_round_floats` and be indistinguishable from a code
+  regression. Settling it needs one `capture-perf-baseline.yml` dispatch on
+  `8edfb70` under 3.12.14.
 - **The PR body IS the writeup.** There is no in-repo `devlog/` (removed
   2026-08-03 — 63 files nothing in the repo read, duplicating what the
   `/devlog` skill publishes to natejswenson.com from git history). A

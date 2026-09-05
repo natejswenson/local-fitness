@@ -6,13 +6,19 @@ so a plain `uv run pytest` never runs the (slow, timed) benchmarks here — only
 an explicit `--benchmark-only` invocation does (see the design doc's
 "Eval-proof methodology" section for the exact commands and CI wiring).
 
-Two axes are asserted, per the design:
+Three axes are asserted:
   * latency — the `benchmark` fixture, compared against a committed
     pytest-benchmark baseline in CI (`--benchmark-compare-fail=min:15%`);
   * connection-open COUNT — a monkeypatched counter around `db.connect`,
     asserting the exact number of `sqlite3` connections each call chain
     opens. Latency alone is noisy and can't distinguish "still fast because
-    the machine is fast" from "actually opens one connection now".
+    the machine is fast" from "actually opens one connection now";
+  * work COUNT (added 2026-09-03, #232) — the same counter pointed at the
+    hot functions themselves (`plans._ran`, `tools._round_floats`), with
+    equivalence oracles beside it proving the work that went away changed no
+    answer. The first two axes both missed a real +13.86% regression for five
+    weeks: it opened no extra connection, and the latency reading it produced
+    was read as runner drift and re-run to green.
 
 # pre-fix baseline (measured 2026-07-09, before Part A fixes #1-#3, against
 # this file's synthetic 3-year/active-plan fixture):
@@ -30,12 +36,15 @@ Two axes are asserted, per the design:
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, timedelta
+from enum import IntEnum
+from pathlib import Path
 
 import pytest
 from perf_fixture import build_perf_fixture_db, build_report_card_fixture_db
 
-from local_fitness import db
+from local_fitness import db, plans
 from local_fitness.agent import brief_planner, report_card, tools
 from local_fitness.agent.status import assemble_status
 
@@ -224,6 +233,286 @@ def test_workout_report_card_opens_two_connections(rc_db, monkeypatch):
         {"activity_id": activity_id, "format": "table"}))
     assert not result.get("is_error"), result
     assert counts["n"] == 2
+
+
+# --- work COUNT: the same instrument, pointed at hot functions --------------
+# A 2 ms call chain is too small for latency alone to separate "the runner was
+# slow" from "the code got slower" — which is exactly how a real +13.86%
+# regression in `get_training_plan_progress` sat one noise-width under the 15%
+# gate from 2026-07-27 to 2026-09-03. These count the work instead: they are
+# deterministic, they do not care which CPU CI drew, and they are what a
+# reviewer can read as "this many fewer Python calls happen now".
+
+def _count_calls(monkeypatch, module, name):
+    """Count calls to ``module.name`` — `_count_connect_opens`'s instrument
+    pointed at a hot function. Recursive calls count too: a module-level
+    function reaches itself through the same module attribute this patches."""
+    counts = {"n": 0}
+    orig = getattr(module, name)
+
+    def counting(*args, **kwargs):
+        counts["n"] += 1
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, counting)
+    return counts
+
+
+_PACED_RUN = {"activity_type": "running", "distance_meters": 9574.85,
+              "duration_seconds": 3000, "avg_pace_sec_per_km": 313.3}
+_PACED_WALK = {"activity_type": "treadmill_running", "distance_meters": 5202.75,
+               "duration_seconds": 4200, "avg_pace_sec_per_km": 807.3}
+_RIDE = {"activity_type": "cycling", "distance_meters": 30000.0,
+         "duration_seconds": 3600, "avg_pace_sec_per_km": 120.0}
+
+
+def test_workout_actuals_evaluates_ran_once_per_on_foot_activity(monkeypatch):
+    """`_workout_actuals`'s docstring has claimed "``_ran`` is evaluated at
+    most once per activity" since 2026-07-22; it stopped being true on
+    2026-07-27 when the pace-gated classifier landed as a second pass over the
+    same list. Two on-foot activities plus a ride: 2 evaluations, not 4."""
+    counts = _count_calls(monkeypatch, plans, "_ran")
+    plans._workout_actuals([_PACED_RUN, _PACED_WALK, _RIDE])
+    assert counts["n"] == 2
+
+
+def test_get_training_plan_progress_does_not_double_classify(default_db, monkeypatch):
+    """The handler-level twin of the assertion above — proof 1 alone is
+    satisfied by a folded helper nobody calls. 123 before the fold, 87 after."""
+    counts = _count_calls(monkeypatch, plans, "_ran")
+    _run(tools.get_training_plan_progress.handler({}))
+    assert counts["n"] <= 90
+
+
+def test_get_training_plan_progress_rounds_without_a_call_per_node(default_db, monkeypatch):
+    """`_round_floats` recursed into every leaf, so serializing this payload
+    cost one Python call per node: 470 for 10 KB. The container branches now
+    handle their own scalar children, leaving one call per dict/list (83 here).
+
+    This is the assertion that binds the `_round_floats` change to a real
+    reduction in work — an output-correct rewrite that is no faster fails it,
+    which the equivalence oracle below cannot detect."""
+    counts = _count_calls(monkeypatch, tools, "_round_floats")
+    _run(tools.get_training_plan_progress.handler({}))
+    assert counts["n"] <= 100
+
+
+# --- equivalence oracles: the work went away, the answers did not -----------
+# Both implementations below are `src/` as it stood at 7326f66, vendored. They
+# are deliberately frozen copies, not imports: their whole job is to still
+# describe the OLD behaviour after the new one lands.
+
+def _normalize_activity_types_reference(activities, cfg=plans._DEFAULT_GRADING_CONFIG):
+    classes: set[str] = set()
+    for a in activities:
+        at = a.get("activity_type")
+        if not plans._is_on_foot(at):
+            if at:
+                classes.add("other")
+            continue
+        classes.add("running" if plans._ran(a, cfg) else "walking")
+    return sorted(classes)
+
+
+def _workout_actuals_reference(day_activities, cfg=plans._DEFAULT_GRADING_CONFIG):
+    foot = run = walk = dur = 0.0
+    for a in day_activities:
+        if not plans._is_on_foot(a.get("activity_type")):
+            continue
+        d = a.get("distance_meters") or 0.0
+        foot += d
+        dur += a.get("duration_seconds") or 0.0
+        if plans._ran(a, cfg):
+            run += d
+        else:
+            walk += d
+    pace = (dur / (foot / 1000.0)) if foot > 0 else None
+    return foot, run, walk, pace, _normalize_activity_types_reference(day_activities, cfg)
+
+
+def _round_floats_reference(obj, key=None):
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        dp = (tools._TEXT_HIGH_DP if key in tools._TEXT_HIGH_PRECISION_KEYS
+              else tools._TEXT_DEFAULT_DP)
+        return round(obj, dp)
+    if isinstance(obj, dict):
+        return {k: _round_floats_reference(v, k) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_round_floats_reference(v, key) for v in obj]
+    return obj
+
+
+_WORKOUT_ACTUALS_EDGE_CASES = [
+    [],
+    [_RIDE],
+    [{"activity_type": None, "distance_meters": 4000.0, "duration_seconds": 1800}],
+    [_PACED_WALK],
+    [{"activity_type": "running", "distance_meters": 0.0,
+      "duration_seconds": 1800, "avg_pace_sec_per_km": 300.0}],
+    [{"activity_type": "walking", "distance_meters": None,
+      "duration_seconds": 1800, "avg_pace_sec_per_km": None}],
+]
+
+
+def test_workout_actuals_still_answers_exactly_what_it_answered_before(perf_db):
+    """The fold removed a pass, not a classification. Every activity-day in the
+    fixture plus six edge cases must produce a five-tuple identical to the
+    pre-fold implementation — otherwise the call-count assertions above could
+    be satisfied by simply not classifying."""
+    with db.connect(perf_db) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM activities ORDER BY date, activity_id")]
+    by_date: dict[str, list[dict]] = {}
+    for row in rows:
+        by_date.setdefault(row["date"], []).append(row)
+    # Anti-vacuity: the fixture seeds one activity every _RUN_EVERY_N_DAYS over
+    # a multi-year history. A query that quietly matched nothing must fail here,
+    # not pass over an empty loop.
+    assert len(by_date) > 500
+
+    for day, activities in by_date.items():
+        assert plans._workout_actuals(activities) == \
+            _workout_actuals_reference(activities), day
+    for case in _WORKOUT_ACTUALS_EDGE_CASES:
+        assert plans._workout_actuals(case) == _workout_actuals_reference(case), case
+
+
+class _FloatSubclass(float):
+    pass
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _DictSubclass(dict):
+    pass
+
+
+class _Grade(IntEnum):
+    OK = 2
+
+
+#: Every branch `_round_floats`'s docstring names, plus the types that decide
+#: whether a fast path may use `type(x) is ...` instead of `isinstance`.
+_ROUND_FLOATS_CASES = [
+    True,
+    False,
+    7,
+    "avg_pace_sec_per_km",
+    None,
+    1.23456789,
+    -0.0,
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+    {"avg_pace_sec_per_km": 333.2222672948015},
+    {"distance_m": 333.2222672948015},
+    (1.23456789, 2.3456789),
+    [(1.23456789,), (2.3456789,)],
+    {"day": {"splits": {"avg_pace_sec_per_km": 333.2222672948015}}},
+    {"aerobic_te": [2.12345678, 3.76543210]},
+    _FloatSubclass(1.23456789),
+    _IntSubclass(7),
+    _DictSubclass({"avg_pace_sec_per_km": 1.23456789}),
+    _Grade.OK,
+    {"rows": [{"avg_pace_sec_per_km": 333.2222672948015, "ok": True,
+               "name": "Run", "reps": 4, "note": None,
+               "splits": [1.111111111, 2.222222222]}]},
+]
+
+
+def _dumped(obj):
+    return json.dumps(obj, default=str)
+
+
+def _capture_progress_payload(monkeypatch):
+    """The object `_text` actually serializes for `get_training_plan_progress`,
+    grabbed at the choke point rather than rebuilt — the oracle runs over the
+    real payload, not a hand-written stand-in for it. The first `_round_floats`
+    call of the handler IS the whole payload."""
+    captured = {}
+    orig = tools._round_floats
+
+    def capturing(obj, key=None):
+        captured.setdefault("payload", obj)
+        return orig(obj, key)
+
+    monkeypatch.setattr(tools, "_round_floats", capturing)
+    _run(tools.get_training_plan_progress.handler({}))
+    monkeypatch.setattr(tools, "_round_floats", orig)
+    return captured["payload"]
+
+
+def test_round_floats_output_is_identical_to_the_pre_inline_implementation(
+        default_db, monkeypatch):
+    """The fast path must be a pure speed change. Byte-compared against the
+    vendored 7326f66 implementation over the real `get_training_plan_progress`
+    payload and every adversarial case above."""
+    payload = _capture_progress_payload(monkeypatch)
+    assert payload.get("workouts"), "the fixture must produce a real plan payload"
+    assert _dumped(tools._round_floats(payload)) == _dumped(_round_floats_reference(payload))
+
+    assert len(_ROUND_FLOATS_CASES) >= 20
+    for case in _ROUND_FLOATS_CASES:
+        assert _dumped(tools._round_floats(case)) == _dumped(_round_floats_reference(case)), case
+
+
+def test_the_round_floats_oracle_can_actually_fail(default_db, monkeypatch):
+    """An equality test that passes against any implementation the author
+    happened to write is not a proof. Two implementations that ARE wrong in the
+    two ways a fast path fails — losing the high-precision key on the way down,
+    and treating a `dict` subclass as an opaque leaf — must diverge from the
+    reference over the same case list.
+
+    Deliberately NOT a bool-dropping mutant: with no `int` branch in the
+    reference, `isinstance(True, float)` is False, so removing the `bool` guard
+    diverges on nothing and would make this test look two-sided when it isn't.
+    """
+    def _ignores_high_precision_keys(obj, key=None):
+        if isinstance(obj, bool):
+            return obj
+        if isinstance(obj, float):
+            return round(obj, tools._TEXT_DEFAULT_DP)
+        if isinstance(obj, dict):
+            return {k: _ignores_high_precision_keys(v, k) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_ignores_high_precision_keys(v, key) for v in obj]
+        return obj
+
+    def _mishandles_a_dict_subclass(obj, key=None):
+        if isinstance(obj, bool):
+            return obj
+        if isinstance(obj, float):
+            dp = (tools._TEXT_HIGH_DP if key in tools._TEXT_HIGH_PRECISION_KEYS
+                  else tools._TEXT_DEFAULT_DP)
+            return round(obj, dp)
+        if type(obj) is dict:
+            return {k: _mishandles_a_dict_subclass(v, k) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_mishandles_a_dict_subclass(v, key) for v in obj]
+        return obj
+
+    payload = _capture_progress_payload(monkeypatch)
+    for broken in (_ignores_high_precision_keys, _mishandles_a_dict_subclass):
+        diverged = [
+            case for case in [payload, *_ROUND_FLOATS_CASES]
+            if _dumped(broken(case)) != _dumped(_round_floats_reference(case))
+        ]
+        assert diverged, broken.__name__
+
+
+def test_the_latency_gate_is_still_armed():
+    """The failure mode this change could quietly turn into is a gate demotion.
+    The fix closes the gap; it does not touch the threshold, the baseline, or
+    the `--benchmark-skip` default that keeps these benchmarks off an ordinary
+    `pytest` run."""
+    root = Path(__file__).resolve().parents[1]
+    assert "--benchmark-compare-fail=min:15%" in (
+        root / ".github/workflows/ci.yml").read_text()
+    assert "--benchmark-skip" in (root / "pyproject.toml").read_text()
 
 
 # --- fix #3 regression: bounded activities lookback -------------------------

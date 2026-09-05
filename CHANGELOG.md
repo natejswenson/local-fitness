@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`get_training_plan_progress` is ~6% faster, closing most of the +13.86%
+  regression PR #162 introduced** (#232). The perf gate had been reading that
+  benchmark over the threshold on slower runners since 2026-07-27 — the day
+  after the baseline was captured — and the failures were being re-run to green
+  as flakes. They were not flakes: bisected to `b28c74e`, confirmed by a local
+  A/B, and confirmed again by the shape of the CI table (on the baseline's own
+  CPU at the same clock, one sibling benchmark came in at −0.34% while this one
+  came in at +13.86%). Two behaviour-preserving fixes to code #162 added:
+  `plans._workout_actuals` folds the pace-gated run/walk classification into
+  the single pass it already runs over the day's activities, instead of walking
+  the list a second time through `_normalize_activity_types` (now deleted —
+  the fold left it with no caller); and `tools._round_floats` stops recursing
+  into leaves, rounding a container's scalar children where it finds them and
+  recursing only into a child that is itself a `dict` or a `list`. Anything
+  that is not exactly one of those types still falls through the original
+  `isinstance` ladder, so no output moves — asserted byte-for-byte against a
+  vendored copy of the old implementation over the real payload and 21
+  adversarial cases. Measured on the perf fixture: `_ran` evaluations per
+  request 123 → 87, `_round_floats` calls 470 → 83, handler latency −6.0%
+  (p05, interleaved in-process A/B). The gate, its 15% threshold and its
+  committed baseline are deliberately untouched.
+
+### Changed
+- **The perf-benchmark suite now counts work, not just connections.** New
+  deterministic assertions in `tests/test_perf_benchmarks.py` pin `_ran` and
+  `_round_floats` call counts for `get_training_plan_progress`, alongside
+  equivalence oracles proving the reductions changed no answer. Latency alone
+  cannot separate "the runner was slow" from "the code got slower" on a 2 ms
+  call — which is exactly how the regression above survived five weeks.
+  `CLAUDE.md`'s drift-vs-regression tell gains its third part: apply it per
+  benchmark, not to the run.
+
 ## [0.61.0] - 2026-09-01
 
 ### Fixed

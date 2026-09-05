@@ -224,34 +224,6 @@ def _foot_distance(activities: list[dict]) -> float:
     )
 
 
-def _normalize_activity_types(
-    activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
-) -> list[str]:
-    """Normalized, deduped, sorted activity classes for a day: running | walking
-    | other. Surfaced so the plan view/agent can say 'walked' vs 'ran'.
-
-    Classified via ``_ran`` (pace-gated), not the raw label. This used to
-    check ``_is_running``/``_is_walking`` directly — Garmin's label, which
-    lies (a walking-desk session logs as ``treadmill_running``) — so the
-    reported class could disagree with the run/walk split fields computed
-    right alongside it. Measured on live data: 4 of 21 graded days on the
-    active plan showed ``actual_activity_types: ["running"]`` sitting beside
-    ``actual_run_distance_m == 0.0`` (100% walking by the pace gate), because
-    this was the one classifier in the module still gated on the label.
-    On-foot activities with no usable pace fall back to the label, same as
-    ``_ran`` itself.
-    """
-    classes: set[str] = set()
-    for a in activities:
-        at = a.get("activity_type")
-        if not _is_on_foot(at):
-            if at:
-                classes.add("other")
-            continue
-        classes.add("running" if _ran(a, cfg) else "walking")
-    return sorted(classes)
-
-
 # --- Task 1.1: validation --------------------------------------------------
 
 def validate_plan_input(
@@ -1219,25 +1191,51 @@ def _workout_actuals(
     ``other``). Surfacing is foot-based on every day regardless of workout type;
     the verdict's type-awareness lives in ``classify_workout``, not here.
 
-    ONE pass, returning all three distances, because the caller needs all of
-    them: computing them as three separate helper calls walked each day's
-    activity list four times and cost a **15.4% regression** on
+    ONE pass, returning all three distances AND the classes, because the
+    caller needs all of them: computing them as separate helper calls walked
+    each day's activity list four times and cost a **15.4% regression** on
     ``get_training_plan_progress`` against the 15% CI gate (measured
     2026-07-22). ``_ran`` is evaluated at most once per activity here.
+
+    That invariant has now been broken twice. The second time was PR #162
+    (2026-07-27), which added the pace-gated class list as a SECOND pass over
+    the same list via ``_normalize_activity_types`` — 123 ``_ran`` evaluations
+    per ``get_training_plan_progress`` request instead of 87, +3.2% on the
+    handler, and a slice of the +13.86% the perf gate then carried under its
+    threshold for five weeks. Anything else this day needs is computed in the
+    loop below, not in a pass of its own.
     """
     foot = run = walk = dur = 0.0
+    classes: set[str] = set()
     for a in day_activities:
-        if not _is_on_foot(a.get("activity_type")):
+        at = a.get("activity_type")
+        if not _is_on_foot(at):
+            # Non-foot activity (a ride, a swim) still tells the reader the day
+            # was not empty; an untyped row tells them nothing and is dropped.
+            if at:
+                classes.add("other")
             continue
         d = a.get("distance_meters") or 0.0
         foot += d
         dur += a.get("duration_seconds") or 0.0
+        # Classified via ``_ran`` (pace-gated), not the raw label. This used to
+        # check ``_is_running``/``_is_walking`` directly — Garmin's label, which
+        # lies (a walking-desk session logs as ``treadmill_running``) — so the
+        # reported class could disagree with the run/walk split fields computed
+        # right alongside it. Measured on live data: 4 of 21 graded days on the
+        # active plan showed ``actual_activity_types: ["running"]`` sitting
+        # beside ``actual_run_distance_m == 0.0`` (100% walking by the pace
+        # gate), because this was the one classifier in the module still gated
+        # on the label. On-foot activities with no usable pace fall back to the
+        # label, same as ``_ran`` itself.
         if _ran(a, cfg):
             run += d
+            classes.add("running")
         else:
             walk += d
+            classes.add("walking")
     pace = (dur / (foot / 1000.0)) if foot > 0 else None
-    return foot, run, walk, pace, _normalize_activity_types(day_activities, cfg)
+    return foot, run, walk, pace, sorted(classes)
 
 
 def build_plan_detail(
