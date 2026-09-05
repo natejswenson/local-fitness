@@ -39,6 +39,25 @@ def frozen_clock(monkeypatch):
     return state
 
 
+@pytest.fixture
+def pinned_clock(monkeypatch):
+    """Patches notes.datetime.now() to return one fixed instant on every
+    call -- the same-wall-clock-second case frozen_clock deliberately
+    removes, and the only condition under which a writer can mint two
+    identical (timestamp, text) pairs on its own. Returns the instant, so
+    a test can plant a bullet already carrying it. Adversarial by design:
+    the collision guard is unreachable without a clock that repeats."""
+    instant = datetime(2026, 1, 1, 0, 0, 0)
+
+    class _PinnedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant
+
+    monkeypatch.setattr(notes, "datetime", _PinnedDatetime)
+    return instant
+
+
 def test_empty_when_missing(notes_path):
     assert notes.read_notes(notes_path) == []
     assert notes.render_for_prompt(notes_path) == ""
@@ -442,6 +461,70 @@ def test_append_never_manufactures_a_handle_collision(notes_path):
     n1 = notes.append_note("same text", path=notes_path)
     assert n0.handle != n1.handle
     assert len({n.handle for n in notes.read_notes(notes_path)}) == 2
+
+
+def test_update_never_manufactures_a_handle_collision(notes_path, pinned_clock):
+    # Two updates rewriting two different notes to the same text inside
+    # one wall-clock second. append_note has always re-stamped out of
+    # this; update_note used to stamp with no handle check at all and
+    # left two live bullets sharing one address.
+    notes.append_note("first preference", path=notes_path)
+    notes.append_note("second preference", path=notes_path)
+    live = notes.read_notes(notes_path)
+
+    first = notes.update_note(live[0].handle, "the same new text", path=notes_path)
+    second = notes.update_note(live[1].handle, "the same new text", path=notes_path)
+    assert first is not None and second is not None
+    assert first[0].handle != second[0].handle
+
+    handles = [n.handle for n in notes.read_notes(notes_path)]
+    assert len(handles) == 2
+    assert len(set(handles)) == 2
+
+
+def test_update_restamps_when_its_stamp_would_hit_an_existing_bullet(notes_path, pinned_clock):
+    # The other shape: the update's own (now, new text) pair is already
+    # on disk, so the naive stamp lands on a live bullet's handle rather
+    # than on another update's.
+    pinned = pinned_clock.isoformat()
+    notes_path.write_text(
+        f"- {pinned} — the text both bullets want\n"
+        "- 2020-01-01T00:00:00 — the note being rewritten\n",
+        encoding="utf-8",
+    )
+    target = next(n for n in notes.read_notes(notes_path)
+                  if n.text == "the note being rewritten")
+
+    result = notes.update_note(target.handle, "the text both bullets want", path=notes_path)
+    assert result is not None
+    updated, _duplicates = result
+    assert updated.timestamp != pinned  # re-stamped forward instead of colliding
+
+    handles = [n.handle for n in notes.read_notes(notes_path)]
+    assert len(handles) == 2
+    assert len(set(handles)) == 2
+
+
+def test_update_leaves_same_text_notes_independently_addressable(notes_path, pinned_clock):
+    # Two bullets carrying identical *text* stays legal — the guard
+    # re-stamps rather than refusing, so "make these two say the same
+    # thing" is not an error. What must stop is one handle addressing
+    # two bullets: a delete used to leave a live twin behind.
+    notes.append_note("first preference", path=notes_path)
+    notes.append_note("second preference", path=notes_path)
+    live = notes.read_notes(notes_path)
+    first = notes.update_note(live[0].handle, "the same new text", path=notes_path)
+    second = notes.update_note(live[1].handle, "the same new text", path=notes_path)
+    assert first is not None and second is not None
+
+    assert notes.delete_note(first[0].handle, path=notes_path) == 1
+    remaining = notes.read_notes(notes_path)
+    assert [n.text for n in remaining] == ["the same new text"]
+    assert remaining[0].handle == second[0].handle
+
+    survivor = notes.update_note(second[0].handle, "now distinct", path=notes_path)
+    assert survivor is not None
+    assert survivor[1] == 1
 
 
 def test_render_for_prompt_handles_all_resolve_via_update(notes_path):

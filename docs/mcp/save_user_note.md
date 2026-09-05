@@ -80,6 +80,18 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
   `delete_user_note` call onto the wrong preference. It stops resolving only
   once *this* note itself is updated, deleted, or rotated to the archive; at
   that point `list_user_notes` is how you get a live handle again.
+- **A handle is never minted twice, so the timestamp may be a second late.**
+  Saving text that a live bullet already carries, inside the same wall-clock
+  second that bullet was stamped, would produce the identical
+  `(timestamp, text)` pair — and therefore the identical handle, which is the
+  one shape the whole addressing scheme cannot resolve. So the stamp steps
+  forward a second at a time until the handle is free, and the `timestamp` you
+  get back is that stamp rather than the second the call landed in.
+  `update_user_note` does the same on the rewrite path. The consequence worth
+  knowing: two live notes may carry identical *text* under two distinct
+  handles, each addressable on its own — duplicate wording is legal, duplicate
+  handles are not, and a duplicate handle in the file is therefore always a
+  hand-edit.
 - **4 KB live cap with silent rotation.** If the append would push the file past
   `LIVE_FILE_MAX_BYTES` (4096), the oldest bullets **by timestamp** — not by
   file position — are dropped from the live file and appended to

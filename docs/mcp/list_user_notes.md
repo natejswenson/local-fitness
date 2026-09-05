@@ -47,9 +47,11 @@ One entry per parsed bullet, newest-first, plus a count:
 note's own timestamp and text, not a file position — so it survives an
 unrelated note being added, deleted, or rotated to the archive. Two live
 notes only ever share a handle if they are byte-for-byte identical in both
-fields (see [`update_user_note`](update_user_note.md)'s Gotchas for how that's
-handled). A missing or unreadable notes file returns `{"notes": [], "count": 0}`
-rather than erroring.
+fields, which only a hand-edit produces — the write tools re-stamp a second
+forward rather than mint a live handle twice (see
+[`update_user_note`](update_user_note.md)'s Gotchas for how a hand-edited pair
+is handled). A missing or unreadable notes file returns
+`{"notes": [], "count": 0}` rather than erroring.
 
 ## Example
 
@@ -90,12 +92,16 @@ rather than erroring.
 - **The file is hand-editable.** Lines not starting with `- ` are skipped by the
   parser (so free prose in the file is tolerated), and a bullet with no ` — `
   separator comes back with an empty `timestamp`.
-- **A hand-typed duplicate bullet gets the same handle.** The handle is derived
-  purely from timestamp + text, so copy-pasting a bullet by hand produces two
-  live notes this tool can't tell apart by handle alone — they read back with
-  identical `handle` values. `update_user_note` / `delete_user_note` tolerate
-  this (they act on the first and report how many matched); this tool just
-  lists them as they are.
+- **A hand-typed duplicate bullet gets the same handle, and it is the only way
+  to get one.** The handle is derived purely from timestamp + text, so
+  copy-pasting a bullet by hand produces two live notes this tool can't tell
+  apart by handle alone — they read back with identical `handle` values.
+  `save_user_note` and `update_user_note` cannot do this to you: each stamps
+  against the handles already live and steps a second forward rather than
+  repeating one. `update_user_note` / `delete_user_note` still tolerate a
+  hand-edited pair (they act on the first and report how many matched); this
+  tool just lists them as they are. Two bullets with the same *text* and
+  different timestamps are ordinary distinct notes, not this case.
 - Not available to the brief generator — `_READ_ONLY_TOOL_NAMES` excludes it;
   the brief already sees notes through the prompt injection.
 
