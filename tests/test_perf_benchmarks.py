@@ -395,6 +395,9 @@ _WORKOUT_ACTUALS_EDGE_CASES = [
     # activity per day, always `running`, never exercises that ordering.
     [_RIDE, _PACED_RUN, _PACED_WALK,
      {"activity_type": None, "distance_meters": 100.0}],
+    # Two on-foot activities of the SAME class plus two typed non-foot rows:
+    # the only shape that can expose a lost dedup (`classes` is a set) (#232).
+    [_PACED_RUN, _PACED_RUN, _RIDE, _RIDE],
 ]
 
 
@@ -460,7 +463,7 @@ _ROUND_FLOATS_CASES = [
     (1.23456789, 2.3456789),
     [(1.23456789,), (2.3456789,)],
     {"day": {"splits": {"avg_pace_sec_per_km": 333.2222672948015}}},
-    {"aerobic_te": [2.12345678, 3.76543210]},
+    {"aerobic_te": [[2.12345678], (3.76543210,)]},
     _FloatSubclass(1.23456789),
     _IntSubclass(7),
     _DictSubclass({"avg_pace_sec_per_km": 1.23456789}),
