@@ -7,6 +7,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **A failing archive write can no longer destroy an evicted preference**
+  (#232). `_append_archive` logged its `OSError` and returned exactly what it
+  returns on success, so `save_user_note` and `update_user_note` truncated the
+  live file regardless: with the archive unwritable, a single capacity-tripping
+  write dropped 9 bullets on the append path and 7 on the update path, and they
+  existed nowhere afterwards — one `LOG.warning` no tool result surfaces was the
+  only trace. It now returns a success flag, and both callers keep the
+  would-be-evicted bullets live and write over the 4 KB budget when it comes
+  back `False`, taking the same way out `_rotate_to_fit` already takes for
+  unevictable prose. The cap exists to bound prompt size, not to guarantee
+  deletion, so a temporarily fat prompt beats a lost preference. Named
+  consequence: while the archive stays broken the live file grows unbounded —
+  every such write logs a `WARNING` naming the archive path and the size it went
+  over by. The update path also stops mis-reporting `position` on that skip
+  path, where nothing was popped and no line ahead of the rewritten one moved.
 - **`update_user_note` can no longer manufacture a handle collision** (#232).
   `save_user_note` has always re-stamped a second forward rather than write a
   `(timestamp, text)` pair a live bullet already carries; `update_user_note`

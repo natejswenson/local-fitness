@@ -1,6 +1,7 @@
 """Tests for notes.py — the durable user-preference store."""
 from __future__ import annotations
 
+import logging
 import stat
 import threading
 from datetime import datetime, timedelta
@@ -636,6 +637,118 @@ def test_append_archive_repairs_missing_trailing_newline_in_existing_archive(not
     # The pre-existing entry must be its own note, not a prefix glued to
     # whatever rotated in behind it.
     assert archived_texts.count("an old archived preference") == 1
+
+
+def _break_the_archive(notes_path):
+    """Make the archive path unwritable the way an operator's environment
+    can: a directory sits where the file belongs, so the append inside
+    ``_append_archive`` raises ``IsADirectoryError`` (an ``OSError``).
+    Returns the archive path. The lock sidecar is a separate file, so the
+    failure lands on the content write, not on the lock."""
+    archive = notes._archive_path(notes_path)
+    archive.mkdir()
+    return archive
+
+
+def test_append_keeps_evicted_bullets_live_when_the_archive_cannot_be_written(
+    notes_path, caplog,
+):
+    # Issue #232 item 2. _append_archive logged the OSError and returned
+    # the same None it returns on success, so append_note truncated the
+    # live file regardless and the evicted preferences existed nowhere:
+    # 60 -> 57 live bullets, archive empty, 3 preferences destroyed. The
+    # 4 KB cap bounds prompt size; it does not license deletion.
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(60)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    archive = _break_the_archive(notes_path)
+
+    with caplog.at_level(logging.WARNING, logger=notes.__name__):
+        new_note = notes.append_note("Never comment on my weekend sleep.", path=notes_path)
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    for text in original_texts:
+        assert text in live_texts  # nothing evicted, because nothing could be archived
+    assert new_note.text in live_texts  # and the incoming preference is still saved
+    assert len(live_texts) == len(original_texts) + 1
+
+    # Knowingly over budget — the named, accepted consequence of not
+    # evicting. A fat prompt beats a destroyed preference.
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) > notes.LIVE_FILE_MAX_BYTES
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(str(archive) in m for m in warnings)
+    assert any("over budget" in m for m in warnings)
+
+
+def test_update_keeps_evicted_bullets_live_when_the_archive_cannot_be_written(
+    notes_path, caplog,
+):
+    # Same defect on the path PR #234 opened, where it costs more: one
+    # capacity-tripping update rotates as many bullets as the new text
+    # costs, so a broken archive destroyed six preferences at a time.
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(50)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    assert len("\n".join(bullets).encode("utf-8")) < notes.LIVE_FILE_MAX_BYTES
+    archive = _break_the_archive(notes_path)
+
+    target = notes.read_notes(notes_path)[10]
+    grown = "grow this one preference until it trips the cap " * 15
+
+    with caplog.at_level(logging.WARNING, logger=notes.__name__):
+        result = notes.update_note(target.handle, grown, path=notes_path)
+
+    assert result is not None
+    new_note, _duplicates = result
+    live = notes.read_notes(notes_path)
+    live_texts = [n.text for n in live]
+    for text in original_texts:
+        if text == target.text:
+            continue  # this one was rewritten, on purpose
+        assert text in live_texts
+    assert new_note.text in live_texts
+    assert len(live_texts) == len(original_texts)
+
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) > notes.LIVE_FILE_MAX_BYTES
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(str(archive) in m for m in warnings)
+    assert any("over budget" in m for m in warnings)
+
+
+def test_update_position_still_points_at_the_updated_bullet_when_archiving_fails(
+    notes_path,
+):
+    # Guards the `new_position = protected_after` assignment moving inside
+    # the archive-succeeded branch. On the skip path nothing was popped,
+    # so the position _rotate_to_fit computed is short by however many
+    # lines it WOULD have evicted, and the returned Note points at some
+    # other user's preference. Position is a hint, but a hint that points
+    # at the wrong bullet is worse than no hint.
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(50)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    _break_the_archive(notes_path)
+
+    target = notes.read_notes(notes_path)[10]
+    grown = "grow this one preference until it trips the cap " * 15
+    result = notes.update_note(target.handle, grown, path=notes_path)
+
+    assert result is not None
+    new_note, _duplicates = result
+    live = notes.read_notes(notes_path)
+    assert new_note.position == 10
+    assert live[new_note.position].handle == new_note.handle
+    assert live[new_note.position].text == new_note.text
 
 
 
