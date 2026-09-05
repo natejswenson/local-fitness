@@ -196,11 +196,27 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   shows a double-digit margin. Confirm both, then recapture via the
   workflow dispatched on `main` (pre-PR code = the honest floor) and
   hand-promote the artifact to the committed `0001_*.json`.
-  **(3) Apply the tell PER BENCHMARK, not to the run.** A clock deficit is
-  fleet-wide: it moves all five together. One benchmark out of line with its
-  four siblings is a code regression however slow the runner was — and the
-  corroborating question to ask next is *how much of the regressed work does
-  each benchmark actually do*. Worked example (2026-09-02, #232): run
+  **(3) Apply the tell PER BENCHMARK, not to the run — but only among
+  benchmarks that do the same fixed amount of work on every run.** A clock
+  deficit is fleet-wide: it moves all five together, so one benchmark out of
+  line with its four siblings is a code regression however slow the runner
+  was, **provided all five are calendar-invariant.** Three are:
+  `assemble_brief_context`, `_build_plan_section` and `daily_snapshot` all
+  pin `today=_TODAY` explicitly, so they do exactly the same work forever.
+  Two are not: `get_training_plan_progress` and `get_training_plan_status`
+  are benchmarked via the production handler with `args={}`, and that
+  handler reads the real `date.today()` — the tool schema has no `today`
+  override — so the longer it has been since the fixture's anchor date, the
+  more of the plan's window falls inside their frontier, and their own work
+  grows with it, with no code change at all. A wide gap since the committed
+  baseline was captured (its filename is date-stamped) is therefore a
+  second candidate explanation for either of those two specifically, on top
+  of runner-fleet drift, and needs the same discipline before it's called a
+  regression: a same-day, same-code local A/B rules calendar drift out (as
+  it did for the worked example below, captured the day after the
+  baseline); a same-code comparison spanning a real calendar gap does not.
+  The corroborating question to ask next is *how much of the regressed work
+  does each benchmark actually do*. Worked example (2026-09-02, #232): run
   `33652312669` passed on the baseline's own CPU (EPYC 7763 @ 3.2407 GHz vs
   the baseline's 3.2410) with `assemble_brief_context` at **−0.34%** and
   `get_training_plan_progress` at **+13.86%** — same silicon, same clock, one
