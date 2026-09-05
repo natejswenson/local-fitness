@@ -442,6 +442,54 @@ def render_for_prompt(path: Path | None = None) -> str:
     return "\n".join(lines)
 
 
+def _live_handles(lines: list[str], skip_index: int | None = None) -> set[str]:
+    """Every content handle currently live in ``lines``, optionally
+    excluding the line at ``skip_index``.
+
+    ``skip_index`` is for a writer replacing a line in place: the line
+    being rewritten is not a competitor with itself, and counting it
+    would force a pointless re-stamp on an update that changes nothing.
+    """
+    return {
+        parsed.handle
+        for i, ln in enumerate(lines)
+        if i != skip_index and (parsed := _parse_line(ln)) is not None
+    }
+
+
+def _stamp_without_collision(existing_handles: set[str], text: str) -> str:
+    """Stamp ``text`` with now() at whole-second resolution, stepping a
+    second forward at a time until ``_handle(timestamp, text)`` is not
+    already in ``existing_handles``. Returns the ISO timestamp.
+
+    Never manufacture a handle collision. Two notes with an identical
+    (timestamp, text) pair parse to the identical handle — the shape
+    update_note/delete_note tolerate as a hand-edited duplicate, not one
+    these tools should create on their own. Both writers share this: the
+    in-app paths to a collision are two save_user_note calls with
+    identical text inside the same wall-clock second, and an
+    update_user_note whose (now, new text) lands on a live bullet's
+    (timestamp, text) — which needs two updates in one second, or a
+    rewrite onto text a bullet stamped this second already carries.
+
+    Re-stamps rather than refusing, so "make these two notes say the same
+    thing" stays a legal request. The consequence, documented in the four
+    note docs: two live bullets may carry identical *text* under two
+    distinct handles, each independently addressable. What cannot happen
+    is one handle addressing two bullets.
+
+    Must be called inside the writer's held lock, against the lines read
+    inside it — a handle set built from a read outside the lock is a set
+    of handles another writer may already have invalidated.
+    """
+    ts_dt = datetime.now().replace(microsecond=0)
+    ts = ts_dt.isoformat()
+    while _handle(ts, text) in existing_handles:
+        ts_dt += timedelta(seconds=1)
+        ts = ts_dt.isoformat()
+    return ts
+
+
 def append_note(text: str, path: Path | None = None) -> Note:
     """Append a single note to the live file. Newline-folds the input so a
     multi-line message doesn't break the bullet structure. If appending
@@ -459,23 +507,10 @@ def append_note(text: str, path: Path | None = None) -> Note:
     p = path or _default_notes_path()
 
     with _locked_rewrite(p) as ctx:
-        # Never manufacture a handle collision. Two notes with an
-        # identical (timestamp, text) pair parse to the identical
-        # handle — the shape update_note/delete_note tolerate as a
-        # hand-edited duplicate, not one this tool should create on its
-        # own. Re-stamp a second later instead; the only in-app path to
-        # this is two save_user_note calls with identical text inside
-        # the same wall-clock second.
-        existing_handles = {
-            parsed.handle
-            for ln in ctx.lines
-            if (parsed := _parse_line(ln)) is not None
-        }
-        ts_dt = datetime.now().replace(microsecond=0)
-        ts = ts_dt.isoformat()
-        while _handle(ts, text) in existing_handles:
-            ts_dt += timedelta(seconds=1)
-            ts = ts_dt.isoformat()
+        # Stamped against the lines read inside this lock, so the append
+        # can never mint a handle a live bullet already carries — see
+        # _stamp_without_collision. update_note shares the guard.
+        ts = _stamp_without_collision(_live_handles(ctx.lines), text)
         new_line = f"- {ts} — {text}\n"
 
         # ctx.existing_text is already newline-normalised (see
@@ -631,7 +666,15 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
     ``duplicates`` is the number of live lines that matched before the
     rewrite, normally 1; see ``_Match``/``_RewriteContext.resolve`` for
     the >1 case. Used for in-place updates so a refined preference
-    doesn't pile a duplicate onto the file.
+    doesn't pile a duplicate onto the file. A ``duplicates`` above 1 is
+    now necessarily a hand-edit: this function used to stamp outside the
+    lock with no handle check, so two updates to the same text inside one
+    wall-clock second minted the very shape ``_Match`` exists to tolerate.
+    The stamp is taken inside the lock and through
+    ``_stamp_without_collision``, against every live handle except the
+    line being replaced — so a same-second rewrite is stamped one or more
+    seconds forward rather than colliding, exactly as ``append_note``
+    already did.
 
     Rewriting a short note into a much longer one can push the live file
     past ``LIVE_FILE_MAX_BYTES`` — unlike ``append_note``, this rewrites a
@@ -663,13 +706,16 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
         return None
 
     handle = _normalize_handle(handle)
-    ts = datetime.now().replace(microsecond=0).isoformat()
     result: tuple[Note, int] | None = None
     with _locked_rewrite(p) as ctx:
         match = ctx.resolve(handle)
         if match is None:
             return None
         lines = ctx.lines
+        # Stamped inside the lock, against the lines read inside it, and
+        # against every live handle except the one on the line being
+        # replaced — see _stamp_without_collision and _live_handles.
+        ts = _stamp_without_collision(_live_handles(lines, match.index), new_text)
         # Preserve trailing newline character of the original line so the
         # file shape stays consistent.
         had_newline = lines[match.index].endswith("\n")

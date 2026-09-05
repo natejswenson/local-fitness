@@ -7,6 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **`update_user_note` can no longer manufacture a handle collision** (#232).
+  `save_user_note` has always re-stamped a second forward rather than write a
+  `(timestamp, text)` pair a live bullet already carries; `update_user_note`
+  stamped outside the lock with no handle check at all, so two updates to the
+  same text inside one wall-clock second — or a rewrite onto text a bullet
+  stamped this second already holds — left two live bullets sharing one
+  address. A later `update_user_note` on that handle came back `duplicates: 2`,
+  and a `delete_user_note` removed one and left the twin in every future system
+  prompt. The guard is now one shared `_stamp_without_collision`, called by both
+  writers inside the held lock; `update_user_note` checks against every live
+  handle except the line it is replacing, so an update that changes nothing is
+  not forced to re-stamp itself. Rewriting two notes to the same wording stays
+  legal — they get distinct timestamps and stay independently addressable. A
+  shared handle in the file is now necessarily a hand-edit, which is what
+  `update_user_note.md`, `delete_user_note.md` and `list_user_notes.md` claimed
+  all along and now describe accurately; `save_user_note.md` documents the
+  re-stamp itself for the first time.
 - **`get_training_plan_progress` is ~6% faster, closing most of the +13.86%
   regression PR #162 introduced** (#232). The perf gate had been reading that
   benchmark over the threshold on slower runners since 2026-07-27 — the day

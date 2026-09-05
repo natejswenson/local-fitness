@@ -60,9 +60,13 @@ Failure returns `is_error: true` with `{"error": "no note with handle '7c2f9a10'
   different note.
 - **A duplicated handle deletes only the first match.** Two bullets only ever
   share a handle if they are byte-for-byte identical in timestamp and text —
-  most likely a hand-edited copy. The call removes the first one in file
-  order and reports `duplicates: 2`; the remaining copy is unique and
-  addressable on its own right after.
+  necessarily a hand-edited copy, since no tool writes that pair:
+  `save_user_note` and `update_user_note` both re-stamp a second forward rather
+  than mint a handle that is already live. The call removes the first one in
+  file order and reports `duplicates: 2`; the remaining copy is unique and
+  addressable on its own right after. Two bullets with the same *text* under
+  different timestamps are not duplicates — each has its own handle, and
+  deleting one leaves the other exactly where it was.
 - **Confirm when the intent is ambiguous.** "I don't need that anymore" over a
   list of five notes is not a target; ask which one.
 - **Fails closed on non-bullet content.** A handle only ever matches a parsed
