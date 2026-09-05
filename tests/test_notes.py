@@ -1298,6 +1298,87 @@ def test_recent_first_sorts_undated_and_malformed_timestamps_last(notes_path):
     # module is designed to tolerate.
 
 
+
+def test_rotation_evicts_dated_bullets_before_an_undated_hand_written_one(notes_path):
+    # Item 3: _recency_key ranks an undated bullet LAST so that a
+    # hand-edited line renders last in the prompt. Eviction reused that
+    # same ranking and popped its tail, which silently made "shown last"
+    # mean "thrown away first" — a bullet a human typed by hand went
+    # before a dated note five and a half years older. Eviction has its
+    # own order now.
+    bullets = [
+        f"- 2020-01-{i:02d}T00:00:00 — preference number {i} " + "with padding text " * 6
+        for i in range(1, 28)
+    ]
+    hand_written = "- A hand-written note with no date at all, written by the user"
+    notes_path.write_text(
+        hand_written + "\n" + "\n".join(bullets) + "\n", encoding="utf-8"
+    )
+    assert len(notes_path.read_text(encoding="utf-8").encode("utf-8")) > notes.LIVE_FILE_MAX_BYTES
+
+    notes.append_note("one more ordinary preference with padding text", path=notes_path)
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert "A hand-written note with no date at all, written by the user" in live_texts
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()  # rotation must actually have fired
+    archived_texts = [
+        parsed.text
+        for parsed in (notes._parse_line(ln) for ln in archive.read_text(encoding="utf-8").splitlines())
+        if parsed is not None
+    ]
+    assert archived_texts  # ... and evicted something, so the assertions below aren't vacuous
+    assert "A hand-written note with no date at all, written by the user" not in archived_texts
+    # The archive is written in eviction order, so entry 0 is the first
+    # thing evicted: the oldest DATED bullet, not the undated one.
+    assert archived_texts[0].startswith("preference number 1 ")
+
+
+def test_display_order_still_sorts_undated_last_after_the_eviction_split(notes_path):
+    # Guard for the item-3 split: eviction stopped sharing recent_first's
+    # key, and display order must not have moved with it. Green by
+    # construction both before and after the change — its job is to stay
+    # green, not to prove the fix.
+    notes_path.write_text(
+        "- A hand-written note with no date at all, written by the user\n"
+        "- 2020-01-01T00:00:00 — the oldest dated note\n"
+        "- 2026-01-01T00:00:00 — the newest dated note\n",
+        encoding="utf-8",
+    )
+    ranked = notes.recent_first(notes.read_notes(notes_path))
+    assert [n.text for n in ranked] == [
+        "the newest dated note",
+        "the oldest dated note",
+        "A hand-written note with no date at all, written by the user",
+    ]
+    assert notes.render_for_prompt(notes_path).splitlines()[-1].endswith(
+        "A hand-written note with no date at all, written by the user"
+    )
+
+
+def test_rotation_of_an_all_undated_file_still_evicts_and_terminates(notes_path):
+    # Most protected is not unevictable: a file of nothing but
+    # hand-written bullets, over the cap, must still shed weight rather
+    # than loop or stay permanently over budget. Red against the rejected
+    # "never evict an undated bullet" variant.
+    bullets = [
+        f"- hand-written preference number {i} " + "with padding text " * 6
+        for i in range(30)
+    ]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    assert len(notes_path.read_text(encoding="utf-8").encode("utf-8")) > notes.LIVE_FILE_MAX_BYTES
+
+    notes.append_note("one more ordinary preference with padding text", path=notes_path)
+
+    live_text = notes_path.read_text(encoding="utf-8")
+    assert "one more ordinary preference with padding text" in live_text
+    assert len(live_text.encode("utf-8")) <= notes.LIVE_FILE_MAX_BYTES
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()
+    assert "hand-written preference number 0 " in archive.read_text(encoding="utf-8")
+
+
 def test_rotation_terminates_on_pure_prose_over_cap(notes_path):
     # A file with no evictable bullet at all — pure hand-edited prose,
     # over the cap on its own — must not spin forever looking for a

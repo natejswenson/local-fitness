@@ -97,7 +97,15 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
   file position — are dropped from the live file and appended to
   `user_notes.archive.md` *before* the write. A note refreshed today via
   `update_user_note` is never the first thing evicted just because it sits
-  early in the file. Archived notes are no longer injected into the prompt and
+  early in the file. A bullet with **no timestamp at all** — hand-typed into the
+  file, or one whose date got mangled by an edit — is the *last* thing evicted,
+  not the first: it carries no evidence of its age, so nothing licenses calling
+  it the oldest note in the file. It is still evictable once every dated bullet
+  is gone, so a file of nothing but hand-written bullets can still come back
+  under the cap. (Display order is the other way round — an undated bullet
+  renders *last* in the prompt and in `list_user_notes`. Ranking last for
+  reading and last for deleting are two different orders, and this is the one
+  rotation uses.) Archived notes are no longer injected into the prompt and
   no longer appear in `list_user_notes` — they are effectively forgotten. The
   tool result does not tell you rotation happened.
 - **If the archive can't be written, nothing is evicted.** The rotation writes
