@@ -7,6 +7,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **An undated hand-written bullet is no longer the first thing rotation
+  evicts** (#232). `_rotate_to_fit` picked its victim with `recent_first`, the
+  ranking that deliberately sorts a bullet with no parseable timestamp *last* so
+  a hand-edited line renders at the bottom of the prompt — and then popped that
+  ranking's tail, which silently turned "shown last" into "deleted first". A
+  file holding one hand-typed bullet plus 27 stamped `2020-01-01` onwards
+  archived the hand-typed one first, ahead of a note five and a half years
+  older, and it was gone from the live file. Eviction now ranks through its own
+  `_eviction_order`, where an undated or malformed bullet is the *most*
+  protected and the tail is the oldest bullet that actually carries a timestamp.
+  It stays evictable as a last resort, so a file of nothing but hand-written
+  bullets can still come back under the 4 KB cap rather than sitting permanently
+  over budget. `recent_first` is untouched: display order in the prompt, in
+  `list_user_notes` and in `daily_snapshot` does not move. `save_user_note.md`,
+  `update_user_note.md` and `list_user_notes.md` all promised "the oldest
+  bullets by timestamp" and now state the undated case they never covered.
 - **A failing archive write can no longer destroy an evicted preference**
   (#232). `_append_archive` logged its `OSError` and returned exactly what it
   returns on success, so `save_user_note` and `update_user_note` truncated the

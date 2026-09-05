@@ -382,6 +382,11 @@ def _recency_key(n: Note) -> tuple[int, str, int]:
     offset at read time) breaks ties between identical timestamps by
     which was written later — the same signal ``reversed(file order)``
     used before this ranking existed.
+
+    This is a *display* key only. Rotation shared it and popped the
+    tail, which silently turned "sorts last in the prompt" into "is the
+    first thing thrown away" for exactly the bullets nobody stamped;
+    eviction ranks through ``_eviction_key`` instead.
     """
     parsed_ok = 0
     if n.timestamp:
@@ -404,8 +409,44 @@ def recent_first(items: list[Note]) -> list[Note]:
     recency order disagreeing, and a 4 KB rotation that evicts by
     position then archives the freshest note first). A blank or
     unparseable timestamp sorts LAST — see ``_recency_key``.
+
+    Display only: ``_rotate_to_fit`` used to reuse this ranking to pick
+    what to evict and no longer does — see ``_eviction_order``.
     """
     return sorted(items, key=_recency_key, reverse=True)
+
+
+def _eviction_key(n: Note) -> tuple[int, str, int]:
+    """Sort key for ``_eviction_order``, meant to be used with
+    ``reverse=True`` — ``_recency_key`` with its ``parsed_ok`` term
+    flipped, and nothing else changed.
+
+    The flip is the whole point. Ranking undated bullets last is right
+    for the prompt and exactly backwards for eviction: it made a line a
+    human typed by hand the first casualty of the 4 KB cap, ahead of a
+    stamped note years older, because rotation pops the tail of the
+    ranking it is given. Here a blank or malformed timestamp sorts
+    FIRST, i.e. most protected — a bullet nobody stamped carries no
+    evidence of its age, and the caller cannot claim it is the oldest
+    thing in the file. It stays evictable as a last resort (a file of
+    nothing but undated bullets must still be able to shed weight), and
+    within each group the ``(timestamp, position)`` tie-break is
+    ``_recency_key``'s, so eviction among dated bullets is unchanged.
+    """
+    parsed_ok, timestamp, position = _recency_key(n)
+    return (1 - parsed_ok, timestamp, position)
+
+
+def _eviction_order(items: list[Note]) -> list[Note]:
+    """Rank notes most-protected-first for rotation: the tail is what
+    ``_rotate_to_fit`` evicts next. Undated/malformed bullets lead
+    (evicted last), then dated bullets newest-first, so the tail is the
+    oldest bullet that actually carries a timestamp.
+
+    Deliberately not ``recent_first`` — see ``_eviction_key``. Display
+    order does not move with it.
+    """
+    return sorted(items, key=_eviction_key, reverse=True)
 
 
 def render_for_prompt(path: Path | None = None) -> str:
@@ -558,7 +599,7 @@ def append_note(text: str, path: Path | None = None) -> Note:
 def _rotate_to_fit(
     existing: str, new_line: str = "", protected_index: int | None = None,
 ) -> tuple[str, str, int | None]:
-    """Drop bullets from ``existing``, oldest by timestamp, until
+    """Drop bullets from ``existing``, oldest dated first, until
     ``existing + new_line`` fits the cap. Returns (kept_text,
     rotated_text, final_protected_index) where rotated_text contains the
     dropped lines, in the order they were evicted, for archiving, and
@@ -567,18 +608,23 @@ def _rotate_to_fit(
     ``None``) — the caller's cheap way to keep addressing the same line
     across a rotation without re-deriving its position by content.
 
-    Eviction ranks by ``recent_first`` and pops from the tail (oldest)
-    end, not by file position — a position-based eviction (the old
-    ``lines.pop(0)``) archives the *freshest* note first the moment any
-    note has been refreshed out of file order (Repro 7): ``update_note``
-    rewrites a timestamp in place without moving the line, so "oldest
-    line" and "oldest note" stop being the same question after the first
-    refinement. A non-bullet line (free prose the file's own docstring
-    invites) carries no timestamp and is never a candidate — only parsed
-    bullets are evicted. If every bullet is gone and the file (now pure
-    prose, or already minimal) still exceeds the cap, the loop stops and
-    the write proceeds over budget rather than spinning forever or
-    discarding content that isn't a note at all.
+    Eviction ranks by ``_eviction_order`` and pops from the tail, not by
+    file position — a position-based eviction (the old ``lines.pop(0)``)
+    archives the *freshest* note first the moment any note has been
+    refreshed out of file order (Repro 7): ``update_note`` rewrites a
+    timestamp in place without moving the line, so "oldest line" and
+    "oldest note" stop being the same question after the first
+    refinement. That ordering is this function's own and is *not*
+    ``recent_first``: an undated or malformed bullet sorts last for
+    display and most-protected for eviction, so a line a human typed by
+    hand is the last bullet to go rather than the first — it carries no
+    evidence of its age, and nothing licenses calling it the oldest
+    thing in the file. A non-bullet line (free prose the file's own
+    docstring invites) carries no timestamp and is never a candidate at
+    all — only parsed bullets are evicted. If every bullet is gone and
+    the file (now pure prose, or already minimal) still exceeds the cap,
+    the loop stops and the write proceeds over budget rather than
+    spinning forever or discarding content that isn't a note at all.
 
     ``new_line`` defaults to empty: ``append_note`` calls this with the
     incoming bullet split out as ``new_line`` (it isn't part of ``lines``
@@ -588,10 +634,10 @@ def _rotate_to_fit(
 
     ``protected_index`` names a line in ``existing`` (by its index at
     call time) that is never a candidate for eviction, no matter what
-    ``recent_first`` would otherwise rank it. ``update_note`` passes the
-    index of the bullet it just rewrote: that bullet's brand-new
-    timestamp *usually* keeps ``recent_first`` from picking it as
-    oldest, but ``_recency_key`` tie-breaks equal timestamps by
+    ``_eviction_order`` would otherwise rank it. ``update_note`` passes
+    the index of the bullet it just rewrote: that bullet's brand-new
+    timestamp *usually* keeps that ordering from picking it as
+    oldest, but ``_eviction_key`` tie-breaks equal timestamps by
     position, and a same-wall-clock-second update racing another note's
     write — or a hand-edited bullet carrying a future timestamp — can
     still make the just-rewritten line the tail of that ordering.
@@ -629,8 +675,8 @@ def _rotate_to_fit(
                 LIVE_FILE_MAX_BYTES, len(candidate.encode("utf-8")),
             )
             break
-        oldest = recent_first(bullets)[-1]
-        popped_index = oldest.position
+        victim = _eviction_order(bullets)[-1]
+        popped_index = victim.position
         rotated.append(lines.pop(popped_index))
         if protected_index is not None and popped_index < protected_index:
             # Everything after the popped line shifted left by one — keep

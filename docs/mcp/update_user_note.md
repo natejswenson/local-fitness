@@ -114,7 +114,9 @@ Read first, then target the handle exactly as shown:
   appending one, so nothing about the write would trip a size check unless
   this tool makes one itself. If the rewrite lands over budget, the oldest
   bullets **by timestamp** are rotated to `user_notes.archive.md`, same as
-  `save_user_note`'s rotation. The note just rewritten is excluded from
+  `save_user_note`'s rotation — and, as there, an **undated** bullet is the last
+  thing evicted rather than the first, however early in the file it sits. The
+  note just rewritten is excluded from
   eviction outright, so it is never the thing evicted by its own update —
   including when another note's timestamp ties it to the same second. If the
   archive cannot be written, nothing is evicted and the file goes over budget

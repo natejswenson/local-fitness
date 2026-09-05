@@ -83,9 +83,14 @@ is handled). A missing or unreadable notes file returns
   again. `read_notes()` itself is still plain on-disk/arrival order, oldest
   first — it's the ranking on top of it that changed, not the reader.)
 - **Archived notes are invisible.** When the live file exceeds the 4 KB cap,
-  the oldest bullets rotate out to `user_notes.archive.md`. This tool reads only
+  the oldest bullets **by timestamp** rotate out to `user_notes.archive.md`.
+  This tool reads only
   the live file, so rotated-out preferences will not appear — and are no longer
-  in the prompt either.
+  in the prompt either. Note that the bullets shown *last* here are not the
+  next ones to go: a bullet with no parseable timestamp sorts last for display
+  and is the last thing rotation evicts, not the first. See
+  [`save_user_note`](save_user_note.md)'s rotation gotcha for the full eviction
+  order.
 - **The recency contract is advisory.** Nothing here dedupes. When two notes
   conflict, the system prompt tells the model to prefer the newer one; that is
   the only reconciliation that exists.
