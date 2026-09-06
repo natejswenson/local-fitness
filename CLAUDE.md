@@ -196,6 +196,52 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   shows a double-digit margin. Confirm both, then recapture via the
   workflow dispatched on `main` (pre-PR code = the honest floor) and
   hand-promote the artifact to the committed `0001_*.json`.
+  **(3) Apply the tell PER BENCHMARK, not to the run — but only among
+  benchmarks that do the same fixed amount of work on every run.** A clock
+  deficit is fleet-wide: it moves all five together, so one benchmark out of
+  line with its four siblings is a code regression however slow the runner
+  was, **provided all five are calendar-invariant.** Four are:
+  `assemble_brief_context`, `_build_plan_section` and `daily_snapshot` all
+  pin `today=_TODAY` explicitly, so they do exactly the same work forever,
+  and `get_training_plan_status` is too despite reading the real
+  `date.today()`: `plans.build_plan_status` grades every workout in
+  `plan["workouts"]` regardless of where `today` falls and returns a
+  fixed-shape slim payload, so its own work does not grow with the wall
+  clock — if anything it shrinks once `today` leaves the plan, since
+  `_slim_workout(None)` returns early. One is not:
+  `get_training_plan_progress` is benchmarked via the production handler
+  with `args={}`, and that handler reads the real `date.today()` — the
+  tool schema has no `today` override — so the longer it has been since
+  the fixture's anchor date, the more of the plan's window falls inside
+  its frontier, and its own work grows with it, with no code change at
+  all. A wide gap since the committed baseline was captured (its filename
+  is date-stamped) is therefore a second candidate explanation for
+  `get_training_plan_progress` specifically, on top of runner-fleet drift,
+  and needs the same discipline before it's called a regression: a
+  same-day BEFORE/AFTER local A/B (two commits, one clock) rules calendar
+  drift out (as it did for the worked example below, captured the day
+  after the baseline); a same-code comparison spanning a real calendar gap
+  does not.
+  The corroborating question to ask next is *how much of the regressed work
+  does each benchmark actually do*. Worked example (2026-09-02, #232): run
+  `33652312669` passed on the baseline's own CPU (EPYC 7763 @ 3.2407 GHz vs
+  the baseline's 3.2410) with `assemble_brief_context` at **−0.34%** and
+  `get_training_plan_progress` at **+13.86%** — same silicon, same clock, one
+  benchmark faster and one 14% slower, which no clock deficit can produce.
+  Counting the work answered why: 470 `_round_floats` calls and 123 `_ran`
+  evaluations in the regressed target against 22 and 15 in the next one.
+  Bisected to **`b28c74e` (PR #162, 2026-07-27)** — one day after the baseline
+  was captured — with every later commit flat, so the "gate is flaky" reading
+  was wrong in the direction that matters: the gate was the only thing
+  reporting a real regression, and rebaselining would have baked it into the
+  floor. **Open, and worth knowing before the next rebaseline:** the committed
+  baseline was captured on CPython **3.12.13** and current runners are on
+  **3.12.14**, which has no macOS-aarch64 build to A/B against locally. The
+  −0.34% sibling bounds it (3.12.14 is not broadly slower here), but a
+  *targeted* 3.12.14 change to comprehensions or small-object allocation would
+  land almost entirely on `_round_floats` and be indistinguishable from a code
+  regression. Settling it needs one `capture-perf-baseline.yml` dispatch on
+  `8edfb70` under 3.12.14.
 - **The PR body IS the writeup.** There is no in-repo `devlog/` (removed
   2026-08-03 — 63 files nothing in the repo read, duplicating what the
   `/devlog` skill publishes to natejswenson.com from git history). A

@@ -80,14 +80,44 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
   `delete_user_note` call onto the wrong preference. It stops resolving only
   once *this* note itself is updated, deleted, or rotated to the archive; at
   that point `list_user_notes` is how you get a live handle again.
+- **A handle is never minted twice, so the timestamp may be a second late.**
+  Saving text that a live bullet already carries, inside the same wall-clock
+  second that bullet was stamped, would produce the identical
+  `(timestamp, text)` pair — and therefore the identical handle, which is the
+  one shape the whole addressing scheme cannot resolve. So the stamp steps
+  forward a second at a time until the handle is free, and the `timestamp` you
+  get back is that stamp rather than the second the call landed in.
+  `update_user_note` does the same on the rewrite path. The consequence worth
+  knowing: two live notes may carry identical *text* under two distinct
+  handles, each addressable on its own — duplicate wording is legal, duplicate
+  handles are not, and a duplicate handle in the file is therefore always a
+  hand-edit.
 - **4 KB live cap with silent rotation.** If the append would push the file past
   `LIVE_FILE_MAX_BYTES` (4096), the oldest bullets **by timestamp** — not by
   file position — are dropped from the live file and appended to
   `user_notes.archive.md` *before* the write. A note refreshed today via
   `update_user_note` is never the first thing evicted just because it sits
-  early in the file. Archived notes are no longer injected into the prompt and
+  early in the file. A bullet with **no timestamp at all** — hand-typed into the
+  file, or one whose date got mangled by an edit — is the *last* thing evicted,
+  not the first: it carries no evidence of its age, so nothing licenses calling
+  it the oldest note in the file. It is still evictable once every dated bullet
+  is gone, so a file of nothing but hand-written bullets can still come back
+  under the cap. (Display order is the other way round — an undated bullet
+  renders *last* in the prompt and in `list_user_notes`. Ranking last for
+  reading and last for deleting are two different orders, and this is the one
+  rotation uses.) Archived notes are no longer injected into the prompt and
   no longer appear in `list_user_notes` — they are effectively forgotten. The
   tool result does not tell you rotation happened.
+- **If the archive can't be written, nothing is evicted.** The rotation writes
+  the archive first and only truncates the live file once that write lands. If
+  it fails — the archive path is read-only, is a directory, the disk is full —
+  the would-be-evicted bullets stay live and the file is written *over* the
+  4 KB budget instead, with a `WARNING` naming the archive path. The cap
+  bounds prompt size; it is not a licence to destroy a preference that has
+  nowhere else to go, so a degraded archive costs you a fat prompt rather than
+  a lost note. Nothing recovers on its own: while the archive stays broken the
+  live file keeps growing at whatever rate notes are written, so the WARNING is
+  the thing to act on.
 - **Recency is a prompt instruction, not enforced code.** Nothing dedupes or
   reconciles conflicting notes. `render_for_prompt()` orders them newest-first
   and the system prompt says "prefer the newer note when two conflict" — that

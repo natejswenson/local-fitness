@@ -1,6 +1,7 @@
 """Tests for notes.py — the durable user-preference store."""
 from __future__ import annotations
 
+import logging
 import stat
 import threading
 from datetime import datetime, timedelta
@@ -37,6 +38,25 @@ def frozen_clock(monkeypatch):
 
     monkeypatch.setattr(notes, "datetime", _FrozenDatetime)
     return state
+
+
+@pytest.fixture
+def pinned_clock(monkeypatch):
+    """Patches notes.datetime.now() to return one fixed instant on every
+    call -- the same-wall-clock-second case frozen_clock deliberately
+    removes, and the only condition under which a writer can mint two
+    identical (timestamp, text) pairs on its own. Returns the instant, so
+    a test can plant a bullet already carrying it. Adversarial by design:
+    the collision guard is unreachable without a clock that repeats."""
+    instant = datetime(2026, 1, 1, 0, 0, 0)
+
+    class _PinnedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant
+
+    monkeypatch.setattr(notes, "datetime", _PinnedDatetime)
+    return instant
 
 
 def test_empty_when_missing(notes_path):
@@ -444,6 +464,70 @@ def test_append_never_manufactures_a_handle_collision(notes_path):
     assert len({n.handle for n in notes.read_notes(notes_path)}) == 2
 
 
+def test_update_never_manufactures_a_handle_collision(notes_path, pinned_clock):
+    # Two updates rewriting two different notes to the same text inside
+    # one wall-clock second. append_note has always re-stamped out of
+    # this; update_note used to stamp with no handle check at all and
+    # left two live bullets sharing one address.
+    notes.append_note("first preference", path=notes_path)
+    notes.append_note("second preference", path=notes_path)
+    live = notes.read_notes(notes_path)
+
+    first = notes.update_note(live[0].handle, "the same new text", path=notes_path)
+    second = notes.update_note(live[1].handle, "the same new text", path=notes_path)
+    assert first is not None and second is not None
+    assert first[0].handle != second[0].handle
+
+    handles = [n.handle for n in notes.read_notes(notes_path)]
+    assert len(handles) == 2
+    assert len(set(handles)) == 2
+
+
+def test_update_restamps_when_its_stamp_would_hit_an_existing_bullet(notes_path, pinned_clock):
+    # The other shape: the update's own (now, new text) pair is already
+    # on disk, so the naive stamp lands on a live bullet's handle rather
+    # than on another update's.
+    pinned = pinned_clock.isoformat()
+    notes_path.write_text(
+        f"- {pinned} — the text both bullets want\n"
+        "- 2020-01-01T00:00:00 — the note being rewritten\n",
+        encoding="utf-8",
+    )
+    target = next(n for n in notes.read_notes(notes_path)
+                  if n.text == "the note being rewritten")
+
+    result = notes.update_note(target.handle, "the text both bullets want", path=notes_path)
+    assert result is not None
+    updated, _duplicates = result
+    assert updated.timestamp != pinned  # re-stamped forward instead of colliding
+
+    handles = [n.handle for n in notes.read_notes(notes_path)]
+    assert len(handles) == 2
+    assert len(set(handles)) == 2
+
+
+def test_update_leaves_same_text_notes_independently_addressable(notes_path, pinned_clock):
+    # Two bullets carrying identical *text* stays legal — the guard
+    # re-stamps rather than refusing, so "make these two say the same
+    # thing" is not an error. What must stop is one handle addressing
+    # two bullets: a delete used to leave a live twin behind.
+    notes.append_note("first preference", path=notes_path)
+    notes.append_note("second preference", path=notes_path)
+    live = notes.read_notes(notes_path)
+    first = notes.update_note(live[0].handle, "the same new text", path=notes_path)
+    second = notes.update_note(live[1].handle, "the same new text", path=notes_path)
+    assert first is not None and second is not None
+
+    assert notes.delete_note(first[0].handle, path=notes_path) == 1
+    remaining = notes.read_notes(notes_path)
+    assert [n.text for n in remaining] == ["the same new text"]
+    assert remaining[0].handle == second[0].handle
+
+    survivor = notes.update_note(second[0].handle, "now distinct", path=notes_path)
+    assert survivor is not None
+    assert survivor[1] == 1
+
+
 def test_render_for_prompt_handles_all_resolve_via_update(notes_path):
     # Correction 2: the prompt path is a second live entry point — every
     # handle rendered into the prompt must be one list_user_notes would
@@ -553,6 +637,118 @@ def test_append_archive_repairs_missing_trailing_newline_in_existing_archive(not
     # The pre-existing entry must be its own note, not a prefix glued to
     # whatever rotated in behind it.
     assert archived_texts.count("an old archived preference") == 1
+
+
+def _break_the_archive(notes_path):
+    """Make the archive path unwritable the way an operator's environment
+    can: a directory sits where the file belongs, so the append inside
+    ``_append_archive`` raises ``IsADirectoryError`` (an ``OSError``).
+    Returns the archive path. The lock sidecar is a separate file, so the
+    failure lands on the content write, not on the lock."""
+    archive = notes._archive_path(notes_path)
+    archive.mkdir()
+    return archive
+
+
+def test_append_keeps_evicted_bullets_live_when_the_archive_cannot_be_written(
+    notes_path, caplog,
+):
+    # Issue #232 item 2. _append_archive logged the OSError and returned
+    # the same None it returns on success, so append_note truncated the
+    # live file regardless and the evicted preferences existed nowhere:
+    # 60 -> 57 live bullets, archive empty, 3 preferences destroyed. The
+    # 4 KB cap bounds prompt size; it does not license deletion.
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(60)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    archive = _break_the_archive(notes_path)
+
+    with caplog.at_level(logging.WARNING, logger=notes.__name__):
+        new_note = notes.append_note("Never comment on my weekend sleep.", path=notes_path)
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    for text in original_texts:
+        assert text in live_texts  # nothing evicted, because nothing could be archived
+    assert new_note.text in live_texts  # and the incoming preference is still saved
+    assert len(live_texts) == len(original_texts) + 1
+
+    # Knowingly over budget — the named, accepted consequence of not
+    # evicting. A fat prompt beats a destroyed preference.
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) > notes.LIVE_FILE_MAX_BYTES
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(str(archive) in m for m in warnings)
+    assert any("over budget" in m for m in warnings)
+
+
+def test_update_keeps_evicted_bullets_live_when_the_archive_cannot_be_written(
+    notes_path, caplog,
+):
+    # Same defect on the path PR #234 opened, where it costs more: one
+    # capacity-tripping update rotates as many bullets as the new text
+    # costs, so a broken archive destroyed six preferences at a time.
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(50)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    assert len("\n".join(bullets).encode("utf-8")) < notes.LIVE_FILE_MAX_BYTES
+    archive = _break_the_archive(notes_path)
+
+    target = notes.read_notes(notes_path)[10]
+    grown = "grow this one preference until it trips the cap " * 15
+
+    with caplog.at_level(logging.WARNING, logger=notes.__name__):
+        result = notes.update_note(target.handle, grown, path=notes_path)
+
+    assert result is not None
+    new_note, _duplicates = result
+    live = notes.read_notes(notes_path)
+    live_texts = [n.text for n in live]
+    for text in original_texts:
+        if text == target.text:
+            continue  # this one was rewritten, on purpose
+        assert text in live_texts
+    assert new_note.text in live_texts
+    assert len(live_texts) == len(original_texts)
+
+    live_bytes = notes_path.read_text(encoding="utf-8").encode("utf-8")
+    assert len(live_bytes) > notes.LIVE_FILE_MAX_BYTES
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(str(archive) in m for m in warnings)
+    assert any("over budget" in m for m in warnings)
+
+
+def test_update_position_still_points_at_the_updated_bullet_when_archiving_fails(
+    notes_path,
+):
+    # Guards the `new_position = protected_after` assignment moving inside
+    # the archive-succeeded branch. On the skip path nothing was popped,
+    # so the position _rotate_to_fit computed is short by however many
+    # lines it WOULD have evicted, and the returned Note points at some
+    # other user's preference. Position is a hint, but a hint that points
+    # at the wrong bullet is worse than no hint.
+    original_texts = [
+        f"note number {i:03d} with some padding text to bulk it up" for i in range(50)
+    ]
+    bullets = [f"- 2026-01-01T00:00:{i:02d} — {t}" for i, t in enumerate(original_texts)]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    _break_the_archive(notes_path)
+
+    target = notes.read_notes(notes_path)[10]
+    grown = "grow this one preference until it trips the cap " * 15
+    result = notes.update_note(target.handle, grown, path=notes_path)
+
+    assert result is not None
+    new_note, _duplicates = result
+    live = notes.read_notes(notes_path)
+    assert new_note.position == 10
+    assert live[new_note.position].handle == new_note.handle
+    assert live[new_note.position].text == new_note.text
 
 
 
@@ -1100,6 +1296,87 @@ def test_recent_first_sorts_undated_and_malformed_timestamps_last(notes_path):
     assert {ranked[1].text, ranked[2].text} == {"malformed date", "just text no separator"}
     # And it must not raise — a hand-edited file is exactly the case this
     # module is designed to tolerate.
+
+
+
+def test_rotation_evicts_dated_bullets_before_an_undated_hand_written_one(notes_path):
+    # Item 3: _recency_key ranks an undated bullet LAST so that a
+    # hand-edited line renders last in the prompt. Eviction reused that
+    # same ranking and popped its tail, which silently made "shown last"
+    # mean "thrown away first" — a bullet a human typed by hand went
+    # before a dated note five and a half years older. Eviction has its
+    # own order now.
+    bullets = [
+        f"- 2020-01-{i:02d}T00:00:00 — preference number {i} " + "with padding text " * 6
+        for i in range(1, 28)
+    ]
+    hand_written = "- A hand-written note with no date at all, written by the user"
+    notes_path.write_text(
+        hand_written + "\n" + "\n".join(bullets) + "\n", encoding="utf-8"
+    )
+    assert len(notes_path.read_text(encoding="utf-8").encode("utf-8")) > notes.LIVE_FILE_MAX_BYTES
+
+    notes.append_note("one more ordinary preference with padding text", path=notes_path)
+
+    live_texts = [n.text for n in notes.read_notes(notes_path)]
+    assert "A hand-written note with no date at all, written by the user" in live_texts
+
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()  # rotation must actually have fired
+    archived_texts = [
+        parsed.text
+        for parsed in (notes._parse_line(ln) for ln in archive.read_text(encoding="utf-8").splitlines())
+        if parsed is not None
+    ]
+    assert archived_texts  # ... and evicted something, so the assertions below aren't vacuous
+    assert "A hand-written note with no date at all, written by the user" not in archived_texts
+    # The archive is written in eviction order, so entry 0 is the first
+    # thing evicted: the oldest DATED bullet, not the undated one.
+    assert archived_texts[0].startswith("preference number 1 ")
+
+
+def test_display_order_still_sorts_undated_last_after_the_eviction_split(notes_path):
+    # Guard for the item-3 split: eviction stopped sharing recent_first's
+    # key, and display order must not have moved with it. Green by
+    # construction both before and after the change — its job is to stay
+    # green, not to prove the fix.
+    notes_path.write_text(
+        "- A hand-written note with no date at all, written by the user\n"
+        "- 2020-01-01T00:00:00 — the oldest dated note\n"
+        "- 2026-01-01T00:00:00 — the newest dated note\n",
+        encoding="utf-8",
+    )
+    ranked = notes.recent_first(notes.read_notes(notes_path))
+    assert [n.text for n in ranked] == [
+        "the newest dated note",
+        "the oldest dated note",
+        "A hand-written note with no date at all, written by the user",
+    ]
+    assert notes.render_for_prompt(notes_path).splitlines()[-1].endswith(
+        "A hand-written note with no date at all, written by the user"
+    )
+
+
+def test_rotation_of_an_all_undated_file_still_evicts_and_terminates(notes_path):
+    # Most protected is not unevictable: a file of nothing but
+    # hand-written bullets, over the cap, must still shed weight rather
+    # than loop or stay permanently over budget. Red against the rejected
+    # "never evict an undated bullet" variant.
+    bullets = [
+        f"- hand-written preference number {i} " + "with padding text " * 6
+        for i in range(30)
+    ]
+    notes_path.write_text("\n".join(bullets) + "\n", encoding="utf-8")
+    assert len(notes_path.read_text(encoding="utf-8").encode("utf-8")) > notes.LIVE_FILE_MAX_BYTES
+
+    notes.append_note("one more ordinary preference with padding text", path=notes_path)
+
+    live_text = notes_path.read_text(encoding="utf-8")
+    assert "one more ordinary preference with padding text" in live_text
+    assert len(live_text.encode("utf-8")) <= notes.LIVE_FILE_MAX_BYTES
+    archive = notes._archive_path(notes_path)
+    assert archive.exists()
+    assert "hand-written preference number 0 " in archive.read_text(encoding="utf-8")
 
 
 def test_rotation_terminates_on_pure_prose_over_cap(notes_path):

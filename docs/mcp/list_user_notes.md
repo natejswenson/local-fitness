@@ -47,9 +47,11 @@ One entry per parsed bullet, newest-first, plus a count:
 note's own timestamp and text, not a file position — so it survives an
 unrelated note being added, deleted, or rotated to the archive. Two live
 notes only ever share a handle if they are byte-for-byte identical in both
-fields (see [`update_user_note`](update_user_note.md)'s Gotchas for how that's
-handled). A missing or unreadable notes file returns `{"notes": [], "count": 0}`
-rather than erroring.
+fields, which only a hand-edit produces — the write tools re-stamp a second
+forward rather than mint a live handle twice (see
+[`update_user_note`](update_user_note.md)'s Gotchas for how a hand-edited pair
+is handled). A missing or unreadable notes file returns
+`{"notes": [], "count": 0}` rather than erroring.
 
 ## Example
 
@@ -81,21 +83,30 @@ rather than erroring.
   again. `read_notes()` itself is still plain on-disk/arrival order, oldest
   first — it's the ranking on top of it that changed, not the reader.)
 - **Archived notes are invisible.** When the live file exceeds the 4 KB cap,
-  the oldest bullets rotate out to `user_notes.archive.md`. This tool reads only
+  the oldest bullets **by timestamp** rotate out to `user_notes.archive.md`.
+  This tool reads only
   the live file, so rotated-out preferences will not appear — and are no longer
-  in the prompt either.
+  in the prompt either. Note that the bullets shown *last* here are not the
+  next ones to go: a bullet with no parseable timestamp sorts last for display
+  and is the last thing rotation evicts, not the first. See
+  [`save_user_note`](save_user_note.md)'s rotation gotcha for the full eviction
+  order.
 - **The recency contract is advisory.** Nothing here dedupes. When two notes
   conflict, the system prompt tells the model to prefer the newer one; that is
   the only reconciliation that exists.
 - **The file is hand-editable.** Lines not starting with `- ` are skipped by the
   parser (so free prose in the file is tolerated), and a bullet with no ` — `
   separator comes back with an empty `timestamp`.
-- **A hand-typed duplicate bullet gets the same handle.** The handle is derived
-  purely from timestamp + text, so copy-pasting a bullet by hand produces two
-  live notes this tool can't tell apart by handle alone — they read back with
-  identical `handle` values. `update_user_note` / `delete_user_note` tolerate
-  this (they act on the first and report how many matched); this tool just
-  lists them as they are.
+- **A hand-typed duplicate bullet gets the same handle, and it is the only way
+  to get one.** The handle is derived purely from timestamp + text, so
+  copy-pasting a bullet by hand produces two live notes this tool can't tell
+  apart by handle alone — they read back with identical `handle` values.
+  `save_user_note` and `update_user_note` cannot do this to you: each stamps
+  against the handles already live and steps a second forward rather than
+  repeating one. `update_user_note` / `delete_user_note` still tolerate a
+  hand-edited pair (they act on the first and report how many matched); this
+  tool just lists them as they are. Two bullets with the same *text* and
+  different timestamps are ordinary distinct notes, not this case.
 - Not available to the brief generator — `_READ_ONLY_TOOL_NAMES` excludes it;
   the brief already sees notes through the prompt injection.
 
