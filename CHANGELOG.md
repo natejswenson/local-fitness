@@ -4,7 +4,135 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.62.0] - 2026-09-05
+
+### Fixed
+- **The evening brief email stopped shipping the deterministic template in the
+  coach's place** (#241). `plan_coach` was the last of the three single-shot
+  SDK-call siblings still following `briefing.DEFAULT_MODEL`, and it inherited
+  the SDK defaults along with the model: no `effort`, no `thinking` — adaptive
+  thinking at high effort — under the lowest ceiling of the three (30 s). It
+  timed out **23 of the 30 nights from 2026-08-07 to 09-05**, and every one of
+  those emails carried `fallback_coaching_line` instead of a coach line. It now
+  owns `DEFAULT_MODEL` (`claude-sonnet-5`), `DEFAULT_EFFORT` (`"low"`),
+  `thinking={"type": "disabled"}` and `DEFAULT_TIMEOUT_S` (45 s, matching
+  `reflect` — a short generation inside a scheduled job, not `workout_coach`'s
+  interactive 90 s), and imports `briefing` nowhere.
+
+  **Measured A/B**, 5 generations per arm against the REAL plan section and the
+  real prompt (2026-09-05, this machine; only the three knobs differ):
+
+  | Arm | Model | effort | thinking | Median | Max | Fallback rate |
+  |---|---|---|---|---|---|---|
+  | old | claude-sonnet-4-6 | (default) | (adaptive) | 35.4 s | 35.5 s | **5/5 (100%)** |
+  | new | claude-sonnet-5 | low | disabled | **6.4 s** | 8.1 s | **0/5 (0%)** |
+
+  Every old-arm run pinned at the ceiling (30 s + ~5.4 s of cancellation
+  unwinding). Output quality holds: the five new-arm lines run 59-98 words, one
+  paragraph, no markdown and no preamble — inside the 54-128 word range of the
+  eight lines the old config actually managed to cache. A live
+  `fitness brief-email --dry-run` generated in 7.6 s, printed
+  `Coaching line: generated`, and put a real coach line in the `.eml`.
+
+  The claim is a **rate**, not a guarantee: `reflect` has failed once in 31 on
+  this exact configuration, and two logged stalls (519.7 s against a 30 s
+  ceiling, 359 s against 45 s) blew past `asyncio.wait_for` entirely. No
+  ceiling value bounds that, which is why the fallback stays and why the second
+  half of this change exists.
+- **A template coaching line is no longer invisible** (#241). The substitution
+  was already logged at WARNING — into a 154 KB launchd *error* log nobody
+  scans, which is how it ran for a month unnoticed. `assemble_brief_render_inputs`
+  now sets `today["coaching_line_source"]` (`"generated"` / `"fallback"`) beside
+  the line, and three channels that are not that log report it: `brief-email`
+  echoes `Coaching line: <source>` to **stdout** (the 4 KB one-line-a-night out
+  log, and it prints on `--dry-run` too), the one existing macOS notification
+  reads `Evening brief emailed (coaching line: TEMPLATE)` on a fallback night
+  rather than firing a second notification, and `generate_brief_report`'s
+  payload carries the field so the stdio PDF path can report it as well. A cache
+  hit counts as `"generated"`: the distinction that matters is template versus
+  coach. The renderers read only `coaching_line`, so the sibling key is inert to
+  them, and it is set after the generation so no prompt or cache key moves. A
+  fallback is not a failure — the email still ships, and the exit code is
+  unchanged.
+- **An undated hand-written bullet is no longer the first thing rotation
+  evicts** (#232). `_rotate_to_fit` picked its victim with `recent_first`, the
+  ranking that deliberately sorts a bullet with no parseable timestamp *last* so
+  a hand-edited line renders at the bottom of the prompt — and then popped that
+  ranking's tail, which silently turned "shown last" into "deleted first". A
+  file holding one hand-typed bullet plus 27 stamped `2020-01-01` onwards
+  archived the hand-typed one first, ahead of a note five and a half years
+  older, and it was gone from the live file. Eviction now ranks through its own
+  `_eviction_order`, where an undated or malformed bullet is the *most*
+  protected and the tail is the oldest bullet that actually carries a timestamp.
+  It stays evictable as a last resort, so a file of nothing but hand-written
+  bullets can still come back under the 4 KB cap rather than sitting permanently
+  over budget. `recent_first` is untouched: display order in the prompt, in
+  `list_user_notes` and in `daily_snapshot` does not move. `save_user_note.md`,
+  `update_user_note.md` and `list_user_notes.md` all promised "the oldest
+  bullets by timestamp" and now state the undated case they never covered.
+- **A failing archive write can no longer destroy an evicted preference**
+  (#232). `_append_archive` logged its `OSError` and returned exactly what it
+  returns on success, so `save_user_note` and `update_user_note` truncated the
+  live file regardless: with the archive unwritable, a single capacity-tripping
+  write dropped 9 bullets on the append path and 7 on the update path, and they
+  existed nowhere afterwards — one `LOG.warning` no tool result surfaces was the
+  only trace. It now returns a success flag, and both callers keep the
+  would-be-evicted bullets live and write over the 4 KB budget when it comes
+  back `False`, taking the same way out `_rotate_to_fit` already takes for
+  unevictable prose. The cap exists to bound prompt size, not to guarantee
+  deletion, so a temporarily fat prompt beats a lost preference. Named
+  consequence: while the archive stays broken the live file grows unbounded —
+  every such write logs a `WARNING` naming the archive path and the size it went
+  over by. The update path also stops mis-reporting `position` on that skip
+  path, where nothing was popped and no line ahead of the rewritten one moved.
+- **`update_user_note` can no longer manufacture a handle collision** (#232).
+  `save_user_note` has always re-stamped a second forward rather than write a
+  `(timestamp, text)` pair a live bullet already carries; `update_user_note`
+  stamped outside the lock with no handle check at all, so two updates to the
+  same text inside one wall-clock second — or a rewrite onto text a bullet
+  stamped this second already holds — left two live bullets sharing one
+  address. A later `update_user_note` on that handle came back `duplicates: 2`,
+  and a `delete_user_note` removed one and left the twin in every future system
+  prompt. The guard is now one shared `_stamp_without_collision`, called by both
+  writers inside the held lock; `update_user_note` checks against every live
+  handle except the line it is replacing, so an update that changes nothing is
+  not forced to re-stamp itself. Rewriting two notes to the same wording stays
+  legal — they get distinct timestamps and stay independently addressable. A
+  shared handle in the file is now necessarily a hand-edit, which is what
+  `update_user_note.md`, `delete_user_note.md` and `list_user_notes.md` claimed
+  all along and now describe accurately; `save_user_note.md` documents the
+  re-stamp itself for the first time.
+- **`get_training_plan_progress` is ~6% faster, closing most of the +13.86%
+  regression PR #162 introduced** (#232). The perf gate had been reading that
+  benchmark over the threshold on slower runners since 2026-07-27 — the day
+  after the baseline was captured — and the failures were being re-run to green
+  as flakes. They were not flakes: bisected to `b28c74e`, confirmed by a local
+  A/B, and confirmed again by the shape of the CI table (on the baseline's own
+  CPU at the same clock, one sibling benchmark came in at −0.34% while this one
+  came in at +13.86%). Two behaviour-preserving fixes to code #162 added:
+  `plans._workout_actuals` folds the pace-gated run/walk classification into
+  the single pass it already runs over the day's activities, instead of walking
+  the list a second time through `_normalize_activity_types` (now deleted —
+  the fold left it with no caller); and `tools._round_floats` stops recursing
+  into leaves, rounding a container's scalar children where it finds them and
+  recursing only into a child that is itself a `dict` or a `list`. Anything
+  that is not exactly one of those types still falls through the original
+  `isinstance` ladder, so no output moves — asserted byte-for-byte against a
+  vendored copy of the old implementation over the real payload and 21
+  adversarial cases. Measured on the perf fixture: `_ran` evaluations per
+  request 123 → 87, `_round_floats` calls 470 → 83, handler latency −6.0%
+  (p05, interleaved in-process A/B). The gate, its 15% threshold and its
+  committed baseline are deliberately untouched.
+
+### Changed
+- **The perf-benchmark suite now counts work, not just connections.** New
+  deterministic assertions in `tests/test_perf_benchmarks.py` pin `_ran` and
+  `_round_floats` call counts for `get_training_plan_progress`, alongside
+  equivalence oracles proving the reductions changed no answer. Latency alone
+  cannot separate "the runner was slow" from "the code got slower" on a 2 ms
+  call — which is exactly how the regression above survived five weeks.
+  `CLAUDE.md`'s drift-vs-regression tell gains its third part: apply it per
+  benchmark, not to the run.
 
 ### Fixed
 - **An undated hand-written bullet is no longer the first thing rotation

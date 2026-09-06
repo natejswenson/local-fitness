@@ -299,6 +299,18 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
     charts, plan_section = asyncio.run(
         agent_tools.assemble_brief_render_inputs(brief, target.isoformat()))
 
+    # STDOUT, deliberately — not err=True. The WARNING behind a fallback
+    # already goes to stderr, and it fired 23 nights running into a 154 KB
+    # launchd error log nobody scans (#241). This lands in the 4 KB
+    # one-line-a-night out log instead, and prints on --dry-run too. Nothing
+    # at all when there is no plan section, or when an older payload carries
+    # no source key. ``coaching_line_source()`` is the one accessor for this
+    # field — shared with generate_brief_report so the same optional-field
+    # guard isn't written twice (#241, f-1f6a8ae5).
+    line_source = agent_tools.coaching_line_source(plan_section)
+    if line_source is not None:
+        click.echo(f"Coaching line: {line_source}")
+
     theme = branding.load_theme()
     html_body = email_render.build_html(
         brief, {int(k) for k in charts}, plan_section, theme)
@@ -337,7 +349,13 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
     _emailed_marker(target).write_text(msg["Message-ID"] or "", encoding="utf-8")
     click.echo(f"Emailed {subject} to {', '.join(cfg.to)}")
     if not no_notify:
-        _notify("Evening brief emailed")
+        # Folded into the ONE existing notification rather than firing a
+        # second: a template line is not a failure, it is a fact about the
+        # email that just shipped, and this is the channel that reaches a human
+        # the same evening.
+        suffix = (" (coaching line: TEMPLATE)"
+                  if line_source == "fallback" else "")
+        _notify(f"Evening brief emailed{suffix}")
 
 
 @main.command(name="plan-calendar")

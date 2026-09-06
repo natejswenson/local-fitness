@@ -1305,8 +1305,8 @@ These are settled — don't redesign without a reason.
     `plan_coach` preps a run not yet done from a prescription while this one
     judges a run already done from graded results — different inputs, tense,
     and failure mode. The model is told the grades are not its to revise: it
-    phrases them, it never re-derives them. Its timeout is far longer than
-    `plan_coach`'s 30s — see the latency bullet below.
+    phrases them, it never re-derives them. Its timeout is longer than
+    `plan_coach`'s 45s — see the latency bullet below.
   - **The read is FOUR labelled paragraphs, one per graded area** — not one
     blended paragraph. `READ_SECTIONS` is the contract; the model emits
     `DISTANCE:` / `PACE:` / `HEART RATE:` / `TRAINING LOAD:` lines and
@@ -1651,8 +1651,9 @@ These are settled — don't redesign without a reason.
   Riegel-projection dict, not a date). The section is omitted entirely
   (not shown empty) when there's no active plan or no plan data in the
   window. Today's coaching line comes from a **new `agent/plan_coach.py`
-  module** — a Claude Agent SDK call (toolless, single-shot, same
-  `briefing.DEFAULT_MODEL` the real daily brief uses) behind a
+  module** — a Claude Agent SDK call (toolless, single-shot, on its **own**
+  `plan_coach.DEFAULT_MODEL`/`DEFAULT_EFFORT`/`DEFAULT_TIMEOUT_S`, never
+  `briefing.DEFAULT_MODEL`; see the three-siblings rule below) behind a
   single-entry disk cache since 0.23.0
   (`generate_coaching_line_cached`, keyed on the pure `build_prompt`
   output hash, stored next to the SQLite DB): identical inputs reuse the
@@ -1661,10 +1662,53 @@ These are settled — don't redesign without a reason.
   failures are never cached. Deterministic template fallback
   (`fallback_coaching_line`) if the call fails for any reason (missing
   credential, network, timeout) — the PDF still generates either way.
-  `plan_coach.py` imports `briefing` lazily, inside the function body,
-  not at module scope: `briefing.py` already imports `tools.py` at module
-  scope (as `agent_tools`), and `tools.py` imports `plan_coach.py` — a
-  module-scope import there would close a real circular import.
+  `plan_coach.py` must never import `briefing` at module scope:
+  `briefing.py` already imports `tools.py` at module scope (as
+  `agent_tools`), and `tools.py` imports `plan_coach.py` — a module-scope
+  import there would close a real circular import. As of 0.62.0 it does not
+  import `briefing` at all; the prohibition outlives the import.
+- **All THREE single-shot SDK-call siblings own their model and set
+  `effort`/`thinking` explicitly** (0.62.0, #241) — `workout_coach`,
+  `reflect` and now `plan_coach`. This deliberately excludes a fourth
+  single-shot caller, the V2 brief composer (`briefing.py`'s toolless,
+  `max_turns=1` generator, see the *Brief composer = V2* bullet above) — it
+  already sets `effort` via `_brief_effort()` but not `thinking`, which
+  would otherwise read as this rule's own counterexample. It stays outside
+  the rule on purpose: it is the eval'd composer, so a knob change there has
+  to clear the prompt scorer, the cross-model A/B and the invention-rate
+  gate first — exactly the per-caller coupling this rule frees the other
+  three siblings from, not something to extend to a fourth surface.
+  `plan_coach` was the last of the THREE following
+  `briefing.DEFAULT_MODEL`, and it inherited the SDK defaults along with the
+  model: no `effort`, no `thinking`, i.e. adaptive thinking at high effort,
+  under the lowest ceiling of the three (30 s). Measured on real evening
+  briefs, **23 of the 30 nights from 2026-08-07 to 09-05 timed out and
+  emailed the deterministic template** in the coach's place. The control is
+  in this app's own logs rather than a lab: on 2026-09-05 the brief composer
+  wrote a whole three-card brief on the SAME model in 64 s with
+  `effort="low"`, 65 seconds before `plan_coach` failed to write two
+  sentences in 30 at default effort — which isolates `effort`, where the
+  sibling comparison can only speak to the whole bundle. `plan_coach` is now
+  `claude-sonnet-5` + `effort="low"` + `thinking` disabled on a 45 s
+  `DEFAULT_TIMEOUT_S` (matching `reflect`, the closer analogue: a short
+  generation inside a scheduled job, not `workout_coach`'s interactive 90 s).
+  **The honest claim is a RATE, not a guarantee** — `reflect` has failed once
+  in 31 on the target config, and two logged stalls (519.7 s against a 30 s
+  ceiling, 359 s against 45 s) blew past `asyncio.wait_for` entirely, so no
+  ceiling value bounds the wall clock. That is why the fix has a second half:
+  the fallback is fail-soft by design and was therefore **invisible for a
+  month**. `assemble_brief_render_inputs` now sets
+  `today["coaching_line_source"]` (`"generated"`/`"fallback"`), `brief-email`
+  echoes it to **stdout** and names a template line in the one existing macOS
+  notification, and `generate_brief_report`'s payload carries it for the stdio
+  path. Stdout deliberately, not stderr: the WARNING behind every one of those
+  23 nights already went to stderr, into a 154 KB launchd error log nobody
+  scans. A signal in the channel that failed is not a signal. A cache hit
+  counts as `"generated"` — the distinction that matters is template versus
+  coach. **When adding a new single-shot SDK-call surface beyond these three
+  (and beyond the excluded V2 composer), give it its own model constant and
+  set both knobs**; and when a fail-soft substitution matters to
+  the user, put its name where a human already looks.
 - **Auth middleware**: `LOCAL_FITNESS_API_TOKEN` env var; constant-time
   bearer check; `_is_public_path` denies by default — only `/health` is
   explicitly whitelisted (2026-07-09 UI-retirement design; no SPA shell

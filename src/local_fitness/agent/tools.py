@@ -4317,6 +4317,24 @@ def _build_plan_section(target_date: str) -> dict | None:
     }
 
 
+def coaching_line_source(plan_section: dict | None) -> str | None:
+    """The single accessor for ``plan_section["today"]["coaching_line_source"]``
+    (#241, f-1f6a8ae5) — tolerates a missing section and a missing ``"today"``,
+    so both ``generate_brief_report`` and ``cli.brief_email`` read the field
+    through one guard instead of two independent copies of the same
+    truthiness check. ``assemble_brief_render_inputs``'s own docstring is what
+    this rule generalizes: "Two copies would drift silently, and the
+    divergence would only be visible to someone holding both artifacts side
+    by side" — that was true of the section-building logic, and it is
+    equally true of reading one optional field back out of it."""
+    if not plan_section:
+        return None
+    today = plan_section.get("today")
+    if not today:
+        return None
+    return today.get("coaching_line_source")
+
+
 async def assemble_brief_render_inputs(
     brief: Brief, target_date: str
 ) -> tuple[dict[str, bytes], dict | None]:
@@ -4334,7 +4352,20 @@ async def assemble_brief_render_inputs(
     ``str(index)`` over ``enumerate(brief.takeaways)`` — NOT by metric name (two
     takeaways can cite the same metric). ``plan_section`` is None when there is
     no active plan or no plan data in the trailing window, and otherwise carries
-    ``today["coaching_line"]`` already resolved.
+    ``today["coaching_line"]`` already resolved, beside
+    ``today["coaching_line_source"]`` — ``"generated"`` or ``"fallback"`` —
+    naming which of the two the caller is holding. Read that field via
+    ``coaching_line_source()`` above, not by indexing ``plan_section`` directly.
+
+    ``coaching_line_source`` is diagnostic metadata about HOW the line was
+    produced, not part of what either renderer draws (#241, f-32b8f4da) — a
+    caller that hashes ``plan_section`` wholesale to name an output file (see
+    ``generate_brief_report``'s ``_render_tag`` call) MUST strip this key
+    first, or a field the page never shows would silently move a
+    content-addressed filename. It is left on the returned dict rather than
+    returned as a third tuple element only because the email path
+    (``cli.brief_email``) wants it alongside the rest of the section, not as
+    a fourth thing to thread through.
 
     Best-effort throughout, and deliberately so: a chart that will not render is
     skipped, a malformed plan section becomes None, and a failed coaching-line
@@ -4420,6 +4451,7 @@ async def assemble_brief_render_inputs(
                 # this cache (see memory.render_memory_for_prompt).
                 memory_text=_memory_text,
             )
+            line_source = "generated"
         except Exception:
             LOG.warning(
                 "plan coaching-line generation failed for brief %s, using fallback",
@@ -4432,7 +4464,23 @@ async def assemble_brief_render_inputs(
                 plan_section["goal_type"],
                 target_date=target_date,
             )
+            line_source = "fallback"
         plan_section["today"]["coaching_line"] = coaching_line
+        # Which line the section actually carries, set AFTER the generation so
+        # no prompt (and no plan_coach cache key) moves. The renderers read only
+        # ``coaching_line``, so this sibling key is inert to THEM — it exists so
+        # a caller can report the substitution on a channel a human reads. The
+        # WARNING above fired 23 nights running into the launchd error log and
+        # nobody saw it (#241). A cache hit counts as "generated": the
+        # distinction that matters is template versus coach.
+        #
+        # It is NOT inert to ``_render_tag`` — a caller that hashes this
+        # section wholesale to name an output file (``generate_brief_report``)
+        # must strip this key before that hash, or a field the page never
+        # shows would silently move a content-addressed filename
+        # (#241, f-32b8f4da). Read it via the ``coaching_line_source()``
+        # accessor above, never by re-implementing this guard.
+        plan_section["today"]["coaching_line_source"] = line_source
 
         # 4a: advisory grounding of the coaching line against the deterministic
         # plan section — mirrors grounding.log_grounding's pattern (log-only,
@@ -4455,7 +4503,10 @@ async def assemble_brief_render_inputs(
     "(visually comparable to the sibling budget project's monthly reports). "
     "Local-only: reachable via stdio MCP clients (Claude Code/Claude Desktop "
     "on this same machine), never over the network. Returns a local file "
-    "path the user can open directly.",
+    "path the user can open directly, plus coaching_line_source "
+    "('generated'/'fallback') whenever the PDF carries a Training Plan rail — "
+    "'fallback' means the coach's line is a deterministic template, not "
+    "Claude's (#241).",
     {"date": str},
 )
 async def generate_brief_report(args: dict) -> dict:
@@ -4475,6 +4526,19 @@ async def generate_brief_report(args: dict) -> dict:
 
     charts_by_index, plan_section = await assemble_brief_render_inputs(
         brief, target_date)
+    # Captured before the strip below, and reported in the payload once the
+    # PDF is written — a filesystem-less MCP client has no other way to tell
+    # the coach's line from the deterministic template (#241).
+    line_source = coaching_line_source(plan_section)
+    if plan_section is not None and plan_section.get("today") is not None:
+        # coaching_line_source is diagnostic metadata, never drawn on the
+        # page — neither renderer below reads it — so it must not ride along
+        # into ``_render_tag``'s wholesale hash of ``plan_section``: that hash
+        # names the output file, and a field the page never shows moving the
+        # filename would contradict "hash the render's logical INPUTS"
+        # (f-32b8f4da). Pop it here, once, rather than at the tag call site,
+        # so nothing downstream can re-add the same mistake.
+        plan_section["today"].pop("coaching_line_source", None)
 
     # Shrink first, then truncate. The density ladder inside render_brief_pdf
     # handles the common case; only when even the densest rung still spills do
@@ -4545,7 +4609,10 @@ async def generate_brief_report(args: dict) -> dict:
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
-    return _text({"path": str(final_path)})
+    payload: dict = {"path": str(final_path)}
+    if line_source is not None:
+        payload["coaching_line_source"] = line_source
+    return _text(payload)
 
 
 _GENERATE_CHART_TYPES = frozenset({"line", "bar", "combo"})
