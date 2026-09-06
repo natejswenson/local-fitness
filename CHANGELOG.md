@@ -4,9 +4,56 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.62.0] - 2026-09-05
 
 ### Fixed
+- **The evening brief email stopped shipping the deterministic template in the
+  coach's place** (#241). `plan_coach` was the last of the three single-shot
+  SDK-call siblings still following `briefing.DEFAULT_MODEL`, and it inherited
+  the SDK defaults along with the model: no `effort`, no `thinking` — adaptive
+  thinking at high effort — under the lowest ceiling of the three (30 s). It
+  timed out **23 of the 30 nights from 2026-08-07 to 09-05**, and every one of
+  those emails carried `fallback_coaching_line` instead of a coach line. It now
+  owns `DEFAULT_MODEL` (`claude-sonnet-5`), `DEFAULT_EFFORT` (`"low"`),
+  `thinking={"type": "disabled"}` and `DEFAULT_TIMEOUT_S` (45 s, matching
+  `reflect` — a short generation inside a scheduled job, not `workout_coach`'s
+  interactive 90 s), and imports `briefing` nowhere.
+
+  **Measured A/B**, 5 generations per arm against the REAL plan section and the
+  real prompt (2026-09-05, this machine; only the three knobs differ):
+
+  | Arm | Model | effort | thinking | Median | Max | Fallback rate |
+  |---|---|---|---|---|---|---|
+  | old | claude-sonnet-4-6 | (default) | (adaptive) | 35.4 s | 35.5 s | **5/5 (100%)** |
+  | new | claude-sonnet-5 | low | disabled | **6.4 s** | 8.1 s | **0/5 (0%)** |
+
+  Every old-arm run pinned at the ceiling (30 s + ~5.4 s of cancellation
+  unwinding). Output quality holds: the five new-arm lines run 59-98 words, one
+  paragraph, no markdown and no preamble — inside the 54-128 word range of the
+  eight lines the old config actually managed to cache. A live
+  `fitness brief-email --dry-run` generated in 7.6 s, printed
+  `Coaching line: generated`, and put a real coach line in the `.eml`.
+
+  The claim is a **rate**, not a guarantee: `reflect` has failed once in 31 on
+  this exact configuration, and two logged stalls (519.7 s against a 30 s
+  ceiling, 359 s against 45 s) blew past `asyncio.wait_for` entirely. No
+  ceiling value bounds that, which is why the fallback stays and why the second
+  half of this change exists.
+- **A template coaching line is no longer invisible** (#241). The substitution
+  was already logged at WARNING — into a 154 KB launchd *error* log nobody
+  scans, which is how it ran for a month unnoticed. `assemble_brief_render_inputs`
+  now sets `today["coaching_line_source"]` (`"generated"` / `"fallback"`) beside
+  the line, and three channels that are not that log report it: `brief-email`
+  echoes `Coaching line: <source>` to **stdout** (the 4 KB one-line-a-night out
+  log, and it prints on `--dry-run` too), the one existing macOS notification
+  reads `Evening brief emailed (coaching line: TEMPLATE)` on a fallback night
+  rather than firing a second notification, and `generate_brief_report`'s
+  payload carries the field so the stdio PDF path can report it as well. A cache
+  hit counts as `"generated"`: the distinction that matters is template versus
+  coach. The renderers read only `coaching_line`, so the sibling key is inert to
+  them, and it is set after the generation so no prompt or cache key moves. A
+  fallback is not a failure — the email still ships, and the exit code is
+  unchanged.
 - **An undated hand-written bullet is no longer the first thing rotation
   evicts** (#232). `_rotate_to_fit` picked its victim with `recent_first`, the
   ranking that deliberately sorts a bullet with no parseable timestamp *last* so
