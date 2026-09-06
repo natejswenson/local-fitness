@@ -598,6 +598,38 @@ def test_cache_regenerates_when_any_input_changes(monkeypatch, tmp_path):
     assert calls["n"] == 2
 
 
+def test_cached_line_forwards_the_modules_default_timeout(monkeypatch, tmp_path):
+    """generate_coaching_line_cached -- not generate_coaching_line -- is what
+    assemble_brief_render_inputs and generate_brief_report actually call, and
+    both call it with no explicit ``timeout`` argument (tools.py:4436). So
+    ITS default is the ceiling that governed 23 of 30 timed-out evening
+    briefs, not generate_coaching_line's own default (#241, f-64d967cd). The
+    two currently share one named constant, but nothing before this test
+    asserted that on the call path a cache miss actually takes -- a caller
+    could revert this function's default to a bare 30.0 literal and the rest
+    of the suite (which either exercises generate_coaching_line directly, or
+    mocks this one's SDK call away without inspecting its timeout kwarg)
+    would stay green while the live path regressed to the exact ceiling the
+    issue reports."""
+    seen: list[float] = []
+
+    async def fake(profile, today_workout, last_7_days, adherence_pct,
+                    days_to_race, goal_type, *, model=None,
+                    timeout=plan_coach.DEFAULT_TIMEOUT_S,
+                    notes_text=None, **_kw):
+        seen.append(timeout)
+        return "Get out the door."
+
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+
+    # No timeout= passed -- this is the exact call shape tools.py uses.
+    asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert seen == [45.0]
+    assert plan_coach.DEFAULT_TIMEOUT_S == 45.0
+
+
 def test_generation_failure_is_not_cached(monkeypatch, tmp_path):
     fake, calls = _fake_generator([RuntimeError("SDK down"), "Recovered line."])
     monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
