@@ -45,8 +45,15 @@ the handle you called with is now stale and will not resolve again.
 
 `duplicates` is also present, normally `1`. It is only greater than 1 when more
 than one live bullet happened to share the exact same timestamp and text — a
-hand-edited copy-paste, most likely (see Gotchas). The tool rewrites the first
-one in file order and reports how many it saw.
+hand-edited copy-paste, necessarily, since no tool can produce that pair (see
+Gotchas). The tool rewrites the first one in file order and reports how many it
+saw.
+
+`timestamp` in the response is not always the second the call landed in. If
+stamping the update with now() would give it the same `(timestamp, text)` pair —
+and therefore the same handle — as a bullet already live, the stamp steps forward
+a second at a time until it doesn't. Two updates to the same text inside one
+wall-clock second come back one second apart; nothing else moves.
 
 Failure returns `is_error: true` with `{"error": "no note with handle '7c2f9a10' — it may have been updated, deleted, or rotated to the archive since you read it; call list_user_notes to re-read"}`, or `{"error": "handle is required"}` / `{"error": "new note text is required"}` for bad arguments.
 
@@ -86,10 +93,18 @@ Read first, then target the handle exactly as shown:
   rather than guessing.
 - **A duplicated handle is acted on, not refused.** Two bullets only ever share
   a handle if they are byte-for-byte identical in timestamp and text — a
-  hand-edit, most likely, since the module invites editing the file directly.
-  The call rewrites the first one in file order and reports `duplicates: 2`;
-  the surviving pair is unique again immediately afterward (the rewritten one
-  has a new handle now).
+  hand-edit, necessarily, since the module invites editing the file directly and
+  no tool will write that pair: both `save_user_note` and this tool re-stamp a
+  second forward rather than mint a handle that is already live. The call
+  rewrites the first one in file order and reports `duplicates: 2`; the
+  surviving pair is unique again immediately afterward (the rewritten one has a
+  new handle now).
+- **Identical text is fine; identical handles are not.** Rewriting two notes to
+  the same wording is a legal request and stays legal — the two bullets get
+  distinct timestamps (see the re-stamp above), so each keeps its own handle and
+  stays independently updatable and deletable. What can never happen is one
+  handle addressing two live bullets, which is why a `duplicates: 2` now points
+  at the file, not at this tool.
 - **Fails closed on non-bullet lines.** A handle can only ever match a parsed
   bullet, so hand-written prose in the file is never a valid target, and a
   missing notes file returns the same no-match error rather than creating one.
@@ -99,10 +114,16 @@ Read first, then target the handle exactly as shown:
   appending one, so nothing about the write would trip a size check unless
   this tool makes one itself. If the rewrite lands over budget, the oldest
   bullets **by timestamp** are rotated to `user_notes.archive.md`, same as
-  `save_user_note`'s rotation. The note just rewritten is excluded from
+  `save_user_note`'s rotation — and, as there, an **undated** bullet is the last
+  thing evicted rather than the first, however early in the file it sits. The
+  note just rewritten is excluded from
   eviction outright, so it is never the thing evicted by its own update —
-  including when another note's timestamp ties it to the same second. The
-  tool result does not tell you rotation happened.
+  including when another note's timestamp ties it to the same second. If the
+  archive cannot be written, nothing is evicted and the file goes over budget
+  instead — see
+  [`save_user_note`](save_user_note.md)'s gotcha of the same name; it matters
+  more here, since one capacity-tripping update rotates as many bullets as the
+  new text costs. The tool result does not tell you rotation happened.
 - Not reachable from the brief loop — `_READ_ONLY_TOOL_NAMES` excludes every
   note-write tool so brief generation cannot mutate preferences.
 
