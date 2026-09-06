@@ -4334,7 +4334,9 @@ async def assemble_brief_render_inputs(
     ``str(index)`` over ``enumerate(brief.takeaways)`` — NOT by metric name (two
     takeaways can cite the same metric). ``plan_section`` is None when there is
     no active plan or no plan data in the trailing window, and otherwise carries
-    ``today["coaching_line"]`` already resolved.
+    ``today["coaching_line"]`` already resolved, beside
+    ``today["coaching_line_source"]`` — ``"generated"`` or ``"fallback"`` —
+    naming which of the two the caller is holding.
 
     Best-effort throughout, and deliberately so: a chart that will not render is
     skipped, a malformed plan section becomes None, and a failed coaching-line
@@ -4420,6 +4422,7 @@ async def assemble_brief_render_inputs(
                 # this cache (see memory.render_memory_for_prompt).
                 memory_text=_memory_text,
             )
+            coaching_line_source = "generated"
         except Exception:
             LOG.warning(
                 "plan coaching-line generation failed for brief %s, using fallback",
@@ -4432,7 +4435,16 @@ async def assemble_brief_render_inputs(
                 plan_section["goal_type"],
                 target_date=target_date,
             )
+            coaching_line_source = "fallback"
         plan_section["today"]["coaching_line"] = coaching_line
+        # Which line the section actually carries, set AFTER the generation so
+        # no prompt (and no plan_coach cache key) moves. The renderers read only
+        # ``coaching_line``, so this sibling key is inert to them — it exists so
+        # a caller can report the substitution on a channel a human reads. The
+        # WARNING above fired 23 nights running into the launchd error log and
+        # nobody saw it (#241). A cache hit counts as "generated": the
+        # distinction that matters is template versus coach.
+        plan_section["today"]["coaching_line_source"] = coaching_line_source
 
         # 4a: advisory grounding of the coaching line against the deterministic
         # plan section — mirrors grounding.log_grounding's pattern (log-only,
@@ -4545,7 +4557,16 @@ async def generate_brief_report(args: dict) -> dict:
     except ValueError:
         return _err("resolved path escaped reports directory")
     await _auto_open(final_path)
-    return _text({"path": str(final_path)})
+    payload: dict = {"path": str(final_path)}
+    if plan_section is not None and plan_section.get("today"):
+        # .get, not []: a section assembled by an older caller has no source
+        # key. Present, it tells a filesystem-less MCP client whether the PDF's
+        # coaching line is the coach's or the deterministic template — the
+        # stdio path had no way to know (#241).
+        source = plan_section["today"].get("coaching_line_source")
+        if source is not None:
+            payload["coaching_line_source"] = source
+    return _text(payload)
 
 
 _GENERATE_CHART_TYPES = frozenset({"line", "bar", "combo"})
