@@ -1669,7 +1669,16 @@ These are settled — don't redesign without a reason.
   import `briefing` at all; the prohibition outlives the import.
 - **All THREE single-shot SDK-call siblings own their model and set
   `effort`/`thinking` explicitly** (0.62.0, #241) — `workout_coach`,
-  `reflect` and now `plan_coach`. `plan_coach` was the last one following
+  `reflect` and now `plan_coach`. This deliberately excludes a fourth
+  single-shot caller, the V2 brief composer (`briefing.py`'s toolless,
+  `max_turns=1` generator, see the *Brief composer = V2* bullet above) — it
+  already sets `effort` via `_brief_effort()` but not `thinking`, which
+  would otherwise read as this rule's own counterexample. It stays outside
+  the rule on purpose: it is the eval'd composer, so a knob change there has
+  to clear the prompt scorer, the cross-model A/B and the invention-rate
+  gate first — exactly the per-caller coupling this rule frees the other
+  three siblings from, not something to extend to a fourth surface.
+  `plan_coach` was the last of the THREE following
   `briefing.DEFAULT_MODEL`, and it inherited the SDK defaults along with the
   model: no `effort`, no `thinking`, i.e. adaptive thinking at high effort,
   under the lowest ceiling of the three (30 s). Measured on real evening
@@ -1696,8 +1705,9 @@ These are settled — don't redesign without a reason.
   23 nights already went to stderr, into a 154 KB launchd error log nobody
   scans. A signal in the channel that failed is not a signal. A cache hit
   counts as `"generated"` — the distinction that matters is template versus
-  coach. **When adding a fourth SDK-call surface, give it its own model
-  constant and set both knobs**; and when a fail-soft substitution matters to
+  coach. **When adding a new single-shot SDK-call surface beyond these three
+  (and beyond the excluded V2 composer), give it its own model constant and
+  set both knobs**; and when a fail-soft substitution matters to
   the user, put its name where a human already looks.
 - **Auth middleware**: `LOCAL_FITNESS_API_TOKEN` env var; constant-time
   bearer check; `_is_public_path` denies by default — only `/health` is

@@ -3459,6 +3459,65 @@ def test_generate_brief_report_coaching_line_failure_falls_back(
     assert payload.get("coaching_line_source") == "fallback"
 
 
+def test_the_render_tag_is_blind_to_coaching_line_source(
+    plan_seeded, reports_tmp, tmp_path, monkeypatch
+):
+    """coaching_line_source is diagnostic metadata about HOW the line was
+    produced, never something either renderer draws — so it must not be part
+    of the hash that names the PDF (f-32b8f4da). Force both branches to carry
+    the IDENTICAL coaching_line text (only coaching_line_source differs) and
+    assert the two runs land on the same content-addressed filename; before
+    the fix, plan_section (with the source key still attached) was hashed
+    wholesale and the filename would have moved on that field alone."""
+    reports_dir, briefs_dir = reports_tmp
+    d = date.today().isoformat()
+    _write_brief_json(briefs_dir, d, [
+        {"headline": "h", "summary": "s", "tone": "neutral", "details": "d"},
+    ])
+    same_line = "Go hit today's easy 4 clean."
+
+    async def fake_generate(*_a, **_k):
+        return same_line
+
+    monkeypatch.setattr(tools.plan_coach, "_cache_path",
+                        lambda: tmp_path / "generated.json")
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", fake_generate)
+    payload1, err1 = call(tools.generate_brief_report, {"date": d})
+    assert not err1
+    assert payload1.get("coaching_line_source") == "generated"
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("no credential")
+
+    # Different cache file so the second call can't just replay the first
+    # run's cached line (which would make coaching_line_source "generated"
+    # again regardless of what's under test here).
+    monkeypatch.setattr(tools.plan_coach, "_cache_path",
+                        lambda: tmp_path / "fallback.json")
+    monkeypatch.setattr(tools.plan_coach, "generate_coaching_line", boom)
+    monkeypatch.setattr(
+        tools.plan_coach, "fallback_coaching_line",
+        lambda *_a, **_k: same_line,
+    )
+    payload2, err2 = call(tools.generate_brief_report, {"date": d})
+    assert not err2
+    assert payload2.get("coaching_line_source") == "fallback"
+
+    assert Path(payload1["path"]).name == Path(payload2["path"]).name
+
+
+def test_coaching_line_source_tolerates_missing_section_and_missing_today():
+    """The shared accessor (#241, f-1f6a8ae5) must not KeyError on any of the
+    shapes its two callers (generate_brief_report, cli.brief_email) can hand
+    it: no plan section at all, a section with no "today", and the real case
+    where the field is present."""
+    assert tools.coaching_line_source(None) is None
+    assert tools.coaching_line_source({"today": None}) is None
+    assert tools.coaching_line_source({"today": {}}) is None
+    assert tools.coaching_line_source(
+        {"today": {"coaching_line_source": "generated"}}) == "generated"
+
+
 def test_assemble_brief_render_inputs_names_the_coaching_line_source(
     plan_seeded, reports_tmp, tmp_path, monkeypatch
 ):
