@@ -299,3 +299,56 @@ def is_running_effort(pace_sec_per_km: float | None) -> bool | None:
     if not pace_sec_per_km or pace_sec_per_km <= 0:
         return None
     return pace_sec_per_km * _KM_PER_MILE <= RUN_PACE_CEILING_SEC_PER_MI
+
+
+# --- rep-split selection ----------------------------------------------------
+# The smallest split a quality-day pace judgment will read. Deliberately NOT
+# the ``partial`` flag: that is relative to the workout's OWN longest lap, so a
+# manually-lapped interval session (2-mile warmup, then 800m reps) marks every
+# rep partial and leaves the warmup as the only "full" split — which graded the
+# reps at warmup pace and guaranteed an F on exactly the workouts the splits
+# exception exists to grade fairly. 300 m sits under a standard 400 m rep and
+# well over any trailing GPS fragment.
+#
+# This lives here, not in ``report_card``, for the same reason
+# ``is_running_effort`` does: ``report_card`` imports ``plans``, so ``plans``
+# cannot import back, and both surfaces must select the rep the same way or a
+# plan verdict and a report card can disagree about the same session (#242).
+QUALITY_MIN_SPLIT_M = 300.0
+
+
+def fastest_rep_split(labelled: dict) -> dict | None:
+    """The fastest rep-sized split, or ``None`` when there isn't one.
+
+    Rep-sized is ``distance_meters >= QUALITY_MIN_SPLIT_M`` rather than "not
+    ``partial``". The partial flag is measured against the workout's own longest
+    lap, which on a manually-lapped session is the warmup — so every rep of a
+    2-mile-warmup-then-800s workout is partial and the warmup is the only
+    candidate left, which is how a correctly-run interval session got graded at
+    warmup pace.
+
+    The distance floor still solves what the partial filter was there for: a
+    90-metre trailing fragment can post an absurdly fast pace and would win
+    every time. Anything long enough to be a rep is a fair candidate, and a
+    slower warmup simply loses ``min()``.
+
+    ``labelled`` is any mapping with a ``rows`` list — ``report_card``'s
+    ``label_splits`` output, or raw ``activity_splits`` rows wrapped as
+    ``{"rows": splits}``: only ``distance_meters`` and ``avg_pace_sec_per_km``
+    are read, and both are columns of the table.
+
+    This is the one place a *grade* is allowed to read splits — see the quality
+    branch of ``report_card.build_card`` and the quality arm of
+    ``plans.classify_workout`` for why, and ``report_card``'s module docstring
+    for the rule it is an exception to.
+    """
+    candidates = [r for r in (labelled.get("rows") or [])
+                  if (r.get("distance_meters") or 0.0) >= QUALITY_MIN_SPLIT_M
+                  and r.get("avg_pace_sec_per_km")]
+    return min(candidates, key=lambda r: r["avg_pace_sec_per_km"]) if candidates else None
+
+
+def fastest_rep_split_pace(labelled: dict) -> float | None:
+    """:func:`fastest_rep_split`'s pace in sec/km, or ``None``."""
+    best = fastest_rep_split(labelled)
+    return best["avg_pace_sec_per_km"] if best else None
