@@ -324,6 +324,20 @@ def validate_plan_input(
             return (f"workout {i}: target_hr_max of {hr_max:.0f} bpm is outside "
                     f"the plausible {MIN_PRESCRIBED_HR:.0f}-{MAX_PRESCRIBED_HR:.0f} bpm range")
 
+        # A quality day states what it wants: a duration, or a distance, or
+        # both. Neither is the "by feel" branch of `classify_workout`, and
+        # before #242 that branch was the ONLY path every proposed quality day
+        # took — it graded `done` for any running at all. The grading side now
+        # reads distance, so this is hardening rather than the fix: it keeps
+        # by-feel reachable only on purpose. Scoped to the CREATE path, like
+        # every other rule here.
+        if wtype in _DURATION_TYPES and not (
+            w.get("target_duration_sec") or w.get("target_distance_m")
+        ):
+            return (f"workout {i}: a {wtype} day needs target_duration_sec or "
+                    f"target_distance_m — without one it is graded 'by feel' "
+                    f"and any running at all counts as done")
+
         desc = w.get("description")
         # Reject a non-string description with a clean indexed error rather than
         # letting .strip() raise a raw AttributeError on a dict/list.

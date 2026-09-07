@@ -537,6 +537,42 @@ These are settled — don't redesign without a reason.
   promote a fast bike ride to a run) — and so does `plans.best_recent_effort`,
   which feeds the Riegel projection (there a paceless row is excluded rather
   than label-fallbacked: an unverifiable pace can't be a "best effort").
+- **A quality day is graded on volume and then CAPPED on rep pace, and the two
+  surfaces share one rep selector** (0.63.0). `classify_workout`'s
+  tempo/interval arm graded duration only, and the proposer writes those days
+  with a distance and a pace and no duration — so the null-duration "by feel"
+  branch was the ONLY path every quality day took, returning `done` for any
+  running whatsoever. Measured on the live plan: four sessions mis-graded,
+  including a 3x1mi tempo prescribing 7:48/mi executed at 10:07/mi, and
+  adherence inflated 66 → 71. It is not a caught-in-review bug — the
+  2026-09-01 brief wrote "tempo hit as prescribed" and `reflect` put it in
+  `coach_journal`, where a later brief cited it back. **The distance fallback
+  is not the fix and shipping only it is a no-op**: all four days ran 84-119%
+  of their prescribed distance, i.e. above `DONE_FRACTION`. The pace cap is the
+  fix. `_cap_on_rep_pace` takes `min(volume_verdict, pace_verdict)` over
+  `missed < partial < done` (the report card's F-cap idiom — never print a
+  verdict the evidence beside it contradicts), and **abstains** with no
+  prescribed pace or no rep-sized split, returning before it touches `_ran` so
+  a splitless day costs exactly what it did before (the backfilled tail carries
+  no splits; the daily sync always does). `QUALITY_PACE_DONE_DEVIATION`
+  (0.0245) and `QUALITY_PACE_PARTIAL_DEVIATION` (0.092) are **not free
+  numbers** — they are the card's "on target" (4.25 stars) and "off target"
+  (2.50) boundaries under `PLAN_TIGHTEN`, and
+  `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives them
+  from that curve so a retune of one rubric can't leave the other stale.
+  `QUALITY_MIN_SPLIT_M`/`fastest_rep_split` moved to `interpret.py` for this —
+  `report_card` imports `plans`, so the shared selector goes in the pure module
+  both may import, exactly as `is_running_effort` did. `load_activities_by_date`
+  attaches `splits` in the LOADER, not in its six callers, for the reason its
+  own comment gives about `avg_pace_sec_per_km`: a gate a caller can forget to
+  wire ships as a silent no-op. `validate_plan_input` now refuses a quality day
+  carrying neither target, so by-feel is only reachable on purpose — hardening,
+  not the fix, since every offending day already had a distance.
+  **`tests/evals/plan_verdicts.py` is the plan-side sibling of the report-card
+  verdict evals**, and the same rule applies: a verdict change needs a scenario
+  there, not just a unit test. `tests/test_plans.py`'s 100+ cases all passed
+  while this shipped, because they assert the grader computes what it says it
+  computes and none of them could fail when the ANSWER was wrong.
 - **Analysis tools carry deterministic interpretation, not just raw numbers**
   (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
   SDK) housing every classifier the brief path already computed in tested

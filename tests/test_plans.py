@@ -118,6 +118,45 @@ def test_validate_rejects_too_many():
     assert err == f"too many workouts ({plans.MAX_WORKOUTS + 1} > {plans.MAX_WORKOUTS})"
 
 
+@pytest.mark.parametrize("wtype", ["tempo", "interval"])
+def test_validate_rejects_a_quality_day_with_no_target(wtype):
+    """Hardening for #242: neither target is the "by feel" branch, which graded
+    `done` for any running at all and was the only path every proposed quality
+    day took."""
+    err = plans.validate_plan_input("10k", "2026-09-14",
+        workouts=[_wk(date="2026-07-01", type=wtype, target_distance_m=None,
+                      target_duration_sec=None, description="Reps")],
+        created_date="2026-06-15")
+    assert err == (f"workout 0: a {wtype} day needs target_duration_sec or "
+                   "target_distance_m — without one it is graded 'by feel' "
+                   "and any running at all counts as done")
+
+
+@pytest.mark.parametrize("target", [
+    {"target_distance_m": 8000.0, "target_duration_sec": None},
+    {"target_distance_m": None, "target_duration_sec": 2400},
+    {"target_distance_m": 8000.0, "target_duration_sec": 2400},
+])
+def test_validate_accepts_a_quality_day_with_either_target(target):
+    """Duration OR distance, not both — the rule is that the day states what it
+    wants, not which field it uses to say so."""
+    err = plans.validate_plan_input("10k", "2026-09-14",
+        workouts=[_wk(date="2026-07-01", type="tempo", description="Reps", **target)],
+        created_date="2026-06-15")
+    assert err is None
+
+
+def test_validate_still_allows_a_target_less_easy_day():
+    """The by-feel branch survives where it was meant to be: an easy day with no
+    distance target still validates, and still grades on any qualifying
+    activity."""
+    err = plans.validate_plan_input("10k", "2026-09-14",
+        workouts=[_wk(date="2026-07-01", type="easy", target_distance_m=None,
+                      description="Easy, by feel")],
+        created_date="2026-06-15")
+    assert err is None
+
+
 def test_validate_accepts_good_plan():
     err = plans.validate_plan_input("10k", "2026-09-14",
         workouts=[_wk(date="2026-07-01"),

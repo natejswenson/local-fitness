@@ -4,6 +4,73 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.0] - 2026-09-06
+
+### Fixed
+- **A tempo or interval day no longer grades `done` for any running at all**
+  (#242). `classify_workout` graded the quality types on duration alone, and
+  the proposer writes those days with a distance and a pace and **no**
+  duration — so the null-duration "by feel" branch, meant for a genuinely
+  target-less day, was the *only* path every proposed quality day took. Four
+  sessions on the active plan were graded `done`:
+
+  | Date | Prescribed | Fastest rep split | Was | Now |
+  |---|---|---|---|---|
+  | 2026-09-01 | tempo 3x1mi @ 7:48/mi | 10:07/mi | `done` | `missed` |
+  | 2026-08-04 | interval 5x600m @ 6:58/mi | 8:04/mi | `done` | `missed` |
+  | 2026-07-28 | tempo 20min @ 8:03/mi | 8:40/mi | `done` | `partial` |
+  | 2026-07-21 | interval 6x400m @ 6:58/mi | 9:12/mi | `done` | `missed` |
+
+  Session adherence on that plan corrects from **71% to 66%** (measured
+  through `build_plan_detail` on the live plan, frontier 2026-09-06). This was
+  not a bug caught in review: the 2026-09-01 brief wrote "tempo hit as prescribed …
+  first clean execution after a week of easy-day overshoots", `reflect` put it
+  in `coach_journal`, and the 2026-09-05 brief cited it back as "since the
+  Sep 1 clean tempo". The report card had graded the same session 1.00 stars
+  the whole time — two surfaces describing one run in opposite terms.
+
+  The fix is in two halves and **only the second one changes those days**.
+  `_quality_volume_verdict` falls back to the run-only distance ladder when no
+  duration is prescribed, which closes a different, unreported hole (a 2 km jog
+  satisfying an 8 km interval day) but calls all four reported days `done`
+  anyway — they ran 84-119% of prescribed distance, above `DONE_FRACTION`.
+  `_cap_on_rep_pace` then lowers that verdict to what the day's fastest
+  rep-sized split earns against `target_pace_sec_per_km`: `min()` over
+  `missed < partial < done`, cap-never-promote, the report card's own F-cap
+  idiom. It abstains — returning the volume verdict untouched — when the day
+  prescribes no pace or the activity carries no rep-sized split, and returns
+  before it touches `_ran` when nothing that day carries splits at all, so the
+  backfilled tail (which has none) grades exactly as it did.
+
+  `QUALITY_PACE_DONE_DEVIATION` (0.0245) and `QUALITY_PACE_PARTIAL_DEVIATION`
+  (0.092) are not free numbers: they are the report card's "on target" (4.25
+  stars) and "off target" (2.50) boundaries under `PLAN_TIGHTEN`, and
+  `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives them
+  from that curve, so a retune of one rubric cannot leave the other stale.
+
+### Changed
+- `QUALITY_MIN_SPLIT_M`, `fastest_rep_split` and `fastest_rep_split_pace` moved
+  from `agent/report_card.py` into `agent/interpret.py` and are re-exported
+  under their existing names (#242). `report_card` imports `plans`, so the
+  selector both surfaces must share belongs in the stdlib-only pure module both
+  may import — the precedent `is_running_effort` set. No behaviour change; two
+  selection rules would be exactly how the plan verdict and the card come to
+  disagree again.
+- `validate_plan_input` rejects a `tempo`/`interval` workout carrying neither
+  `target_duration_sec` nor `target_distance_m`, so the by-feel branch is only
+  reachable on purpose (#242). Hardening, **not** the fix: every offending day
+  already carried a distance, so validation alone would have prevented none of
+  them. Scoped to the create path.
+
+### Added
+- `tests/evals/plan_verdicts.py` + `tests/evals/test_plan_verdicts.py` — the
+  plan-side sibling of the report-card verdict evals (#242). Fabricated
+  scenarios driven through a real SQLite database, asserting the verdict a
+  session *deserves* rather than that the grader is self-consistent.
+  `tests/test_plans.py`'s cases all passed while this shipped, because not one
+  of them could fail when the answer was wrong. A verdict change needs a
+  scenario here.
+
 ## [0.62.0] - 2026-09-05
 
 ### Fixed
