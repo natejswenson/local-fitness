@@ -307,38 +307,54 @@ def test_get_training_plan_progress_does_not_double_classify(default_db, monkeyp
     pinned exactly rather than as an upper bound so an early-return handler
     (0 calls) cannot pass over unclassified work (#232).
 
-    92 since #242 r2, and the +5 is the fix being exercised rather than drift.
-    The quality-day pace cap calls `_ran` to pick the day's running activities
-    before reading their splits, and it short-circuits before that whenever
-    nothing on the day HAS splits — so while the shared fixture wrote no
-    `activity_splits` rows the cap never ran here and this count could not see
-    it. The fixture now carries splits (f-f56ee4d1: the benchmarks were
-    measuring an empty table), and exactly five of its quality days reach the
-    comparison. Verified by A/B on `perf_fixture._SPLIT_DAYS`: 87 at 0, 92 at
-    120, deterministic across runs.
+    92 for one release (#242 r2 through r2's own fix): the quality-day pace
+    cap called `_ran` to pick the day's running activities before reading
+    their splits, short-circuiting before that whenever nothing on the day
+    HAS splits — so while the shared fixture wrote no `activity_splits` rows
+    the cap never ran here and this count could not see it. Once the fixture
+    carried splits (f-f56ee4d1: the benchmarks were measuring an empty
+    table), exactly five of its quality days reached the comparison, each
+    adding one `_ran` call: 87 at 0 split-covered days, 92 at 120 (A/B on
+    `perf_fixture._SPLIT_DAYS`, deterministic across runs).
+
+    Back to 87 at #242 r3 (f-90178752): `_ran`'s label fallback (a paceless
+    on-foot row counts as running) is a MILEAGE decision, wrongly reused here
+    for a PACE decision on exactly the rows the label is known to lie about —
+    see `plans._ran_by_measured_pace`. The pace cap now calls that instead,
+    so it no longer touches `_ran` at all; the 5 quality days still reach the
+    comparison (`perf_fixture._tempo_plan_dates` stamps them a measured pace
+    so the gate keeps exercising it — see
+    `test_the_benchmarked_plan_paths_actually_fetch_splits`), they just don't
+    count here any more. The +5 that told r2's fix apart from a no-op is now
+    correctly invisible to a function it no longer calls.
     """
     _freeze_progress_clock(monkeypatch, _TODAY + timedelta(days=58))
     counts = _count_calls(monkeypatch, plans, "_ran")
     _run(tools.get_training_plan_progress.handler({}))
-    assert counts["n"] == 92
+    assert counts["n"] == 87
 
 
 def test_get_training_plan_progress_rounds_without_a_call_per_node(default_db, monkeypatch):
     """`_round_floats` recursed into every leaf, so serializing this payload
     cost one Python call per node: 470 for 10 KB. The container branches now
-    handle their own scalar children, leaving one call per dict/list (83 here,
-    with the clock pinned to `_TODAY` + 58d — see `_freeze_progress_clock` for
-    why an unpinned clock makes this count grow with wall-clock date).
+    handle their own scalar children, leaving one call per dict/list (85
+    here, with the clock pinned to `_TODAY` + 58d — see `_freeze_progress_clock`
+    for why an unpinned clock makes this count grow with wall-clock date).
 
     This is the assertion that binds the `_round_floats` change to a real
     reduction in work — an output-correct rewrite that is no faster fails it,
     which the equivalence oracle below cannot detect. Pinned exactly rather
     than as an upper bound so an early-return handler (1 call) cannot pass
-    over the reduction this test exists to prove (#232)."""
+    over the reduction this test exists to prove (#232).
+
+    83 before #242 r3; the +2 is the fixture change that fix required
+    (`perf_fixture._tempo_plan_dates` stamping a measured pace on 5 tempo-day
+    activities), not drift — see
+    ``test_get_training_plan_progress_does_not_double_classify``."""
     _freeze_progress_clock(monkeypatch, _TODAY + timedelta(days=58))
     counts = _count_calls(monkeypatch, tools, "_round_floats")
     _run(tools.get_training_plan_progress.handler({}))
-    assert counts["n"] == 83
+    assert counts["n"] == 85
 
 
 # --- equivalence oracles: the work went away, the answers did not -----------
@@ -640,12 +656,22 @@ def test_the_shared_fixture_keeps_its_activities_paceless(perf_db):
     `get_training_plan_status`, measured 2026-08-02). `activity_splits` is a
     different table no other plan/brief query reads. This pins the distinction
     so a later change cannot cite the splits precedent to add paces too.
-    """
+
+    #242 r3, f-90178752 needed a NARROW, deliberate exception: the pace cap's
+    candidate gate stopped falling back to the label for a paceless row (the
+    exact fallback this module's `_ran`-based mileage decisions still use on
+    purpose), so the fixture's activities could no longer reach the pace
+    comparison at all without SOME of them carrying a measured pace. Exactly
+    the plan's 5 tempo-day activities get one (`perf_fixture._tempo_plan_dates`),
+    stamped from each row's own distance/duration ratio — not the whole
+    `_SPLIT_DAYS` window, which would have hit `best_recent_effort`'s pool far
+    harder. This still pins the count, now at 5 rather than 0, so a further
+    change cannot silently widen it."""
     with db.connect(perf_db) as conn:
         paced = conn.execute(
             "SELECT COUNT(*) AS n FROM activities "
             "WHERE avg_pace_sec_per_km IS NOT NULL").fetchone()["n"]
-    assert paced == 0
+    assert paced == 5
 
 
 # --- fix #3 regression: bounded activities lookback -------------------------

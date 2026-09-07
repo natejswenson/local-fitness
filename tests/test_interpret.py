@@ -426,6 +426,41 @@ def test_bookends_are_matched_by_identity_not_equality():
     assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(300.0)
 
 
+# --- a fragment OUTSIDE the warmup/cooldown pair defeats the pair, not just
+# the pair's own bucket ---------------------------------------------------
+# #242 r3, f-6d873a9b: bookends were keyed on candidates[0]/candidates[-1],
+# so a trailing remainder lap (or a leading walk-out) — a candidate the
+# warmup/cooldown pair does not include — became one of the two bookend ids
+# in its place. The pair's own bucket then failed the identity match, fell
+# back into the dominant-cluster pool, and its floor deleted the real rep
+# between them. Every case here FAILED on the pre-fix code, each returning
+# the warmup's pace (410.0) instead of the rep's (260.0).
+
+def test_a_trailing_remainder_lap_does_not_defeat_the_bookend_pair():
+    """The exact r3 failure scenario: a manually-lapped session's trailing
+    remainder lap (the segment Garmin always emits after the last lap press)
+    sits after the cooldown and is itself long enough to be a candidate."""
+    labelled = _rows((3218.688, 410.0), (800.0, 260.0), (3218.688, 425.0),
+                     (400.0, 500.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(260.0)
+
+
+def test_a_leading_walk_out_fragment_does_not_defeat_the_bookend_pair():
+    """Same failure, mirrored: a fragment before the warmup instead of after
+    the cooldown breaks the identity match from the other end."""
+    labelled = _rows((300.0, 200.0), (3218.688, 410.0), (800.0, 260.0),
+                     (3218.688, 425.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(260.0)
+
+
+def test_a_trailing_remainder_lap_is_dropped_even_with_no_other_repeat():
+    """No warmup/cooldown pair at all — just two reps and a trailing
+    remainder lap. The remainder must never win on pace alone merely because
+    nothing repeated to floor it out."""
+    labelled = _rows((800.0, 260.0), (800.0, 255.0), (400.0, 100.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(255.0)
+
+
 # === module hygiene =============================================================
 
 def test_interpret_imports_nothing_outside_stdlib():

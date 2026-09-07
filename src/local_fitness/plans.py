@@ -204,6 +204,25 @@ _PACE_EPS = 1e-9
 MIN_PRESCRIBED_HR = 90.0
 MAX_PRESCRIBED_HR = 210.0
 
+#: Plausible bounds for a PRESCRIBED pace (3:00-30:00/mi, the stored sec/km
+#: unit) — the exact create/edit asymmetry the HR bound above was added to
+#: close, reproduced on the field this module just made GRADED (#242 r3,
+#: f-84d486cd). `target_pace_sec_per_km` used to be display/coaching-only, so
+#: `validate_plan_input` never bounded it beyond finite-and-non-negative; now
+#: `_cap_on_rep_pace` caps every quality-day verdict against it, so a
+#: transposed or unit-confused value (decimal minutes-per-mile written into
+#: the seconds-per-km column — `target_pace_sec_per_km: 7.8` for a 7:48/mi
+#: tempo) validates and stores, then caps every quality day on that plan to
+#: ``missed`` for its life, no error anywhere — the same blast radius the
+#: comment above `hr_max` describes verbatim, on this field, in this
+#: function. One definition, shared by both write paths: `validate_plan_input`
+#: (plan creation) here, and `_prescription_fields` in `tools.py` (a
+#: single-day edit).
+MIN_PRESCRIBED_PACE_SEC_PER_MI = 180.0
+MAX_PRESCRIBED_PACE_SEC_PER_MI = 1800.0
+MIN_PRESCRIBED_PACE_SEC_PER_KM = units.pace_sec_per_mi_to_sec_per_km(MIN_PRESCRIBED_PACE_SEC_PER_MI)
+MAX_PRESCRIBED_PACE_SEC_PER_KM = units.pace_sec_per_mi_to_sec_per_km(MAX_PRESCRIBED_PACE_SEC_PER_MI)
+
 # numeric workout fields that, when present, must be finite and non-negative
 _NUMERIC_FIELDS = ("target_distance_m", "target_pace_sec_per_km",
                    "target_duration_sec", "target_hr_max", "week_index", "seq")
@@ -405,6 +424,17 @@ def validate_plan_input(
             return (f"workout {i}: target_hr_max of {hr_max:.0f} bpm is outside "
                     f"the plausible {MIN_PRESCRIBED_HR:.0f}-{MAX_PRESCRIBED_HR:.0f} bpm range")
 
+        # Same discipline, same reason, on the field this module just made
+        # GRADED (#242 r3, f-84d486cd): see MIN_PRESCRIBED_PACE_SEC_PER_KM's
+        # docstring. `update_plan_workout`'s edit path has bounded a pace
+        # (3:00-30:00/mi) since before this change; the create path had not.
+        pace = w.get("target_pace_sec_per_km")
+        if pace is not None and not (
+                MIN_PRESCRIBED_PACE_SEC_PER_KM <= pace <= MAX_PRESCRIBED_PACE_SEC_PER_KM):
+            return (f"workout {i}: target_pace_sec_per_km of {pace:.1f} is outside "
+                    f"the plausible {MIN_PRESCRIBED_PACE_SEC_PER_KM:.1f}-"
+                    f"{MAX_PRESCRIBED_PACE_SEC_PER_KM:.1f} s/km (3:00-30:00/mi) range")
+
         # A quality day states what it wants: a duration, or a distance, or
         # both. Neither is the "by feel" branch of `classify_workout`, and
         # before #242 that branch was the ONLY path every proposed quality day
@@ -480,6 +510,32 @@ def _quality_volume_verdict(
     return _ladder(_running_distance(day_activities, cfg) / distance_target, cfg)
 
 
+def _ran_by_measured_pace(activity: dict) -> bool:
+    """On foot AND running by MEASURED pace, with no label fallback — the
+    deliberate difference from ``_ran`` (#242 r3, f-90178752).
+
+    ``_ran``'s label fallback (a paceless on-foot row counts as running when
+    the label says so) is justified for a MILEAGE decision: the label is at
+    least right about foot-vs-wheel, and the cost of a wrong guess is a few
+    tenths of a mile folded into a distance sum. Deciding which activity's
+    SPLITS feed a PACE judgment is a different decision with a much larger
+    blast radius, and ``select_best_effort`` already draws this exact line
+    for the Riegel projection, for the same reason: "here a paceless row is
+    EXCLUDED: dropping one costs nothing... while admitting one wrong row
+    re-prices the entire [judgment]." Reused here verbatim. Concretely: a
+    prescribed run that is a manual entry or a backfilled row (no splits, no
+    measured pace) contributes nothing either way, while a paceless
+    walking-desk session the same day — labelled ``treadmill_running`` — DOES
+    carry splits, and ``_ran``'s fallback would pass it on the label alone,
+    handing the tempo's pace cap a ~16:00/mi walking split as its "fastest
+    rep".
+    """
+    return (
+        _is_on_foot(activity.get("activity_type"))
+        and interpret.is_running_effort(activity.get("avg_pace_sec_per_km")) is True
+    )
+
+
 def _fastest_rep_pace(
     day_activities: list[dict], cfg: GradingConfig
 ) -> float | None:
@@ -491,17 +547,24 @@ def _fastest_rep_pace(
     different reps out of one session. Raw ``activity_splits`` rows carry the
     two columns it reads, so they are wrapped rather than labelled.
 
-    Returns ``None`` before touching ``_ran`` when nothing on the day has
-    splits at all. That is the ordinary case on the backfilled tail (the
-    historical import never wrote splits; the daily sync always does), and the
-    early return keeps a splitless day costing exactly what it did before.
+    Returns ``None`` before touching ``_ran_by_measured_pace`` when nothing on
+    the day has splits at all. That is the ordinary case on the backfilled
+    tail (the historical import never wrote splits; the daily sync always
+    does), and the early return keeps a splitless day costing exactly what it
+    did before.
+
+    Gated on ``_ran_by_measured_pace``, not ``_ran`` — see that function's
+    docstring. ``cfg`` is accepted (unused here) to keep this function's
+    signature uniform with its sibling quality-day helpers above; the
+    measured-pace-only gate is deliberately not conditional on
+    ``cfg.pace_gated_locomotion``, matching ``select_best_effort``.
     """
     if not any(a.get("splits") for a in day_activities):
         return None
     paces = [
         p for p in (
             interpret.fastest_rep_split_pace({"rows": a.get("splits")})
-            for a in day_activities if _ran(a, cfg)
+            for a in day_activities if _ran_by_measured_pace(a)
         ) if p
     ]
     return min(paces) if paces else None
@@ -1336,10 +1399,24 @@ def load_activities_by_date(
     # by date (#242 r2, f-f56ee4d1). The join re-derived a set this function
     # already has in hand, and `activity_splits` is PRIMARY KEY (activity_id,
     # split_index) — so an `activity_id IN (...)` lookup is an index seek that
-    # also returns split-ordered rows for free, where the join had to scan and
-    # sort. Splits for an activity outside `rows` could not be attached to
+    # also returns split-ordered rows for free WHEN the planner chooses that
+    # index. Splits for an activity outside `rows` could not be attached to
     # anything anyway. Measured on the perf fixture: the join cost +6.2% on
     # `_build_plan_section`'s min; this form gives most of that back.
+    #
+    # **The ORDER BY is explicit, not assumed** (#242 r3, f-ffcb10f2). The
+    # comment above used to stop at "for free" — true only while the planner
+    # actually uses `sqlite_autoindex_activity_splits_1`. With enough ids
+    # (measured: 450, the `quality_dates=None` fallback over a multi-year
+    # plan) it degrades to a full `SCAN activity_splits`, which returns rowid
+    # order instead. `_drop_outlier_fragments`/`fastest_rep_split`
+    # (`interpret.py`) make a POSITIONAL decision on the first/last candidate
+    # of each activity's own split list, so a reordering changes which split
+    # gets selected as the warmup/cooldown bookend — and because
+    # `split_index` was not even in the SELECT list, nothing downstream could
+    # restore the order defensively. Ordering by the PK's own columns means a
+    # planner that DOES use the index pays nothing extra for it, and one that
+    # doesn't gets a real sort instead of silently-wrong grouping.
     sql = (
         "SELECT activity_id, date, activity_type, distance_meters, "
         "duration_seconds, avg_pace_sec_per_km "
@@ -1360,8 +1437,9 @@ def load_activities_by_date(
             return rows, []
         placeholders = ", ".join("?" * len(wanted))
         split_rows = c.execute(
-            "SELECT activity_id, distance_meters, avg_pace_sec_per_km "
-            f"FROM activity_splits WHERE activity_id IN ({placeholders})",
+            "SELECT activity_id, split_index, distance_meters, avg_pace_sec_per_km "
+            f"FROM activity_splits WHERE activity_id IN ({placeholders}) "
+            "ORDER BY activity_id, split_index",
             wanted,
         ).fetchall()
         return rows, split_rows

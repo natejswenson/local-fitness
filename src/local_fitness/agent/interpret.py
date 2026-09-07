@@ -381,36 +381,81 @@ def _drop_outlier_fragments(candidates: list[dict]) -> list[dict]:
     to compare against, and this must not invent one. Never returns an empty
     list: the dominant cluster's own members always clear the floor they
     define, so at minimum they survive.
+
+    **The day's first and last CANDIDATE is not the same thing as the day's
+    first and last STRUCTURED lap** (#242 r3, f-6d873a9b). A trailing
+    remainder lap — the segment Garmin logs after the last lap press, which
+    every manually-lapped activity emits — or a leading walk-out fragment
+    sits above ``QUALITY_MIN_SPLIT_M`` and so is a "candidate", but it is
+    outside the warmup/cooldown pair, not part of it. Keying the bookend
+    check on ``candidates[0]``/``candidates[-1]`` literally meant such a
+    fragment became one of the two bookend ids instead of the real
+    warmup/cooldown lap, so the pair's own bucket no longer matched
+    ``bookends`` and fell back into the dominant-cluster pool — the exact
+    "graded the reps at warmup pace" failure this whole guard exists to
+    prevent, reintroduced by a lap the guard never anticipated.
+    :func:`_trim_framing_fragments` runs first so the bookend check always
+    sees the true outer edge of the day's REPEATED lap sizes, regardless of
+    what Garmin tacked on before or after them.
     """
     if len(candidates) < 2:
         return candidates
+    trimmed = _trim_framing_fragments(candidates)
     buckets: dict[int, list[dict]] = {}
-    for r in candidates:
+    for r in trimmed:
         key = round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)
         buckets.setdefault(key, []).append(r)
-    bookends = {id(candidates[0]), id(candidates[-1])}
+    bookends = {id(trimmed[0]), id(trimmed[-1])} if len(trimmed) > 2 else set()
     repeated = [
         b for b in buckets.values()
-        if len(b) >= 2 and not _is_bookend_pair(b, bookends, len(candidates))
+        if len(b) >= 2 and not _is_bookend_pair(b, bookends)
     ]
     if not repeated:
-        return candidates
+        return trimmed
     dominant = min(repeated, key=lambda b: (-len(b), b[0]["distance_meters"]))
     floor = dominant[0]["distance_meters"] * _MIN_FRACTION_OF_DOMINANT_SPLIT
-    kept = [r for r in candidates if r["distance_meters"] >= floor]
-    return kept or candidates
+    kept = [r for r in trimmed if r["distance_meters"] >= floor]
+    return kept or trimmed
 
 
-def _is_bookend_pair(bucket: list[dict], bookends: set[int], total: int) -> bool:
-    """Is ``bucket`` exactly the day's first and last candidate, with work
-    between them? Those two laps are a warmup/cooldown pair, never the reps —
-    see :func:`_drop_outlier_fragments`. Identity, not equality: two laps of
-    the same distance and pace are equal dicts but different laps."""
-    return (
-        len(bucket) == 2
-        and total > 2
-        and {id(bucket[0]), id(bucket[1])} == bookends
-    )
+def _trim_framing_fragments(candidates: list[dict]) -> list[dict]:
+    """Drop any leading/trailing candidate that is NOT part of a repeated
+    (>= 2) lap size, before bookend detection runs (#242 r3, f-6d873a9b).
+
+    A trailing remainder lap or a leading walk-out fragment sits outside the
+    warmup/cooldown pair but, left in place, becomes the literal first or
+    last element :func:`_drop_outlier_fragments` used to key its bookend
+    check on — see that function's docstring for the failure this causes.
+    Trimming first means the true warmup/cooldown lap, wherever a repeated
+    bucket puts it, is always what ends up at the trimmed edges.
+
+    Only ever trims a run of candidates whose OWN lap size never repeats; a
+    genuinely single-rep day (nothing repeats at all) has no repeated bucket
+    to trim toward and is returned unchanged, exactly as
+    :func:`_drop_outlier_fragments` already leaves it alone in that case.
+    """
+    counts: dict[int, int] = {}
+    for r in candidates:
+        key = round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)
+        counts[key] = counts.get(key, 0) + 1
+    framed = [
+        i for i, r in enumerate(candidates)
+        if counts[round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)] >= 2
+    ]
+    if len(framed) < 2:
+        return candidates
+    return candidates[framed[0]: framed[-1] + 1]
+
+
+def _is_bookend_pair(bucket: list[dict], bookends: set[int]) -> bool:
+    """Is ``bucket`` exactly the trimmed day's first and last candidate, with
+    work between them? Those two laps are a warmup/cooldown pair, never the
+    reps — see :func:`_drop_outlier_fragments`. ``bookends`` is the empty set
+    whenever the trimmed candidate list has 2 or fewer members (the pair IS
+    the whole day, or there's nothing to bracket), so no bucket can ever
+    match it. Identity, not equality: two laps of the same distance and pace
+    are equal dicts but different laps."""
+    return len(bucket) == 2 and {id(bucket[0]), id(bucket[1])} == bookends
 
 
 def fastest_rep_split(labelled: dict) -> dict | None:

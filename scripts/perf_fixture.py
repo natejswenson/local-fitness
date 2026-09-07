@@ -71,6 +71,49 @@ _SPLIT_DAYS = 120
 # prescribed reps — the shape `interpret.fastest_rep_split` selects from.
 _SPLIT_LAP_M = 1609.34
 
+# --- a measured pace on the plan's TEMPO-day activities (#242 r3, f-90178752) -
+#
+# `plans._fastest_rep_pace` used to gate its candidate activities on `_ran`,
+# which falls back to the activity_type LABEL for a paceless row — a fallback
+# meant for a mileage decision, reused for a pace decision on exactly the rows
+# the label is known to lie about (a paceless walking-desk session labelled
+# `treadmill_running` could out-pick a real run with no splits). The fix reads
+# `_ran_by_measured_pace` instead, which never falls back — an activity with no
+# `avg_pace_sec_per_km` of its own is EXCLUDED, matching `best_recent_effort`'s
+# own paceless-exclusion precedent.
+#
+# That means the shared fixture's activities — deliberately paceless, per the
+# comment above `_RC_DAYS` — can no longer reach the pace comparison at all,
+# and `tests/test_perf_benchmarks.py::test_the_benchmarked_plan_paths_
+# actually_fetch_splits` would go back to measuring an empty gate the same way
+# f-f56ee4d1 found the splits JOIN doing. So the plan's TEMPO-day activities
+# only (5 of them, at the same dates `_seed_plan` prescribes a tempo day —
+# `_tempo_plan_dates` computes the same set `_seed_plan` does, from one shared
+# `_PLAN_TYPES` tuple, so the two cannot drift apart) get a measured
+# `avg_pace_sec_per_km`, stamped from each activity's OWN already-written
+# distance/duration ratio rather than an invented number.
+#
+# This is a SMALLER, more targeted version of the exact trade-off the
+# `_RC_DAYS` comment already describes for `activities.avg_pace_sec_per_km`
+# generally: `best_recent_effort`'s 120-day lookback (`DEFAULT_RIEGEL_
+# LOOKBACK_DAYS`) exactly covers `_SPLIT_DAYS`, so these 5 newly-paced
+# activities do enter its candidate pool too, rather than the whole window's
+# ~60 activities. Measured impact is in the 0.63.0 CHANGELOG entry alongside
+# the recaptured baseline this change requires.
+_PLAN_TYPES = ("easy", "tempo", "long", "easy", "rest", "easy", "long")
+
+
+def _tempo_plan_dates(today: date) -> set[str]:
+    """ISO dates the fixture's active plan prescribes a `tempo` day — the same
+    `(day_offset, type)` assignment `_seed_plan` makes, from the same
+    `_PLAN_TYPES` tuple, so the two can never disagree about which dates are
+    tempo days."""
+    return {
+        (today + timedelta(days=day_offset)).isoformat()
+        for i, day_offset in enumerate(range(-70, 98, 2))
+        if _PLAN_TYPES[i % len(_PLAN_TYPES)] == "tempo"
+    }
+
 # --- report-card fixture -----------------------------------------------------
 #
 # A SEPARATE database, not extra rows in the one above, and that separation is
@@ -185,10 +228,9 @@ def _seed_plan(conn, today: date) -> None:
     )
     plan_id = cur.lastrowid
 
-    types = ("easy", "tempo", "long", "easy", "rest", "easy", "long")
     for i, day_offset in enumerate(range(-70, 98, 2)):  # 10 weeks back, 14 ahead
         d = today + timedelta(days=day_offset)
-        wtype = types[i % len(types)]
+        wtype = _PLAN_TYPES[i % len(_PLAN_TYPES)]
         week_index = (day_offset + 70) // 7 + 1
         if wtype == "rest":
             dist, pace, dur, desc = None, None, None, "Rest day"
@@ -245,19 +287,30 @@ def build_perf_fixture_db(dest: Path, *, today: date | None = None) -> Path:
                 {"date": day, **_baseline_row(d)},
             )
 
+        tempo_dates = _tempo_plan_dates(today)
         activity_id = 1
         for d in range(0, DAYS, _RUN_EVERY_N_DAYS):
             day = (today - timedelta(days=d)).isoformat()
             dist_m = 6000 + (d % 9) * 800
+            duration_s = int(dist_m / 3.0)
             conn.execute(
                 "INSERT INTO activities (activity_id, date, start_time, "
                 "activity_type, activity_name, duration_seconds, distance_meters, "
                 "avg_hr, training_load, aerobic_te) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (activity_id, day, day + "T07:00:00", "running", "Run",
-                 int(dist_m / 3.0), dist_m, 148 + (d % 10), 40.0 + (d % 15) * 3, 2.0 + (d % 4) * 0.3),
+                 duration_s, dist_m, 148 + (d % 10), 40.0 + (d % 15) * 3, 2.0 + (d % 4) * 0.3),
             )
             if d < _SPLIT_DAYS:
                 _seed_splits(conn, activity_id, dist_m, dist_m / 3.0)
+            if day in tempo_dates:
+                # A measured pace on the plan's TEMPO-day activities ONLY —
+                # see the comment above `_PLAN_TYPES`. Stamped from the row's
+                # own distance/duration ratio, not an invented number, so it
+                # stays self-consistent with what was just inserted.
+                conn.execute(
+                    "UPDATE activities SET avg_pace_sec_per_km = ? WHERE activity_id = ?",
+                    (duration_s * 1000.0 / dist_m, activity_id),
+                )
             activity_id += 1
 
         _seed_plan(conn, today)

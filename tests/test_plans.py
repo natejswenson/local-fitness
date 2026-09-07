@@ -239,12 +239,31 @@ def _split(distance_m, pace_sec_per_km):
     return {"distance_meters": distance_m, "avg_pace_sec_per_km": pace_sec_per_km}
 
 
+#: A realistic whole-activity average pace for these fixtures — comfortably
+#: inside `interpret.is_running_effort`'s running band (well under
+#: `RUN_PACE_CEILING_SEC_PER_MI`), and deliberately independent of
+#: `pace_sec_per_km` below, which describes the REP splits, not the
+#: whole-activity average (the two are different numbers even in real data —
+#: that gap is why `fastest_rep_split` exists instead of grading off the
+#: average directly). #242 r3, f-90178752: the rep-pace cap no longer falls
+#: back to the label for a paceless activity, so a fixture with no
+#: activity-level pace would be silently EXCLUDED from the cap's candidate
+#: pool regardless of what its splits say — reproducing the exact failure
+#: this round fixes, in the test fixtures instead of production data.
+_GENERIC_RUN_AVG_PACE = 450.0  # ~12:04/mi
+
+
 def _quality_run(dist, pace_sec_per_km, duration=1800, atype="running", splits=None):
     """A running activity carrying rep-sized splits, as `load_activities_by_date`
-    now hands them to grading."""
+    now hands them to grading. Also stamps a whole-activity
+    `avg_pace_sec_per_km` (`_GENERIC_RUN_AVG_PACE`) so the activity clears the
+    measured-pace gate `_fastest_rep_pace` now applies — see that constant's
+    docstring. A test simulating an actual walk overrides this field
+    explicitly after construction, same as before."""
     a = _run(dist, duration=duration, atype=atype)
     a["splits"] = (splits if splits is not None
                    else [_split(1609.344, pace_sec_per_km) for _ in range(3)])
+    a["avg_pace_sec_per_km"] = _GENERIC_RUN_AVG_PACE
     return a
 
 
@@ -377,6 +396,24 @@ def test_the_pace_cap_ignores_splits_from_a_walk():
 
     assert plans.classify_workout(_tempo(), [walk, run]) == "done"
     assert plans.classify_workout(_tempo(), [walk]) == "missed"
+
+
+def test_the_pace_cap_ignores_a_paceless_walks_splits_via_label_fallback():
+    """#242 r3, f-90178752: the case the test above does NOT cover — the walk
+    is paceless, not measured-slow. `_ran`'s label fallback is a MILEAGE
+    decision (a paceless on-foot row still counts toward distance); reusing
+    it to pick which activity's splits feed the pace cap let a paceless
+    walking-desk session (labelled `treadmill_running`) pass on its label
+    alone. Here the prescribed run itself is a manual/backfilled row with no
+    splits recorded, so if the walk's splits were admitted they would be the
+    ONLY pace evidence for the day and would cap the tempo to `missed` off a
+    16:00/mi walking lap. The cap must abstain instead, leaving the
+    volume-only verdict (`done`) standing."""
+    walk = _quality_run(6000, 596.0, duration=3600, atype="treadmill_running")
+    walk["avg_pace_sec_per_km"] = None   # unmeasured — exactly what _ran falls back on
+    run = _run(8000, duration=2400)      # the actual tempo; no splits, no measured pace
+
+    assert plans.classify_workout(_tempo(), [walk, run]) == "done"
 
 
 def test_a_prescribed_duration_still_wins_over_distance():
@@ -816,6 +853,37 @@ def test_load_activities_by_date_selects_the_pace_the_gate_needs(tmp_path):
     row = by_date["2026-07-21"][0]
     assert row["avg_pace_sec_per_km"] == pytest.approx(1090.5)
     assert plans._running_distance([row]) == 0.0
+
+
+def test_load_activities_by_date_orders_splits_by_split_index(tmp_path):
+    """#242 r3, f-ffcb10f2: the splits query relied on an IMPLICIT order the
+    SQL never requested — correct only while the planner happens to use the
+    `(activity_id, split_index)` primary-key index; a plan with enough
+    quality days degrades it to a table scan, returning rowid (insertion)
+    order instead. `interpret._drop_outlier_fragments`/`fastest_rep_split`
+    make a POSITIONAL decision on each activity's first/last split, so a
+    reordering changes which split gets selected as the warmup/cooldown
+    bookend. Splits are inserted out of `split_index` order (2, 0, 1); the
+    returned list must still read back in ascending `split_index` order."""
+    import sqlite3
+
+    from local_fitness import db as db_mod
+
+    path = tmp_path / "order.db"
+    db_mod.init_schema(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO activities (activity_id, date, activity_type, "
+            "distance_meters, duration_seconds, avg_pace_sec_per_km) "
+            "VALUES (1, '2026-07-21', 'running', 4800, 1500, 300.0)")
+        for idx, pace in [(2, 425.0), (0, 410.0), (1, 260.0)]:
+            conn.execute(
+                "INSERT INTO activity_splits (activity_id, split_index, "
+                "distance_meters, avg_pace_sec_per_km) VALUES (1, ?, 1600.0, ?)",
+                (idx, pace))
+    by_date = plans.load_activities_by_date("2026-07-01", "2026-07-31", db_path=path)
+    splits = by_date["2026-07-21"][0]["splits"]
+    assert [s["avg_pace_sec_per_km"] for s in splits] == [410.0, 260.0, 425.0]
 
 
 def test_a_bike_ride_is_never_run_distance():

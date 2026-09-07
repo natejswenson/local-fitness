@@ -289,6 +289,79 @@ key. The warm is still owed as a release step; it is not this change's debt.
   `validate_plan_input`, so they now share ONE description constant rather
   than two strings that can drift.
 
+### Fixed (round-3 review)
+- **The bookend exclusion is trimmed BEFORE it looks for the day's edges, not
+  keyed on `candidates[0]`/`candidates[-1]` literally** (f-6d873a9b).
+  A trailing remainder lap (the segment Garmin logs after the last lap press
+  on every manually-lapped activity) or a leading walk-out fragment sat
+  outside the warmup/cooldown pair but became one of the two bookend ids in
+  its place, so the pair's own bucket failed the identity match, fell back
+  into the dominant-cluster pool, and its floor deleted the real rep between
+  them — the exact "graded the reps at warmup pace" failure the guard exists
+  to prevent, reintroduced by a lap it never anticipated. `interpret.
+  _trim_framing_fragments` drops any leading/trailing candidate that isn't
+  part of a repeated lap size before the bookend check runs, so it always
+  sees the true outer edge of the day's structured laps. New cases for a
+  trailing remainder lap, a leading fragment, and a remainder lap with no
+  other repeat at all.
+- **`plans._fastest_rep_pace` no longer trusts the activity_type LABEL for a
+  paceless row** (f-90178752). It used to gate its candidates on `_ran`,
+  whose label fallback is a MILEAGE decision (`_running_distance` et al.
+  charitably count a paceless on-foot row rather than drop it) — reused here
+  for a PACE decision on exactly the rows the label is known to lie about. A
+  prescribed run with no splits of its own (a manual entry / backfilled row)
+  next to a paceless walking-desk session (labelled `treadmill_running`,
+  carrying splits) let the walk's ~16:00/mi lap pace become the day's ONLY
+  pace evidence and cap a correctly-run tempo to `missed`. `_ran_by_measured_
+  pace` gates on the activity's own measured pace with NO label fallback —
+  the same exclusion `select_best_effort` already applies for the Riegel
+  basis, for the identical reason.
+- **A prescribed pace is now bounded the same way on both write paths**
+  (f-84d486cd). `target_pace_sec_per_km` went from display-only to the field
+  `_cap_on_rep_pace` grades every quality day against, but `validate_plan_
+  input` still only checked finite-and-non-negative — the exact create/edit
+  asymmetry `target_hr_max`'s bound was added to close. `MIN/MAX_PRESCRIBED_
+  PACE_SEC_PER_KM` (3:00-30:00/mi, in `plans.py`) is now shared by
+  `validate_plan_input` and `_prescription_fields` in `tools.py`.
+- **The `activity_splits` fetch backing the rep selector is explicitly
+  ordered** (f-ffcb10f2). `plans.load_activities_by_date` relied on the
+  `(activity_id, split_index)` primary key to return splits pre-ordered
+  "for free," which only holds while the query planner actually uses that
+  index — with enough ids (the `quality_dates=None` fallback over a
+  multi-year plan) it degrades to a table scan and returns rowid order
+  instead. `interpret._drop_outlier_fragments`/`fastest_rep_split` make a
+  POSITIONAL decision on each activity's own split list, so a reordering
+  changes which split a plan verdict and a report card each select — the
+  exact disagreement #242 exists to close. The query now selects
+  `split_index` and orders by `activity_id, split_index` explicitly.
+- **The edit-path schema states the quality-day contract too, not just the
+  proposer's** (f-db0b1fbe). `update_plan_workout`/`update_plan_workouts`
+  have enforced `_quality_target_error` since round-2 review (f-a9f42ce8),
+  but `_UPDATE_WORKOUT_SCHEMA` — the model's only in-call guidance for this
+  surface — never said a tempo/interval day must end up with a duration or a
+  distance target, and even told the model the opposite ("omit for rest /
+  by-feel") on `distance_mi`. `type`, `distance_mi`, and `duration_min` now
+  all state the requirement; `update_plan_workouts`'s batch schema inherits
+  the same property definitions, so a 60-entry batch edit gets the same
+  guidance the single-day edit does.
+- **The shared perf fixture's tempo-day activities now carry a measured
+  pace, and the ubuntu baseline needs a fresh capture** (f-f447488c,
+  f-a801fb5e). `_fastest_rep_pace`'s `_ran_by_measured_pace` gate (above)
+  excludes a paceless activity outright, so the fixture's activities —
+  deliberately paceless since the header comment's `best_recent_effort`
+  trade-off — could no longer reach the pace comparison at all, which would
+  have put `test_the_benchmarked_plan_paths_actually_fetch_splits` back to
+  measuring an empty gate. `perf_fixture._tempo_plan_dates` stamps a
+  measured `avg_pace_sec_per_km` on exactly the plan's 5 tempo-day
+  activities — computed from each row's own already-written distance/
+  duration ratio, not an invented number — rather than the whole
+  `_SPLIT_DAYS` window, to keep `best_recent_effort`'s pool disturbance as
+  small as the fix allows. This is on top of round-2's still-uncaptured
+  `activity_splits` addition (f-f447488c/f-a801fb5e as originally filed):
+  the committed `.benchmarks/Linux-CPython-3.12-64bit/0001_*.json` baseline
+  now needs recapturing via `capture-perf-baseline.yml`'s `workflow_dispatch`
+  on `ubuntu-latest`, dispatched against this branch after this round's push.
+
 ## [0.62.0] - 2026-09-05
 
 ### Fixed

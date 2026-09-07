@@ -3250,13 +3250,27 @@ _UPDATE_WORKOUT_SCHEMA = {
     "type": "object",
     "properties": {
         "date": {"type": "string", "description": "ISO YYYY-MM-DD of the day to re-prescribe in the ACTIVE plan"},
-        "type": {"type": "string", "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"]},
+        "type": {
+            "type": "string",
+            "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"],
+            "description": "A tempo or interval day is REQUIRED to end up with "
+                           "target_duration_sec or target_distance_m set — set "
+                           "distance_mi and/or duration_min in THIS SAME call "
+                           "whenever the existing day (e.g. a former rest day) "
+                           "has neither, or the edit is rejected and nothing is "
+                           "written. A day with no volume target would otherwise "
+                           "be graded 'by feel', where any running at all counts "
+                           "as done.",
+        },
         "distance_mi": {
             "type": "number",
-            "description": "target distance in miles (omit for rest / by-feel). "
-                           "On tempo/interval this is the graded VOLUME whenever "
-                           "duration_min isn't set; on easy/long/race it is always "
-                           "the graded field.",
+            "description": "target distance in miles (omit for rest, or for a "
+                           "tempo/interval day whose duration_min you are "
+                           "setting instead). On tempo/interval this is the "
+                           "graded VOLUME whenever duration_min isn't set — see "
+                           "type's description for when it (or duration_min) is "
+                           "REQUIRED; on easy/long/race it is always the graded "
+                           "field.",
         },
         "pace_min_per_mi": {
             "type": ["string", "number"],
@@ -3271,8 +3285,10 @@ _UPDATE_WORKOUT_SCHEMA = {
             "type": "number",
             "description": "target duration in minutes — the graded VOLUME field "
                            "for tempo/interval when you set it; distance_mi is the "
-                           "fallback volume when you don't. The pace cap above "
-                           "still applies either way.",
+                           "fallback volume when you don't. See type's description: "
+                           "a tempo/interval day must end up with THIS or "
+                           "distance_mi set, or the edit is rejected. The pace cap "
+                           "above still applies either way.",
         },
         "hr_max": {
             "type": "number",
@@ -3314,9 +3330,14 @@ def _prescription_fields(args: dict) -> tuple[dict | None, str | None]:
         if sec_per_mi is None:
             return None, ('pace_min_per_mi must be "M:SS" (e.g. "9:39") or decimal '
                           "minutes (9.65 = 9:39/mi)")
-        # Sanity bound: 3:00–30:00/mi. Catches transposed args and
+        # Sanity bound: 3:00-30:00/mi. Catches transposed args and
         # unit-confused numbers before they land on the active plan.
-        if not (180.0 <= sec_per_mi <= 1800.0):
+        # Bounds live in plans.py so the CREATE path (validate_plan_input)
+        # and this EDIT path share one definition (#242 r3, f-84d486cd) —
+        # the same discipline as the hr_max bound just below, which
+        # disagreed between the two paths until 0.47.0.
+        if not (plans.MIN_PRESCRIBED_PACE_SEC_PER_MI <= sec_per_mi
+                <= plans.MAX_PRESCRIBED_PACE_SEC_PER_MI):
             return None, (
                 f"pace_min_per_mi of {units.format_pace_min_per_mi(units.pace_sec_per_mi_to_sec_per_km(sec_per_mi))}/mi "
                 "is outside the plausible 3:00–30:00/mi range")
