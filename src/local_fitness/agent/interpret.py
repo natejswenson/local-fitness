@@ -347,6 +347,35 @@ def _drop_outlier_fragments(candidates: list[dict]) -> list[dict]:
     candidate is exactly the one this function must NOT drop, and it is the
     one that repeats.
 
+    **A repeat is not automatically a rep, and the exception is bookends**
+    (#242 r2, f-854c3442 / f-04b7680c). A warmup and a cooldown of the same
+    length REPEAT, so ``len(bucket) >= 2`` alone identified the two laps on
+    the day that are definitionally *not* reps as the dominant unit, and the
+    floor they define then deleted the real work sitting between them:
+
+    * ``[2mi @ 6:36, 800 m @ 6:58, 2mi @ 6:50]`` — one rep bracketed by a
+      matched warmup/cooldown pair. The 3218 m bucket repeats, the floor lands
+      at 1931 m, and the only rep on the day is dropped, grading the session
+      at *warmup* pace.
+    * ``[1mi wu, 800 m, 800 m, 1mi cd]`` — a manually-lapped 2x800. Both
+      buckets hold two members, and the old ``max()`` tie-break on
+      ``distance_meters`` chose the *larger*, dropping both reps.
+
+    Both are the "graded the reps at warmup pace" failure ``fastest_rep_split``
+    exists to escape, reintroduced one layer up. So a bucket whose only members
+    are the day's FIRST and LAST candidate is excluded from the dominant
+    choice: bookending the session is what a warmup/cooldown pair does and what
+    a rep set structurally cannot, since a rep set has work on at least one
+    side of it. (Not excluded when the pair IS the whole day — two laps and
+    nothing else are the reps, and there is nothing for a floor to drop
+    anyway.)
+
+    Ties in count break toward the SMALLER lap size for the same reason, and
+    the asymmetry is deliberate: keeping a fragment risks it winning ``min()``,
+    which the distance floor already bounds, while dropping a rep GUARANTEES
+    the grade is read off a warmup. Erring toward keeping is the cheaper
+    mistake.
+
     Deliberately does nothing when no lap size repeats at least twice — a
     single-rep day, or one with no consistent lap size, has no dominant unit
     to compare against, and this must not invent one. Never returns an empty
@@ -359,13 +388,29 @@ def _drop_outlier_fragments(candidates: list[dict]) -> list[dict]:
     for r in candidates:
         key = round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)
         buckets.setdefault(key, []).append(r)
-    repeated = [b for b in buckets.values() if len(b) >= 2]
+    bookends = {id(candidates[0]), id(candidates[-1])}
+    repeated = [
+        b for b in buckets.values()
+        if len(b) >= 2 and not _is_bookend_pair(b, bookends, len(candidates))
+    ]
     if not repeated:
         return candidates
-    dominant = max(repeated, key=lambda b: (len(b), b[0]["distance_meters"]))
+    dominant = min(repeated, key=lambda b: (-len(b), b[0]["distance_meters"]))
     floor = dominant[0]["distance_meters"] * _MIN_FRACTION_OF_DOMINANT_SPLIT
     kept = [r for r in candidates if r["distance_meters"] >= floor]
     return kept or candidates
+
+
+def _is_bookend_pair(bucket: list[dict], bookends: set[int], total: int) -> bool:
+    """Is ``bucket`` exactly the day's first and last candidate, with work
+    between them? Those two laps are a warmup/cooldown pair, never the reps —
+    see :func:`_drop_outlier_fragments`. Identity, not equality: two laps of
+    the same distance and pace are equal dicts but different laps."""
+    return (
+        len(bucket) == 2
+        and total > 2
+        and {id(bucket[0]), id(bucket[1])} == bookends
+    )
 
 
 def fastest_rep_split(labelled: dict) -> dict | None:

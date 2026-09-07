@@ -16,11 +16,14 @@ the **verdict a session deserves** — the thing a reader acts on. Same rule
 CLAUDE.md already states for the report card: a grade change needs a verdict
 eval, not just a unit test.
 
-They run the full path — a real SQLite DB through ``load_activities_by_date``
--> ``build_plan_detail`` — rather than handing ``classify_workout`` a hand-made
-day. That is load-bearing: the splits the pace cap reads are attached by the
-loader, and a fixture that hand-attached them could not catch the loader
-forgetting to.
+They run the full path — a real SQLite DB through ``quality_pace_dates`` ->
+``load_activities_by_date`` -> ``build_plan_detail`` — rather than handing
+``classify_workout`` a hand-made day. That is load-bearing: the splits the pace
+cap reads are attached by the loader, and a fixture that hand-attached them
+could not catch the loader forgetting to. Since #242 r2 that includes the
+``quality_dates`` NARROWING every live caller passes: grading through the
+unnarrowed fallback left the shipping branch untested, and an empty
+``quality_pace_dates`` drops every split on every production surface.
 
   tempo_jogged            — THE #242 shape: 7:48/mi prescribed, 10:07/mi run,
                             89% of the prescribed distance covered
@@ -278,26 +281,39 @@ def build_scenario_db(scenario: str, dest: Path) -> Path:
     return dest
 
 
-def graded_day(scenario: str, tmp_dir: Path) -> dict:
+def graded_day(scenario: str, tmp_dir: Path, *, narrow: bool = True) -> dict:
     """Build the scenario and return its ONE graded workout, via the production
     path.
 
     Deliberately not ``classify_workout`` on a hand-made day: the splits the
     pace cap reads are attached by ``load_activities_by_date``, and a fixture
     that attached them itself could not catch the loader dropping them.
+
+    ``narrow`` selects the loader branch, and the DEFAULT is the production one
+    (#242 r2, f-0c763f3a / f-cbfe0378). Every live caller passes
+    ``quality_pace_dates(...)``; these evals originally passed nothing and so
+    graded through the unnarrowed fallback, which meant the one branch that
+    actually ships was the one branch nothing exercised — a
+    ``quality_pace_dates`` that returned an empty set would drop every split on
+    every production surface, restoring #242 outright, with the whole suite
+    green. ``narrow=False`` keeps the fallback reachable so
+    ``test_the_narrowing_cannot_change_a_verdict`` can pin the two branches
+    against each other.
     """
     path = build_scenario_db(scenario, Path(tmp_dir) / scenario / "fitness.db")
     plan = plans.get_active_plan(db_path=path)
     assert plan is not None, f"{scenario}: fixture did not resolve an active plan"
-    by_date = plans.load_activities_by_date(GRADED_DATE, GRADED_DATE, db_path=path)
+    quality_dates = plans.quality_pace_dates(plan["workouts"]) if narrow else None
+    by_date = plans.load_activities_by_date(
+        GRADED_DATE, GRADED_DATE, db_path=path, quality_dates=quality_dates)
     detail = plans.build_plan_detail(plan, frontier=FRONTIER,
                                      activities_by_date=by_date)
     return detail["workouts"][0]
 
 
-def verdict(scenario: str, tmp_dir: Path) -> str:
+def verdict(scenario: str, tmp_dir: Path, *, narrow: bool = True) -> str:
     """``graded_day``'s verdict word."""
-    return graded_day(scenario, tmp_dir)["verdict"]
+    return graded_day(scenario, tmp_dir, narrow=narrow)["verdict"]
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke

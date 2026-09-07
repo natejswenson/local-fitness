@@ -562,12 +562,37 @@ These are settled — don't redesign without a reason.
   selector, not the module). `load_activities_by_date` attaches `splits` in
   the LOADER, not in its six callers, for the reason its own comment gives
   about `avg_pace_sec_per_km`: a gate a caller can forget to wire ships as a
-  silent no-op — and `quality_pace_dates(workouts)` narrows the JOIN to only
+  silent no-op — and `quality_pace_dates(workouts)` narrows the fetch to only
   the dates a duration-type day with a prescribed pace can actually reach the
-  splits-reading branch on, since the shared perf fixture is (deliberately)
-  forbidden from carrying `activity_splits` rows and an unscoped fetch on the
-  full window would run unconditionally on every perf-gated call for a table
-  the fixture can never populate.
+  splits-reading branch on. The fetch is keyed on the activity ids the loader
+  has already read, NOT joined back to `activities` by date: the join
+  re-derived a set the function has in hand, while `activity_splits` is
+  PRIMARY KEY `(activity_id, split_index)`, so an `IN (...)` lookup is an
+  index seek that returns split-ordered rows for free.
+
+  **A narrowing that no test takes is #242 one level up** (round-2 review,
+  f-cbfe0378/f-0c763f3a). Every production caller passes `quality_dates`; the
+  evals passed nothing and graded through the additive-safe fallback, so the
+  branch that ships was the branch nothing exercised. A `quality_pace_dates`
+  returning an empty set drops every split on every live surface and restores
+  the original bug — measured, that stub passed 285 tests. The evals now grade
+  through the narrowing by default and pin both branches against each other
+  (`test_the_narrowing_cannot_change_a_verdict`), and a separate case asserts
+  the set actually narrows, so it can fail neither open nor closed.
+
+  **The shared perf fixture now CARRIES `activity_splits` rows** (round-2
+  review, f-f56ee4d1), because without them the 15%-of-min gate on four
+  plan/brief hot paths was certifying a query against an empty table. This is
+  not the exception `perf_fixture`'s header forbids: that rule is about
+  `activities.avg_pace_sec_per_km`, which `best_recent_effort` filters on, and
+  the fixture's activities stay paceless (pinned by
+  `test_the_shared_fixture_keeps_its_activities_paceless`). Coverage is
+  partial and recent (`_SPLIT_DAYS`) because that is the real shape — the
+  daily sync writes splits, the historical backfill never did. Measured cost
+  on the gated `min`: +5.6% worst case (`_build_plan_section`), all four paths
+  inside the bar but spending roughly a third of it, against a baseline
+  captured on a splitless fixture — recapture on ubuntu CI if `validate` reads
+  tight, never locally.
 
   **Nothing in the live data is manually lapped** (round-1 review,
   f-1c0a5538/f-8a26a574) — every "rep" split a GPS watch reports is really a
@@ -583,16 +608,50 @@ These are settled — don't redesign without a reason.
   point the card has no more resolution to give either, so a plan that also
   stops distinguishing partial from missed there cannot disagree with the card
   by construction, even though it is no longer one of the curve's named knots.
-  `QUALITY_PACE_DONE_DEVIATION` (0.0245, the "on target" knot) is untouched —
-  reaching `done` still requires genuinely rep-paced execution, which a
-  blended auto-lap split structurally cannot show.
+  **`QUALITY_PACE_DONE_DEVIATION` took the same correction one round later**
+  (0.047, round-2 review, f-cb50f53f). It shipped as the card's "on target"
+  knot (0.0245) on the reasoning quoted above — that a blended auto-lap
+  structurally cannot show rep pace, so `done` *should* be hard. Measured, it
+  was not hard, it was impossible: `done` was awarded to **0 of 19** rated
+  quality days across every plan in the live database, which is the same
+  punitive-skew signature the partial cut had just been moved off. Grading a
+  diluted quantity against an undiluted target is the 0.40.0 load inversion in
+  a new place, so the DONE cut gets one knot of headroom ("slightly off
+  target", 3.5 stars) as the dilution correction. It still cannot readmit
+  #242: the least bad of the four reported days is 7.7% slow.
   `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives both
-  cuts from the card's curve so a retune of one rubric can't leave the other
-  stale. `fastest_rep_split` also drops a short, fast, one-off fragment sitting
+  cuts from the card's curve — **two-sidedly** since round 2 (f-84f85a3d): a
+  saturation point is a half-open property, so `stars(PARTIAL) == STAR_FLOOR`
+  alone was satisfied by any larger value and 0.25 passed the whole suite.
+
+  **`scripts/calibrate_plan_verdicts.py` is the executable form of all of
+  that**, and its absence is why two cuts in a row shipped wrong. CLAUDE.md
+  required a real-data calibration check for the report card and had no
+  plan-side equivalent; the pattern generalises — **a grading constant with no
+  way to ask the data whether it is right will be wrong and stay wrong.** It
+  regrades every quality day on every stored plan through the production path
+  and fails on punitive skew or an unreachable `done`. Only days the pace cap
+  had an opinion on are rated: over half the live quality days have no
+  qualifying run at all, and counting absence as a verdict about the yardstick
+  is the error the card gate avoids by grading only running efforts. Manual,
+  read-only, not in CI, same as its sibling. Run it before touching either cut
+  and paste the output into the CHANGELOG and the PR.
+
+  `fastest_rep_split` also drops a short, fast, one-off fragment sitting
   beside a lap size that repeats (`_drop_outlier_fragments`) — a closing kick
   tacked onto a 3x1mi tempo whose real reps are mile-length auto-laps would
   otherwise win on pace alone and certify a session whose every prescribed
-  mile ran minutes off target.
+  mile ran minutes off target. **But a repeat is not automatically a rep, and
+  the exception is bookends** (round-2 review, f-854c3442/f-04b7680c): a
+  warmup and a cooldown of the same length REPEAT, so `len(bucket) >= 2` named
+  the two laps that definitionally are not reps as the session's dominant
+  unit, and the floor they defined deleted the real work between them —
+  grading at warmup pace, the exact failure the selector exists to escape,
+  reintroduced in the guard added beside it. A bucket whose only members are
+  the day's first and last candidate is excluded, and count ties break toward
+  the SMALLER lap size. The asymmetry is deliberate: keeping a fragment risks
+  it winning `min()`, which the distance floor already bounds, while dropping
+  a rep GUARANTEES the grade is read off a warmup.
 
   **The by-feel-on-purpose rule is enforced on every write path, not just
   creation** (round-1 review, f-a9f42ce8). `validate_plan_input` refuses a
@@ -615,7 +674,17 @@ These are settled — don't redesign without a reason.
   auto-lap-blending gap: `interval_reps_hit` proved the selector reads real
   reps over a manually-lapped run's average, but every activity in the live
   database is auto-lapped, a lapping style no scenario exercised until this
-  one.
+  one. **The rep selector is shared, so a change to it needs a scenario on
+  BOTH sides** (round-2 review, f-bdd259c2/f-890ff6a1): the bookend fix moved
+  the report card's quality-day pace grade too, and
+  `tests/evals/report_cards.py` gained `interval_two_reps_bookended` and
+  `interval_one_rep_bookended` for it. `interval_manual_laps` could not catch
+  either — its four reps outnumber its two bookends, so the dominant-bucket
+  count never ties. Both new scenarios fail on the pre-fix selector and pass
+  after; the sibling `interval_autolapped_reps_hit` does the same job on the
+  plan side. Touching `interpret.fastest_rep_split` means running
+  `calibrate_report_card.py` AND `calibrate_plan_verdicts.py`, and shipping
+  a `warm_report_cards.py` pass with the release.
 - **Analysis tools carry deterministic interpretation, not just raw numbers**
   (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
   SDK) housing every classifier the brief path already computed in tested

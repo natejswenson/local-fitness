@@ -43,6 +43,34 @@ _USER_NAME = "Nate"
 # activities query (unbounded pre-fix; bounded to 35 days post-fix).
 _RUN_EVERY_N_DAYS = 2
 
+# --- splits on the SHARED fixture (#242 r2, f-f56ee4d1) ----------------------
+#
+# `plans.load_activities_by_date` runs a second query joining `activity_splits`
+# — on all four of the plan/brief hot paths this file's baseline gates. With no
+# split rows here that JOIN returned nothing on every benchmarked run, so the
+# gate certified a query it had never measured: the real cost is every split row
+# in the window, fetched for all six callers.
+#
+# **This is not the exception the header warns about.** That warning is about
+# `activities.avg_pace_sec_per_km` specifically, because `best_recent_effort`
+# EXCLUDES paceless rows and adding paces hands the baselined benchmarks rows
+# they currently skip (+7.2% on `get_training_plan_status`). `activity_splits`
+# is a different table that no plan/brief query reads except the one being
+# measured, and the activities here stay paceless, so the pool
+# `best_recent_effort` sees is byte-identical. Measured A/B on this change is
+# in the 0.63.0 CHANGELOG entry.
+#
+# Split coverage is deliberately PARTIAL and recent, because that is the real
+# shape: the daily sync writes splits and the historical backfill never did
+# (live DB, 2026-09: 135 of 795 activities overall, but 66 of 66 since the sync
+# started). A fixture with splits on all three years would measure a table that
+# does not exist, and one with none measures an empty JOIN.
+_SPLIT_DAYS = 120
+
+# Metres per auto-lap. A GPS watch laps on a fixed distance regardless of the
+# prescribed reps — the shape `interpret.fastest_rep_split` selects from.
+_SPLIT_LAP_M = 1609.34
+
 # --- report-card fixture -----------------------------------------------------
 #
 # A SEPARATE database, not extra rows in the one above, and that separation is
@@ -115,6 +143,30 @@ def _baseline_row(d: int) -> dict:
         "stress_60day_mean": 25.0,
         "ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(ctl - atl, 1),
     }
+
+
+def _seed_splits(conn, activity_id: int, distance_m: float,
+                 duration_s: float) -> None:
+    """Mile auto-laps for one activity, so the plan loader's splits JOIN
+    returns rows on the benchmarked window. See ``_SPLIT_DAYS``.
+
+    Paces vary lap to lap (deterministically) so the fixture exercises
+    ``fastest_rep_split``'s ``min()`` rather than handing it one repeated
+    value, and land near the plan's 300 s/km tempo target so the pace cap
+    reaches its comparison instead of short-circuiting.
+    """
+    laps = max(1, int(distance_m // _SPLIT_LAP_M))
+    lap_seconds = duration_s / laps
+    for idx in range(laps):
+        # +/- ~4%, one lap slower, none identical.
+        factor = 1.0 + ((idx % 5) - 2) * 0.02
+        conn.execute(
+            "INSERT INTO activity_splits (activity_id, split_index, "
+            "distance_meters, duration_seconds, avg_hr, avg_pace_sec_per_km) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (activity_id, idx, _SPLIT_LAP_M, lap_seconds * factor,
+             150 + idx, lap_seconds * factor / (_SPLIT_LAP_M / 1000.0)),
+        )
 
 
 def _seed_plan(conn, today: date) -> None:
@@ -204,6 +256,8 @@ def build_perf_fixture_db(dest: Path, *, today: date | None = None) -> Path:
                 (activity_id, day, day + "T07:00:00", "running", "Run",
                  int(dist_m / 3.0), dist_m, 148 + (d % 10), 40.0 + (d % 15) * 3, 2.0 + (d % 4) * 0.3),
             )
+            if d < _SPLIT_DAYS:
+                _seed_splits(conn, activity_id, dist_m, dist_m / 3.0)
             activity_id += 1
 
         _seed_plan(conn, today)

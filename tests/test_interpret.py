@@ -363,6 +363,69 @@ def test_fastest_rep_split_does_nothing_without_a_repeated_lap_size():
     assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(250.0)
 
 
+# --- a matched warmup/cooldown pair is a repeat that is not a rep -------------
+# #242 r2, f-854c3442 / f-04b7680c. `len(bucket) >= 2` treated bookends as the
+# session's dominant unit and the floor they defined deleted the real work
+# between them — the "graded the reps at warmup pace" failure the whole selector
+# exists to escape, one layer up. Every case below FAILS on the pre-fix code
+# with the warmup's pace as the answer.
+
+@pytest.mark.parametrize("splits, expected, note", [
+    # f-854c3442: a single 800 m rep bracketed by a matched 2-mile warmup and
+    # cooldown. The 3218 m bucket repeats, floor 1931 m, the one rep is dropped.
+    ([(3218.688, 410.0), (800.0, 260.0), (3218.688, 425.0)], 260.0,
+     "one rep inside a matched 2mi warmup/cooldown"),
+    ([(1609.344, 400.0), (600.0, 255.0), (1609.344, 415.0)], 255.0,
+     "one rep inside a matched 1mi warmup/cooldown"),
+    # f-04b7680c: counts TIE at 2, and the old tie-break took the larger bucket.
+    ([(1609.344, 390.0), (800.0, 260.0), (800.0, 262.0), (1609.344, 430.0)], 260.0,
+     "manually-lapped 2x800 inside a matched 1mi warmup/cooldown"),
+    ([(3218.688, 420.0), (1609.344, 270.0), (1609.344, 272.0), (3218.688, 450.0)], 270.0,
+     "manually-lapped 2x1mi inside a matched 2mi warmup/cooldown"),
+])
+def test_a_matched_warmup_cooldown_pair_is_never_the_dominant_unit(
+        splits, expected, note):
+    assert interpret.fastest_rep_split_pace(_rows(*splits)) == \
+        pytest.approx(expected), note
+
+
+def test_the_bookend_exclusion_does_not_readmit_the_closing_kick():
+    """The guard the exclusion sits beside must survive it: a 400 m kick after
+    three mile auto-laps is still dropped, because the repeated 1609 m bucket
+    holds three members and so is not a bookend pair."""
+    labelled = _rows((1609.344, 625.0), (1609.344, 607.0), (1609.344, 648.0),
+                     (400.0, 421.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(607.0)
+
+
+def test_a_repeated_pair_that_is_the_whole_day_still_counts():
+    """Two laps and nothing else ARE the reps — there is no third lap for a
+    floor to drop, so excluding them would only lose the dominant unit."""
+    assert interpret.fastest_rep_split_pace(
+        _rows((800.0, 260.0), (800.0, 255.0))) == pytest.approx(255.0)
+
+
+def test_a_count_tie_breaks_toward_the_smaller_lap_size():
+    """1mi warmup, 2x800 reps, 1mi, then a 400 m kick: the mile bucket is no
+    longer a bookend pair (the kick is last), so both buckets tie at two
+    members. Breaking toward the larger drops both reps AND the kick and grades
+    the day off a mile lap; breaking toward the smaller drops only the kick."""
+    labelled = _rows((1609.344, 390.0), (800.0, 260.0), (800.0, 262.0),
+                     (1609.344, 430.0), (400.0, 200.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(260.0)
+
+
+def test_bookends_are_matched_by_identity_not_equality():
+    """Two laps with the same distance and pace are equal dicts but different
+    laps. A three-member bucket whose first and last members happen to equal
+    each other must not read as a bookend pair."""
+    labelled = _rows((1609.344, 400.0), (1609.344, 300.0), (1609.344, 400.0),
+                     (400.0, 250.0))
+    # All three miles are one bucket (len 3, not a pair), so the kick is still
+    # dropped and the fastest mile wins.
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(300.0)
+
+
 # === module hygiene =============================================================
 
 def test_interpret_imports_nothing_outside_stdlib():

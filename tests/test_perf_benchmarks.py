@@ -305,11 +305,22 @@ def test_get_training_plan_progress_does_not_double_classify(default_db, monkeyp
     """The handler-level twin of the assertion above — proof 1 alone is
     satisfied by a folded helper nobody calls. 123 before the fold, 87 after,
     pinned exactly rather than as an upper bound so an early-return handler
-    (0 calls) cannot pass over unclassified work (#232)."""
+    (0 calls) cannot pass over unclassified work (#232).
+
+    92 since #242 r2, and the +5 is the fix being exercised rather than drift.
+    The quality-day pace cap calls `_ran` to pick the day's running activities
+    before reading their splits, and it short-circuits before that whenever
+    nothing on the day HAS splits — so while the shared fixture wrote no
+    `activity_splits` rows the cap never ran here and this count could not see
+    it. The fixture now carries splits (f-f56ee4d1: the benchmarks were
+    measuring an empty table), and exactly five of its quality days reach the
+    comparison. Verified by A/B on `perf_fixture._SPLIT_DAYS`: 87 at 0, 92 at
+    120, deterministic across runs.
+    """
     _freeze_progress_clock(monkeypatch, _TODAY + timedelta(days=58))
     counts = _count_calls(monkeypatch, plans, "_ran")
     _run(tools.get_training_plan_progress.handler({}))
-    assert counts["n"] == 87
+    assert counts["n"] == 92
 
 
 def test_get_training_plan_progress_rounds_without_a_call_per_node(default_db, monkeypatch):
@@ -575,6 +586,66 @@ def test_the_latency_gate_is_still_armed():
     addopts = tomllib.loads((root / "pyproject.toml").read_text())[
         "tool"]["pytest"]["ini_options"]["addopts"]
     assert "--benchmark-skip" in addopts
+
+
+def test_the_benchmarked_plan_paths_actually_fetch_splits(perf_db):
+    """The gate must measure the splits query with rows in it (#242 r2,
+    f-f56ee4d1).
+
+    `load_activities_by_date` runs a second query for `activity_splits` on all
+    four plan/brief hot paths gated here. The shared fixture wrote no split
+    rows, so that query returned nothing on every benchmarked run and the gate
+    certified a cost it had never paid — a latency floor measured against an
+    empty table is not a floor.
+
+    Asserts the whole chain rather than a row count: split rows exist, the
+    plan's `quality_pace_dates` narrowing selects real dates, splits survive
+    that narrowing onto the activities the grader sees, and the pace cap
+    reaches an actual comparison on at least one benchmarked day. Any link
+    breaking silently returns the benchmarks to measuring an empty JOIN.
+    """
+    with db.connect(perf_db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM activity_splits").fetchone()["n"] > 0
+
+        plan = plans.get_active_plan(conn=conn)
+        workouts = plan["workouts"]
+        quality_dates = plans.quality_pace_dates(workouts)
+        assert quality_dates, "no pace-graded quality day: the fetch is skipped"
+        # A real narrowing, not "every date" — that is the cost this exists to
+        # keep visible.
+        assert len(quality_dates) < len({w["date"] for w in workouts})
+
+        by_date = plans.load_activities_by_date(
+            workouts[0]["date"], workouts[-1]["date"], conn=conn,
+            quality_dates=quality_dates)
+        with_splits = [a for acts in by_date.values() for a in acts if a["splits"]]
+        assert with_splits, "the narrowed fetch attached no splits at all"
+
+        cfg = plans.GradingConfig()
+        rated = [
+            w for w in workouts
+            if w.get("type") in plans._DURATION_TYPES
+            and plans._fastest_rep_pace(by_date.get(w["date"], []), cfg) is not None
+        ]
+        assert rated, "no benchmarked quality day reaches the pace comparison"
+
+
+def test_the_shared_fixture_keeps_its_activities_paceless(perf_db):
+    """The splits above are NOT the exception `perf_fixture`'s header forbids.
+
+    That rule is about `activities.avg_pace_sec_per_km` specifically:
+    `best_recent_effort` excludes paceless rows, so pacing the shared fixture
+    hands the baselined benchmarks rows they currently skip (+7.2% on
+    `get_training_plan_status`, measured 2026-08-02). `activity_splits` is a
+    different table no other plan/brief query reads. This pins the distinction
+    so a later change cannot cite the splits precedent to add paces too.
+    """
+    with db.connect(perf_db) as conn:
+        paced = conn.execute(
+            "SELECT COUNT(*) AS n FROM activities "
+            "WHERE avg_pace_sec_per_km IS NOT NULL").fetchone()["n"]
+    assert paced == 0
 
 
 # --- fix #3 regression: bounded activities lookback -------------------------

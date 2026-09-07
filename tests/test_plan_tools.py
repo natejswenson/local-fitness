@@ -1174,3 +1174,62 @@ def test_both_write_paths_share_one_hr_bound(seeded):
     _active_plan(seeded)
     _body2, edit_err = call(tools.update_plan_workout, {"date": d, "hr_max": 14})
     assert create_err and edit_err, (create_err, edit_err)
+
+
+# --- the in-call contract for a quality day (#242 r2, f-cdcc3388) ------------
+# `validate_plan_input` refuses a target-less tempo/interval day and the pace
+# cap grades `target_pace_sec_per_km`. Both rules are invisible to the model
+# unless the tool's own schema says so — and the proposer is the surface #242
+# originated on, where an unstated rule costs a whole 60-workout call.
+
+def test_both_plan_write_schemas_state_the_quality_day_contract():
+    """A rule enforced on both write paths, stated on one, is a rule the model
+    learns by having a call rejected. `propose_training_plan` and
+    `revise_training_plan` both run `plans.validate_plan_input`, so they must
+    carry the same guidance — asserted as ONE shared constant rather than two
+    matching strings, because two copies drift."""
+    proposed = tools._PROPOSE_PLAN_SCHEMA["properties"]["workouts"]["description"]
+    revised = tools._REVISE_PLAN_SCHEMA["properties"]["workouts"]["description"]
+    assert proposed is revised is tools._PLAN_WORKOUTS_DESCRIPTION
+
+
+def test_the_quality_day_schema_states_what_the_rule_actually_is():
+    """Pinned against behaviour, not against wording: each clause below names a
+    field the grader really reads, so the description cannot go stale while the
+    rules change underneath it."""
+    text = tools._PLAN_WORKOUTS_DESCRIPTION
+
+    # The refusal, in the words validate_plan_input uses for it.
+    assert "target_duration_sec or target_distance_m" in text
+    assert "by feel" in text
+    for wtype in plans._DURATION_TYPES:
+        assert wtype in text
+    # ...and the refusal is real, so the schema is describing the code.
+    assert plans._quality_target_error("tempo", None, None)
+    assert plans._quality_target_error("tempo", None, 8000.0) is None
+
+    # The pace is graded now, and against the REP, not the run average.
+    assert "target_pace_sec_per_km" in text
+    assert "GRADED" in text
+    assert "run average" in text
+
+
+def test_a_target_less_quality_day_is_refused_by_both_write_paths(seeded):
+    """The behaviour the schema promises. Create and revise share
+    `validate_plan_input`, so a rule stated once must bite on both."""
+    t = date.today()
+    d = (t + timedelta(days=1)).isoformat()
+    bad = dict(date=d, week_index=1, type="tempo",
+               target_pace_sec_per_km=300.0, description="3x1mi")
+
+    _body, create_err = call(tools.propose_training_plan, _args(workouts=[bad]))
+    assert create_err and "target_duration_sec or target_distance_m" in _body["error"]
+
+    good = dict(bad, target_distance_m=8000.0)
+    body, err = call(tools.propose_training_plan, _args(workouts=[good]))
+    assert not err, body
+    plan_id = plans.get_draft_plan(db_path=seeded)["plan_id"]
+
+    _b2, revise_err = call(tools.revise_training_plan,
+                           {"plan_id": plan_id, "workouts": [bad]})
+    assert revise_err and "target_duration_sec or target_distance_m" in _b2["error"]

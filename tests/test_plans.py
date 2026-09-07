@@ -437,13 +437,35 @@ def test_the_quality_pace_cuts_still_match_the_card_star_bands():
     def stars(d):
         return rc.stars_from_deviation(d, "pace", rc.PLAN_TIGHTEN)
 
-    on_target = dict(rc.STAR_VERDICT_CUTS)
-    assert stars(plans.QUALITY_PACE_DONE_DEVIATION) == pytest.approx(4.25)
+    cuts = dict(rc.STAR_VERDICT_CUTS)
+    # DONE is the card's "slightly off target" knot, not its "on target" one:
+    # the plan grades a BLENDED auto-lap against a rep target, and one knot of
+    # headroom is that dilution correction (#242 r2, f-cb50f53f — at 0.0245,
+    # `done` was unreachable across 19 rated quality days of live history).
+    assert stars(plans.QUALITY_PACE_DONE_DEVIATION) == pytest.approx(3.5)
+    assert 3.5 in cuts and cuts[3.5] == "slightly off target"
+    assert rc.star_verdict(stars(plans.QUALITY_PACE_DONE_DEVIATION)) == \
+        "slightly off target"
+    # Two-sided, like PARTIAL below: a hair past the cut is a strictly worse
+    # star value, so the constant cannot drift up the curve unnoticed.
+    assert stars(plans.QUALITY_PACE_DONE_DEVIATION + 1e-6) < 3.5
+    # And it still cannot readmit #242 — the least bad of the four days the
+    # issue reported was 7.7% slow.
+    assert plans.QUALITY_PACE_DONE_DEVIATION < 0.077
+    # PARTIAL_DEVIATION is pinned TWO-SIDEDLY (#242 r2, f-84f85a3d). Saturation
+    # to STAR_FLOOR is a half-open property — every d at or above 0.212 has it —
+    # so `stars(PARTIAL) == STAR_FLOOR` alone is satisfied by 0.25, or by any
+    # larger number, while the docstring, the constant's comment, the CHANGELOG
+    # and CLAUDE.md all say it is the saturation POINT. Derive it from the
+    # curve's own formula, then bracket it: the value saturates and a hair below
+    # it does not.
+    saturation = rc.PLAN_TIGHTEN * rc.STAR_SCALE["pace"] + rc.STAR_NOISE["pace"]
+    assert plans.QUALITY_PACE_PARTIAL_DEVIATION == pytest.approx(saturation)
     assert stars(plans.QUALITY_PACE_PARTIAL_DEVIATION) == pytest.approx(rc.STAR_FLOOR)
-    # ...and QUALITY_PACE_DONE_DEVIATION is still the card's own "on target"
-    # boundary, not a free number that happens to sit on the curve.
-    assert 4.25 in on_target and on_target[4.25] == "on target"
-    assert rc.star_verdict(stars(plans.QUALITY_PACE_DONE_DEVIATION)) == "on target"
+    assert stars(plans.QUALITY_PACE_PARTIAL_DEVIATION - 1e-6) > rc.STAR_FLOOR
+    # The two cuts stay ordered and distinct — one ladder, three rungs.
+    assert (plans.QUALITY_PACE_DONE_DEVIATION
+            < plans.QUALITY_PACE_PARTIAL_DEVIATION)
     # Past PARTIAL_DEVIATION the card has no more resolution left to give —
     # it reads the same floor severity word a wildly worse session would.
     assert rc.star_verdict(stars(plans.QUALITY_PACE_PARTIAL_DEVIATION)) == "missed badly"

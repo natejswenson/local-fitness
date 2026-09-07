@@ -119,16 +119,39 @@ _DURATION_TYPES = frozenset({"interval", "tempo"})
 #:
 #: These are not free numbers: each is exactly a ``report_card`` star boundary
 #: under the plan yardstick, so the plan verdict and the card cannot say
-#: different things about the same session (#242). 0.0245 is 4.25 stars ("on
-#: target"), both through ``stars_from_deviation(d, "pace", widen=PLAN_TIGHTEN)``.
+#: different things about the same session (#242). 0.047 is 3.5 stars
+#: ("slightly off target"), through
+#: ``stars_from_deviation(d, "pace", widen=PLAN_TIGHTEN)``.
 #: ``test_the_quality_pace_cuts_still_match_the_card_star_bands`` re-derives
 #: them from that curve, so a retune of one rubric that leaves the other stale
 #: fails the build rather than silently reopening the disagreement.
 #:
+#: **It is the card's "slightly off target" knot and not its "on target" one
+#: (0.0245), and the one knot of headroom is the dilution correction** (#242
+#: r2, f-cb50f53f). The card's knots are calibrated for a rep graded against a
+#: rep. The plan verdict does not have that: nothing in the live history is
+#: manually lapped, so the fastest rep-sized split is a fixed-distance AUTO-LAP
+#: that blends reps with their jog recovery and reads slower than the rep target
+#: under flawless execution — the same arithmetic that moved
+#: ``QUALITY_PACE_PARTIAL_DEVIATION`` off its own knot below. Holding a blended
+#: quantity to an undiluted target is the 0.40.0 load inversion in a new place,
+#: and it showed up as exactly that: at 0.0245, ``done`` was awarded to **0 of
+#: 19** rated quality days across every plan in the live database — a ladder
+#: whose top rung no real session could stand on. The three best-executed
+#: sessions in that history sit at 3.5%, 3.6% and 6.2% slow.
+#:
+#: The cut still cannot readmit #242: the *least* bad of the four days the
+#: issue reported is 7.7% slow, so every one of them stays off ``done``, and
+#: ``tests/evals/`` pins that day by day rather than in aggregate.
+#: ``scripts/calibrate_plan_verdicts.py`` is the executable form of this
+#: paragraph — the plan-side sibling of ``calibrate_report_card.py``, which
+#: CLAUDE.md required for the card and which this surface shipped without. Run
+#: it before touching either constant.
+#:
 #: The cap can reach ``missed``, deliberately. A tempo run executed at easy
 #: pace is an easy run, and the card's own read of one of them said "never hit
 #: interval intensity at all" while the plan called it done.
-QUALITY_PACE_DONE_DEVIATION = 0.0245
+QUALITY_PACE_DONE_DEVIATION = 0.047
 
 #: PARTIAL_DEVIATION was originally the card's "off target" knot (0.092,
 #: 2.50 stars) — correct for a genuinely rep-sized split, wrong for the ONLY
@@ -1306,35 +1329,41 @@ def load_activities_by_date(
     # reads `splits` (`quality_pace_dates`), so fetching every OTHER date's
     # splits is pure waste that a benchmark fixture with no split rows at all
     # can never make visible (#242, f-f56ee4d1) — every caller here now passes
-    # its own plan's `quality_pace_dates(workouts)`.
+    # its own plan's `quality_pace_dates(workouts)`, and the shared perf fixture
+    # now carries split rows so the gate measures this query with data in it.
+    #
+    # Keyed on the activity ids we JUST fetched, not joined back to `activities`
+    # by date (#242 r2, f-f56ee4d1). The join re-derived a set this function
+    # already has in hand, and `activity_splits` is PRIMARY KEY (activity_id,
+    # split_index) — so an `activity_id IN (...)` lookup is an index seek that
+    # also returns split-ordered rows for free, where the join had to scan and
+    # sort. Splits for an activity outside `rows` could not be attached to
+    # anything anyway. Measured on the perf fixture: the join cost +6.2% on
+    # `_build_plan_section`'s min; this form gives most of that back.
     sql = (
         "SELECT activity_id, date, activity_type, distance_meters, "
         "duration_seconds, avg_pace_sec_per_km "
         "FROM activities WHERE date >= ? AND date <= ? ORDER BY date"
     )
-    if quality_dates is None:
-        splits_sql = (
-            "SELECT s.activity_id, s.distance_meters, s.avg_pace_sec_per_km "
-            "FROM activity_splits s JOIN activities a USING (activity_id) "
-            "WHERE a.date >= ? AND a.date <= ? ORDER BY s.activity_id, s.split_index"
-        )
-        splits_params: tuple = (start, end)
-    elif not quality_dates:
-        splits_sql = None
-        splits_params = ()
-    else:
-        placeholders = ", ".join("?" * len(quality_dates))
-        splits_sql = (
-            "SELECT s.activity_id, s.distance_meters, s.avg_pace_sec_per_km "
-            "FROM activity_splits s JOIN activities a USING (activity_id) "
-            f"WHERE a.date >= ? AND a.date <= ? AND a.date IN ({placeholders}) "
-            "ORDER BY s.activity_id, s.split_index"
-        )
-        splits_params = (start, end, *quality_dates)
 
     def _fetch(c):
         rows = c.execute(sql, (start, end)).fetchall()
-        split_rows = c.execute(splits_sql, splits_params).fetchall() if splits_sql else []
+        # `None` means "no narrowing given" — every fetched activity is a
+        # candidate, the additive-safe fallback. An explicit empty set means
+        # the caller's plan has no pace-graded quality day, so nothing here can
+        # ever be read and the query is skipped entirely.
+        wanted = [
+            r["activity_id"] for r in rows
+            if quality_dates is None or r["date"] in quality_dates
+        ]
+        if not wanted:
+            return rows, []
+        placeholders = ", ".join("?" * len(wanted))
+        split_rows = c.execute(
+            "SELECT activity_id, distance_meters, avg_pace_sec_per_km "
+            f"FROM activity_splits WHERE activity_id IN ({placeholders})",
+            wanted,
+        ).fetchall()
         return rows, split_rows
 
     if conn is not None:

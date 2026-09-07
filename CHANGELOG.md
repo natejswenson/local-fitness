@@ -26,9 +26,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `QUALITY_PACE_DONE_DEVIATION` is unchanged and every day here still ran too
   far off pace to reach `done`.) Session adherence on that plan corrects
   **downward from 71%** (measured through `build_plan_detail` on the live
-  plan, frontier 2026-09-06) — the exact corrected figure moved again with
-  the round-1 pace-cut recalibration, so treat the originally-measured 66%
-  as no longer current pending a fresh live recompute. This was not a bug
+  plan, frontier 2026-09-07) **to 67%** — re-measured at round 2 after the
+  `QUALITY_PACE_DONE_DEVIATION` retune, superseding both the originally
+  reported 66% and the round-1 figure. This was not a bug
   caught in review: the 2026-09-01 brief wrote "tempo hit as prescribed …
   first clean execution after a week of easy-day overshoots", `reflect` put it
   in `coach_journal`, and the 2026-09-05 brief cited it back as "since the
@@ -48,11 +48,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before it touches `_ran` when nothing that day carries splits at all, so the
   backfilled tail (which has none) grades exactly as it did.
 
-  `QUALITY_PACE_DONE_DEVIATION` (0.0245) is not a free number: it is the report
-  card's "on target" (4.25 stars) boundary under `PLAN_TIGHTEN`, and
+  `QUALITY_PACE_DONE_DEVIATION` (0.047) is not a free number: it is the report
+  card's "slightly off target" (3.5 stars) boundary under `PLAN_TIGHTEN`, and
   `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives it
-  from that curve, so a retune of the card's rubric cannot leave this one
-  stale.
+  from that curve — two-sidedly, so the constant can neither drift up the
+  curve nor sit above the least-bad day #242 reported (7.7% slow).
+
+  **It was 0.0245 — the card's "on target" knot — until round-2 review
+  (f-cb50f53f), and the one knot of headroom is the dilution correction.**
+  The card's knots are calibrated for a rep graded against a rep; the plan
+  verdict grades a fixed-distance AUTO-LAP that blends reps with their jog
+  recovery against a rep target, which is the same arithmetic that had already
+  moved `QUALITY_PACE_PARTIAL_DEVIATION` off its own knot below. Holding a
+  diluted quantity to an undiluted target is the 0.40.0 load inversion in a
+  new place, and it measured as one: at 0.0245, `done` was awarded to **0 of
+  19** rated quality days across every plan in the live database. The three
+  best-executed sessions in that history sit at 3.5%, 3.6% and 6.2% slow. At
+  0.047 two of them reach `done`, all four #242 evidence days stay off it, and
+  `interval_autolapped_reps_hit` still grades `partial`.
 
   **`QUALITY_PACE_PARTIAL_DEVIATION` was revised from 0.092 to 0.212 during
   round-1 review** (f-cb50f53f, f-1c0a5538). It shipped as the card's "off
@@ -73,14 +86,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   closing kick tacked onto a 3x1mi tempo whose real reps are mile-length
   auto-laps was otherwise winning on pace alone (f-8a26a574).
 
+- **A matched warmup/cooldown pair is a repeat that is not a rep** (round-2
+  review, f-854c3442 / f-04b7680c). `_drop_outlier_fragments` treated any lap
+  size occurring twice as the session's dominant unit — and a warmup and a
+  cooldown of the same length repeat, while being the two laps on the day
+  that definitionally are *not* reps. The floor they defined then deleted the
+  real work between them, grading the session at **warmup pace**: exactly the
+  manual-lap failure `fastest_rep_split` exists to escape, reintroduced in the
+  guard added beside it. Two shapes, both verified by running the code:
+
+  | splits (m @ s/km) | selected before | should be |
+  |---|---|---|
+  | 3218 @ 410, 800 @ 260, 3218 @ 425 | 410 (warmup) | 260 |
+  | 1609 @ 390, 800 @ 260, 800 @ 262, 1609 @ 430 | 390 (warmup) | 260 |
+
+  The first had no tie at all — the bookends were the only repeated size, so
+  the single genuine rep fell under their floor. The second tied at two
+  members each and the old `max()` broke the tie toward the *larger* bucket.
+  Downstream both capped a correctly-executed session to `missed` on the plan
+  verdict and graded it 1.00 stars on the card, where the F-cap pulled the
+  overall down with it. Fixed by excluding a bucket whose only members are the
+  day's first and last candidate (bookending is what a warmup/cooldown pair
+  does and what a rep set structurally cannot, since a rep set has work on at
+  least one side), and by breaking count ties toward the **smaller** lap size.
+  The asymmetry is deliberate: keeping a fragment risks it winning `min()`,
+  which the distance floor already bounds, while dropping a rep guarantees the
+  grade is read off a warmup.
+
+  **Measured no-op on live data.** Nothing in the 90-day live corpus is
+  manually lapped with matched bookends, so all 44 cards grade identically
+  before and after (per-card diff via `calibrate_report_card --verbose`), and
+  the five graded metrics' distributions are unchanged. The fix is for the
+  session shape the fixtures prove is mis-graded, not for a regression anyone
+  has seen on this database.
+
 ### Changed
 - `QUALITY_MIN_SPLIT_M`, `fastest_rep_split` and `fastest_rep_split_pace` moved
   from `agent/report_card.py` into `agent/interpret.py` and are re-exported
   under their existing names (#242). `report_card` imports `plans`, so the
   selector both surfaces must share belongs in the stdlib-only pure module both
-  may import — the precedent `is_running_effort` set. No behaviour change; two
-  selection rules would be exactly how the plan verdict and the card come to
-  disagree again. (`report_card.py`'s module docstring and CLAUDE.md's
+  may import — the precedent `is_running_effort` set. The *move* is behaviour-
+  preserving; the selector itself is not unchanged in this release, and the
+  report card reads it, so the card's quality-day pace grade moves wherever
+  `_drop_outlier_fragments` (added above, corrected in round 2) changes which
+  split is selected. Measured on the live corpus that is nowhere: 44 of 44
+  cards grade identically to `dev`. Two selection rules would be exactly how
+  the plan verdict and the card come to disagree again. (`report_card.py`'s module docstring and CLAUDE.md's
   matching bullet are now scoped to say "in this module" rather than "no other
   grade" — f-c25a7c98.)
 - `validate_plan_input` rejects a `tempo`/`interval` workout carrying neither
@@ -95,12 +146,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `load_activities_by_date` accepts an optional `quality_dates` set narrowing
   its `activity_splits` fetch to the dates that could actually reach the pace
   cap, via the new `quality_pace_dates(workouts)` helper — wired into all six
-  callers (round-1 review, f-f56ee4d1). The shared perf fixture is
-  deliberately forbidden from carrying `activity_splits` rows, so an
-  unscoped fetch cost nothing the benchmark could measure while still
-  running unconditionally on every perf-gated call; the narrowing makes that
-  cost genuinely near-zero rather than merely unmeasured, without touching
-  the fixture-separation rule.
+  callers (round-1 review, f-f56ee4d1). **Round-2 review found the narrowing
+  was still being certified against an empty table** and closed that three
+  ways. The shared perf fixture now writes `activity_splits` rows for its
+  trailing 120 days (`perf_fixture._SPLIT_DAYS`), so the query the gate
+  measures has data in it; `test_the_benchmarked_plan_paths_actually_fetch_
+  splits` asserts the whole chain, down to a benchmarked quality day reaching
+  the pace comparison, so it cannot silently revert to measuring nothing.
+  This is **not** the exception `perf_fixture`'s header forbids — that rule is
+  about `activities.avg_pace_sec_per_km`, which `best_recent_effort` filters
+  on; the fixture's activities stay paceless and
+  `test_the_shared_fixture_keeps_its_activities_paceless` pins the
+  distinction. And the splits fetch no longer joins back to `activities` by
+  date: it is keyed on the activity ids the function has already fetched,
+  an index seek on `activity_splits`' primary key that also returns
+  split-ordered rows for free.
+
+  Measured on the fixture (best-of-two `min`, the gated statistic, macOS
+  local):
+
+  | benchmark | no splits | with splits | delta |
+  |---|---|---|---|
+  | `_build_plan_section` | 624.6 us | 659.7 us | +5.6% |
+  | `get_training_plan_status` | 636.1 us | 662.6 us | +4.2% |
+  | `assemble_brief_context` | 949.2 us | 972.3 us | +2.4% |
+  | `get_training_plan_progress` | 960.3 us | 972.5 us | +1.3% |
+
+  Isolating `load_activities_by_date` itself: 28.3 us with the fetch skipped,
+  **43.5 us id-keyed**, 46.0 us via the old JOIN, and 111.2 us unnarrowed —
+  so the narrowing is worth 67 us and is now visible to the gate that is
+  supposed to see it. All four paths stay inside the 15%-of-min bar, but the
+  committed baseline was captured on ubuntu against a splitless fixture, so
+  this consumes roughly a third of that budget on the worst path. If
+  `validate` reads tight, recapture via the `capture-perf-baseline.yml`
+  `workflow_dispatch` job on ubuntu — never locally. `_ran`'s pinned handler
+  count in `test_get_training_plan_progress_does_not_double_classify` moves
+  87 -> 92 for the same reason: five of the fixture's quality days now reach
+  the pace cap, which the empty table had been hiding.
 
 ### Added
 - `tests/evals/plan_verdicts.py` + `tests/evals/test_plan_verdicts.py` — the
@@ -113,7 +195,99 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   review** (f-1c0a5538): every existing manually-lapped scenario used a
   lapping style that does not occur in the live database, so nothing covered
   a genuinely well-run session whose only available splits are full-lap
-  blends of reps and jog recovery.
+  blends of reps and jog recovery. **Round-2 review** made every scenario
+  grade through the `quality_dates` narrowing every production caller passes
+  (f-0c763f3a / f-cbfe0378) and pinned both loader branches against each other
+  — the evals had been taking the unnarrowed fallback, so the one branch that
+  ships was the one branch nothing exercised. Stubbing `quality_pace_dates` to
+  return an empty set (which drops every split, makes the pace cap abstain
+  everywhere, and restores #242 on every live surface) previously passed 285
+  tests; it now fails 14.
+- `scripts/calibrate_plan_verdicts.py` — the **plan-side sibling of
+  `calibrate_report_card.py`** (round-2 review, f-cb50f53f). CLAUDE.md requires
+  the card's bands to be calibrated against real data with an executable
+  check; the plan verdict had no such thing, which is how a cut that made
+  `done` unreachable shipped and survived a review round. It regrades every
+  quality day on every stored plan through the production path and fails on
+  two signatures: **punitive skew** (>60% of rated days `missed`, the card
+  gate's own bar) and an **unreachable verdict** (`done` never awarded). Only
+  days the pace cap actually had an opinion on are rated — more than half the
+  quality days in the live history have no qualifying run at all, and counting
+  absence as a verdict about the yardstick is the error the card gate avoids
+  by grading only running efforts. Manual, read-only (`mode=ro`), and
+  deliberately not in CI for the same reason as its sibling;
+  `test_the_plan_gate_is_not_wired_into_ci` fails if someone wires it up.
+  Run before touching either pace cut.
+- Two report-card verdict scenarios, `interval_two_reps_bookended` and
+  `interval_one_rep_bookended` (round-2 review, f-bdd259c2 / f-890ff6a1). This
+  release changes what the card's quality-day pace grade reads, and CLAUDE.md
+  is explicit that a grade change needs a verdict eval rather than a unit
+  test. `interval_manual_laps` could not catch either defect: its four reps
+  outnumber its two bookends, so the dominant-bucket count never ties. Both
+  new scenarios fail on the pre-fix selector (graded at warmup pace) and pass
+  after.
+
+### Release gates
+
+Per CLAUDE.md, run before shipping — output pasted rather than summarised.
+
+`uv run python scripts/calibrate_report_card.py` (exit 0):
+
+```
+Report-card calibration — 44 running efforts, trailing 90 days
+
+metric                 1.00 .. 5.00        mean    n  verdict
+-------------------------------------------------------------
+distance               ##.#.#.#......###   3.67   44  ok — 8 buckets used, top 57%, interior 25%, <=2.0* 32%
+pace                   #.#...####..#####   4.26   44  ok — 11 buckets used, top 55%, interior 41%, <=2.0* 7%
+hr (rolling band)      ....#.##...#..###   4.50   28  ok — 7 buckets used, top 68%, interior 32%, <=2.0* 7%
+hr (prescribed cap)    #.#.###.#....##.#   2.70   16  ok — 9 buckets used, top 25%, interior 56%, <=2.0* 44%
+continuity             #.#...##.#....#.#   4.45   42  ok — 7 buckets used, top 79%, interior 19%, <=2.0* 7%
+
+overall (informational, not gated)
+  mean 3.87, median 3.89 · 9/44 at 5.00 (20%) · cap fired on 16/44 (36%)
+
+OK — every rated metric still uses its scale.
+```
+
+Byte-identical to the same run with `_drop_outlier_fragments` disabled, and
+per-card identical across all 44 — this release moves no live card grade.
+
+`uv run python scripts/calibrate_plan_verdicts.py`, before and after the
+`QUALITY_PACE_DONE_DEVIATION` retune:
+
+```
+  cuts: done <= 0.0245 slow, partial <= 0.2120 slow      cuts: done <= 0.0470 slow
+  done       0  (  0%)                                   done       2  ( 11%)
+  partial   13  ( 68%)                                   partial   11  ( 58%)
+  missed     6  ( 32%)                                   missed     6  ( 32%)
+  deviation range -0.0625 .. +0.4542, median +0.1356
+  UNREACHABLE VERDICT — exit 1                           OK — exit 0
+```
+
+`uv run python scripts/warm_report_cards.py` (free survey): **21 of 21 stored
+cards stale, ~21 Claude calls / ~3.5 min.** Run `--yes` at deploy. Note the
+same survey on `dev` also reports 21 of 21 — the staleness predates this
+branch, and the per-card grade diff above confirms this release moves no read
+key. The warm is still owed as a release step; it is not this change's debt.
+
+### Fixed (docs)
+- `docs/mcp/plan_chart.md`'s overachievement gotcha said a day that runs past
+  its prescription keeps a green verdict, using the 2026-07-21 interval day as
+  its worked example — the very day this change regrades to `missed`
+  (round-2 review, f-281fe323). The page now distinguishes volume-graded days
+  (`easy`/`long`/`race`, unchanged) from quality days, and the sample chart's
+  two quality rows carry the glyphs the new grading actually produces.
+- `_PROPOSE_PLAN_SCHEMA` and `_REVISE_PLAN_SCHEMA` state the quality-day
+  contract (round-2 review, f-cdcc3388): that a `tempo`/`interval` day is
+  required to carry `target_duration_sec` or `target_distance_m`, and that
+  `target_pace_sec_per_km` on those days is now GRADED against the fastest
+  rep-sized split rather than advisory. The schema is the only guidance a
+  plan-writing model gets in-call, and #242 originated on that surface — a
+  model that has not been told has a 60-workout proposal rejected whole for a
+  rule nothing it read mentioned. Both write paths run the same
+  `validate_plan_input`, so they now share ONE description constant rather
+  than two strings that can drift.
 
 ## [0.62.0] - 2026-09-05
 

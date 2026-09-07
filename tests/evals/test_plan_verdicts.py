@@ -56,6 +56,63 @@ def test_scenario_meets_its_declared_verdict(scenario, tmp_path):
         f"{scenario}: got {got!r}, expected {spec['verdict']!r} — {spec['why']}")
 
 
+@pytest.mark.parametrize("scenario", SCENARIOS)
+def test_the_narrowing_cannot_change_a_verdict(scenario, tmp_path):
+    """The `quality_dates` narrowing is an optimisation, so it must be
+    verdict-neutral — and it is the branch every production caller takes.
+
+    #242 r2, f-cbfe0378 / f-0c763f3a. `load_activities_by_date` has two split-
+    fetching branches: unnarrowed (the additive-safe fallback, which is what
+    these evals used to grade through) and narrowed to
+    `quality_pace_dates(workouts)`, which brief_planner, ledger and all four
+    tools call sites pass. Nothing exercised the narrowed one, so a
+    `quality_pace_dates` that returned an empty set — dropping every split,
+    making the pace cap abstain everywhere and restoring #242 on every live
+    surface — left the whole suite green. Measured: stubbing it to
+    `frozenset()` passed 285 tests.
+
+    Both branches are graded here and required to agree, so a narrowing that
+    starts excluding a day the cap needs fails on the DAY'S VERDICT rather than
+    on a query shape.
+    """
+    spec = EXPECTED_VERDICTS[scenario]
+    narrowed = verdict(scenario, tmp_path / "narrow", narrow=True)
+    full = verdict(scenario, tmp_path / "full", narrow=False)
+    assert narrowed == full == spec["verdict"], (
+        f"{scenario}: narrowed={narrowed!r} unnarrowed={full!r}, "
+        f"expected {spec['verdict']!r} — {spec['why']}")
+
+
+def test_the_narrowing_selects_exactly_the_days_the_cap_can_read(tmp_path):
+    """...and it must actually narrow, or the test above passes vacuously.
+
+    A quality day carrying a prescribed pace is the only day whose `splits` key
+    is ever read, so it must be IN the set; a rest day on the same plan must be
+    out. Without this, `quality_pace_dates` could return every date (no
+    narrowing at all, the cost f-f56ee4d1 is about) or the empty set (no splits
+    at all, #242 restored) and both agree with the fallback on a one-day plan.
+    """
+    path = build_scenario_db("tempo_jogged", tmp_path / "fitness.db")
+    plan = plans.get_active_plan(db_path=path)
+    quality = plan["workouts"][0]
+    assert quality["type"] == "tempo" and quality["target_pace_sec_per_km"]
+
+    selected = plans.quality_pace_dates(plan["workouts"] + [
+        {"date": "2026-07-02", "type": "rest"},
+        {"date": "2026-07-03", "type": "easy", "target_pace_sec_per_km": 300.0},
+        # A quality day with no prescribed pace: the cap abstains on it, so
+        # fetching its splits would be pure waste.
+        {"date": "2026-07-04", "type": "interval", "target_pace_sec_per_km": None},
+    ])
+    assert selected == frozenset({GRADED_DATE})
+
+    # And the splits really do arrive on the selected date through that set.
+    by_date = plans.load_activities_by_date(
+        GRADED_DATE, GRADED_DATE, db_path=path, quality_dates=selected)
+    assert by_date[GRADED_DATE][0]["splits"], \
+        "the narrowed fetch dropped the splits the pace cap grades on"
+
+
 # --- the pace cap -----------------------------------------------------------
 
 def test_a_tempo_run_at_easy_pace_is_not_a_tempo(day):
@@ -86,7 +143,9 @@ def test_the_distance_ladder_alone_would_still_have_said_done(tmp_path):
     """
     path = build_scenario_db("tempo_jogged", tmp_path / "fitness.db")
     plan = plans.get_active_plan(db_path=path)
-    by_date = plans.load_activities_by_date(GRADED_DATE, GRADED_DATE, db_path=path)
+    by_date = plans.load_activities_by_date(
+        GRADED_DATE, GRADED_DATE, db_path=path,
+        quality_dates=plans.quality_pace_dates(plan["workouts"]))
     workout = plan["workouts"][0]
     activities = by_date[GRADED_DATE]
     ran_seconds = plans._running_duration(activities)

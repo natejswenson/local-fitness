@@ -3090,6 +3090,38 @@ async def delete_manual_workout(args: dict) -> dict:
 # draft, or abandon the active plan outright). See plans.py for the enforced
 # write boundary.
 
+# The ONE description both plan-writing schemas use, because both run the same
+# `plans.validate_plan_input` and a rule stated on only one of them is a rule
+# the model learns on one call and gets rejected by on the other.
+#
+# The quality-day sentence is #242's proposer half (r2, f-cdcc3388). Every
+# tempo/interval day the proposer wrote carried a pace and a distance and NO
+# duration, which fell through `classify_workout`'s "by feel" branch and graded
+# `done` for any running at all. Grading now reads the pace, and
+# `validate_plan_input` REFUSES a target-less quality day — so a model that has
+# not been told will have a 60-workout proposal rejected whole for a rule
+# nothing it read mentioned. Same shape as the 0.40.0 `target_hr_max` note
+# beside it: state what the grader does with the field, in the only guidance a
+# tool call gets.
+_PLAN_WORKOUTS_DESCRIPTION = (
+    "Full schedule: each {date, week_index, type, target_distance_m?, "
+    "target_pace_sec_per_km?, target_duration_sec?, target_hr_max?, "
+    "description, seq?}. "
+    "Set target_hr_max (bpm) on any day with a heart-rate ceiling — the report "
+    "card grades against it, and a cap written only into the description is "
+    "invisible to the grader. "
+    "A tempo or interval day is REQUIRED to carry target_duration_sec or "
+    "target_distance_m; one with neither is rejected, because a quality day "
+    "with no volume target is graded 'by feel' and any running at all counts "
+    "as done. "
+    "On those days target_pace_sec_per_km is GRADED, not advisory: it is the "
+    "REP pace, compared against the fastest rep-sized split of the session "
+    "(never the run average, which blends in warmup and recovery), and a "
+    "session run well off it is capped to partial or missed however much "
+    "ground it covered. Prescribe the pace you actually mean the reps to be "
+    "run at, and put the rep structure in the description."
+)
+
 _PROPOSE_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -3101,7 +3133,7 @@ _PROPOSE_PLAN_SCHEMA = {
         "ability_snapshot": {"type": "object", "description": "Current-ability estimate you derived from the athlete's data"},
         "workouts": {
             "type": "array",
-            "description": "Full schedule: each {date, week_index, type, target_distance_m?, target_pace_sec_per_km?, target_duration_sec?, target_hr_max?, description, seq?}. Set target_hr_max (bpm) on any day with a heart-rate ceiling — the report card grades against it, and a cap written only into the description is invisible to the grader.",
+            "description": _PLAN_WORKOUTS_DESCRIPTION,
             "items": {"type": "object"},
         },
     },
@@ -3117,7 +3149,11 @@ _REVISE_PLAN_SCHEMA = {
         "target_time_seconds": {"type": "integer"},
         "goal_distance_m": {"type": "number"},
         "title": {"type": "string"},
-        "workouts": {"type": "array", "items": {"type": "object"}},
+        "workouts": {
+            "type": "array",
+            "description": _PLAN_WORKOUTS_DESCRIPTION,
+            "items": {"type": "object"},
+        },
     },
     "required": ["plan_id"],
 }
