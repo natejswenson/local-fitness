@@ -118,6 +118,45 @@ def test_validate_rejects_too_many():
     assert err == f"too many workouts ({plans.MAX_WORKOUTS + 1} > {plans.MAX_WORKOUTS})"
 
 
+@pytest.mark.parametrize("wtype", ["tempo", "interval"])
+def test_validate_rejects_a_quality_day_with_no_target(wtype):
+    """Hardening for #242: neither target is the "by feel" branch, which graded
+    `done` for any running at all and was the only path every proposed quality
+    day took."""
+    err = plans.validate_plan_input("10k", "2026-09-14",
+        workouts=[_wk(date="2026-07-01", type=wtype, target_distance_m=None,
+                      target_duration_sec=None, description="Reps")],
+        created_date="2026-06-15")
+    assert err == (f"workout 0: a {wtype} day needs target_duration_sec or "
+                   "target_distance_m — without one it is graded 'by feel' "
+                   "and any running at all counts as done")
+
+
+@pytest.mark.parametrize("target", [
+    {"target_distance_m": 8000.0, "target_duration_sec": None},
+    {"target_distance_m": None, "target_duration_sec": 2400},
+    {"target_distance_m": 8000.0, "target_duration_sec": 2400},
+])
+def test_validate_accepts_a_quality_day_with_either_target(target):
+    """Duration OR distance, not both — the rule is that the day states what it
+    wants, not which field it uses to say so."""
+    err = plans.validate_plan_input("10k", "2026-09-14",
+        workouts=[_wk(date="2026-07-01", type="tempo", description="Reps", **target)],
+        created_date="2026-06-15")
+    assert err is None
+
+
+def test_validate_still_allows_a_target_less_easy_day():
+    """The by-feel branch survives where it was meant to be: an easy day with no
+    distance target still validates, and still grades on any qualifying
+    activity."""
+    err = plans.validate_plan_input("10k", "2026-09-14",
+        workouts=[_wk(date="2026-07-01", type="easy", target_distance_m=None,
+                      description="Easy, by feel")],
+        created_date="2026-06-15")
+    assert err is None
+
+
 def test_validate_accepts_good_plan():
     err = plans.validate_plan_input("10k", "2026-09-14",
         workouts=[_wk(date="2026-07-01"),
@@ -183,6 +222,193 @@ def test_duration_no_target_is_by_feel():
     w = {"type": "tempo", "target_duration_sec": None}
     assert plans.classify_workout(w, [_run(3000, duration=300)]) == "done"
     assert plans.classify_workout(w, []) == "missed"
+
+
+# --- quality days: volume, then the rep-pace cap (#242) --------------------
+# The proposer writes tempo/interval days with a distance and a pace and NO
+# duration, so before 0.63.0 every one of them took the by-feel branch above and
+# graded `done` for any running at all: a tempo prescribing 7:48/mi whose
+# fastest mile was 10:07 reported done, and the brief wrote "tempo hit as
+# prescribed" into permanent memory.
+
+#: 7:48/mi, the prescription on the 2026-09-01 session the issue reports.
+_REP_TARGET = 468.0 / 1.609344
+
+
+def _split(distance_m, pace_sec_per_km):
+    return {"distance_meters": distance_m, "avg_pace_sec_per_km": pace_sec_per_km}
+
+
+def _quality_run(dist, pace_sec_per_km, duration=1800, atype="running", splits=None):
+    """A running activity carrying rep-sized splits, as `load_activities_by_date`
+    now hands them to grading."""
+    a = _run(dist, duration=duration, atype=atype)
+    a["splits"] = (splits if splits is not None
+                   else [_split(1609.344, pace_sec_per_km) for _ in range(3)])
+    return a
+
+
+def _tempo(**over):
+    w = {"type": "tempo", "target_distance_m": 8000.0,
+         "target_pace_sec_per_km": _REP_TARGET, "target_duration_sec": None}
+    w.update(over)
+    return w
+
+
+def test_quality_day_without_a_duration_grades_on_distance():
+    """The by-feel branch is only for a day prescribing NEITHER target. With a
+    distance target the run-only distance ladder applies, so a 2 km jog no
+    longer satisfies an 8 km interval day."""
+    w = _tempo(target_pace_sec_per_km=None)
+    assert plans.classify_workout(w, [_quality_run(6400, 290.0)]) == "done"      # 0.80
+    assert plans.classify_workout(w, [_quality_run(6300, 290.0)]) == "partial"   # 0.79
+    assert plans.classify_workout(w, [_quality_run(3200, 290.0)]) == "partial"   # 0.40
+    assert plans.classify_workout(w, [_quality_run(3100, 290.0)]) == "missed"    # 0.39
+
+
+def test_the_september_tempo_is_not_done():
+    """THE issue. 4.01 mi of an 4.5 mi prescription — 89% of target, comfortably
+    above DONE_FRACTION — run at 10:07/mi against a prescribed 7:48/mi."""
+    w = _tempo(target_distance_m=4.5 * 1609.344)
+    splits = [_split(1609.344, p / 1.609344) for p in (625.0, 607.0, 790.0, 648.0)]
+    day = [_quality_run(4.01 * 1609.344, 0, duration=2540, splits=splits)]
+
+    assert plans._running_distance(day) / w["target_distance_m"] > plans.DONE_FRACTION
+    assert plans.classify_workout(w, day) == "missed"
+
+
+def test_the_distance_ladder_alone_would_still_have_said_done():
+    """Pinned as its own case because it is the finding that decides the shape
+    of this fix: all four mis-graded days ran 84-119% of their prescribed
+    distance, so a volume-only fallback leaves every one of them `done`. A
+    future simplification that deletes the pace cap fails here."""
+    w = _tempo(target_distance_m=4.5 * 1609.344)
+    day = [_quality_run(4.01 * 1609.344, 625.0 / 1.609344, duration=2540)]
+
+    assert plans._quality_volume_verdict(w, day, 2540, plans._DEFAULT_GRADING_CONFIG) == "done"
+    assert plans.classify_workout(w, day) == "missed"
+
+
+def test_a_quality_day_executed_at_rep_pace_is_still_done():
+    """The other direction, and the one that stops this becoming a ratchet that
+    marks every quality day down — the 0.55.0 prescribed-walk inversion."""
+    assert plans.classify_workout(
+        _tempo(), [_quality_run(8000, _REP_TARGET, duration=2400)]) == "done"
+
+
+def test_beating_the_rep_target_is_not_a_miss():
+    """Slow-side only, like the card's quality pace branch: running the reps
+    faster than prescribed is compliance."""
+    assert plans.classify_workout(
+        _tempo(), [_quality_run(8000, _REP_TARGET * 0.85)]) == "done"
+
+
+@pytest.mark.parametrize("mult,expected", [
+    (1.0 + plans.QUALITY_PACE_DONE_DEVIATION, "done"),          # boundary: inclusive
+    (1.0 + plans.QUALITY_PACE_DONE_DEVIATION + 1e-6, "partial"),
+    (1.0 + plans.QUALITY_PACE_PARTIAL_DEVIATION, "partial"),    # boundary: inclusive
+    (1.0 + plans.QUALITY_PACE_PARTIAL_DEVIATION + 1e-6, "missed"),
+])
+def test_the_rep_pace_cut_boundaries(mult, expected):
+    """Both cuts pinned on both sides. Distance is at target throughout, so the
+    verdict moves only with the rep pace."""
+    assert plans.classify_workout(
+        _tempo(), [_quality_run(8000, _REP_TARGET * mult)]) == expected
+
+
+def test_the_pace_cap_lowers_a_verdict_and_never_raises_one():
+    """`min()` over the severity ordering, the card's F-cap idiom: a perfect rep
+    does not rescue a session that covered half the prescribed ground."""
+    w = _tempo()
+    assert plans.classify_workout(w, [_quality_run(4000, _REP_TARGET)]) == "partial"
+    assert plans.classify_workout(w, [_quality_run(2000, _REP_TARGET)]) == "missed"
+
+
+def test_the_pace_cap_reads_the_fastest_rep_not_the_warmup():
+    """One selector, shared with the report card. A 2 km warmup at 6:30/km and
+    four 800 m reps at target: the reps decide."""
+    splits = ([_split(2000.0, 390.0)] + [_split(800.0, _REP_TARGET)] * 4
+              + [_split(2000.0, 528.0)])
+    assert plans.classify_workout(
+        _tempo(), [_quality_run(8000, 0, splits=splits)]) == "done"
+
+
+def test_a_recovery_jog_below_the_rep_floor_cannot_carry_the_verdict():
+    """QUALITY_MIN_SPLIT_M keeps a 200 m fragment from posting the day's pace."""
+    splits = [_split(1609.344, _REP_TARGET * 1.5), _split(200.0, _REP_TARGET * 0.5)]
+    assert plans.classify_workout(
+        _tempo(), [_quality_run(8000, 0, splits=splits)]) == "missed"
+
+
+def test_the_pace_cap_abstains_without_a_prescribed_pace():
+    """No pace target, nothing to cap against — the volume verdict stands."""
+    w = _tempo(target_pace_sec_per_km=None)
+    assert plans.classify_workout(w, [_quality_run(8000, 900.0)]) == "done"
+
+
+def test_the_pace_cap_abstains_on_the_backfilled_tail():
+    """A day whose activities carry no splits grades EXACTLY as it would have on
+    volume alone — the historical import never wrote splits, and a gate that
+    failed a session it cannot measure would rewrite years of verdicts.
+
+    Asserted as an equality between the with- and without-splits shapes, the
+    same construction as the card's `test_only_the_documented_exceptions_read
+    _splits`."""
+    w = _tempo()
+    slow = _quality_run(8000, _REP_TARGET * 2.0, duration=2400)
+    splitless = dict(slow, splits=[])
+
+    assert plans.classify_workout(w, [slow]) == "missed"
+    assert plans.classify_workout(w, [splitless]) == "done"
+    assert (plans.classify_workout(w, [splitless])
+            == plans.classify_workout(w, [dict(slow, splits=None)])
+            == plans._quality_volume_verdict(w, [splitless], 2400,
+                                             plans._DEFAULT_GRADING_CONFIG))
+
+
+def test_the_pace_cap_ignores_splits_from_a_walk():
+    """`_ran` gates the cap's inputs too. A walking-desk session logged as
+    `treadmill_running` posts 16:00/mi splits; they must not fail the tempo the
+    real run satisfied, and the walk's own distance must not satisfy it either."""
+    walk = _quality_run(6000, 596.0, duration=3600, atype="treadmill_running")
+    walk["avg_pace_sec_per_km"] = 596.0        # 16:00/mi — the pace gate sees a walk
+    run = _quality_run(8000, _REP_TARGET, duration=2400)
+    run["avg_pace_sec_per_km"] = _REP_TARGET
+
+    assert plans.classify_workout(_tempo(), [walk, run]) == "done"
+    assert plans.classify_workout(_tempo(), [walk]) == "missed"
+
+
+def test_a_prescribed_duration_still_wins_over_distance():
+    """Unchanged behaviour: when the plan states a duration that is the graded
+    volume, and the distance target beside it is not consulted."""
+    w = _tempo(target_duration_sec=2400, target_distance_m=99999.0,
+               target_pace_sec_per_km=None)
+    assert plans.classify_workout(w, [_quality_run(4000, 290.0, duration=2400)]) == "done"
+    assert plans.classify_workout(w, [_quality_run(4000, 290.0, duration=1200)]) == "partial"
+
+
+def test_the_quality_pace_cuts_still_match_the_card_star_bands():
+    """The anti-drift guard. Each cut is a `report_card` star boundary under the
+    plan yardstick, so the plan verdict and the card cannot come to describe the
+    same session differently — which is #242 in the other direction. Re-derived
+    from the card's own curve rather than restated, so a retune of `STAR_KNOTS`,
+    `STAR_SCALE`, `STAR_NOISE` or `PLAN_TIGHTEN` that leaves these constants
+    stale fails the build."""
+    from local_fitness.agent import report_card as rc
+
+    def stars(d):
+        return rc.stars_from_deviation(d, "pace", rc.PLAN_TIGHTEN)
+
+    on_target = dict(rc.STAR_VERDICT_CUTS)
+    assert stars(plans.QUALITY_PACE_DONE_DEVIATION) == pytest.approx(4.25)
+    assert stars(plans.QUALITY_PACE_PARTIAL_DEVIATION) == pytest.approx(2.50)
+    # ...and those two values are the card's own "on target" / "off target"
+    # boundaries, not free numbers that happen to sit on the curve.
+    assert 4.25 in on_target and on_target[4.25] == "on target"
+    assert 2.50 in on_target and on_target[2.50] == "off target"
+    assert rc.star_verdict(stars(plans.QUALITY_PACE_DONE_DEVIATION)) == "on target"
+    assert rc.star_verdict(stars(plans.QUALITY_PACE_PARTIAL_DEVIATION)) == "off target"
 
 
 def test_cross_matches_non_running_only():

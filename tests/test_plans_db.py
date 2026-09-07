@@ -253,6 +253,92 @@ def test_build_plan_detail_surfaces_walk_on_long_day_still_missed():
     assert w0["actual_activity_types"] == ["walking"]
 
 
+# --- the quality-day pace cap, end to end (#242) ---------------------------
+
+def _insert_activity(conn, aid, day, atype, dist, dur, pace, splits=()):
+    conn.execute(
+        "INSERT INTO activities (activity_id, date, activity_type, "
+        "distance_meters, duration_seconds, avg_pace_sec_per_km) "
+        "VALUES (?, ?, ?, ?, ?, ?)", (aid, day, atype, dist, dur, pace))
+    for i, (sd, sp) in enumerate(splits):
+        conn.execute(
+            "INSERT INTO activity_splits (activity_id, split_index, "
+            "distance_meters, duration_seconds, avg_pace_sec_per_km) "
+            "VALUES (?, ?, ?, ?, ?)", (aid, i, sd, sd / 1000.0 * sp, sp))
+
+
+def test_load_activities_by_date_attaches_splits(dbp):
+    """The cap reads splits, and this is the ONLY place they are fetched — for
+    the reason avg_pace_sec_per_km is fetched here (see the query's comment): a
+    gate a caller can forget to wire ships as a silent no-op."""
+    with db.connect(dbp) as conn:
+        _insert_activity(conn, 1, "2026-07-01", "running", 8000.0, 2400, 300.0,
+                         splits=[(1609.344, 290.0), (1609.344, 310.0)])
+        _insert_activity(conn, 2, "2026-07-02", "running", 5000.0, 1500, 300.0)
+
+    by_date = plans.load_activities_by_date("2026-07-01", "2026-07-31", db_path=dbp)
+    with_splits = by_date["2026-07-01"][0]
+    assert [s["avg_pace_sec_per_km"] for s in with_splits["splits"]] == [290.0, 310.0]
+    assert with_splits["splits"][0]["distance_meters"] == pytest.approx(1609.344)
+    # A splitless activity carries the key with an empty list, never a missing
+    # key: the cap's `any(a.get("splits"))` short-circuit reads it on every day.
+    assert by_date["2026-07-02"][0]["splits"] == []
+
+
+def test_load_activities_by_date_keeps_each_activitys_splits_to_itself(dbp):
+    """Two runs on one day, one fast and one slow. Attaching the day's splits to
+    every row would let a walk-warmup lap fail the run beside it."""
+    with db.connect(dbp) as conn:
+        _insert_activity(conn, 1, "2026-07-01", "running", 8000.0, 2400, 300.0,
+                         splits=[(1609.344, 290.0)])
+        _insert_activity(conn, 2, "2026-07-01", "running", 3000.0, 1500, 500.0,
+                         splits=[(1609.344, 500.0)])
+
+    day = plans.load_activities_by_date("2026-07-01", "2026-07-01", db_path=dbp)["2026-07-01"]
+    by_id = {a["activity_id"]: a for a in day}
+    assert [s["avg_pace_sec_per_km"] for s in by_id[1]["splits"]] == [290.0]
+    assert [s["avg_pace_sec_per_km"] for s in by_id[2]["splits"]] == [500.0]
+
+
+def test_build_plan_detail_caps_a_quality_day_on_rep_pace(dbp):
+    """The #242 shape through the assembly path: a tempo prescribing 7:48/mi and
+    4.5 mi, run 4.01 mi at 10:07/mi. Volume alone says done (89% of target, over
+    DONE_FRACTION); the reps say it was not a tempo.
+
+    Asserted against the same plan grading an obedient run, so what moves the
+    verdict is only the pace — and adherence moves with it, which is the
+    inflation the issue reports."""
+    target_pace = 468.0 / 1.609344            # 7:48/mi
+    plan = {
+        "plan_id": 1, "goal_type": "half", "race_date": "2026-09-14",
+        "workouts": [_wk(date="2026-07-01", type="tempo",
+                         target_distance_m=4.5 * 1609.344,
+                         target_pace_sec_per_km=target_pace,
+                         description="3x1mi @ 7:48/mi")],
+    }
+    with db.connect(dbp) as conn:
+        _insert_activity(
+            conn, 1, "2026-07-01", "running", 4.01 * 1609.344, 2540,
+            633.0 / 1.609344,                 # 10:33/mi overall — still a run
+            splits=[(1609.344, p / 1.609344) for p in (625.0, 607.0, 790.0)])
+    by_date = plans.load_activities_by_date("2026-07-01", "2026-07-31", db_path=dbp)
+
+    detail = plans.build_plan_detail(plan, frontier="2026-07-08",
+                                     activities_by_date=by_date)
+    assert detail["workouts"][0]["verdict"] == "missed"
+    assert detail["adherence_pct"] == 0
+
+    # Same prescription, reps at target: done, and adherence with it.
+    obedient = {"2026-07-01": [dict(by_date["2026-07-01"][0],
+                                    distance_meters=4.5 * 1609.344,
+                                    splits=[{"distance_meters": 1609.344,
+                                             "avg_pace_sec_per_km": target_pace}] * 3)]}
+    done = plans.build_plan_detail(plan, frontier="2026-07-08",
+                                   activities_by_date=obedient)
+    assert done["workouts"][0]["verdict"] == "done"
+    assert done["adherence_pct"] == 100
+
+
 def test_build_plan_status_inactive():
     assert plans.build_plan_status(None, frontier="2026-07-08",
                                    activities_by_date={}, today="2026-07-05") == {"active": False}

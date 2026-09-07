@@ -128,8 +128,17 @@ Then present the schedule to the athlete, revise if they push back, and only cal
   week-over-week mileage spike validates and stores fine. Judge the ramp yourself before proposing.
 - **`custom` goals get no `goal_distance_m`.** Without it, `predicted_finish_seconds` and
   `goal_gap` in `get_training_plan_progress` are permanently `null`.
-- **`target_pace_sec_per_km` is never graded.** Adherence grades distance (`easy`/`long`/`race`) or
-  duration (`tempo`/`interval`). A prescribed pace is coaching prose in numeric form.
+- **`target_pace_sec_per_km` IS graded on a quality day** (0.63.0). A `tempo`/`interval` day is
+  graded on volume — duration if you prescribe one, else distance — and the verdict is then CAPPED
+  by the pace of the day's fastest rep-sized split (≥300 m, the same split the report card grades
+  reps on). Within ~2.5% of the prescribed pace keeps `done`, out to ~9.2% caps at `partial`, past
+  that `missed`. The cap only ever lowers a verdict, and it abstains when the day has no prescribed
+  pace or the activity carries no splits. On `easy`/`long`/`race` a prescribed pace is still
+  coaching prose in numeric form.
+- **A `tempo`/`interval` day must carry `target_duration_sec` or `target_distance_m`.** A day with
+  neither is graded "by feel" — any running at all counts as `done` — which is how four quality
+  days on the active plan graded `done` for sessions run 2:19/mi off their prescription (#242).
+  Validation rejects the shape now.
 - **A `null`/`0` `target_distance_m` on a distance-type workout means "by feel"** — any qualifying
   activity that day grades `done`, none grades `missed`.
 

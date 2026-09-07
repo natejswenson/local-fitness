@@ -285,6 +285,55 @@ def test_riegel_confidence_degenerate_inputs_are_no_data(ratio):
     assert interpret.riegel_confidence(ratio) == "no data"
 
 
+# === fastest_rep_split =======================================================
+# Moved here from report_card at 0.63.0 so plans.classify_workout can select the
+# same rep the card grades (#242). The card's own cases stay in
+# tests/test_report_card.py against the re-exported names; these pin the
+# selection rule at its new home, including the raw-rows calling convention
+# plans.py uses.
+
+def _rows(*pairs):
+    """``(distance_m, pace_sec_per_km)`` pairs as raw ``activity_splits`` rows."""
+    return {"rows": [{"distance_meters": d, "avg_pace_sec_per_km": p}
+                     for d, p in pairs]}
+
+
+def test_fastest_rep_split_takes_the_fastest_rep_sized_split():
+    # 2 km warmup at 410, four 800m reps at 260, 2 km cooldown at 528.
+    labelled = _rows((2000.0, 410.0), *[(800.0, 260.0)] * 4, (2000.0, 528.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(260.0)
+    assert interpret.fastest_rep_split(labelled)["distance_meters"] == 800.0
+
+
+def test_fastest_rep_split_ignores_anything_under_the_floor():
+    """A 90 m trailing fragment posts an absurd pace and would win every time;
+    a 200 m recovery jog is not a rep either. Both sit under the floor."""
+    assert interpret.QUALITY_MIN_SPLIT_M == 300.0
+    labelled = _rows((1609.344, 400.0), (90.0, 120.0), (200.0, 250.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(400.0)
+
+
+def test_fastest_rep_split_boundary_is_inclusive():
+    """Exactly QUALITY_MIN_SPLIT_M is rep-sized; a hair under is not."""
+    assert interpret.fastest_rep_split_pace(
+        _rows((1000.0, 400.0), (300.0, 250.0))) == pytest.approx(250.0)
+    assert interpret.fastest_rep_split_pace(
+        _rows((1000.0, 400.0), (299.99, 250.0))) == pytest.approx(400.0)
+
+
+@pytest.mark.parametrize("labelled", [
+    {}, {"rows": None}, {"rows": []},
+    {"rows": [{"distance_meters": 800.0, "avg_pace_sec_per_km": None}]},
+    {"rows": [{"distance_meters": None, "avg_pace_sec_per_km": 260.0}]},
+])
+def test_fastest_rep_split_abstains_rather_than_raising(labelled):
+    """No splits, no paces, no distances — every degenerate shape returns None
+    so the caller abstains. plans.py grades the backfilled tail (no splits at
+    all) on volume alone through exactly this path."""
+    assert interpret.fastest_rep_split(labelled) is None
+    assert interpret.fastest_rep_split_pace(labelled) is None
+
+
 # === module hygiene =============================================================
 
 def test_interpret_imports_nothing_outside_stdlib():

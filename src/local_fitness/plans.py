@@ -112,6 +112,36 @@ _WALKING_SUBSTRINGS = ("walk", "hik")
 _DISTANCE_TYPES = frozenset({"easy", "long", "race"})
 _DURATION_TYPES = frozenset({"interval", "tempo"})
 
+#: Slow-side pace deviation from a quality day's prescribed rep pace, at which
+#: the verdict stops being ``done`` and then stops being ``partial``. Measured
+#: against the fastest rep-sized split, never the run average — see
+#: ``_fastest_rep_pace``.
+#:
+#: These are not free numbers: each is exactly a ``report_card`` star boundary
+#: under the plan yardstick, so the plan verdict and the card cannot say
+#: different things about the same session (#242). 0.0245 is 4.25 stars ("on
+#: target") and 0.092 is 2.50 ("off target"), both through
+#: ``stars_from_deviation(d, "pace", widen=PLAN_TIGHTEN)``.
+#: ``test_the_quality_pace_cuts_still_match_the_card_star_bands`` re-derives
+#: them from that curve, so a retune of one rubric that leaves the other stale
+#: fails the build rather than silently reopening the disagreement.
+#:
+#: The cap can reach ``missed``, deliberately. A tempo run executed at easy
+#: pace is an easy run, and the card's own read of one of them said "never hit
+#: interval intensity at all" while the plan called it done.
+QUALITY_PACE_DONE_DEVIATION = 0.0245
+QUALITY_PACE_PARTIAL_DEVIATION = 0.092
+
+#: Verdict severity, worst first — the ordering the pace cap takes a ``min()``
+#: over. Mirrors the report card's F-cap idiom: never print a verdict that
+#: contradicts the evidence beside it.
+_VERDICT_SEVERITY = ("missed", "partial", "done")
+
+#: Float slop on the pace cuts, the same idiom (and value) as
+#: ``report_card._EPS``: a deviation of exactly QUALITY_PACE_DONE_DEVIATION must
+#: land on the generous side of its boundary rather than a bit-width past it.
+_PACE_EPS = 1e-9
+
 #: Plausible bounds for a PRESCRIBED heart-rate ceiling (bpm). One definition
 #: shared by both write paths — `validate_plan_input` (plan creation) and
 #: `update_plan_workout` (a single-day edit). They disagreed until 0.47.0: the
@@ -294,6 +324,20 @@ def validate_plan_input(
             return (f"workout {i}: target_hr_max of {hr_max:.0f} bpm is outside "
                     f"the plausible {MIN_PRESCRIBED_HR:.0f}-{MAX_PRESCRIBED_HR:.0f} bpm range")
 
+        # A quality day states what it wants: a duration, or a distance, or
+        # both. Neither is the "by feel" branch of `classify_workout`, and
+        # before #242 that branch was the ONLY path every proposed quality day
+        # took — it graded `done` for any running at all. The grading side now
+        # reads distance, so this is hardening rather than the fix: it keeps
+        # by-feel reachable only on purpose. Scoped to the CREATE path, like
+        # every other rule here.
+        if wtype in _DURATION_TYPES and not (
+            w.get("target_duration_sec") or w.get("target_distance_m")
+        ):
+            return (f"workout {i}: a {wtype} day needs target_duration_sec or "
+                    f"target_distance_m — without one it is graded 'by feel' "
+                    f"and any running at all counts as done")
+
         desc = w.get("description")
         # Reject a non-string description with a clean indexed error rather than
         # letting .strip() raise a raw AttributeError on a dict/list.
@@ -313,16 +357,123 @@ def validate_plan_input(
 
 # --- Task 1.2: type-aware adherence ---------------------------------------
 
+def _ladder(frac: float, cfg: GradingConfig) -> str:
+    """The shared done|partial|missed ladder over an achieved fraction."""
+    if frac >= cfg.done_fraction:
+        return "done"
+    if frac >= cfg.partial_fraction:
+        return "partial"
+    return "missed"
+
+
+def _quality_volume_verdict(
+    workout: dict, day_activities: list[dict], ran_seconds: float,
+    cfg: GradingConfig,
+) -> str:
+    """How much of a quality day was done — duration if prescribed, else
+    distance, else "by feel".
+
+    ``target_duration_sec`` first because it is the target a rep session states
+    when it states one. The DISTANCE fallback is why this exists: the proposer
+    writes quality days with a distance and a pace and no duration, so before
+    #242 every one of them fell through to the by-feel branch and graded
+    ``done`` for any running whatsoever — a 2 km jog satisfied an 8 km interval
+    day. The by-feel branch survives for a day that genuinely prescribes
+    neither, which ``validate_plan_input`` now refuses to create.
+
+    ``ran_seconds`` is passed in rather than recomputed: the caller has already
+    paid for the ``_ran`` pass, and this function is on the plan hot path.
+    """
+    target = workout.get("target_duration_sec")
+    if target:
+        # Mirror the distance ladder: quality days grade done|partial|missed
+        # against the same cfg fractions. Before this the branch never consulted
+        # cfg.done_fraction — any running ≥ 40% of target graded a full "done",
+        # so a 25-min effort against a 60-min tempo scored 1.0 adherence.
+        return _ladder(ran_seconds / target, cfg)
+    distance_target = workout.get("target_distance_m")
+    if not distance_target:  # neither target → "by feel": any running counts
+        return "done"
+    # Run-only, like long/race: a walk labelled `treadmill_running` must not
+    # satisfy a rep session.
+    return _ladder(_running_distance(day_activities, cfg) / distance_target, cfg)
+
+
+def _fastest_rep_pace(
+    day_activities: list[dict], cfg: GradingConfig
+) -> float | None:
+    """Fastest rep-sized split pace (sec/km) across the day's RUNNING
+    activities, or ``None`` when the day carries no rep-sized split.
+
+    The selector is ``interpret.fastest_rep_split_pace`` — the same one the
+    report card grades a quality day on — so the two surfaces cannot pick
+    different reps out of one session. Raw ``activity_splits`` rows carry the
+    two columns it reads, so they are wrapped rather than labelled.
+
+    Returns ``None`` before touching ``_ran`` when nothing on the day has
+    splits at all. That is the ordinary case on the backfilled tail (the
+    historical import never wrote splits; the daily sync always does), and the
+    early return keeps a splitless day costing exactly what it did before.
+    """
+    if not any(a.get("splits") for a in day_activities):
+        return None
+    paces = [
+        p for p in (
+            interpret.fastest_rep_split_pace({"rows": a.get("splits")})
+            for a in day_activities if _ran(a, cfg)
+        ) if p
+    ]
+    return min(paces) if paces else None
+
+
+def _cap_on_rep_pace(
+    workout: dict, day_activities: list[dict], verdict: str, cfg: GradingConfig,
+) -> str:
+    """Lower ``verdict`` to what the day's fastest rep pace earns. Never raise
+    it — a session that skipped half the work is not rescued by a fast rep.
+
+    Volume alone cannot grade a quality day: all four of the mis-graded days in
+    #242 ran 84-119% of their prescribed distance, so the distance ladder above
+    leaves every one of them ``done``. The pace is the whole finding — a tempo
+    prescribing 7:48/mi whose fastest mile was 10:07 is not a tempo that
+    happened.
+
+    ABSTAINS (returns ``verdict`` untouched) when the day prescribes no pace or
+    carries no rep-sized split, exactly as the card's quality-pace metric
+    abstains rather than failing a session it cannot measure.
+    """
+    target_pace = workout.get("target_pace_sec_per_km")
+    if not target_pace:
+        return verdict
+    actual_pace = _fastest_rep_pace(day_activities, cfg)
+    if not actual_pace:
+        return verdict
+    # Slow-side only, like report_card.pace_deviation's quality branch: beating
+    # the rep target is compliance, not a miss.
+    slow = max(0.0, (actual_pace - target_pace) / target_pace)
+    if slow <= QUALITY_PACE_DONE_DEVIATION + _PACE_EPS:
+        capped = "done"
+    elif slow <= QUALITY_PACE_PARTIAL_DEVIATION + _PACE_EPS:
+        capped = "partial"
+    else:
+        capped = "missed"
+    return min(verdict, capped, key=_VERDICT_SEVERITY.index)
+
+
 def classify_workout(
     workout: dict, day_activities: list[dict], cfg: GradingConfig = _DEFAULT_GRADING_CONFIG
 ) -> str:
     """Grade one prescribed workout against that day's activities.
 
     Returns ``done`` | ``partial`` | ``missed`` | ``compliant`` (rest days).
-    Distance is used only for the types where distance is the target; quality
-    sessions grade on duration, cross-training on any non-running activity.
-    ``cfg`` carries the user's tunable thresholds and walk-counting toggle; the
-    default reproduces the historical hardcoded behavior.
+    Distance is used only for the types where distance is the target;
+    cross-training counts any non-running activity. A quality day
+    (tempo/interval) grades on VOLUME — duration if prescribed, else distance —
+    and is then CAPPED by the pace of its fastest rep-sized split, so a session
+    run at easy pace can no longer report ``done`` for having covered the
+    ground (#242). ``cfg`` carries the user's tunable thresholds and
+    walk-counting toggle; the default reproduces the historical hardcoded
+    behavior.
     """
     wtype = workout.get("type")
 
@@ -351,19 +502,8 @@ def classify_workout(
         actual = _running_duration(day_activities, cfg)
         if actual <= 0:
             return "missed"
-        target = workout.get("target_duration_sec")
-        if not target:  # null/0 target → "by feel": any running duration counts
-            return "done"
-        # Mirror the distance ladder: quality days grade done|partial|missed
-        # against the same cfg fractions. Before this the branch never consulted
-        # cfg.done_fraction — any running ≥ 40% of target graded a full "done",
-        # so a 25-min effort against a 60-min tempo scored 1.0 adherence.
-        frac = actual / target
-        if frac >= cfg.done_fraction:
-            return "done"
-        if frac >= cfg.partial_fraction:
-            return "partial"
-        return "missed"
+        verdict = _quality_volume_verdict(workout, day_activities, actual, cfg)
+        return _cap_on_rep_pace(workout, day_activities, verdict, cfg)
 
     if wtype == "cross":
         has_cross = any(
@@ -1044,19 +1184,43 @@ def load_activities_by_date(
     # on measured pace, and without this column every row silently falls back
     # to the (wrong) activity_type label — which is the bug the gate exists to
     # fix. Shipping the gate without this column made it a no-op.
+    #
+    # `splits` is required for the same reason and was wired here rather than in
+    # the six callers on the strength of that precedent (#242): a quality day's
+    # pace cap reads the fastest rep-sized split, and a caller that forgot to
+    # fetch them would silently grade every tempo day on volume alone. Every
+    # caller of this function feeds grading, so none of them wants the old
+    # shape; the key is additive, so none of them breaks either.
     sql = (
-        "SELECT date, activity_type, distance_meters, duration_seconds, "
-        "avg_pace_sec_per_km "
+        "SELECT activity_id, date, activity_type, distance_meters, "
+        "duration_seconds, avg_pace_sec_per_km "
         "FROM activities WHERE date >= ? AND date <= ? ORDER BY date"
     )
-    out: dict[str, list[dict]] = {}
+    splits_sql = (
+        "SELECT s.activity_id, s.distance_meters, s.avg_pace_sec_per_km "
+        "FROM activity_splits s JOIN activities a USING (activity_id) "
+        "WHERE a.date >= ? AND a.date <= ? ORDER BY s.activity_id, s.split_index"
+    )
+
+    def _fetch(c):
+        return (c.execute(sql, (start, end)).fetchall(),
+                c.execute(splits_sql, (start, end)).fetchall())
+
     if conn is not None:
-        rows = conn.execute(sql, (start, end)).fetchall()
+        rows, split_rows = _fetch(conn)
     else:
         with db.connect(db_path) as c:
-            rows = c.execute(sql, (start, end)).fetchall()
+            rows, split_rows = _fetch(c)
+
+    by_activity: dict[int, list[dict]] = {}
+    for s in split_rows:
+        by_activity.setdefault(s["activity_id"], []).append(dict(s))
+
+    out: dict[str, list[dict]] = {}
     for r in rows:
-        out.setdefault(r["date"], []).append(dict(r))
+        a = dict(r)
+        a["splits"] = by_activity.get(a["activity_id"], [])
+        out.setdefault(r["date"], []).append(a)
     return out
 
 
