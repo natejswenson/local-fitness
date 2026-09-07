@@ -17,13 +17,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   | Date | Prescribed | Fastest rep split | Was | Now |
   |---|---|---|---|---|
   | 2026-09-01 | tempo 3x1mi @ 7:48/mi | 10:07/mi | `done` | `missed` |
-  | 2026-08-04 | interval 5x600m @ 6:58/mi | 8:04/mi | `done` | `missed` |
+  | 2026-08-04 | interval 5x600m @ 6:58/mi | 8:04/mi | `done` | `partial` |
   | 2026-07-28 | tempo 20min @ 8:03/mi | 8:40/mi | `done` | `partial` |
   | 2026-07-21 | interval 6x400m @ 6:58/mi | 9:12/mi | `done` | `missed` |
 
-  Session adherence on that plan corrects from **71% to 66%** (measured
-  through `build_plan_detail` on the live plan, frontier 2026-09-06). This was
-  not a bug caught in review: the 2026-09-01 brief wrote "tempo hit as prescribed …
+  (2026-08-04's "Now" was revised from `missed` to `partial` during round-1
+  review — see the `QUALITY_PACE_PARTIAL_DEVIATION` note below;
+  `QUALITY_PACE_DONE_DEVIATION` is unchanged and every day here still ran too
+  far off pace to reach `done`.) Session adherence on that plan corrects
+  **downward from 71%** (measured through `build_plan_detail` on the live
+  plan, frontier 2026-09-06) — the exact corrected figure moved again with
+  the round-1 pace-cut recalibration, so treat the originally-measured 66%
+  as no longer current pending a fresh live recompute. This was not a bug
+  caught in review: the 2026-09-01 brief wrote "tempo hit as prescribed …
   first clean execution after a week of easy-day overshoots", `reflect` put it
   in `coach_journal`, and the 2026-09-05 brief cited it back as "since the
   Sep 1 clean tempo". The report card had graded the same session 1.00 stars
@@ -42,11 +48,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before it touches `_ran` when nothing that day carries splits at all, so the
   backfilled tail (which has none) grades exactly as it did.
 
-  `QUALITY_PACE_DONE_DEVIATION` (0.0245) and `QUALITY_PACE_PARTIAL_DEVIATION`
-  (0.092) are not free numbers: they are the report card's "on target" (4.25
-  stars) and "off target" (2.50) boundaries under `PLAN_TIGHTEN`, and
-  `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives them
-  from that curve, so a retune of one rubric cannot leave the other stale.
+  `QUALITY_PACE_DONE_DEVIATION` (0.0245) is not a free number: it is the report
+  card's "on target" (4.25 stars) boundary under `PLAN_TIGHTEN`, and
+  `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives it
+  from that curve, so a retune of the card's rubric cannot leave this one
+  stale.
+
+  **`QUALITY_PACE_PARTIAL_DEVIATION` was revised from 0.092 to 0.212 during
+  round-1 review** (f-cb50f53f, f-1c0a5538). It shipped as the card's "off
+  target" interior knot (2.50 stars) and, on the live plan, made `done`
+  unreachable for every quality day (6 missed / 1 partial / 0 done across 7
+  sessions) — a punitive-skew signature with no plan-side gate to catch it,
+  because nothing in the live data is manually lapped: every "rep" split is a
+  fixed-distance auto-lap blending reps with jog recovery, so even a
+  flawlessly-executed short-rep session reads 15-19% slow from that blending
+  alone. 0.212 is instead the exact deviation
+  (`widen * STAR_SCALE["pace"] + STAR_NOISE["pace"]` under `PLAN_TIGHTEN`) at
+  which the card's own curve saturates to `STAR_FLOOR` — past it the card has
+  no more resolution to give either, so a plan verdict that also stops
+  distinguishing partial from missed there cannot disagree with the card by
+  construction, even though it is no longer one of the curve's named knots.
+  `fastest_rep_split` also now drops a short, fast, one-off fragment sitting
+  beside a lap size that repeats (`interpret._drop_outlier_fragments`) — a
+  closing kick tacked onto a 3x1mi tempo whose real reps are mile-length
+  auto-laps was otherwise winning on pace alone (f-8a26a574).
 
 ### Changed
 - `QUALITY_MIN_SPLIT_M`, `fastest_rep_split` and `fastest_rep_split_pace` moved
@@ -55,12 +80,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   selector both surfaces must share belongs in the stdlib-only pure module both
   may import — the precedent `is_running_effort` set. No behaviour change; two
   selection rules would be exactly how the plan verdict and the card come to
-  disagree again.
+  disagree again. (`report_card.py`'s module docstring and CLAUDE.md's
+  matching bullet are now scoped to say "in this module" rather than "no other
+  grade" — f-c25a7c98.)
 - `validate_plan_input` rejects a `tempo`/`interval` workout carrying neither
   `target_duration_sec` nor `target_distance_m`, so the by-feel branch is only
   reachable on purpose (#242). Hardening, **not** the fix: every offending day
   already carried a distance, so validation alone would have prevented none of
-  them. Scoped to the create path.
+  them. **Round-1 review (f-a9f42ce8) extended the same check to
+  `update_plan_workout` / `update_plan_workouts`**, checked on the RESOLVED
+  row after the write (a rest day's targets are NULL, so flipping one straight
+  to a quality type with no target reproduced the exact by-feel shape through
+  an edit); a violation on the batch path rolls back the whole batch.
+- `load_activities_by_date` accepts an optional `quality_dates` set narrowing
+  its `activity_splits` fetch to the dates that could actually reach the pace
+  cap, via the new `quality_pace_dates(workouts)` helper — wired into all six
+  callers (round-1 review, f-f56ee4d1). The shared perf fixture is
+  deliberately forbidden from carrying `activity_splits` rows, so an
+  unscoped fetch cost nothing the benchmark could measure while still
+  running unconditionally on every perf-gated call; the narrowing makes that
+  cost genuinely near-zero rather than merely unmeasured, without touching
+  the fixture-separation rule.
 
 ### Added
 - `tests/evals/plan_verdicts.py` + `tests/evals/test_plan_verdicts.py` — the
@@ -69,7 +109,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session *deserves* rather than that the grader is self-consistent.
   `tests/test_plans.py`'s cases all passed while this shipped, because not one
   of them could fail when the answer was wrong. A verdict change needs a
-  scenario here.
+  scenario here. **`interval_autolapped_reps_hit` was added during round-1
+  review** (f-1c0a5538): every existing manually-lapped scenario used a
+  lapping style that does not occur in the live database, so nothing covered
+  a genuinely well-run session whose only available splits are full-lap
+  blends of reps and jog recovery.
 
 ## [0.62.0] - 2026-09-05
 

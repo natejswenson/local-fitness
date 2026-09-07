@@ -316,6 +316,57 @@ def is_running_effort(pace_sec_per_km: float | None) -> bool | None:
 # plan verdict and a report card can disagree about the same session (#242).
 QUALITY_MIN_SPLIT_M = 300.0
 
+#: Bucket width (metres) for clustering same-sized laps when looking for the
+#: day's DOMINANT split size — see ``_drop_outlier_fragments``. Wide enough to
+#: absorb ordinary GPS variance between nominally-identical auto-laps (a
+#: "mile" split from a watch is rarely exactly 1609.34 m twice), narrow enough
+#: that a 400 m rep and an 800 m rep never land in the same bucket.
+_SIZE_CLUSTER_BUCKET_M = 100.0
+
+#: A lone rep-sized candidate must be at least this fraction of the day's
+#: DOMINANT (repeated >= 2x) lap size to stay eligible. See
+#: ``_drop_outlier_fragments``.
+_MIN_FRACTION_OF_DOMINANT_SPLIT = 0.6
+
+
+def _drop_outlier_fragments(candidates: list[dict]) -> list[dict]:
+    """Remove a short, one-off fragment sitting alongside a REPEATED lap size —
+    e.g. a fast closing kick tacked onto a 3x1mi tempo whose real reps are
+    mile-length auto-laps (#242, f-8a26a574).
+
+    An auto-lap GPS watch laps on a fixed distance regardless of the
+    prescribed workout, so nothing here can see "this session's reps are 1
+    mile" directly. The lap size that REPEATS is the best available proxy for
+    the unit the athlete was actually running, the same way a warmup/cooldown
+    is identified today by being the odd one out rather than by any label.
+
+    Deliberately keyed on the HIGHEST-COUNT bucket, not the largest one: a
+    3x1mi tempo's four 1609 m laps (a real rep every time) must outrank a
+    single 400 m closing kick, and a manually-lapped session's four 800 m reps
+    must outrank a single 1600 m warmup lap — in both cases the smaller
+    candidate is exactly the one this function must NOT drop, and it is the
+    one that repeats.
+
+    Deliberately does nothing when no lap size repeats at least twice — a
+    single-rep day, or one with no consistent lap size, has no dominant unit
+    to compare against, and this must not invent one. Never returns an empty
+    list: the dominant cluster's own members always clear the floor they
+    define, so at minimum they survive.
+    """
+    if len(candidates) < 2:
+        return candidates
+    buckets: dict[int, list[dict]] = {}
+    for r in candidates:
+        key = round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)
+        buckets.setdefault(key, []).append(r)
+    repeated = [b for b in buckets.values() if len(b) >= 2]
+    if not repeated:
+        return candidates
+    dominant = max(repeated, key=lambda b: (len(b), b[0]["distance_meters"]))
+    floor = dominant[0]["distance_meters"] * _MIN_FRACTION_OF_DOMINANT_SPLIT
+    kept = [r for r in candidates if r["distance_meters"] >= floor]
+    return kept or candidates
+
 
 def fastest_rep_split(labelled: dict) -> dict | None:
     """The fastest rep-sized split, or ``None`` when there isn't one.
@@ -330,22 +381,32 @@ def fastest_rep_split(labelled: dict) -> dict | None:
     The distance floor still solves what the partial filter was there for: a
     90-metre trailing fragment can post an absurdly fast pace and would win
     every time. Anything long enough to be a rep is a fair candidate, and a
-    slower warmup simply loses ``min()``.
+    slower warmup simply loses ``min()`` — UNLESS the fast candidate is itself
+    a one-off fragment beside a lap size that repeats, which ``min()`` cannot
+    see and ``_drop_outlier_fragments`` exists to catch.
 
     ``labelled`` is any mapping with a ``rows`` list — ``report_card``'s
     ``label_splits`` output, or raw ``activity_splits`` rows wrapped as
     ``{"rows": splits}``: only ``distance_meters`` and ``avg_pace_sec_per_km``
     are read, and both are columns of the table.
 
-    This is the one place a *grade* is allowed to read splits — see the quality
-    branch of ``report_card.build_card`` and the quality arm of
-    ``plans.classify_workout`` for why, and ``report_card``'s module docstring
-    for the rule it is an exception to.
+    This is the ONE SELECTOR both grades that are allowed to read splits share
+    — the quality branch of ``report_card.build_card`` and the quality arm of
+    ``plans.classify_workout`` (#242, which added the second one; before it
+    this really was the one place). Sharing it is the point: two rep-selection
+    rules is exactly how a plan verdict and a report card come to disagree
+    about the same session again. See ``report_card``'s module docstring for
+    the rule report_card's own splits reads are exceptions to, and
+    ``plans.py``'s docstring for why a duration-type grade needed the same
+    escape hatch.
     """
     candidates = [r for r in (labelled.get("rows") or [])
                   if (r.get("distance_meters") or 0.0) >= QUALITY_MIN_SPLIT_M
                   and r.get("avg_pace_sec_per_km")]
-    return min(candidates, key=lambda r: r["avg_pace_sec_per_km"]) if candidates else None
+    if not candidates:
+        return None
+    candidates = _drop_outlier_fragments(candidates)
+    return min(candidates, key=lambda r: r["avg_pace_sec_per_km"])
 
 
 def fastest_rep_split_pace(labelled: dict) -> float | None:

@@ -429,3 +429,87 @@ def test_update_active_workout_only_touches_active_plan(dbp):
         d = conn.execute("SELECT description FROM plan_workouts WHERE plan_id=? AND date='2026-07-01'", (pid_draft,)).fetchone()
     assert a["description"] == "active edit"
     assert d["description"] == "draft day"  # the draft's day is left alone
+
+
+# --- #242 f-a9f42ce8: the write paths get the same quality-target rule -------
+# as `validate_plan_input` (the create path). Without this, the two-call
+# "move the long run" idiom (rest the old day, prescribe the new one) can
+# reproduce the original #242 bug through an edit: a rest day's targets are
+# NULL, so flipping it to `tempo`/`interval` with no target reproduces the
+# exact by-feel shape the create-path check exists to refuse.
+
+def test_update_active_workout_rejects_a_would_be_target_less_quality_day(dbp):
+    _active(dbp)  # 2026-07-01 is `easy`, target_distance_m=6000.0
+    with pytest.raises(ValueError, match="needs target_duration_sec or target_distance_m"):
+        # Flip an easy day to tempo without setting a duration or a distance —
+        # the row's existing target_distance_m came from `easy` grading, but
+        # the write path must still refuse it once the type moves to tempo,
+        # so the merged row is what gets judged, not the field alone.
+        plans.update_active_workout(
+            "2026-07-01",
+            {"type": "tempo", "target_distance_m": None, "description": "tempo, feel it out"},
+            db_path=dbp,
+        )
+    with db.connect(dbp) as conn:  # the whole write rolled back, not just the type
+        row = conn.execute(
+            "SELECT type, target_distance_m FROM plan_workouts WHERE date='2026-07-01'"
+        ).fetchone()
+    assert row["type"] == "easy" and row["target_distance_m"] == 6000.0
+
+
+def test_update_active_workout_rejects_the_rest_to_tempo_represcription_shape(dbp):
+    """The exact f-a9f42ce8 failure scenario: a rest day (targets NULL via
+    `apply_rest_semantics`) re-prescribed straight to `tempo` with no target."""
+    _active(dbp)
+    plans.update_active_workout("2026-07-01", {"type": "rest"}, db_path=dbp)
+    with pytest.raises(ValueError, match="needs target_duration_sec or target_distance_m"):
+        plans.update_active_workout(
+            "2026-07-01", {"type": "tempo", "description": "3x1mi"}, db_path=dbp)
+
+
+def test_update_active_workout_allows_a_quality_day_with_an_existing_target(dbp):
+    """A partial edit (description only) on an existing quality day must not
+    be judged against the FIELDS passed — the row already carries a target."""
+    _active(dbp, workouts=[
+        _wk(date="2026-07-01", type="tempo", target_distance_m=None,
+            target_duration_sec=2400, description="tempo 40min"),
+        _wk(date="2026-07-02", type="long", target_distance_m=12000.0),
+    ])
+    row = plans.update_active_workout(
+        "2026-07-01", {"description": "tempo 40min, moved up"}, db_path=dbp)
+    assert row["description"] == "tempo 40min, moved up"
+    assert row["target_duration_sec"] == 2400
+
+
+def test_update_active_workouts_rejects_a_target_less_quality_day(dbp):
+    _active(dbp)
+    with pytest.raises(ValueError, match=r"update 1 \(2026-07-02\): .*needs target_duration_sec"):
+        plans.update_active_workouts(
+            [
+                ("2026-07-01", 1, {"description": "still easy"}),
+                ("2026-07-02", 1, {"type": "interval", "target_distance_m": None,
+                                    "description": "reps, no target"}),
+            ],
+            db_path=dbp,
+        )
+
+
+def test_update_active_workouts_rolls_back_the_whole_batch_on_a_target_less_day(dbp):
+    """All-or-nothing: the FIRST entry's write must not survive a LATER
+    entry's rejection — same contract the existence pre-flight already gets,
+    now proven for a check that can only run after the merge."""
+    _active(dbp)
+    with pytest.raises(ValueError, match="needs target_duration_sec or target_distance_m"):
+        plans.update_active_workouts(
+            [
+                ("2026-07-01", 1, {"description": "already-applied edit"}),
+                ("2026-07-02", 1, {"type": "tempo", "target_distance_m": None,
+                                    "description": "reps, no target"}),
+            ],
+            db_path=dbp,
+        )
+    with db.connect(dbp) as conn:
+        first = conn.execute(
+            "SELECT description FROM plan_workouts WHERE date='2026-07-01'"
+        ).fetchone()
+    assert first["description"] == "6km easy"  # unchanged — the batch rolled back

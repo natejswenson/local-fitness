@@ -65,6 +65,7 @@ SCENARIOS = (
     "tempo_hit",
     "interval_reps_hit",
     "interval_reps_missed",
+    "interval_autolapped_reps_hit",
     "tempo_short_and_slow",
     "tempo_no_splits",
     "quality_walked",
@@ -112,6 +113,21 @@ EXPECTED_VERDICTS: dict[str, dict] = {
                "mile slow. Pinned beside interval_reps_hit so the rep selector "
                "is proven to discriminate rather than to always find something "
                "fast enough somewhere in a lapped workout.",
+    },
+    "interval_autolapped_reps_hit": {
+        "verdict": "partial",
+        "why": "#242 f-8a26a574 / f-1c0a5538: the real database has NO manual "
+               "laps — `interval_reps_hit`'s 800 m reps do not occur in live "
+               "data, where a GPS watch auto-laps at a fixed distance "
+               "regardless of the prescribed reps. Six genuinely well-run "
+               "400/600m reps with short jog recoveries, seen only through "
+               "six full-mile auto-laps, average ~8:02/mi against a 6:58/mi "
+               "rep target (15.3% slow) purely from the recovery jogs each "
+               "lap blends in — arithmetic, not effort. `missed` was the "
+               "shipped behavior at the original 9.2% partial cut and would "
+               "have re-punished the exact execution #242 asked to stop "
+               "punishing; `done` is not achievable through a blended split "
+               "and must not be faked by loosening the done cut instead.",
     },
     "tempo_short_and_slow": {
         "verdict": "missed",
@@ -181,10 +197,23 @@ _GRADED: dict[str, tuple[dict, dict, list[tuple[float, float]]]] = {
         _INTERVAL_PLAN, _run(6 * MILE_M, 3852, 642.0),
         [(2 * MILE_M, 660.0)] + [(800.0, 418.0)] * 4 + [(2 * MILE_M, 850.0)],
     ),
-    # ...and the same session with the reps a minute per mile slow.
+    # ...and the same session with the reps 26.3% off pace — comfortably past
+    # QUALITY_PACE_PARTIAL_DEVIATION (0.21, widened from 0.092 by #242
+    # f-cb50f53f/f-1c0a5538) so this stays unambiguously `missed` rather than
+    # sitting near the boundary the widened cut moved.
     "interval_reps_missed": (
-        _INTERVAL_PLAN, _run(6 * MILE_M, 4032, 672.0),
-        [(2 * MILE_M, 660.0)] + [(800.0, 478.0)] * 4 + [(2 * MILE_M, 850.0)],
+        _INTERVAL_PLAN, _run(6 * MILE_M, 4406, 734.0),
+        [(2 * MILE_M, 660.0)] + [(800.0, 528.0)] * 4 + [(2 * MILE_M, 850.0)],
+    ),
+    # #242 f-1c0a5538/f-8a26a574: no live activity is manually lapped — every
+    # split IS a fixed-distance auto-lap. Six genuinely well-executed reps
+    # (short enough that jog recovery is baked into every mile-length lap)
+    # average 8:02/mi (482 s/mi) against the 6:58/mi rep target purely from
+    # that blending — 15.3% slow, inside the old 9.2% "missed" cut and the
+    # scenario that cut had no eval covering.
+    "interval_autolapped_reps_hit": (
+        _INTERVAL_PLAN, _run(6 * MILE_M, 2892, 482.0),
+        _mile_splits(482.0, 482.0, 482.0, 482.0, 482.0, 482.0),
     ),
     # 2.2 mi of 4.5, and slow with it.
     "tempo_short_and_slow": (

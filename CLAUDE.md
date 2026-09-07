@@ -543,36 +543,79 @@ These are settled — don't redesign without a reason.
   with a distance and a pace and no duration — so the null-duration "by feel"
   branch was the ONLY path every quality day took, returning `done` for any
   running whatsoever. Measured on the live plan: four sessions mis-graded,
-  including a 3x1mi tempo prescribing 7:48/mi executed at 10:07/mi, and
-  adherence inflated 66 → 71. It is not a caught-in-review bug — the
-  2026-09-01 brief wrote "tempo hit as prescribed" and `reflect` put it in
-  `coach_journal`, where a later brief cited it back. **The distance fallback
-  is not the fix and shipping only it is a no-op**: all four days ran 84-119%
-  of their prescribed distance, i.e. above `DONE_FRACTION`. The pace cap is the
-  fix. `_cap_on_rep_pace` takes `min(volume_verdict, pace_verdict)` over
-  `missed < partial < done` (the report card's F-cap idiom — never print a
-  verdict the evidence beside it contradicts), and **abstains** with no
-  prescribed pace or no rep-sized split, returning before it touches `_ran` so
-  a splitless day costs exactly what it did before (the backfilled tail carries
-  no splits; the daily sync always does). `QUALITY_PACE_DONE_DEVIATION`
-  (0.0245) and `QUALITY_PACE_PARTIAL_DEVIATION` (0.092) are **not free
-  numbers** — they are the card's "on target" (4.25 stars) and "off target"
-  (2.50) boundaries under `PLAN_TIGHTEN`, and
-  `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives them
-  from that curve so a retune of one rubric can't leave the other stale.
-  `QUALITY_MIN_SPLIT_M`/`fastest_rep_split` moved to `interpret.py` for this —
-  `report_card` imports `plans`, so the shared selector goes in the pure module
-  both may import, exactly as `is_running_effort` did. `load_activities_by_date`
-  attaches `splits` in the LOADER, not in its six callers, for the reason its
-  own comment gives about `avg_pace_sec_per_km`: a gate a caller can forget to
-  wire ships as a silent no-op. `validate_plan_input` now refuses a quality day
-  carrying neither target, so by-feel is only reachable on purpose — hardening,
-  not the fix, since every offending day already had a distance.
+  including a 3x1mi tempo prescribing 7:48/mi executed at 10:07/mi. It is not a
+  caught-in-review bug — the 2026-09-01 brief wrote "tempo hit as prescribed"
+  and `reflect` put it in `coach_journal`, where a later brief cited it back.
+  **The distance fallback is not the fix and shipping only it is a no-op**: all
+  four days ran 84-119% of their prescribed distance, i.e. above
+  `DONE_FRACTION`. The pace cap is the fix. `_cap_on_rep_pace` takes
+  `min(volume_verdict, pace_verdict)` over `missed < partial < done` (the
+  report card's F-cap idiom — never print a verdict the evidence beside it
+  contradicts), and **abstains** with no prescribed pace or no rep-sized split,
+  returning before it touches `_ran` so a splitless day costs exactly what it
+  did before (the backfilled tail carries no splits; the daily sync always
+  does). `QUALITY_MIN_SPLIT_M`/`fastest_rep_split` moved to `interpret.py` for
+  this — `report_card` imports `plans`, so the shared selector goes in the pure
+  module both may import, exactly as `is_running_effort` did (see the "Splits
+  are presentation-only" bullet above: `report_card`'s "no other grade reads
+  `activity_splits`" is now scoped to that module, since this one shares the
+  selector, not the module). `load_activities_by_date` attaches `splits` in
+  the LOADER, not in its six callers, for the reason its own comment gives
+  about `avg_pace_sec_per_km`: a gate a caller can forget to wire ships as a
+  silent no-op — and `quality_pace_dates(workouts)` narrows the JOIN to only
+  the dates a duration-type day with a prescribed pace can actually reach the
+  splits-reading branch on, since the shared perf fixture is (deliberately)
+  forbidden from carrying `activity_splits` rows and an unscoped fetch on the
+  full window would run unconditionally on every perf-gated call for a table
+  the fixture can never populate.
+
+  **Nothing in the live data is manually lapped** (round-1 review,
+  f-1c0a5538/f-8a26a574) — every "rep" split a GPS watch reports is really a
+  fixed-distance auto-lap that blends one or more reps with their jog
+  recovery, so a flawlessly-executed short-rep session still reads 15-19% slow
+  against the rep target from that blending alone. `QUALITY_PACE_PARTIAL_DEVIATION`
+  therefore is **not** the card's "off target" interior knot (0.092, 2.50
+  stars) any more — at that cut, a real live plan's quality days graded 6
+  missed / 1 partial / 0 done across 7 sessions, a punitive-skew signature
+  with no plan-side gate to catch it. It is now the exact deviation
+  (`widen * STAR_SCALE["pace"] + STAR_NOISE["pace"]` under `PLAN_TIGHTEN`,
+  0.212) at which `stars_from_deviation` SATURATES to `STAR_FLOOR` — past that
+  point the card has no more resolution to give either, so a plan that also
+  stops distinguishing partial from missed there cannot disagree with the card
+  by construction, even though it is no longer one of the curve's named knots.
+  `QUALITY_PACE_DONE_DEVIATION` (0.0245, the "on target" knot) is untouched —
+  reaching `done` still requires genuinely rep-paced execution, which a
+  blended auto-lap split structurally cannot show.
+  `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives both
+  cuts from the card's curve so a retune of one rubric can't leave the other
+  stale. `fastest_rep_split` also drops a short, fast, one-off fragment sitting
+  beside a lap size that repeats (`_drop_outlier_fragments`) — a closing kick
+  tacked onto a 3x1mi tempo whose real reps are mile-length auto-laps would
+  otherwise win on pace alone and certify a session whose every prescribed
+  mile ran minutes off target.
+
+  **The by-feel-on-purpose rule is enforced on every write path, not just
+  creation** (round-1 review, f-a9f42ce8). `validate_plan_input` refuses a
+  quality day carrying neither target at CREATE time, but `update_plan_workout`
+  / `update_plan_workouts` can re-prescribe a day too — most commonly flipping
+  a `rest` day (targets NULL via `apply_rest_semantics`) straight to
+  `tempo`/`interval` with no target, reproducing the exact by-feel shape
+  through an edit. `plans._quality_target_error` is the one definition of the
+  rule, checked on the RESOLVED row (existing columns merged with what the
+  call changed) by all three write paths; on the batch path a violation rolls
+  back the WHOLE batch, including entries the call already wrote, via the same
+  `db.connect()` exception-rolls-back contract every other batch failure uses.
+
   **`tests/evals/plan_verdicts.py` is the plan-side sibling of the report-card
   verdict evals**, and the same rule applies: a verdict change needs a scenario
   there, not just a unit test. `tests/test_plans.py`'s 100+ cases all passed
   while this shipped, because they assert the grader computes what it says it
   computes and none of them could fail when the ANSWER was wrong.
+  `interval_autolapped_reps_hit` is the scenario that would have caught the
+  auto-lap-blending gap: `interval_reps_hit` proved the selector reads real
+  reps over a manually-lapped run's average, but every activity in the live
+  database is auto-lapped, a lapping style no scenario exercised until this
+  one.
 - **Analysis tools carry deterministic interpretation, not just raw numbers**
   (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
   SDK) housing every classifier the brief path already computed in tested
@@ -1292,8 +1335,11 @@ These are settled — don't redesign without a reason.
     runs BEFORE widening, since widening is what would otherwise drag the whole
     walking corpus into a thin running pool. `reference_line` states the
     exclusion count on the card — it is invisible in the numbers otherwise.
-  - **Splits are presentation-only, with exactly THREE documented exceptions** —
-    no other grade reads `activity_splits`. Only ~97 of 757 activities have them
+  - **Splits are presentation-only IN `report_card.py`, with exactly THREE
+    documented exceptions there** (a FOURTH exists in `plans.py` — see the
+    "quality day is graded on volume, then capped on rep pace" bullet below;
+    #242, f-c25a7c98 caught this bullet claiming "no other grade" after that
+    fourth one shipped). Only ~97 of 757 activities have them
     (daily-sync ingest writes them, backfill never does), so a splits-dependent
     grade would be unavailable on ~87% of history and mean different things on
     different rows. **Every exception must handle absence explicitly**, and they

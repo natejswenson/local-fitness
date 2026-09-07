@@ -131,6 +131,29 @@ def test_rep_pace_is_read_from_the_reps_not_the_run_average(day):
     assert day("interval_reps_missed")["verdict"] == "missed"
 
 
+def test_autolapped_reps_are_not_punished_for_being_autolapped(day):
+    """#242 f-1c0a5538: nothing in the live database is manually lapped, so
+    `fastest_rep_split` reads the fastest AUTO-LAP split as if it were a rep.
+    A genuinely well-executed short-rep session (jog recoveries baked into
+    every full-mile lap) reads 15.3% slow against the rep target from pure
+    lap-blending arithmetic, not effort — the fix must not read that as
+    `missed`, which is what shipped at the original 9.2% partial cut."""
+    hit = day("interval_reps_hit")                     # manually lapped, on pace
+    autolapped = day("interval_autolapped_reps_hit")    # auto-lapped, on pace
+
+    assert hit["target_pace_sec_per_km"] == autolapped["target_pace_sec_per_km"]
+    slow = (autolapped["actual_pace_sec_per_km"] - autolapped["target_pace_sec_per_km"]) \
+        / autolapped["target_pace_sec_per_km"]
+    assert slow == pytest.approx(0.1531, abs=0.001)
+    assert plans.QUALITY_PACE_DONE_DEVIATION < slow <= plans.QUALITY_PACE_PARTIAL_DEVIATION
+
+    assert autolapped["verdict"] == "partial"
+    # Discrimination survives: a manually-lapped session at the SAME
+    # prescribed pace still reads `done`, because its splits are real reps,
+    # not a lap blended with jog recovery.
+    assert hit["verdict"] == "done"
+
+
 def test_the_cap_abstains_on_the_backfilled_tail(day):
     """Splits cover the daily-sync era and nothing before it. A cap that failed
     a session it cannot measure would rewrite years of verdicts on the strength

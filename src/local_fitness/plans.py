@@ -120,8 +120,7 @@ _DURATION_TYPES = frozenset({"interval", "tempo"})
 #: These are not free numbers: each is exactly a ``report_card`` star boundary
 #: under the plan yardstick, so the plan verdict and the card cannot say
 #: different things about the same session (#242). 0.0245 is 4.25 stars ("on
-#: target") and 0.092 is 2.50 ("off target"), both through
-#: ``stars_from_deviation(d, "pace", widen=PLAN_TIGHTEN)``.
+#: target"), both through ``stars_from_deviation(d, "pace", widen=PLAN_TIGHTEN)``.
 #: ``test_the_quality_pace_cuts_still_match_the_card_star_bands`` re-derives
 #: them from that curve, so a retune of one rubric that leaves the other stale
 #: fails the build rather than silently reopening the disagreement.
@@ -130,7 +129,39 @@ _DURATION_TYPES = frozenset({"interval", "tempo"})
 #: pace is an easy run, and the card's own read of one of them said "never hit
 #: interval intensity at all" while the plan called it done.
 QUALITY_PACE_DONE_DEVIATION = 0.0245
-QUALITY_PACE_PARTIAL_DEVIATION = 0.092
+
+#: PARTIAL_DEVIATION was originally the card's "off target" knot (0.092,
+#: 2.50 stars) — correct for a genuinely rep-sized split, wrong for the ONLY
+#: split shape the live data actually has. Nothing here is manually lapped
+#: (#242 f-1c0a5538): every quality-day split is a fixed-distance auto-lap
+#: that BLENDS one or more reps with their jog recovery, so its pace is
+#: structurally slower than the rep target even under flawless execution — a
+#: perfectly-run 5x600m @ 260 s/km with 90s jog recoveries still averages
+#: roughly 18-19% slow across a 1609 m auto-lap, arithmetic that has nothing
+#: to do with effort. At 0.092 that made ``done`` unreachable for the live
+#: plan's short-interval days (f-cb50f53f: 6 missed / 1 partial / 0 done
+#: across 7 graded days through ``build_plan_detail``) — a punitive-skew
+#: signature CLAUDE.md's sibling rubric gate exists to refuse, just with no
+#: plan-side gate to catch it.
+#:
+#: 0.212 is not a new free number either: it is ``widen * STAR_SCALE["pace"] +
+#: STAR_NOISE["pace"]`` (0.6 * 0.35 + 0.002) under ``PLAN_TIGHTEN`` — the exact
+#: deviation at which ``stars_from_deviation`` SATURATES to ``STAR_FLOOR``
+#: (``test_the_quality_pace_cuts_still_match_the_card_star_bands`` re-derives
+#: it from that formula, not from this comment). Past it the card can no
+#: longer distinguish "bad" from "worse", so a plan verdict that also stops
+#: distinguishing partial from missed at that exact point cannot disagree
+#: with the card by construction — it is simply the last point the card has
+#: an opinion at, rather than one of its interior knots (0.092, "off target",
+#: was the knot; it is what made ``done`` unreachable in the first place).
+#: ``QUALITY_PACE_DONE_DEVIATION`` is untouched: reaching ``done`` still
+#: requires genuinely rep-paced execution, and every one of the four #242
+#: evidence days (7.7%-32.1% slow) still lands at partial or missed with the
+#: wider cut — the skew narrows because a moderately-diluted session (e.g.
+#: 15.8% slow, blended) now earns partial credit instead of being flattened
+#: to missed alongside a session that never ran at interval effort at all
+#: (32.1%).
+QUALITY_PACE_PARTIAL_DEVIATION = 0.212
 
 #: Verdict severity, worst first — the ordering the pace cap takes a ``min()``
 #: over. Mirrors the report card's F-cap idiom: never print a verdict that
@@ -256,6 +287,33 @@ def _foot_distance(activities: list[dict]) -> float:
 
 # --- Task 1.1: validation --------------------------------------------------
 
+def _quality_target_error(
+    wtype: str | None, target_duration_sec, target_distance_m,
+) -> str | None:
+    """A quality (duration-type) day states what it wants: a duration, or a
+    distance, or both. Neither is the "by feel" branch of ``classify_workout``,
+    which before #242 was the ONLY path every proposed quality day took — it
+    graded ``done`` for any running at all.
+
+    Shared by every write path that can leave a workout row in this shape, not
+    just the CREATE path (#242, f-a9f42ce8): ``update_active_workout`` /
+    ``update_active_workouts`` can reach it too — a rest day (whose targets
+    ``apply_rest_semantics`` cleared to NULL) re-prescribed with
+    ``type='tempo'`` and no target carries neither, reproducing the original
+    bug through an edit rather than a proposal. Takes the RESOLVED values
+    (what the row will actually hold after the write), not just the fields a
+    caller happened to pass, so a partial edit that only changes
+    ``description`` on an existing quality day is judged by what the row
+    already carries, and a `type` change onto a duration-less row is caught
+    even when neither target field is touched by that edit.
+    """
+    if wtype in _DURATION_TYPES and not (target_duration_sec or target_distance_m):
+        return (f"a {wtype} day needs target_duration_sec or target_distance_m "
+                f"— without one it is graded 'by feel' and any running at all "
+                f"counts as done")
+    return None
+
+
 def validate_plan_input(
     goal_type: str,
     race_date: str,
@@ -329,14 +387,14 @@ def validate_plan_input(
         # before #242 that branch was the ONLY path every proposed quality day
         # took — it graded `done` for any running at all. The grading side now
         # reads distance, so this is hardening rather than the fix: it keeps
-        # by-feel reachable only on purpose. Scoped to the CREATE path, like
-        # every other rule here.
-        if wtype in _DURATION_TYPES and not (
-            w.get("target_duration_sec") or w.get("target_distance_m")
-        ):
-            return (f"workout {i}: a {wtype} day needs target_duration_sec or "
-                    f"target_distance_m — without one it is graded 'by feel' "
-                    f"and any running at all counts as done")
+        # by-feel reachable only on purpose. `_quality_target_error` is the one
+        # definition of this rule — `update_active_workout(s)` apply it too
+        # (#242, f-a9f42ce8), since the create path alone left the by-feel
+        # branch reachable through an edit.
+        err = _quality_target_error(
+            wtype, w.get("target_duration_sec"), w.get("target_distance_m"))
+        if err:
+            return f"workout {i}: {err}"
 
         desc = w.get("description")
         # Reject a non-string description with a clean indexed error rather than
@@ -491,12 +549,7 @@ def classify_workout(
         )
         if not target:  # null/0 target → "by feel": any qualifying activity counts
             return "done" if actual > 0 else "missed"
-        frac = actual / target
-        if frac >= cfg.done_fraction:
-            return "done"
-        if frac >= cfg.partial_fraction:
-            return "partial"
-        return "missed"
+        return _ladder(actual / target, cfg)
 
     if wtype in _DURATION_TYPES:
         actual = _running_duration(day_activities, cfg)
@@ -886,7 +939,12 @@ def update_active_workout(
     change (so a day can be re-prescribed but the plan can't be re-keyed/moved);
     ``type`` is validated against ``WORKOUT_TYPES``. Returns the updated row as a
     dict. Raises ``NoActivePlanError`` (no active plan), ``ValueError`` (bad
-    field / unknown type / no workout on that date / nothing to update).
+    field / unknown type / no workout on that date / nothing to update / the
+    edit would leave a `tempo`/`interval` day with neither
+    `target_duration_sec` nor `target_distance_m` — #242, f-a9f42ce8; the row
+    is checked AFTER the merge, so an edit that doesn't touch either target
+    column is still caught when the row it lands on has neither, and the
+    write rolls back with it).
     """
     bad = set(fields) - _EDITABLE_WORKOUT_COLS
     if bad:
@@ -916,6 +974,16 @@ def update_active_workout(
             "SELECT * FROM plan_workouts WHERE plan_id=? AND date=? AND seq=?",
             (plan_id, date, seq),
         ).fetchone()
+        # Checked on the RESOLVED row, not on `fields` alone (#242, f-a9f42ce8):
+        # a rest day's targets are NULL, so `type='tempo'` with no target field
+        # in this call would otherwise land on exactly the by-feel shape the
+        # create-path check exists to refuse. Raising here rolls the UPDATE
+        # back — `db.connect` rolls back on any exception raised in its `with`
+        # block — so a rejected edit never lands half-applied.
+        err = _quality_target_error(
+            row["type"], row["target_duration_sec"], row["target_distance_m"])
+        if err:
+            raise ValueError(f"{date} (seq {seq}): {err}")
         return dict(row)
 
 
@@ -950,7 +1018,10 @@ def update_active_workouts(
     same ``apply_rest_semantics``, and the same keyed ``UPDATE``. It cannot
     insert a day, move one, or change a plan's status; ``date`` is the key, not
     an editable column. Raises ``NoActivePlanError`` or ``ValueError`` (the
-    message names the offending index and date).
+    message names the offending index and date) — including the same
+    quality-target check ``update_active_workout`` makes on the resolved row
+    (#242, f-a9f42ce8), which rolls back every write in the batch, not just
+    the offending entry.
     """
     if not updates:
         raise ValueError("no updates provided")
@@ -1005,17 +1076,26 @@ def update_active_workouts(
                 )
 
         rows = []
-        for date, seq, fields in prepared:
+        for i, (date, seq, fields) in enumerate(prepared):
             sets = ", ".join(f"{c}=:{c}" for c in fields)  # keys whitelisted above
             conn.execute(
                 f"UPDATE plan_workouts SET {sets} "
                 "WHERE plan_id=:plan_id AND date=:date AND seq=:seq",
                 {**fields, "plan_id": plan_id, "date": date, "seq": seq},
             )
-            rows.append(dict(conn.execute(
+            row = dict(conn.execute(
                 "SELECT * FROM plan_workouts WHERE plan_id=? AND date=? AND seq=?",
                 (plan_id, date, seq),
-            ).fetchone()))
+            ).fetchone())
+            # Checked on the RESOLVED row, same as the single-day path (#242,
+            # f-a9f42ce8) — raising here rolls back the WHOLE batch, including
+            # entries already written this call, preserving the all-or-nothing
+            # contract this function documents above.
+            err = _quality_target_error(
+                row["type"], row["target_duration_sec"], row["target_distance_m"])
+            if err:
+                raise ValueError(f"update {i} ({date}): {err}")
+            rows.append(row)
         return rows
 
 
@@ -1172,14 +1252,43 @@ def get_active_plan(
     return _get_by_status("active", db_path, conn=conn)
 
 
+def quality_pace_dates(workouts: list[dict]) -> frozenset[str]:
+    """Dates on which a quality day's pace cap can possibly read splits — the
+    narrowing ``load_activities_by_date``'s ``quality_dates`` needs (#242,
+    f-f56ee4d1).
+
+    A day only ever reaches ``_cap_on_rep_pace``'s split-reading branch when
+    its type is a duration type AND it carries a prescribed pace; every other
+    day's ``splits`` key is never read regardless of what gets fetched for it.
+    Pure and cheap so every caller can compute it from the plan it already
+    has in hand rather than re-deriving the two conditions itself.
+    """
+    return frozenset(
+        w["date"] for w in workouts
+        if w.get("type") in _DURATION_TYPES and w.get("target_pace_sec_per_km")
+    )
+
+
 def load_activities_by_date(
-    start: str, end: str, db_path: Path | None = None, conn: sqlite3.Connection | None = None
+    start: str, end: str, db_path: Path | None = None, conn: sqlite3.Connection | None = None,
+    quality_dates: frozenset[str] | None = None,
 ) -> dict[str, list[dict]]:
     """Activities in [start, end] grouped by date — input to adherence grading.
 
     Accepts an already-open ``conn`` to let hot-path callers share one
     connection instead of opening a fresh one per lookup; behavior is
-    unchanged when omitted."""
+    unchanged when omitted.
+
+    ``quality_dates`` narrows which dates' ``activity_splits`` rows are worth
+    fetching at all — see ``quality_pace_dates``. ``None`` (the default) keeps
+    the old whole-range fetch, so a caller that does not know about this
+    parameter still grades correctly, just without the narrowing; passing an
+    (possibly empty) explicit set is what actually saves the query. This is
+    deliberately additive-safe rather than opt-in-to-fetch, for the same
+    reason the ``splits`` key itself lives here and not in the six callers:
+    a caller that forgot to narrow must still get correct grading, only a
+    caller that forgot to fetch at all would silently break it, and this
+    keeps the fetch as the default."""
     # avg_pace_sec_per_km is REQUIRED, not incidental: `_ran` gates run-vs-walk
     # on measured pace, and without this column every row silently falls back
     # to the (wrong) activity_type label — which is the bug the gate exists to
@@ -1191,20 +1300,42 @@ def load_activities_by_date(
     # fetch them would silently grade every tempo day on volume alone. Every
     # caller of this function feeds grading, so none of them wants the old
     # shape; the key is additive, so none of them breaks either.
+    #
+    # The fetch itself is scoped to `quality_dates` when given: only a
+    # tempo/interval day with a prescribed pace can ever reach the branch that
+    # reads `splits` (`quality_pace_dates`), so fetching every OTHER date's
+    # splits is pure waste that a benchmark fixture with no split rows at all
+    # can never make visible (#242, f-f56ee4d1) — every caller here now passes
+    # its own plan's `quality_pace_dates(workouts)`.
     sql = (
         "SELECT activity_id, date, activity_type, distance_meters, "
         "duration_seconds, avg_pace_sec_per_km "
         "FROM activities WHERE date >= ? AND date <= ? ORDER BY date"
     )
-    splits_sql = (
-        "SELECT s.activity_id, s.distance_meters, s.avg_pace_sec_per_km "
-        "FROM activity_splits s JOIN activities a USING (activity_id) "
-        "WHERE a.date >= ? AND a.date <= ? ORDER BY s.activity_id, s.split_index"
-    )
+    if quality_dates is None:
+        splits_sql = (
+            "SELECT s.activity_id, s.distance_meters, s.avg_pace_sec_per_km "
+            "FROM activity_splits s JOIN activities a USING (activity_id) "
+            "WHERE a.date >= ? AND a.date <= ? ORDER BY s.activity_id, s.split_index"
+        )
+        splits_params: tuple = (start, end)
+    elif not quality_dates:
+        splits_sql = None
+        splits_params = ()
+    else:
+        placeholders = ", ".join("?" * len(quality_dates))
+        splits_sql = (
+            "SELECT s.activity_id, s.distance_meters, s.avg_pace_sec_per_km "
+            "FROM activity_splits s JOIN activities a USING (activity_id) "
+            f"WHERE a.date >= ? AND a.date <= ? AND a.date IN ({placeholders}) "
+            "ORDER BY s.activity_id, s.split_index"
+        )
+        splits_params = (start, end, *quality_dates)
 
     def _fetch(c):
-        return (c.execute(sql, (start, end)).fetchall(),
-                c.execute(splits_sql, (start, end)).fetchall())
+        rows = c.execute(sql, (start, end)).fetchall()
+        split_rows = c.execute(splits_sql, splits_params).fetchall() if splits_sql else []
+        return rows, split_rows
 
     if conn is not None:
         rows, split_rows = _fetch(conn)

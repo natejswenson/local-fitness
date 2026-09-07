@@ -334,6 +334,35 @@ def test_fastest_rep_split_abstains_rather_than_raising(labelled):
     assert interpret.fastest_rep_split_pace(labelled) is None
 
 
+def test_fastest_rep_split_ignores_a_closing_kick_beside_repeated_mile_laps():
+    """#242 f-8a26a574: a tempo prescribing 3x1mi has reps that ARE mile-length
+    auto-laps. A fast trailing fragment (a closing kick, or the watch's own
+    always-emitted partial lap) sits above QUALITY_MIN_SPLIT_M and would win
+    on pace alone — certifying a session whose every prescribed mile ran
+    2:20/mi off target as having hit its rep pace."""
+    labelled = _rows((1609.344, 625.0), (1609.344, 607.0), (1609.344, 648.0),
+                      (400.0, 421.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(607.0)
+    assert interpret.fastest_rep_split(labelled)["distance_meters"] == \
+        pytest.approx(1609.344)
+
+
+def test_fastest_rep_split_still_prefers_a_genuine_short_rep_over_the_warmup():
+    """The dominant-cluster guard must not resurrect the manual-lap failure it
+    sits beside: four repeated 800 m reps outrank a single, larger 1600 m
+    warmup lap even though the warmup's bucket has only one member."""
+    labelled = _rows((1600.0, 390.0), *[(800.0, 260.0)] * 4)
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(260.0)
+
+
+def test_fastest_rep_split_does_nothing_without_a_repeated_lap_size():
+    """A single-rep day (or one with no consistent lap size) has no dominant
+    unit to compare against — the guard must not invent one and exclude the
+    only rep-sized split there is."""
+    labelled = _rows((1000.0, 400.0), (300.0, 250.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(250.0)
+
+
 # === module hygiene =============================================================
 
 def test_interpret_imports_nothing_outside_stdlib():

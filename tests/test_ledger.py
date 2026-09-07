@@ -517,7 +517,7 @@ def test_compute_relationship_ledger_wires_cards_into_notables(tmp_path, monkeyp
     monkeypatch.setattr(plans_mod, "get_active_plan", lambda conn=None: {"workouts": []})
     monkeypatch.setattr(
         plans_mod, "load_activities_by_date",
-        lambda start, end, conn=None: {})
+        lambda start, end, conn=None, quality_dates=None: {})
     monkeypatch.setattr(plans_mod, "resolve_grading_config", lambda conn=None: None)
     monkeypatch.setattr(
         plans_mod, "build_plan_detail",

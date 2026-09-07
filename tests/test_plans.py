@@ -388,13 +388,50 @@ def test_a_prescribed_duration_still_wins_over_distance():
     assert plans.classify_workout(w, [_quality_run(4000, 290.0, duration=1200)]) == "partial"
 
 
+def test_a_prescribed_duration_is_still_capped_by_rep_pace():
+    """#242 f-7c3268d2: every eval scenario and all-but-one unit case above pin
+    `target_duration_sec=None`, so the duration-volume + pace-cap combination —
+    the shape `scripts/perf_fixture.py` and plans 1 and 2 actually write, per
+    the investigation — was completely uncovered. A workout implementing the
+    'duration wins over distance' rule that also skipped the pace cap when a
+    duration is present would pass every existing test and reintroduce #242
+    for every plan that prescribes a duration."""
+    w = _tempo(target_duration_sec=2400, target_distance_m=None)  # pace stays _REP_TARGET
+    # Duration target met in full, but the reps ran at easy pace: the duration
+    # ladder alone says `done` — the pace cap must still pull it to `missed`.
+    assert plans._quality_volume_verdict(
+        w, [_quality_run(8000, _REP_TARGET * 2.0, duration=2400)], 2400,
+        plans._DEFAULT_GRADING_CONFIG) == "done"
+    assert plans.classify_workout(
+        w, [_quality_run(8000, _REP_TARGET * 2.0, duration=2400)]) == "missed"
+    # Duration met AND reps at target pace: both axes agree on `done`.
+    assert plans.classify_workout(
+        w, [_quality_run(8000, _REP_TARGET, duration=2400)]) == "done"
+    # The cap still only ever LOWERS: duration half met, pace at target — the
+    # volume ladder's `partial` stands, not raised by a clean rep pace.
+    assert plans.classify_workout(
+        w, [_quality_run(8000, _REP_TARGET, duration=1200)]) == "partial"
+
+
 def test_the_quality_pace_cuts_still_match_the_card_star_bands():
     """The anti-drift guard. Each cut is a `report_card` star boundary under the
     plan yardstick, so the plan verdict and the card cannot come to describe the
     same session differently — which is #242 in the other direction. Re-derived
     from the card's own curve rather than restated, so a retune of `STAR_KNOTS`,
     `STAR_SCALE`, `STAR_NOISE` or `PLAN_TIGHTEN` that leaves these constants
-    stale fails the build."""
+    stale fails the build.
+
+    `QUALITY_PACE_PARTIAL_DEVIATION` is no longer the card's "off target"
+    interior knot (2.50 stars, d=0.092) — #242 f-1c0a5538/f-cb50f53f found
+    that knot made `done` unreachable for every quality day in the live data,
+    because nothing there is manually lapped and a blended auto-lap split
+    reads 15-19% slow even when flawlessly executed. It is now the point
+    where the card's own curve SATURATES to `STAR_FLOOR` — past that, the
+    card no longer distinguishes "bad" from "worse", so a plan that also
+    stops distinguishing partial from missed there cannot disagree with the
+    card by construction, even though it is no longer one of the curve's
+    named knots.
+    """
     from local_fitness.agent import report_card as rc
 
     def stars(d):
@@ -402,13 +439,15 @@ def test_the_quality_pace_cuts_still_match_the_card_star_bands():
 
     on_target = dict(rc.STAR_VERDICT_CUTS)
     assert stars(plans.QUALITY_PACE_DONE_DEVIATION) == pytest.approx(4.25)
-    assert stars(plans.QUALITY_PACE_PARTIAL_DEVIATION) == pytest.approx(2.50)
-    # ...and those two values are the card's own "on target" / "off target"
-    # boundaries, not free numbers that happen to sit on the curve.
+    assert stars(plans.QUALITY_PACE_PARTIAL_DEVIATION) == pytest.approx(rc.STAR_FLOOR)
+    # ...and QUALITY_PACE_DONE_DEVIATION is still the card's own "on target"
+    # boundary, not a free number that happens to sit on the curve.
     assert 4.25 in on_target and on_target[4.25] == "on target"
-    assert 2.50 in on_target and on_target[2.50] == "off target"
     assert rc.star_verdict(stars(plans.QUALITY_PACE_DONE_DEVIATION)) == "on target"
-    assert rc.star_verdict(stars(plans.QUALITY_PACE_PARTIAL_DEVIATION)) == "off target"
+    # Past PARTIAL_DEVIATION the card has no more resolution left to give —
+    # it reads the same floor severity word a wildly worse session would.
+    assert rc.star_verdict(stars(plans.QUALITY_PACE_PARTIAL_DEVIATION)) == "missed badly"
+    assert stars(plans.QUALITY_PACE_PARTIAL_DEVIATION + 0.05) == pytest.approx(rc.STAR_FLOOR)
 
 
 def test_cross_matches_non_running_only():

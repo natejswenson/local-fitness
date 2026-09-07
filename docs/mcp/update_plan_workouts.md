@@ -51,7 +51,13 @@ Validation happens in three passes, all before any row changes:
    `SELECT` before the first `UPDATE`. A typo'd date fails the batch instead of half-applying it.
 
 Only then do the writes run, inside one `db.connect()` — which commits on clean exit and rolls back
-on any exception.
+on any exception. One check happens DURING that phase rather than before it, because it can only be
+judged on the row as written: after each entry's `UPDATE`, its RESOLVED row (existing columns plus
+whatever this entry changed) is checked so a `tempo`/`interval` day never ends up with neither
+`target_duration_sec` nor `target_distance_m` (0.63.0, #242) — the exact by-feel shape that used to
+grade `done` for any running at all. A violation raises, and because it is raised inside the same
+`db.connect()` block it rolls back the WHOLE batch, including entries this call already wrote —
+the all-or-nothing contract holds even for a check that only the write itself can evaluate.
 
 Every error message names the offending entry by index and date:
 
@@ -89,9 +95,9 @@ Each entry:
 |---|---|---|---|---|
 | `date` | string | yes | — | ISO `YYYY-MM-DD` of a day that **already exists** on the active plan. |
 | `type` | string | no | unchanged | `easy` \| `long` \| `tempo` \| `interval` \| `rest` \| `race` \| `cross`. |
-| `distance_mi` | number | no | unchanged | Miles → metres. |
-| `pace_min_per_mi` | string \| number | no | unchanged | **`"M:SS"` preferred** (`"9:39"`). A bare number is *decimal minutes* — `9.65` is 9:39/mi, `9.39` is 9:23/mi. |
-| `duration_min` | number | no | unchanged | Minutes. The **graded** field for `tempo`/`interval`. |
+| `distance_mi` | number | no | unchanged | Miles → metres. On `tempo`/`interval` this is the graded VOLUME whenever `duration_min` isn't set (0.63.0) — display-only only on `easy`/`long`/`race`. |
+| `pace_min_per_mi` | string \| number | no | unchanged | **`"M:SS"` preferred** (`"9:39"`). A bare number is *decimal minutes* — `9.65` is 9:39/mi, `9.39` is 9:23/mi. On `tempo`/`interval` this IS graded (0.63.0) — it caps the day's verdict against the fastest rep-sized split. Display-only on `easy`/`long`/`race`. |
+| `duration_min` | number | no | unchanged | Minutes. The graded VOLUME field for `tempo`/`interval` when you set it — `distance_mi` is the fallback volume when you don't; the pace cap above applies either way. |
 | `hr_max` | number | no | unchanged | Prescribed HR **ceiling**, bpm, bounded 90–210. Pass it whenever the day has a cap — prose in `description` is invisible to the grader. |
 | `description` | string | no | unchanged | Prose prescription. |
 | `seq` | integer | no | `1` | 1 = first/AM, 2 = second/PM. |
@@ -155,6 +161,14 @@ is still there — which is the whole point.
   means the caller lost track of its own intent.
 - **`hr_max` is not inferred from prose.** Writing "keep HR under 140" in `description` for twenty
   days still leaves twenty ungraded caps. Pass `hr_max` on each entry.
+- **A `pace_min_per_mi` left over from a prior prescription is load-bearing the moment a day's type
+  is (or becomes) `tempo`/`interval`** (0.63.0) — it caps that day's verdict against the fastest
+  rep-sized split. Batching a `type` change onto a quality type without also setting or clearing
+  `pace_min_per_mi` for that entry carries the old pace forward into a NEW grading role.
+- **Every entry that ends up `tempo`/`interval` needs a duration or a distance.** Batching
+  `{"type": "tempo"}` onto a day whose existing targets are NULL (most commonly a former `rest`
+  day) fails that entry — and the whole batch — with the same error
+  [`update_plan_workout`](update_plan_workout.md) raises.
 - **A rolled-back batch writes nothing at all** — including the entries that were individually fine.
   That is the contract, but it means a 60-entry batch with one bad date reports one error and no
   progress. Fix the entry and resend the whole batch.

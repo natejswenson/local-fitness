@@ -948,7 +948,9 @@ async def plan_chart(args: dict) -> dict:
         anchor = frontier or date.today().isoformat()
         start = min(plan_dates) if plan_dates else anchor
         end = max([anchor, *plan_dates])
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cfg = plans.resolve_grading_config(conn=conn)
     detail = plans.build_plan_detail(active, frontier, activities_by_date, cfg=cfg)
 
@@ -3213,14 +3215,29 @@ _UPDATE_WORKOUT_SCHEMA = {
     "properties": {
         "date": {"type": "string", "description": "ISO YYYY-MM-DD of the day to re-prescribe in the ACTIVE plan"},
         "type": {"type": "string", "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"]},
-        "distance_mi": {"type": "number", "description": "target distance in miles (omit for rest / by-feel)"},
+        "distance_mi": {
+            "type": "number",
+            "description": "target distance in miles (omit for rest / by-feel). "
+                           "On tempo/interval this is the graded VOLUME whenever "
+                           "duration_min isn't set; on easy/long/race it is always "
+                           "the graded field.",
+        },
         "pace_min_per_mi": {
             "type": ["string", "number"],
             "description": 'target pace per mile as "M:SS" (preferred). A bare '
                            "number is DECIMAL minutes — 9.65 is 9:39/mi, 9.39 "
-                           "is 9:23/mi; never copy a display string as a number.",
+                           "is 9:23/mi; never copy a display string as a number. "
+                           "On tempo/interval this IS graded — it caps the day's "
+                           "verdict against the fastest rep-sized split. Display/"
+                           "coaching only on easy/long/race.",
         },
-        "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
+        "duration_min": {
+            "type": "number",
+            "description": "target duration in minutes — the graded VOLUME field "
+                           "for tempo/interval when you set it; distance_mi is the "
+                           "fallback volume when you don't. The pace cap above "
+                           "still applies either way.",
+        },
         "hr_max": {
             "type": "number",
             "description": "prescribed heart-rate CEILING in bpm. The grader "
@@ -3335,8 +3352,8 @@ async def update_plan_workout(args: dict) -> dict:
 
     # Echo the whole prescription that was written, so the model can confirm
     # the change from the tool result without a follow-up read. duration_min is
-    # the graded field for tempo/interval days (per this tool's own
-    # description), so target_duration_sec MUST be in the echo — via the
+    # a graded VOLUME field for tempo/interval days when set (per this tool's
+    # own description), so target_duration_sec MUST be in the echo — via the
     # duration_seconds key _augment_workout formats into duration_formatted,
     # mirroring the distance_meters/avg_pace_sec_per_km remaps beside it. seq
     # tells the user which session of a double day was edited.
@@ -3703,7 +3720,9 @@ async def get_training_plan_status(_args: dict) -> dict:
         dates = [w["date"] for w in active["workouts"]] or [today]
         start = min(dates)
         end = max([today, *dates] + ([frontier] if frontier else []))
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cfg = plans.resolve_grading_config(conn=conn)
     status = plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
     status["pending_draft"] = pending_draft
@@ -3770,7 +3789,9 @@ async def get_training_plan_progress(args: dict) -> dict:
         dates = [w["date"] for w in active["workouts"]] or [today]
         start = min(dates)
         end = max([today, *dates] + ([frontier] if frontier else []))
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cutoff = (date.today() - timedelta(
             days=config.riegel_lookback_days(conn=conn))).isoformat()
         # The goal distance is a PREFERENCE for the basis, not a filter: it
@@ -4244,7 +4265,9 @@ def _build_plan_section(target_date: str) -> dict | None:
         dates = [w["date"] for w in active["workouts"]] or [target_date]
         start = min(dates)
         end = max([target_date, *dates] + ([frontier] if frontier else []))
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cfg = plans.resolve_grading_config(conn=conn)
     # build_plan_detail has no "as of" date concept — grade_workout's pending
     # holdout compares each workout's OWN date against the real data frontier,

@@ -73,12 +73,13 @@ So easy/long days are penalized only for running too FAST, quality days only
 for running too SLOW, and each metric's expectation is scaled by the workout's
 intent (from the plan when present, inferred otherwise).
 
-Splits are presentation-only, with exactly THREE documented exceptions. No other
-grade reads ``activity_splits`` — only 100 of 760 activities have them (they are
-written by the daily-sync ingest path, never by backfill), so a splits-dependent
-grade would be unavailable on ~87% of the history and would silently mean
-different things on different rows. Every exception must handle absence
-explicitly, and they do it two different ways on purpose.
+Splits are presentation-only in THIS module, with exactly THREE documented
+exceptions HERE. No other grade in ``report_card.py`` reads ``activity_splits``
+— only 100 of 760 activities have them (they are written by the daily-sync
+ingest path, never by backfill), so a splits-dependent grade would be
+unavailable on ~87% of the history and would silently mean different things on
+different rows. Every exception must handle absence explicitly, and they do it
+two different ways on purpose.
 
 1. **quality-day pace against a prescribed rep target** — see
    ``fastest_rep_split``. It exists because the alternative was not a strict
@@ -91,6 +92,16 @@ explicitly, and they do it two different ways on purpose.
 3. **the prescribed-HR-cap exceedance** — see ``hr_exceedance_bpm``. This one
    *degrades* instead: with no splits the cap is still graded on the average
    alone, so it adds no new availability cliff.
+
+A FOURTH exception exists OUTSIDE this module (#242, f-c25a7c98):
+``plans.classify_workout``'s quality arm caps a `tempo`/`interval` verdict on
+the same ``fastest_rep_split`` selector — same reason as exception 1 above,
+one level up (a plan verdict and this card must not disagree about the same
+session), sharing the selector itself via ``interpret.py`` rather than
+re-deriving it. "No other grade reads ``activity_splits``" was true when
+written and is no longer true of the codebase as a whole; it was never
+rewritten to say "in this module" until this fix, so do not grep this comment
+alone and conclude a plan verdict never touches splits.
 
 The pure section below is import-light (stdlib + ``render``/``units``) and
 unit-testable with plain dicts; DB access lives under the persistence divider,
