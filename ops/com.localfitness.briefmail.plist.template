@@ -18,10 +18,9 @@
     * LOCAL_FITNESS_SMTP_PASSWORD — a Gmail app password
       (myaccount.google.com/apppasswords)
     * LOCAL_FITNESS_SMTP_USER / LOCAL_FITNESS_BRIEF_EMAIL_TO
-  The brief GENERATION step additionally needs a Claude credential; the
-  bundled SDK CLI resolves it from the login keychain, which a LaunchAgent
-  can reach because it runs inside the user's security session (a system
-  daemon in /Library/LaunchDaemons could not — do not "promote" this job).
+  The brief generation step uses LOCAL_FITNESS_BRIEF_PROVIDER=claude|codex.
+  Credentials and the absolute LOCAL_FITNESS_CODEX_BIN path for Codex live in
+  <repo>/.env; a system daemon must not replace this per-user LaunchAgent.
 -->
 <plist version="1.0">
 <dict>

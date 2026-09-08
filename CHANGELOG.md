@@ -4,6 +4,24 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.64.0] - 2026-09-08
+
+### Added
+- **Scheduled briefs can now use Codex while retaining Claude.** Set
+  `LOCAL_FITNESS_BRIEF_PROVIDER=codex` to route the existing deterministic V2
+  briefing context through non-interactive `codex exec`; the default remains
+  `claude`, including its V1 rollback. Codex runs ephemerally with a read-only
+  sandbox, no user MCP configuration, and a strict 3-5 takeaway JSON schema.
+  `LOCAL_FITNESS_CODEX_MODEL` optionally selects a model, while
+  `LOCAL_FITNESS_CODEX_BIN` supplies an absolute executable path for schedulers
+  such as macOS `launchd` that do not inherit Homebrew's PATH.
+
+### Changed
+- The test suite now clears ambient brief-provider configuration and blocks
+  live Codex calls, preventing a developer's `.env` from turning unit tests
+  into real model runs. Shared operator documentation describes both provider
+  credentials and their failure modes.
+
 ## [0.63.1] - 2026-09-08
 
 ### Added

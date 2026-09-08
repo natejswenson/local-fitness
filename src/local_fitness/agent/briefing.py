@@ -34,6 +34,7 @@ from . import (
     brief_planner,
     briefs,
     coach,
+    codex_model,
     grounding,
     local_model,
     memory,
@@ -59,6 +60,19 @@ from .schemas import Brief
 LOG = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+_BRIEF_PROVIDER_ENV = "LOCAL_FITNESS_BRIEF_PROVIDER"
+_VALID_BRIEF_PROVIDERS = frozenset({"claude", "codex"})
+
+
+def _brief_provider() -> str:
+    """Production composer backend; Claude remains the compatible default."""
+    provider = os.environ.get(_BRIEF_PROVIDER_ENV, "claude").strip().lower()
+    if provider not in _VALID_BRIEF_PROVIDERS:
+        raise ValueError(
+            f"invalid {_BRIEF_PROVIDER_ENV}={provider!r}; expected claude or codex"
+        )
+    return provider
 
 # Reasoning effort for the brief composer. Measured 2026-06-20: the brief's
 # wall-clock is dominated by extended thinking (~12.7k of ~14k output tokens,
@@ -550,8 +564,8 @@ async def _finalize_brief(raw: str, user_name: str, save: bool, brief_context):
         # the parser — and at re-minting a healthy token — instead of at the
         # stream (2026-07-19 facet review, AUX-1).
         msg = (
-            "brief generator produced no output (0 chars) — the Claude SDK "
-            "stream died before emitting anything (idle timeout, subprocess "
+            "brief generator produced no output (0 chars) — the model "
+            "stream ended before emitting anything (idle timeout, subprocess "
             "crash, or credential failure at spawn). Not a JSON problem; "
             "see logs for the stream error and retry."
         )
@@ -705,6 +719,29 @@ async def generate_streaming(model: str = DEFAULT_MODEL, save: bool = True):
         if profile.plan_status_appendix and brief_context.plan_today is not None:
             raw = profile.plan_status_appendix(raw, brief_context.plan_today)
 
+        async for evt in _finalize_brief(raw, user_name, save, brief_context):
+            yield evt
+        return
+
+    provider = _brief_provider()
+    if provider == "codex":
+        if not _brief_v2_enabled():
+            raise ValueError(
+                "LOCAL_FITNESS_BRIEF_PROVIDER=codex requires the V2 toolless composer"
+            )
+        brief_context = brief_planner.assemble_brief_context(
+            today=date.today().isoformat())
+        system_prompt = prompts.brief_v2_system_prompt(
+            user_name, coach_profile, memory_compact)
+        prompt_text = prompts.brief_v2_user_prompt(
+            brief_context, user_name, daily_step_goal, recent_briefs, coach_profile)
+        codex_model_name = os.environ.get("LOCAL_FITNESS_CODEX_MODEL") or None
+        raw = await asyncio.to_thread(
+            codex_model.generate_codex_completion,
+            system_prompt,
+            prompt_text,
+            model=codex_model_name,
+        )
         async for evt in _finalize_brief(raw, user_name, save, brief_context):
             yield evt
         return
@@ -970,7 +1007,7 @@ def generate_and_save(model: str = DEFAULT_MODEL) -> Path:
     ``cli.py``'s "Brief written to: {path}" echo keeps working.
 
     Retries up to ``_brief_max_attempts()`` times: the observed failure modes
-    (SDK stream idle-out, subprocess crash mid-stream) are transient — a fresh
+    (model stream idle-out, subprocess crash mid-stream) are transient — a fresh
     attempt minutes later routinely succeeds — so one bad stream must not cost
     the whole day's brief. Raises the final attempt's error when all fail."""
     last_brief: dict | None = None

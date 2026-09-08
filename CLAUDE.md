@@ -844,7 +844,7 @@ These are settled — don't redesign without a reason.
   recall still works (the switch never touches journal data). Memory
   resolution never runs inside a perf-benchmarked hot path — SDK-call sites
   only.
-- **Daily brief job needs a Claude credential in `.env`.** The launchd job
+- **Daily brief job supports Claude and Codex composers.** The launchd job
   (`com.localfitness.brief` → `fitness brief --if-missing`) couples pull →
   recompute-baselines → generate → save atomically, firing at **08:30 with
   a 09:30 backstop slot** (same command both times; `--if-missing` makes
@@ -854,15 +854,20 @@ These are settled — don't redesign without a reason.
   load-bearing (0.59.0): the old 06:30 fire pulled MID-SLEEP, so the brief
   shipped provisional recovery numbers Garmin later revised (measured
   2026-08-10: rhr 54 at 06:30, settled 50 post-wake) — past typical wake,
-  rhr/sleep are settled-by-construction. Its *generate* step
-  spawns a **headless** Claude via the Agent SDK, which authenticates from
-  the process env only — `cli.py` `load_dotenv()`s `<repo>/.env`, so the
-  token must live there as `CLAUDE_CODE_OAUTH_TOKEN` (Nate's Max token,
+  rhr/sleep are settled-by-construction. Its *generate* step selects a
+  headless backend with `LOCAL_FITNESS_BRIEF_PROVIDER=claude|codex` (default
+  `claude`); `cli.py` `load_dotenv()`s `<repo>/.env`. Claude uses the Agent SDK
+  and a `CLAUDE_CODE_OAUTH_TOKEN` (Nate's Max token,
   minted with `claude setup-token`, no per-brief cost, expires ~yearly) or
   `ANTHROPIC_API_KEY` (never expires, bills per brief). A live Claude
   session (like this chat) can compose + `save_brief` fine because it
   already holds a token — but that's **not** the unattended path.
-  **Failure signatures — read the log before touching the token** (the
+  Codex uses the V2 toolless prompt through `codex exec`, its cached ChatGPT
+  login (or Codex automation credentials), and a strict output schema. Set
+  `LOCAL_FITNESS_CODEX_BIN` to `command -v codex` because launchd's minimal
+  PATH commonly omits Homebrew. Codex deliberately rejects the V1 tool-driven
+  rollback; switch the provider to Claude before setting BRIEF_V2=0.
+  **Claude failure signatures — read the log before touching its token** (the
   2026-07-19 facet review found an earlier draft of this note blamed the
   credential for what was actually SDK stream instability; following it
   meant re-minting a healthy token while failures continued):
@@ -881,6 +886,8 @@ These are settled — don't redesign without a reason.
     `_BRIEF_RETRY_DELAY_S`, see `.env.example`). If all attempts fail,
     `fitness brief` fires a distinct macOS **failure** notification
     (silence no longer is the only signal) and exits non-zero.
+  Codex failures are reported directly as `codex exec failed`, timeout, missing
+  CLI, or empty response errors and go through the same three-attempt retry.
   Either way the outcome is **no brief saves** (orphaned sync — pull ran,
   brief didn't). That state is now surfaced: `assemble_status()` (→
   `daily_snapshot`) carries `latest_brief_date` +
