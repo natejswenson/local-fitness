@@ -387,34 +387,73 @@ def _drop_outlier_fragments(candidates: list[dict]) -> list[dict]:
     remainder lap — the segment Garmin logs after the last lap press, which
     every manually-lapped activity emits — or a leading walk-out fragment
     sits above ``QUALITY_MIN_SPLIT_M`` and so is a "candidate", but it is
-    outside the warmup/cooldown pair, not part of it. Keying the bookend
-    check on ``candidates[0]``/``candidates[-1]`` literally meant such a
-    fragment became one of the two bookend ids instead of the real
-    warmup/cooldown lap, so the pair's own bucket no longer matched
-    ``bookends`` and fell back into the dominant-cluster pool — the exact
-    "graded the reps at warmup pace" failure this whole guard exists to
-    prevent, reintroduced by a lap the guard never anticipated.
-    :func:`_trim_framing_fragments` runs first so the bookend check always
-    sees the true outer edge of the day's REPEATED lap sizes, regardless of
-    what Garmin tacked on before or after them.
+    outside the warmup/cooldown pair, not part of it. :func:`_trim_framing_fragments`
+    runs first so the bookend identity below is always the true outer edge of
+    the day's REPEATED lap sizes, regardless of what Garmin tacked on before
+    or after them.
+
+    **Everything inside the trimmed/framed range is trusted unconditionally;
+    only a candidate trimming discarded outright is ever floor-tested**
+    (#242 r4, f-7fe7b9d1 / f-405976cb / f-e04f6232 / f-e3a8a465). The
+    previous design re-bucketed the *trimmed* list by distance and asked
+    "which bucket dominates by member count", which fails in both
+    directions at once: a size that repeats because it happens to cover
+    warmup **and** an interior recovery lap (three members) escapes the
+    old bookend check (which only ever fired on a bucket of exactly two)
+    and outnumbers the real reps, while a symmetric pyramid's own
+    smallest reps sit at the literal first/last position and get
+    misread as a bookend pair even though they ARE the work. Both
+    failures come from asking a *bucket* "are you the bookends" instead
+    of asking each *element* "are you outside the framed core". Now:
+
+    * The day's two bookends are still exactly ``trimmed``'s first and last
+      position (empty exclusion when the framed core has 2 or fewer
+      members) — but every element of ``trimmed``, bookends included, is
+      part of the identified structure and is kept outright. A pyramid's
+      outer reps are literally the first/last framed candidates, so they
+      survive here regardless of how small they are next to the middle of
+      the pyramid; a warmup/cooldown pair survives too, but that costs
+      nothing since ``min()`` already ignores a slower lap on its own.
+    * The floor exists only to judge candidates trimming discarded
+      entirely — a closing kick, a trailing remainder, a leading
+      walk-out — none of which are part of the framed core at all. Its
+      basis is the framed core's OWN interior (``trimmed`` minus its two
+      edges): the repeated bucket there if one exists, else the largest
+      interior candidate. A genuine short standalone rep positioned at
+      the very edge of a *different* repeated pair (f-405976cb: one 1 km
+      rep before two easy cooldown miles) is judged against that basis
+      and clears it; a kick or a remainder, always far smaller than
+      whatever the day's real work measures, does not.
+
+    Never returns an empty list: ``trimmed`` is always non-empty and every
+    one of its members is kept unconditionally.
     """
     if len(candidates) < 2:
         return candidates
     trimmed = _trim_framing_fragments(candidates)
+    trimmed_ids = {id(c) for c in trimmed}
+    # Positional, not identity-filtered: "trimmed minus its own two edges" is
+    # unambiguous by index within `trimmed` itself, and stays well-defined
+    # even when two positions happen to hold the identical object (a
+    # `[{...}] * n`-built fixture, not something real split rows ever do,
+    # since every row from the DB is its own dict) — an identity-based
+    # exclusion would misfire there, since every aliased slot then matches
+    # every OTHER aliased slot's id, not just the two true edges.
+    core = trimmed[1:-1] if len(trimmed) > 2 else trimmed
     buckets: dict[int, list[dict]] = {}
-    for r in trimmed:
+    for r in core:
         key = round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)
         buckets.setdefault(key, []).append(r)
-    bookends = {id(trimmed[0]), id(trimmed[-1])} if len(trimmed) > 2 else set()
-    repeated = [
-        b for b in buckets.values()
-        if len(b) >= 2 and not _is_bookend_pair(b, bookends)
+    repeated = [b for b in buckets.values() if len(b) >= 2]
+    if repeated:
+        dominant = min(repeated, key=lambda b: (-len(b), b[0]["distance_meters"]))
+        floor = dominant[0]["distance_meters"] * _MIN_FRACTION_OF_DOMINANT_SPLIT
+    else:
+        floor = max(r["distance_meters"] for r in core) * _MIN_FRACTION_OF_DOMINANT_SPLIT
+    kept = [
+        r for r in candidates
+        if id(r) in trimmed_ids or r["distance_meters"] >= floor
     ]
-    if not repeated:
-        return trimmed
-    dominant = min(repeated, key=lambda b: (-len(b), b[0]["distance_meters"]))
-    floor = dominant[0]["distance_meters"] * _MIN_FRACTION_OF_DOMINANT_SPLIT
-    kept = [r for r in trimmed if r["distance_meters"] >= floor]
     return kept or trimmed
 
 
@@ -445,17 +484,6 @@ def _trim_framing_fragments(candidates: list[dict]) -> list[dict]:
     if len(framed) < 2:
         return candidates
     return candidates[framed[0]: framed[-1] + 1]
-
-
-def _is_bookend_pair(bucket: list[dict], bookends: set[int]) -> bool:
-    """Is ``bucket`` exactly the trimmed day's first and last candidate, with
-    work between them? Those two laps are a warmup/cooldown pair, never the
-    reps — see :func:`_drop_outlier_fragments`. ``bookends`` is the empty set
-    whenever the trimmed candidate list has 2 or fewer members (the pair IS
-    the whole day, or there's nothing to bracket), so no bucket can ever
-    match it. Identity, not equality: two laps of the same distance and pace
-    are equal dicts but different laps."""
-    return len(bucket) == 2 and {id(bucket[0]), id(bucket[1])} == bookends
 
 
 def fastest_rep_split(labelled: dict) -> dict | None:

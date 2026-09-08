@@ -461,6 +461,60 @@ def test_a_trailing_remainder_lap_is_dropped_even_with_no_other_repeat():
     assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(255.0)
 
 
+# --- #242 r4: the dominant-by-count design still misread interior filler as
+# the reps, and misread a pyramid's own outer reps as filler. Every case
+# below FAILED on the pre-fix (r3) code.
+
+def test_a_repeated_recovery_lap_does_not_outcount_the_reps():
+    """f-7fe7b9d1: a warmup, an interior recovery mile, and a cooldown all
+    share the same 1609 m lap size, outnumbering the two real 800 m reps
+    three to two. The old count-based dominance made the 1609 m size
+    "dominant" and its 60% floor (965 m) deleted both reps, grading the
+    session at warmup pace (360) instead of rep pace (240)."""
+    labelled = _rows((1609.344, 360.0), (800.0, 240.0), (1609.344, 400.0),
+                      (800.0, 240.0), (1609.344, 380.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(240.0)
+
+
+def test_a_unique_leading_rep_survives_next_to_a_cooldown_pair():
+    """f-405976cb: a single hard 1 km rep ahead of two easy cooldown miles.
+    The old trim step removed ANY leading/trailing candidate whose own lap
+    size didn't repeat, before the floor ratio was ever computed — deleting
+    a genuine rep merely for being alone at the edge, not for being small
+    (1000 m is 62% of the 1609 m cooldown pair, well clear of the 60%
+    floor). Old code returned 400 (the cooldown); the rep is 300."""
+    labelled = _rows((1000.0, 300.0), (1609.344, 400.0), (1609.344, 401.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(300.0)
+
+
+def test_a_symmetric_pyramids_outer_reps_are_not_bookends():
+    """f-e04f6232: a 400-800-1200-1600-1200-800-400 pyramid with no separate
+    warmup/cooldown lap at all. The two 400 m reps are the day's literal
+    first and last candidates and share a bucket of exactly two, so the old
+    bookend check misread them as a warmup/cooldown pair and excluded them
+    from the dominance contest — then the 800 m bucket's 60% floor (480 m)
+    deleted them outright. They are the fastest reps on the day; old code
+    returned 240, the true answer is 230."""
+    labelled = _rows((400.0, 230.0), (800.0, 240.0), (1200.0, 250.0),
+                      (1600.0, 260.0), (1200.0, 251.0), (800.0, 241.0),
+                      (400.0, 231.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(230.0)
+
+
+def test_a_bookend_pair_sharing_size_with_an_interior_lap_is_still_excluded():
+    """f-e3a8a465: a pyramid with genuine mile warmup/cooldown laps, where
+    the day's longest rep (1600 m) does NOT collide with the 1609 m
+    bookends (they land in different 100 m buckets), but the bookend
+    bucket itself only ever has two members (the warmup and the cooldown)
+    — the case the old exactly-len-2 bookend check was built for. Confirms
+    the r4 rewrite keeps this working: bookend identity is now per-element,
+    not per-bucket, so it never depended on the bucket staying at exactly
+    two members in the first place."""
+    labelled = _rows((1609.344, 410.0), (400.0, 230.0), (800.0, 245.0),
+                      (1200.0, 255.0), (1600.0, 265.0), (1609.344, 430.0))
+    assert interpret.fastest_rep_split_pace(labelled) == pytest.approx(230.0)
+
+
 # === module hygiene =============================================================
 
 def test_interpret_imports_nothing_outside_stdlib():

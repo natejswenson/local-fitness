@@ -241,7 +241,13 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   *targeted* 3.12.14 change to comprehensions or small-object allocation would
   land almost entirely on `_round_floats` and be indistinguishable from a code
   regression. Settling it needs one `capture-perf-baseline.yml` dispatch on
-  `8edfb70` under 3.12.14.
+  `8edfb70` under 3.12.14. **That settling is still blocked on this exact
+  artifact surviving** — a round-4 #242 review (f-cdf9cf20) caught a
+  same-PR recapture that dispatched against the feature branch itself
+  (neither legitimate trigger above) and deleted this `8edfb70`/3.12.13
+  baseline in the process; it was reverted rather than kept, precisely so
+  this open question stays answerable. See the CHANGELOG's round-4 entry
+  for the full incident.
 - **The PR body IS the writeup.** There is no in-repo `devlog/` (removed
   2026-08-03 — 63 files nothing in the repo read, duplicating what the
   `/devlog` skill publishes to natejswenson.com from git history). A
@@ -685,6 +691,37 @@ These are settled — don't redesign without a reason.
   plan side. Touching `interpret.fastest_rep_split` means running
   `calibrate_report_card.py` AND `calibrate_plan_verdicts.py`, and shipping
   a `warm_report_cards.py` pass with the release.
+
+  **The count-based "dominant bucket" replaced above was itself replaced**
+  (round-4 review, f-7fe7b9d1/f-405976cb/f-e04f6232/f-e3a8a465): asking
+  "which lap size has the most members" fails whenever a non-rep size
+  outnumbers the reps (a warmup, an interior recovery lap, and a cooldown
+  all sharing one size out-count two real reps three-to-two) OR a rep size
+  IS the day's smallest and sits at the literal edge (a symmetric pyramid's
+  outer reps read as a bookend pair and get excluded from their own
+  dominance contest). `_drop_outlier_fragments` no longer buckets by count
+  at all: everything inside the trimmed/framed range — bookends included —
+  is kept unconditionally, since a slower warmup or a small-but-genuine
+  pyramid leg costs nothing sitting beside `min()`; only a candidate
+  trimming discarded entirely (a closing kick, a trailing remainder, a
+  leading walk-out) is ever floor-tested, against the framed core's own
+  interior. `_is_bookend_pair` is gone. Four new pinned scenarios in
+  `tests/test_interpret.py` reproduce the finding text's exact splits.
+
+  **`_ran`'s label fallback satisfying a quality day's VOLUME is not the
+  same thing as confirming the day was RUN** (round-4 review, f-f0c01058).
+  A solitary paceless on-foot row Garmin mislabels `treadmill_running`
+  could satisfy the distance ladder on label alone while `_fastest_rep_pace`
+  simultaneously abstained on the identical row for having no measured pace
+  — leaving the volume-only `done` to stand uncapped, #242's own symptom
+  surviving the fix. `_cap_on_rep_pace` now checks, only when it would
+  otherwise abstain, whether ANY volume-crediting activity can be confirmed
+  running — by measured pace, or by the pace implied by its own
+  duration/distance when no explicit pace was ever stamped (the implied-pace
+  fallback is what keeps a genuinely backfilled, never-paced run abstaining
+  as before, since its own numbers almost always imply a plainly running
+  pace). Nothing confirmed ⇒ `missed`, not abstain — there is no measured
+  pace to cap the day TO.
 - **Analysis tools carry deterministic interpretation, not just raw numbers**
   (2026-07-13). `agent/interpret.py` is a pure, stdlib-only module (no I/O, no
   SDK) housing every classifier the brief path already computed in tested

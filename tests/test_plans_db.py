@@ -329,10 +329,17 @@ def test_build_plan_detail_caps_a_quality_day_on_rep_pace(dbp):
     assert detail["adherence_pct"] == 0
 
     # Same prescription, reps at target: done, and adherence with it.
+    # Three DISTINCT dicts, not `[{...}] * 3` — the latter aliases one dict
+    # object across all three list slots, which collapses
+    # interpret._drop_outlier_fragments's identity-based bookend detection
+    # (every slot shares one id, so "first" and "last" are the same object
+    # as every interior slot too, and the middle slot is misread as the
+    # bookend-excluded edge — #242 r4, caught by this fixture crashing).
     obedient = {"2026-07-01": [dict(by_date["2026-07-01"][0],
                                     distance_meters=4.5 * 1609.344,
                                     splits=[{"distance_meters": 1609.344,
-                                             "avg_pace_sec_per_km": target_pace}] * 3)]}
+                                             "avg_pace_sec_per_km": target_pace}
+                                            for _ in range(3)])]}
     done = plans.build_plan_detail(plan, frontier="2026-07-08",
                                    activities_by_date=obedient)
     assert done["workouts"][0]["verdict"] == "done"

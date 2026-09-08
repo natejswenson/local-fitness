@@ -359,8 +359,91 @@ key. The warm is still owed as a release step; it is not this change's debt.
   small as the fix allows. This is on top of round-2's still-uncaptured
   `activity_splits` addition (f-f447488c/f-a801fb5e as originally filed):
   the committed `.benchmarks/Linux-CPython-3.12-64bit/0001_*.json` baseline
-  now needs recapturing via `capture-perf-baseline.yml`'s `workflow_dispatch`
-  on `ubuntu-latest`, dispatched against this branch after this round's push.
+  measurably shifts and needs recapturing — but per CLAUDE.md's perf-gate
+  rule, that recapture is only legitimate via `capture-perf-baseline.yml`'s
+  `workflow_dispatch` on `main`, after this branch merges, and only under one
+  of its two named triggers (a further perf improvement, or measured
+  runner-fleet drift). **Dispatching it against this feature branch mid-PR —
+  as an earlier draft of this note said to — is neither**: it is pre-PR/
+  post-PR cost shifting from #242's own changes, not the improvement or
+  drift the rule gates on, and it would bake this branch's own cost straight
+  into the floor it is supposed to be measured against.
+
+### Fixed (round-4 review)
+- **The perf-baseline recapture this round-3 note asked for was done anyway,
+  on the wrong branch, and reverted** (f-cdf9cf20). A round-3 follow-up
+  dispatched `capture-perf-baseline.yml` against `feature/issue-242` itself
+  (`commit_info.branch: "feature/issue-242"`, not `main`) and hand-promoted
+  the artifact to `.benchmarks/Linux-CPython-3.12-64bit/0001_*.json` —
+  exactly the "bake this branch's own cost into the floor" outcome the
+  paragraph above warns against, for neither of the rule's two legitimate
+  triggers. It also **deleted** the prior `0001_8edfb701..._20260726` (Python
+  3.12.13) artifact that CLAUDE.md's runner-fleet-drift section names as
+  still needed to settle #232 (whether 3.12.13 vs 3.12.14 alone explains a
+  measured drift) — a `capture-baseline.yml` dispatch on `8edfb70` under
+  3.12.14 can no longer be compared against it once it's gone. Reverted to
+  the original 3.12.13 baseline. The five gated benchmarks' real cost shift
+  from round 2's `activity_splits` addition and round 3's tempo-pace stamp
+  (measured in the reverted commit: `get_training_plan_progress` and
+  `get_training_plan_status` both +22-23.5%, over the 15% gate) is therefore
+  **still unrecaptured** — the CI perf-benchmark gate may fail on this PR
+  until a `main`-dispatched recapture happens post-merge, which is the
+  correct order per CLAUDE.md and not something this round can perform
+  itself.
+- **A paceless on-foot row credits a quality day's volume through `_ran`'s
+  label fallback while contributing nothing to the pace cap, and the gap
+  between the two let a full walking session grade a completed tempo**
+  (f-f0c01058). `_ran`'s label fallback is a deliberate MILEAGE-only
+  concession (a paceless row still counts toward distance because the label
+  is at least right about foot-vs-wheel), but `_cap_on_rep_pace` reused it as
+  if it also meant "confirmed running" — when `_fastest_rep_pace` found no
+  rep-sized split (the ordinary shape for a paceless row, which
+  `_ran_by_measured_pace` excludes from the pace pool entirely), the cap
+  abstained and let the volume-only verdict stand. A solitary
+  `treadmill_running` row whose distance happened to match the prescription
+  (8100 m against an 8000 m target, 8000 s duration — an implied ~26:29/mi)
+  graded `done` with zero measured running evidence anywhere in the day.
+  `_unverified_running_credit` now checks, only when the pace cap already
+  abstained, whether ANY activity crediting the day's volume can be
+  confirmed running — by measured pace, or (new) by the coarse pace implied
+  by its own `duration_seconds`/`distance_meters` when no explicit pace was
+  ever stamped. The implied-pace fallback is what keeps this from
+  over-firing on the ordinary case it must not touch: a genuinely backfilled
+  run row with no `avg_pace_sec_per_km` at all almost always implies a
+  plainly running pace from its own numbers, so it still confirms and the
+  day still abstains, unchanged. Only when nothing on the day clears either
+  bar does the day drop straight to `missed` — there is no measured pace to
+  cap it TO, and no benefit of the doubt left to extend.
+- **`interpret._drop_outlier_fragments`'s dominant-bucket selector is
+  rewritten; the previous design failed in both directions on real workout
+  shapes** (f-7fe7b9d1, f-405976cb, f-e04f6232, f-e3a8a465). Bucketing the
+  *trimmed* list by distance and asking "which bucket dominates by member
+  count" meant: (1) a lap size covering both the warmup/cooldown AND an
+  interior recovery lap (three members) escaped the old bookend check, which
+  only ever fired on a bucket of exactly two, and outnumbered the real reps
+  — a warmup/recovery/cooldown all at 1609 m deleted two genuine 800 m reps,
+  grading the session at warmup pace; (2) a single genuine standalone rep
+  positioned at the edge next to an unrelated repeated pair (a 1 km rep
+  before two easy cooldown miles) was trimmed away for being alone at the
+  edge, before its size was ever weighed against anything, losing to the
+  slower cooldown by default; (3) a symmetric pyramid's own smallest reps
+  (its literal first and last candidates) were misread as a matched
+  warmup/cooldown pair and excluded, then floored out entirely by the
+  pyramid's own middle reps; (4) a bucket the bookend pair merely SHARED a
+  size with (an interior lap of the same rounded distance) could still
+  dominate, since the exactly-two-member check never fired on a
+  three-member bucket. All four are the same category error: deciding
+  "bookend or not" at the *bucket* level rather than the *element* level.
+  The rewrite keeps everything inside the trimmed/framed range — bookends
+  included — unconditionally, since a pyramid's outer reps or a slower
+  warmup/cooldown both cost nothing sitting beside `min()`; the floor now
+  judges only what trimming discarded entirely (a closing kick, a trailing
+  remainder, a leading walk-out), against the framed core's own interior.
+  `_is_bookend_pair` is gone; the four scenarios above are pinned as new
+  regression cases in `tests/test_interpret.py`, and a test-fixture data bug
+  this exposed (`[{...}] * 3` aliasing one dict object across three list
+  slots, which collapsed the old and new identity-based bookend detection
+  alike) is fixed in `tests/test_plans_db.py`.
 
 ## [0.62.0] - 2026-09-05
 

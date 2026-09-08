@@ -416,6 +416,34 @@ def test_the_pace_cap_ignores_a_paceless_walks_splits_via_label_fallback():
     assert plans.classify_workout(_tempo(), [walk, run]) == "done"
 
 
+def test_a_solitary_paceless_walk_does_not_satisfy_a_quality_day():
+    """#242 r4, f-f0c01058: the walk above is credited via `_ran`'s label
+    fallback ALONGSIDE a genuine paceless run, so the day still abstains —
+    correctly, since the run's own distance/duration imply a running pace.
+    Here there is no run at all: the ONLY on-foot activity is a paceless
+    `treadmill_running` row whose distance conveniently matches the
+    prescription (Garmin's standing walking-desk mislabel; see `_ran`'s
+    docstring) — the day's #242 symptom surviving the original fix, since
+    `_running_distance` credited it on the label and `_fastest_rep_pace`
+    abstained on the identical row for having no measured pace to confirm
+    it, leaving the volume-only verdict (`done`) to stand uncapped. Its own
+    implied pace (duration/distance) is ~26:29/mi — walking, not a tempo —
+    so the day must grade `missed`, not abstain."""
+    walk = _run(8100.0, duration=8000, atype="treadmill_running")
+    assert plans.classify_workout(_tempo(), [walk]) == "missed"
+
+
+def test_a_solitary_paceless_run_with_no_measured_pace_still_abstains():
+    """The companion case f-f0c01058 must NOT break: a genuinely backfilled
+    run row, labelled plain `running`, stamped with neither
+    `avg_pace_sec_per_km` nor splits — the ordinary historical-import shape.
+    Its own distance/duration imply ~8:03/mi, a plainly running pace, so the
+    day abstains (volume-only `done`) exactly as before rather than being
+    swept into the new `missed` floor meant for an unconfirmed walk."""
+    run = _run(8000.0, duration=2400, atype="running")
+    assert plans.classify_workout(_tempo(), [run]) == "done"
+
+
 def test_a_prescribed_duration_still_wins_over_distance():
     """Unchanged behaviour: when the plan states a duration that is the graded
     volume, and the distance target beside it is not consulted."""

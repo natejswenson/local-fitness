@@ -570,6 +570,74 @@ def _fastest_rep_pace(
     return min(paces) if paces else None
 
 
+def _implied_pace_sec_per_km(activity: dict) -> float | None:
+    """A coarse whole-activity pace (sec/km) inferred from ``duration_seconds``
+    / ``distance_meters`` when ``avg_pace_sec_per_km`` was never stamped.
+
+    Only trustworthy as a run-or-walk MODE signal, never as a value to grade
+    rep pace against — it blends warmup, reps and cooldown exactly the way
+    ``report_card``'s Rejected section already ruled out for grading (see
+    ``interpret.fastest_rep_split``'s module docstring). Used solely by
+    :func:`_unverified_running_credit` to settle whether a paceless row is
+    plausibly a run at all when nothing else on the day can say so.
+    """
+    dist = activity.get("distance_meters") or 0.0
+    dur = activity.get("duration_seconds") or 0.0
+    if dist <= 0 or dur <= 0:
+        return None
+    return dur / dist * 1000.0
+
+
+def _unverified_running_credit(
+    day_activities: list[dict], cfg: GradingConfig,
+) -> bool:
+    """True when no activity crediting the day's volume (``_ran`` is True) can
+    be confirmed as running at all — not by measured pace, and not even by
+    the coarse whole-activity pace implied by its own distance and duration
+    (#242 r4, f-f0c01058).
+
+    ``_ran``'s label fallback is deliberately generous for a mileage decision
+    (see its docstring): a paceless on-foot row counts as running when the
+    label says so, because the label is at least right about foot-vs-wheel.
+    That generosity is exactly wrong for a PACE judgment, which is why
+    ``_ran_by_measured_pace`` exists and gates ``_fastest_rep_pace`` — but the
+    gap between the two meant a paceless on-foot row Garmin mislabels
+    ``treadmill_running`` (the standing walking-desk case; see ``_ran``'s
+    docstring) could satisfy a quality day's volume ladder through ``_ran``
+    while ``_fastest_rep_pace`` abstained on the identical row for having no
+    measured pace to confirm it, leaving the volume verdict to stand
+    uncapped — a full walking session credited as a completed tempo.
+
+    The implied-pace fallback is what keeps this from over-firing on the
+    ordinary case it must NOT touch: a genuinely backfilled/manual run row
+    that was never stamped ``avg_pace_sec_per_km`` at all. Its own
+    distance/duration ratio is almost always a plainly running pace (a 4.97
+    mi / 40 min tempo implies ~8:03/mi), which is enough to confirm it
+    without ever grading rep pace off it. A row whose implied pace is itself
+    walking-slow (#242's own repro: 8100 m in 8000 s implies ~26:29/mi)
+    earns no such benefit of the doubt.
+
+    Only meaningful when ``_fastest_rep_pace`` already abstained (no rep-sized
+    split to grade the day on); a day carrying a genuinely confirmed running
+    activity — even one lacking splits, the ordinary backfilled-tail case
+    ``_cap_on_rep_pace`` is documented to abstain on — is never flagged here.
+    """
+    credited = [a for a in day_activities if _ran(a, cfg)]
+    if not credited:
+        return False
+
+    def _confirmed(a: dict) -> bool:
+        if _ran_by_measured_pace(a):
+            return True
+        pace = a.get("avg_pace_sec_per_km") or _implied_pace_sec_per_km(a)
+        return (
+            _is_on_foot(a.get("activity_type"))
+            and interpret.is_running_effort(pace) is True
+        )
+
+    return not any(_confirmed(a) for a in credited)
+
+
 def _cap_on_rep_pace(
     workout: dict, day_activities: list[dict], verdict: str, cfg: GradingConfig,
 ) -> str:
@@ -584,13 +652,22 @@ def _cap_on_rep_pace(
 
     ABSTAINS (returns ``verdict`` untouched) when the day prescribes no pace or
     carries no rep-sized split, exactly as the card's quality-pace metric
-    abstains rather than failing a session it cannot measure.
+    abstains rather than failing a session it cannot measure — UNLESS the
+    volume itself was never confirmed as running in the first place
+    (``_unverified_running_credit``, #242 r4, f-f0c01058), in which case
+    abstaining would let the exact label-fallback gap it exists to close
+    stand as ``done``. There is nothing to cap TO in that case — no measured
+    pace exists to grade — so the day drops straight to ``missed``, the same
+    outcome a confirmed run at the wrong pace already earns past
+    ``QUALITY_PACE_PARTIAL_DEVIATION``.
     """
     target_pace = workout.get("target_pace_sec_per_km")
     if not target_pace:
         return verdict
     actual_pace = _fastest_rep_pace(day_activities, cfg)
     if not actual_pace:
+        if _unverified_running_credit(day_activities, cfg):
+            return "missed"
         return verdict
     # Slow-side only, like report_card.pace_deviation's quality branch: beating
     # the rep target is compliance, not a miss.
