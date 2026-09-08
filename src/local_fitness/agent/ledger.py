@@ -514,7 +514,9 @@ def load_ledger_inputs(conn: sqlite3.Connection, today: str,
         dates = [w["date"] for w in active["workouts"]] or [today]
         start = min(dates)
         end = max([today, *dates] + ([frontier] if frontier else []))
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cfg = plans.resolve_grading_config(conn=conn)
         detail = plans.build_plan_detail(active, frontier, activities_by_date, cfg=cfg)
         graded = detail["workouts"]

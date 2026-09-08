@@ -948,7 +948,9 @@ async def plan_chart(args: dict) -> dict:
         anchor = frontier or date.today().isoformat()
         start = min(plan_dates) if plan_dates else anchor
         end = max([anchor, *plan_dates])
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cfg = plans.resolve_grading_config(conn=conn)
     detail = plans.build_plan_detail(active, frontier, activities_by_date, cfg=cfg)
 
@@ -3088,6 +3090,38 @@ async def delete_manual_workout(args: dict) -> dict:
 # draft, or abandon the active plan outright). See plans.py for the enforced
 # write boundary.
 
+# The ONE description both plan-writing schemas use, because both run the same
+# `plans.validate_plan_input` and a rule stated on only one of them is a rule
+# the model learns on one call and gets rejected by on the other.
+#
+# The quality-day sentence is #242's proposer half (r2, f-cdcc3388). Every
+# tempo/interval day the proposer wrote carried a pace and a distance and NO
+# duration, which fell through `classify_workout`'s "by feel" branch and graded
+# `done` for any running at all. Grading now reads the pace, and
+# `validate_plan_input` REFUSES a target-less quality day — so a model that has
+# not been told will have a 60-workout proposal rejected whole for a rule
+# nothing it read mentioned. Same shape as the 0.40.0 `target_hr_max` note
+# beside it: state what the grader does with the field, in the only guidance a
+# tool call gets.
+_PLAN_WORKOUTS_DESCRIPTION = (
+    "Full schedule: each {date, week_index, type, target_distance_m?, "
+    "target_pace_sec_per_km?, target_duration_sec?, target_hr_max?, "
+    "description, seq?}. "
+    "Set target_hr_max (bpm) on any day with a heart-rate ceiling — the report "
+    "card grades against it, and a cap written only into the description is "
+    "invisible to the grader. "
+    "A tempo or interval day is REQUIRED to carry target_duration_sec or "
+    "target_distance_m; one with neither is rejected, because a quality day "
+    "with no volume target is graded 'by feel' and any running at all counts "
+    "as done. "
+    "On those days target_pace_sec_per_km is GRADED, not advisory: it is the "
+    "REP pace, compared against the fastest rep-sized split of the session "
+    "(never the run average, which blends in warmup and recovery), and a "
+    "session run well off it is capped to partial or missed however much "
+    "ground it covered. Prescribe the pace you actually mean the reps to be "
+    "run at, and put the rep structure in the description."
+)
+
 _PROPOSE_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -3099,7 +3133,7 @@ _PROPOSE_PLAN_SCHEMA = {
         "ability_snapshot": {"type": "object", "description": "Current-ability estimate you derived from the athlete's data"},
         "workouts": {
             "type": "array",
-            "description": "Full schedule: each {date, week_index, type, target_distance_m?, target_pace_sec_per_km?, target_duration_sec?, target_hr_max?, description, seq?}. Set target_hr_max (bpm) on any day with a heart-rate ceiling — the report card grades against it, and a cap written only into the description is invisible to the grader.",
+            "description": _PLAN_WORKOUTS_DESCRIPTION,
             "items": {"type": "object"},
         },
     },
@@ -3115,7 +3149,11 @@ _REVISE_PLAN_SCHEMA = {
         "target_time_seconds": {"type": "integer"},
         "goal_distance_m": {"type": "number"},
         "title": {"type": "string"},
-        "workouts": {"type": "array", "items": {"type": "object"}},
+        "workouts": {
+            "type": "array",
+            "description": _PLAN_WORKOUTS_DESCRIPTION,
+            "items": {"type": "object"},
+        },
     },
     "required": ["plan_id"],
 }
@@ -3212,15 +3250,46 @@ _UPDATE_WORKOUT_SCHEMA = {
     "type": "object",
     "properties": {
         "date": {"type": "string", "description": "ISO YYYY-MM-DD of the day to re-prescribe in the ACTIVE plan"},
-        "type": {"type": "string", "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"]},
-        "distance_mi": {"type": "number", "description": "target distance in miles (omit for rest / by-feel)"},
+        "type": {
+            "type": "string",
+            "enum": ["easy", "long", "tempo", "interval", "rest", "race", "cross"],
+            "description": "A tempo or interval day is REQUIRED to end up with "
+                           "target_duration_sec or target_distance_m set — set "
+                           "distance_mi and/or duration_min in THIS SAME call "
+                           "whenever the existing day (e.g. a former rest day) "
+                           "has neither, or the edit is rejected and nothing is "
+                           "written. A day with no volume target would otherwise "
+                           "be graded 'by feel', where any running at all counts "
+                           "as done.",
+        },
+        "distance_mi": {
+            "type": "number",
+            "description": "target distance in miles (omit for rest, or for a "
+                           "tempo/interval day whose duration_min you are "
+                           "setting instead). On tempo/interval this is the "
+                           "graded VOLUME whenever duration_min isn't set — see "
+                           "type's description for when it (or duration_min) is "
+                           "REQUIRED; on easy/long/race it is always the graded "
+                           "field.",
+        },
         "pace_min_per_mi": {
             "type": ["string", "number"],
             "description": 'target pace per mile as "M:SS" (preferred). A bare '
                            "number is DECIMAL minutes — 9.65 is 9:39/mi, 9.39 "
-                           "is 9:23/mi; never copy a display string as a number.",
+                           "is 9:23/mi; never copy a display string as a number. "
+                           "On tempo/interval this IS graded — it caps the day's "
+                           "verdict against the fastest rep-sized split. Display/"
+                           "coaching only on easy/long/race.",
         },
-        "duration_min": {"type": "number", "description": "target duration in minutes — the graded field for tempo/interval sessions"},
+        "duration_min": {
+            "type": "number",
+            "description": "target duration in minutes — the graded VOLUME field "
+                           "for tempo/interval when you set it; distance_mi is the "
+                           "fallback volume when you don't. See type's description: "
+                           "a tempo/interval day must end up with THIS or "
+                           "distance_mi set, or the edit is rejected. The pace cap "
+                           "above still applies either way.",
+        },
         "hr_max": {
             "type": "number",
             "description": "prescribed heart-rate CEILING in bpm. The grader "
@@ -3261,9 +3330,14 @@ def _prescription_fields(args: dict) -> tuple[dict | None, str | None]:
         if sec_per_mi is None:
             return None, ('pace_min_per_mi must be "M:SS" (e.g. "9:39") or decimal '
                           "minutes (9.65 = 9:39/mi)")
-        # Sanity bound: 3:00–30:00/mi. Catches transposed args and
+        # Sanity bound: 3:00-30:00/mi. Catches transposed args and
         # unit-confused numbers before they land on the active plan.
-        if not (180.0 <= sec_per_mi <= 1800.0):
+        # Bounds live in plans.py so the CREATE path (validate_plan_input)
+        # and this EDIT path share one definition (#242 r3, f-84d486cd) —
+        # the same discipline as the hr_max bound just below, which
+        # disagreed between the two paths until 0.47.0.
+        if not (plans.MIN_PRESCRIBED_PACE_SEC_PER_MI <= sec_per_mi
+                <= plans.MAX_PRESCRIBED_PACE_SEC_PER_MI):
             return None, (
                 f"pace_min_per_mi of {units.format_pace_min_per_mi(units.pace_sec_per_mi_to_sec_per_km(sec_per_mi))}/mi "
                 "is outside the plausible 3:00–30:00/mi range")
@@ -3335,8 +3409,8 @@ async def update_plan_workout(args: dict) -> dict:
 
     # Echo the whole prescription that was written, so the model can confirm
     # the change from the tool result without a follow-up read. duration_min is
-    # the graded field for tempo/interval days (per this tool's own
-    # description), so target_duration_sec MUST be in the echo — via the
+    # a graded VOLUME field for tempo/interval days when set (per this tool's
+    # own description), so target_duration_sec MUST be in the echo — via the
     # duration_seconds key _augment_workout formats into duration_formatted,
     # mirroring the distance_meters/avg_pace_sec_per_km remaps beside it. seq
     # tells the user which session of a double day was edited.
@@ -3703,7 +3777,9 @@ async def get_training_plan_status(_args: dict) -> dict:
         dates = [w["date"] for w in active["workouts"]] or [today]
         start = min(dates)
         end = max([today, *dates] + ([frontier] if frontier else []))
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cfg = plans.resolve_grading_config(conn=conn)
     status = plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
     status["pending_draft"] = pending_draft
@@ -3770,7 +3846,9 @@ async def get_training_plan_progress(args: dict) -> dict:
         dates = [w["date"] for w in active["workouts"]] or [today]
         start = min(dates)
         end = max([today, *dates] + ([frontier] if frontier else []))
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cutoff = (date.today() - timedelta(
             days=config.riegel_lookback_days(conn=conn))).isoformat()
         # The goal distance is a PREFERENCE for the basis, not a filter: it
@@ -4244,7 +4322,9 @@ def _build_plan_section(target_date: str) -> dict | None:
         dates = [w["date"] for w in active["workouts"]] or [target_date]
         start = min(dates)
         end = max([target_date, *dates] + ([frontier] if frontier else []))
-        activities_by_date = plans.load_activities_by_date(start, end, conn=conn)
+        activities_by_date = plans.load_activities_by_date(
+            start, end, conn=conn,
+            quality_dates=plans.quality_pace_dates(active["workouts"]))
         cfg = plans.resolve_grading_config(conn=conn)
     # build_plan_detail has no "as of" date concept — grade_workout's pending
     # holdout compares each workout's OWN date against the real data frontier,

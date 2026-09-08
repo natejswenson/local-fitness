@@ -299,3 +299,235 @@ def is_running_effort(pace_sec_per_km: float | None) -> bool | None:
     if not pace_sec_per_km or pace_sec_per_km <= 0:
         return None
     return pace_sec_per_km * _KM_PER_MILE <= RUN_PACE_CEILING_SEC_PER_MI
+
+
+# --- rep-split selection ----------------------------------------------------
+# The smallest split a quality-day pace judgment will read. Deliberately NOT
+# the ``partial`` flag: that is relative to the workout's OWN longest lap, so a
+# manually-lapped interval session (2-mile warmup, then 800m reps) marks every
+# rep partial and leaves the warmup as the only "full" split — which graded the
+# reps at warmup pace and guaranteed an F on exactly the workouts the splits
+# exception exists to grade fairly. 300 m sits under a standard 400 m rep and
+# well over any trailing GPS fragment.
+#
+# This lives here, not in ``report_card``, for the same reason
+# ``is_running_effort`` does: ``report_card`` imports ``plans``, so ``plans``
+# cannot import back, and both surfaces must select the rep the same way or a
+# plan verdict and a report card can disagree about the same session (#242).
+QUALITY_MIN_SPLIT_M = 300.0
+
+#: Bucket width (metres) for clustering same-sized laps when looking for the
+#: day's DOMINANT split size — see ``_drop_outlier_fragments``. Wide enough to
+#: absorb ordinary GPS variance between nominally-identical auto-laps (a
+#: "mile" split from a watch is rarely exactly 1609.34 m twice), narrow enough
+#: that a 400 m rep and an 800 m rep never land in the same bucket.
+_SIZE_CLUSTER_BUCKET_M = 100.0
+
+#: A lone rep-sized candidate must be at least this fraction of the day's
+#: DOMINANT (repeated >= 2x) lap size to stay eligible. See
+#: ``_drop_outlier_fragments``.
+_MIN_FRACTION_OF_DOMINANT_SPLIT = 0.6
+
+
+def _drop_outlier_fragments(candidates: list[dict]) -> list[dict]:
+    """Remove a short, one-off fragment sitting alongside a REPEATED lap size —
+    e.g. a fast closing kick tacked onto a 3x1mi tempo whose real reps are
+    mile-length auto-laps (#242, f-8a26a574).
+
+    An auto-lap GPS watch laps on a fixed distance regardless of the
+    prescribed workout, so nothing here can see "this session's reps are 1
+    mile" directly. The lap size that REPEATS is the best available proxy for
+    the unit the athlete was actually running, the same way a warmup/cooldown
+    is identified today by being the odd one out rather than by any label.
+
+    Deliberately keyed on the HIGHEST-COUNT bucket, not the largest one: a
+    3x1mi tempo's four 1609 m laps (a real rep every time) must outrank a
+    single 400 m closing kick, and a manually-lapped session's four 800 m reps
+    must outrank a single 1600 m warmup lap — in both cases the smaller
+    candidate is exactly the one this function must NOT drop, and it is the
+    one that repeats.
+
+    **A repeat is not automatically a rep, and the exception is bookends**
+    (#242 r2, f-854c3442 / f-04b7680c). A warmup and a cooldown of the same
+    length REPEAT, so ``len(bucket) >= 2`` alone identified the two laps on
+    the day that are definitionally *not* reps as the dominant unit, and the
+    floor they define then deleted the real work sitting between them:
+
+    * ``[2mi @ 6:36, 800 m @ 6:58, 2mi @ 6:50]`` — one rep bracketed by a
+      matched warmup/cooldown pair. The 3218 m bucket repeats, the floor lands
+      at 1931 m, and the only rep on the day is dropped, grading the session
+      at *warmup* pace.
+    * ``[1mi wu, 800 m, 800 m, 1mi cd]`` — a manually-lapped 2x800. Both
+      buckets hold two members, and the old ``max()`` tie-break on
+      ``distance_meters`` chose the *larger*, dropping both reps.
+
+    Both are the "graded the reps at warmup pace" failure ``fastest_rep_split``
+    exists to escape, reintroduced one layer up. So a bucket whose only members
+    are the day's FIRST and LAST candidate is excluded from the dominant
+    choice: bookending the session is what a warmup/cooldown pair does and what
+    a rep set structurally cannot, since a rep set has work on at least one
+    side of it. (Not excluded when the pair IS the whole day — two laps and
+    nothing else are the reps, and there is nothing for a floor to drop
+    anyway.)
+
+    Ties in count break toward the SMALLER lap size for the same reason, and
+    the asymmetry is deliberate: keeping a fragment risks it winning ``min()``,
+    which the distance floor already bounds, while dropping a rep GUARANTEES
+    the grade is read off a warmup. Erring toward keeping is the cheaper
+    mistake.
+
+    Deliberately does nothing when no lap size repeats at least twice — a
+    single-rep day, or one with no consistent lap size, has no dominant unit
+    to compare against, and this must not invent one. Never returns an empty
+    list: the dominant cluster's own members always clear the floor they
+    define, so at minimum they survive.
+
+    **The day's first and last CANDIDATE is not the same thing as the day's
+    first and last STRUCTURED lap** (#242 r3, f-6d873a9b). A trailing
+    remainder lap — the segment Garmin logs after the last lap press, which
+    every manually-lapped activity emits — or a leading walk-out fragment
+    sits above ``QUALITY_MIN_SPLIT_M`` and so is a "candidate", but it is
+    outside the warmup/cooldown pair, not part of it. :func:`_trim_framing_fragments`
+    runs first so the bookend identity below is always the true outer edge of
+    the day's REPEATED lap sizes, regardless of what Garmin tacked on before
+    or after them.
+
+    **Everything inside the trimmed/framed range is trusted unconditionally;
+    only a candidate trimming discarded outright is ever floor-tested**
+    (#242 r4, f-7fe7b9d1 / f-405976cb / f-e04f6232 / f-e3a8a465). The
+    previous design re-bucketed the *trimmed* list by distance and asked
+    "which bucket dominates by member count", which fails in both
+    directions at once: a size that repeats because it happens to cover
+    warmup **and** an interior recovery lap (three members) escapes the
+    old bookend check (which only ever fired on a bucket of exactly two)
+    and outnumbers the real reps, while a symmetric pyramid's own
+    smallest reps sit at the literal first/last position and get
+    misread as a bookend pair even though they ARE the work. Both
+    failures come from asking a *bucket* "are you the bookends" instead
+    of asking each *element* "are you outside the framed core". Now:
+
+    * The day's two bookends are still exactly ``trimmed``'s first and last
+      position (empty exclusion when the framed core has 2 or fewer
+      members) — but every element of ``trimmed``, bookends included, is
+      part of the identified structure and is kept outright. A pyramid's
+      outer reps are literally the first/last framed candidates, so they
+      survive here regardless of how small they are next to the middle of
+      the pyramid; a warmup/cooldown pair survives too, but that costs
+      nothing since ``min()`` already ignores a slower lap on its own.
+    * The floor exists only to judge candidates trimming discarded
+      entirely — a closing kick, a trailing remainder, a leading
+      walk-out — none of which are part of the framed core at all. Its
+      basis is the framed core's OWN interior (``trimmed`` minus its two
+      edges): the repeated bucket there if one exists, else the largest
+      interior candidate. A genuine short standalone rep positioned at
+      the very edge of a *different* repeated pair (f-405976cb: one 1 km
+      rep before two easy cooldown miles) is judged against that basis
+      and clears it; a kick or a remainder, always far smaller than
+      whatever the day's real work measures, does not.
+
+    Never returns an empty list: ``trimmed`` is always non-empty and every
+    one of its members is kept unconditionally.
+    """
+    if len(candidates) < 2:
+        return candidates
+    trimmed = _trim_framing_fragments(candidates)
+    trimmed_ids = {id(c) for c in trimmed}
+    # Positional, not identity-filtered: "trimmed minus its own two edges" is
+    # unambiguous by index within `trimmed` itself, and stays well-defined
+    # even when two positions happen to hold the identical object (a
+    # `[{...}] * n`-built fixture, not something real split rows ever do,
+    # since every row from the DB is its own dict) — an identity-based
+    # exclusion would misfire there, since every aliased slot then matches
+    # every OTHER aliased slot's id, not just the two true edges.
+    core = trimmed[1:-1] if len(trimmed) > 2 else trimmed
+    buckets: dict[int, list[dict]] = {}
+    for r in core:
+        key = round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)
+        buckets.setdefault(key, []).append(r)
+    repeated = [b for b in buckets.values() if len(b) >= 2]
+    if repeated:
+        dominant = min(repeated, key=lambda b: (-len(b), b[0]["distance_meters"]))
+        floor = dominant[0]["distance_meters"] * _MIN_FRACTION_OF_DOMINANT_SPLIT
+    else:
+        floor = max(r["distance_meters"] for r in core) * _MIN_FRACTION_OF_DOMINANT_SPLIT
+    kept = [
+        r for r in candidates
+        if id(r) in trimmed_ids or r["distance_meters"] >= floor
+    ]
+    return kept or trimmed
+
+
+def _trim_framing_fragments(candidates: list[dict]) -> list[dict]:
+    """Drop any leading/trailing candidate that is NOT part of a repeated
+    (>= 2) lap size, before bookend detection runs (#242 r3, f-6d873a9b).
+
+    A trailing remainder lap or a leading walk-out fragment sits outside the
+    warmup/cooldown pair but, left in place, becomes the literal first or
+    last element :func:`_drop_outlier_fragments` used to key its bookend
+    check on — see that function's docstring for the failure this causes.
+    Trimming first means the true warmup/cooldown lap, wherever a repeated
+    bucket puts it, is always what ends up at the trimmed edges.
+
+    Only ever trims a run of candidates whose OWN lap size never repeats; a
+    genuinely single-rep day (nothing repeats at all) has no repeated bucket
+    to trim toward and is returned unchanged, exactly as
+    :func:`_drop_outlier_fragments` already leaves it alone in that case.
+    """
+    counts: dict[int, int] = {}
+    for r in candidates:
+        key = round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)
+        counts[key] = counts.get(key, 0) + 1
+    framed = [
+        i for i, r in enumerate(candidates)
+        if counts[round(r["distance_meters"] / _SIZE_CLUSTER_BUCKET_M)] >= 2
+    ]
+    if len(framed) < 2:
+        return candidates
+    return candidates[framed[0]: framed[-1] + 1]
+
+
+def fastest_rep_split(labelled: dict) -> dict | None:
+    """The fastest rep-sized split, or ``None`` when there isn't one.
+
+    Rep-sized is ``distance_meters >= QUALITY_MIN_SPLIT_M`` rather than "not
+    ``partial``". The partial flag is measured against the workout's own longest
+    lap, which on a manually-lapped session is the warmup — so every rep of a
+    2-mile-warmup-then-800s workout is partial and the warmup is the only
+    candidate left, which is how a correctly-run interval session got graded at
+    warmup pace.
+
+    The distance floor still solves what the partial filter was there for: a
+    90-metre trailing fragment can post an absurdly fast pace and would win
+    every time. Anything long enough to be a rep is a fair candidate, and a
+    slower warmup simply loses ``min()`` — UNLESS the fast candidate is itself
+    a one-off fragment beside a lap size that repeats, which ``min()`` cannot
+    see and ``_drop_outlier_fragments`` exists to catch.
+
+    ``labelled`` is any mapping with a ``rows`` list — ``report_card``'s
+    ``label_splits`` output, or raw ``activity_splits`` rows wrapped as
+    ``{"rows": splits}``: only ``distance_meters`` and ``avg_pace_sec_per_km``
+    are read, and both are columns of the table.
+
+    This is the ONE SELECTOR both grades that are allowed to read splits share
+    — the quality branch of ``report_card.build_card`` and the quality arm of
+    ``plans.classify_workout`` (#242, which added the second one; before it
+    this really was the one place). Sharing it is the point: two rep-selection
+    rules is exactly how a plan verdict and a report card come to disagree
+    about the same session again. See ``report_card``'s module docstring for
+    the rule report_card's own splits reads are exceptions to, and
+    ``plans.py``'s docstring for why a duration-type grade needed the same
+    escape hatch.
+    """
+    candidates = [r for r in (labelled.get("rows") or [])
+                  if (r.get("distance_meters") or 0.0) >= QUALITY_MIN_SPLIT_M
+                  and r.get("avg_pace_sec_per_km")]
+    if not candidates:
+        return None
+    candidates = _drop_outlier_fragments(candidates)
+    return min(candidates, key=lambda r: r["avg_pace_sec_per_km"])
+
+
+def fastest_rep_split_pace(labelled: dict) -> float | None:
+    """:func:`fastest_rep_split`'s pace in sec/km, or ``None``."""
+    best = fastest_rep_split(labelled)
+    return best["avg_pace_sec_per_km"] if best else None

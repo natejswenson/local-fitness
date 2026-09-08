@@ -61,6 +61,8 @@ SCENARIOS = (
     "obedient_easy_straddling",
     "cap_blown_hard",
     "interval_manual_laps",
+    "interval_two_reps_bookended",
+    "interval_one_rep_bookended",
     "walk_mislabelled",
     "prescribed_walk_obeyed",
 )
@@ -129,6 +131,32 @@ EXPECTED_VERDICTS: dict[str, dict] = {
                "`test_every_scenario_actually_grades_something` can. Both "
                "guards are load-bearing here; neither is sufficient.",
     },
+    "interval_two_reps_bookended": {
+        "min_stars": 3.50,
+        "why": "#242 r2, f-04b7680c. A manually-lapped 2x1000m between a "
+               "warmup and cooldown of the SAME length. Both lap sizes repeat "
+               "twice, so `_drop_outlier_fragments` tied on count and broke "
+               "the tie toward the LARGER bucket — naming the bookends the "
+               "session's dominant unit, setting a 1931 m floor and dropping "
+               "both reps. The card then graded a correctly-executed session "
+               "at warmup pace (410 vs a 260 s/km target, 1.00 stars) and the "
+               "F-cap dragged the overall down with it. This is the exact "
+               "failure `fastest_rep_split` exists to escape, reintroduced in "
+               "the guard added beside it, and `interval_manual_laps` cannot "
+               "catch it: its four reps outnumber its two bookends, so the "
+               "count never ties.",
+    },
+    "interval_one_rep_bookended": {
+        "min_stars": 3.50,
+        "why": "#242 r2, f-854c3442. One genuine 1000m rep between a matched "
+               "warmup and cooldown. Only ONE lap size repeats — the "
+               "bookends — so there is no tie to break and the floor they "
+               "define deletes the only rep on the day. `_drop_outlier_"
+               "fragments`'s docstring claimed it 'does nothing when no lap "
+               "size repeats', but a warmup and cooldown of equal length ARE "
+               "a repeat, and they are the two laps on the day that are "
+               "definitionally not reps.",
+    },
     "walk_mislabelled": {
         "min_stars": 3.50,
         "why": "An ordinary easy run whose 60-day pool is 30 walking-desk "
@@ -168,6 +196,11 @@ _EASY_PLAN = {
     "description": "Easy 5mi. Keep HR under 140.",
 }
 
+#: A 2-mile warmup/cooldown lap. Named because two scenarios below depend on
+#: the warmup and the cooldown being the SAME length — that is what makes them
+#: a repeated bucket, and it is the whole mechanism under test.
+_BOOKEND_M = 2 * MILE_M
+
 _GRADED = {
     # Comfortably inside the ceiling the whole way.
     "obedient_easy_clean": (
@@ -204,6 +237,46 @@ _GRADED = {
             "avg_pace_sec_per_km": 260.0} for _ in range(4)]
         + [{"distance_meters": 2 * MILE_M, "duration_seconds": 1700, "avg_hr": 132,
             "avg_pace_sec_per_km": 528.0}],
+    ),
+    # #242 r2, f-04b7680c: two reps between a warmup and cooldown of the SAME
+    # length. Both lap sizes repeat exactly twice, so the dominant-bucket
+    # choice TIES on count — and breaking that tie toward the larger bucket
+    # names the bookends the session's unit and deletes both reps. Distances
+    # are chosen so total = target, isolating PACE as the axis under test.
+    "interval_two_reps_bookended": (
+        {"activity_type": "running", "activity_name": "Intervals",
+         "distance_meters": 2 * _BOOKEND_M + 2 * 1000.0, "duration_seconds": 3541,
+         "avg_pace_sec_per_km": 419.7, "avg_hr": 150, "training_load": 100.0,
+         "aerobic_te": 3.4},
+        {"type": "interval", "target_distance_m": 2 * _BOOKEND_M + 2 * 1000.0,
+         "target_pace_sec_per_km": 260.0, "target_hr_max": None,
+         "description": "2mi w/u, 2x1000m @ 6:58/mi, 2mi c/d"},
+        [{"distance_meters": _BOOKEND_M, "duration_seconds": 1320, "avg_hr": 138,
+          "avg_pace_sec_per_km": 410.0},
+         {"distance_meters": 1000.0, "duration_seconds": 260, "avg_hr": 168,
+          "avg_pace_sec_per_km": 260.0},
+         {"distance_meters": 1000.0, "duration_seconds": 262, "avg_hr": 170,
+          "avg_pace_sec_per_km": 262.0},
+         {"distance_meters": _BOOKEND_M, "duration_seconds": 1699, "avg_hr": 132,
+          "avg_pace_sec_per_km": 528.0}],
+    ),
+    # #242 r2, f-854c3442: ONE rep between matched bookends. No tie this time —
+    # the bookends are the only repeated size at all, so the floor they define
+    # drops the single real rep and nothing is left but warmup pace.
+    "interval_one_rep_bookended": (
+        {"activity_type": "running", "activity_name": "Threshold",
+         "distance_meters": 2 * _BOOKEND_M + 1000.0, "duration_seconds": 3281,
+         "avg_pace_sec_per_km": 446.6, "avg_hr": 146, "training_load": 88.0,
+         "aerobic_te": 3.2},
+        {"type": "interval", "target_distance_m": 2 * _BOOKEND_M + 1000.0,
+         "target_pace_sec_per_km": 260.0, "target_hr_max": None,
+         "description": "2mi w/u, 1x1000m @ 6:58/mi, 2mi c/d"},
+        [{"distance_meters": _BOOKEND_M, "duration_seconds": 1320, "avg_hr": 138,
+          "avg_pace_sec_per_km": 410.0},
+         {"distance_meters": 1000.0, "duration_seconds": 261, "avg_hr": 169,
+          "avg_pace_sec_per_km": 261.0},
+         {"distance_meters": _BOOKEND_M, "duration_seconds": 1700, "avg_hr": 131,
+          "avg_pace_sec_per_km": 528.0}],
     ),
     # The plan asked for a walk and got one. Stored as type `easy` because that
     # is how CLAUDE.md says a walk is prescribed (it is what makes the day
@@ -272,6 +345,8 @@ _POOLS = {
     "obedient_easy_straddling": _run_pool(),
     "cap_blown_hard": _run_pool(),
     "interval_manual_laps": _run_pool(),
+    "interval_two_reps_bookended": _run_pool(),
+    "interval_one_rep_bookended": _run_pool(),
     # The whole point of this scenario: the walks OUTNUMBER the runs 30-16, so
     # an unfiltered median is a walk.
     "walk_mislabelled": _run_pool() + _walk_pool(),
