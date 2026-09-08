@@ -57,9 +57,10 @@ def main(verbose: bool):
 def mcp_stdio():
     """Serve the fitness tools as an MCP server over stdio (local, auth-free).
 
-    For Claude Desktop / `claude mcp add --transport stdio fitness -- \
-    uv run fitness mcp-stdio`. The deployed HTTP endpoint lives at
-    /mcp/ behind the bearer token (see web/server.py)."""
+    Claude: `claude mcp add --transport stdio fitness -- uv run fitness
+    mcp-stdio`. Codex: `codex mcp add fitness -- uv run fitness mcp-stdio`.
+    The deployed HTTP endpoint lives at /mcp/ behind the bearer token (see
+    web/server.py)."""
     import asyncio
 
     from . import db
