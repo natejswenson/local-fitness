@@ -49,9 +49,9 @@ invent a schedule. The tool validates *structure*, not *sensibility*.
 | `week_index` | integer | yes (schema `NOT NULL`) | 1-based week. Drives `weekly_mileage` rollups. |
 | `type` | string | yes | `easy` \| `long` \| `tempo` \| `interval` \| `rest` \| `race` \| `cross`. |
 | `description` | string | yes | Non-blank after `.strip()`. This is what gets rendered to the athlete. |
-| `target_distance_m` | number | no | Metres. The graded field for `easy` / `long` / `race`. |
-| `target_pace_sec_per_km` | number | no | Seconds per km. Never graded — display/coaching only. |
-| `target_duration_sec` | number | no | Seconds. The graded field for `tempo` / `interval`. |
+| `target_distance_m` | number | no | Metres. The graded field for `easy` / `long` / `race`; on `tempo` / `interval` it is the volume fallback used when you don't prescribe a duration (see Gotchas). |
+| `target_pace_sec_per_km` | number | no | Seconds per km. On `easy` / `long` / `race` this is display/coaching only — never graded. On `tempo` / `interval` it IS graded: the verdict is capped by the pace of the day's fastest rep-sized split (see Gotchas). |
+| `target_duration_sec` | number | no | Seconds. The graded VOLUME field for `tempo` / `interval` when you set it — the pace cap below still applies on top of it. |
 | `target_hr_max` | number | no | Prescribed HR ceiling in bpm (90–210). Set it on any day with a cap — the report card grades against this column, and a cap stated only in `description` cannot be read by the grader (0.40.0). |
 | `seq` | integer | no | Intra-day session on a double day; defaults to 1. `(date, seq)` must be unique across the schedule. |
 
@@ -128,8 +128,24 @@ Then present the schedule to the athlete, revise if they push back, and only cal
   week-over-week mileage spike validates and stores fine. Judge the ramp yourself before proposing.
 - **`custom` goals get no `goal_distance_m`.** Without it, `predicted_finish_seconds` and
   `goal_gap` in `get_training_plan_progress` are permanently `null`.
-- **`target_pace_sec_per_km` is never graded.** Adherence grades distance (`easy`/`long`/`race`) or
-  duration (`tempo`/`interval`). A prescribed pace is coaching prose in numeric form.
+- **`target_pace_sec_per_km` IS graded on a quality day** (0.63.0). A `tempo`/`interval` day is
+  graded on volume — duration if you prescribe one, else distance — and the verdict is then CAPPED
+  by the pace of the day's fastest rep-sized split (≥300 m, the same split the report card grades
+  reps on). Within ~2.5% of the prescribed pace keeps `done`, out to ~21.2% caps at `partial`, past
+  that `missed` (widened from an original ~9.2% cut: nothing in the live data is manually lapped, so
+  a "rep" split is really a fixed-distance auto-lap that blends one or more reps with jog recovery —
+  a flawlessly-executed short-rep session still reads 15-19% slow on that blended pace, which the
+  tighter cut graded `missed`). A short, fast closing fragment beside a lap size that repeats (e.g. a
+  kick tacked onto 3x1mi whose real reps are mile-length auto-laps) is dropped rather than let win on
+  pace alone. The cap only ever lowers a verdict, and it abstains when the day has no prescribed pace
+  or the activity carries no splits. On `easy`/`long`/`race` a prescribed pace is still coaching
+  prose in numeric form.
+- **A `tempo`/`interval` day must carry `target_duration_sec` or `target_distance_m`.** A day with
+  neither is graded "by feel" — any running at all counts as `done` — which is how four quality
+  days on the active plan graded `done` for sessions run 2:19/mi off their prescription (#242).
+  Validation rejects the shape on creation, and `update_plan_workout` / `update_plan_workouts`
+  reject an edit that would leave an existing quality day in that shape too (e.g. flipping a rest
+  day — whose targets are NULL — straight to `tempo` with no target).
 - **A `null`/`0` `target_distance_m` on a distance-type workout means "by feel"** — any qualifying
   activity that day grades `done`, none grades `missed`.
 

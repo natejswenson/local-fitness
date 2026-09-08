@@ -39,14 +39,14 @@ plan vs actual · last 10d · 10 runs · adherence 94%
 █ on-foot mi vs ░ short of plan · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending
 07-12 easy     🟩 ████████             3.6 /  3.0
 07-13 easy     🟨 ███████░░            3.0 /  4.0
-07-14 tempo    🟩 ███████░░░░          3.0 /  5.0
+07-14 tempo    🟨 ███████░░░░          3.0 /  5.0
 07-15 easy     🟩 █████████            4.0 /  4.0
 07-16 easy     🟩 █████████            4.0 /  4.0
 07-17 long     🟩 ███████████████      7.0 /  7.0
 07-18 easy     🟩 ████░                2.0 /  2.5
 07-19 easy     🟩 ███████              3.1 /  3.0
 07-20 easy     🟩 █████████            4.0 /  4.0
-07-21 interval 🟩 ████████████████████ 9.2 /  5.0
+07-21 interval 🟥 ████████████████████ 9.2 /  5.0
 ```
 
 Weekly mode swaps the labels to `wk MM-DD`, sums planned and actual mileage per
@@ -77,11 +77,17 @@ Two row shapes are not bars:
 plan_chart(days=10)
 ```
 
-Paste the block above into the reply, then the read: *"94% adherence and the
-only yellow in ten days is a 3-of-4 easy day. The 07-14 tempo came in 2 miles
-light, and yesterday's interval bar reads 9.2 on-foot against a prescribed 5 —
-but that's run plus walking-pad miles, so check `week_run_mi` before calling it
-over-cooked; the run itself may have been on target."*
+Paste the block above into the reply, then the read: *"Easy days are clean —
+eight of eight. Both quality days are not. The 07-14 tempo came in 2 miles
+light. Yesterday's interval bar is the one to read carefully: 9.2 on-foot
+against a prescribed 5, and still 🟥, because the reps ran 9:12/mi against a
+6:58/mi target. That bar is volume, not execution — some of it is walking-pad
+miles (check `week_run_mi`), and none of it is interval work."*
+
+Note the shape of that last row, because it is the one an agent misreads: **a
+full bar with a red glyph on a `tempo` or `interval` day is not a
+contradiction.** Volume and pace are graded separately there — see the
+overachievement gotcha below.
 
 ## Gotchas
 
@@ -98,9 +104,18 @@ over-cooked; the run itself may have been on target."*
   verdict-conditional rule `weekly_rollup` (and therefore the brief PDF's plan
   table) uses. Chart and PDF agree by construction; don't "fix" a blank actual
   on a pending day.
-- **Overachievement has no separate glyph.** Running past the prescription just
-  produces a longer all-`█` bar (see `07-21` above: 9.2 against 5.0). The
-  verdict stays 🟩 — this chart shows adherence, not restraint.
+- **Overachievement has no separate glyph, and on a quality day it does not buy
+  a green verdict.** Running past the prescription just produces a longer
+  all-`█` bar (see `07-21` above: 9.2 against 5.0). On an `easy`, `long` or
+  `race` day the verdict stays 🟩 — those are graded on volume, and this chart
+  shows adherence, not restraint. On a `tempo` or `interval` day it does not:
+  since 0.63.0 a quality day is graded on volume and then **capped by the pace
+  of its fastest rep-sized split** (#242), so covering the ground at easy pace
+  reads 🟨 or 🟥 under a bar that runs past the prescription. `07-21` is exactly
+  that case — 9.2 mi against a prescribed 5.0, but the reps came in at 9:12/mi
+  against a 6:58/mi target, so it grades `missed` and prints 🟥. **A long bar
+  beside a red glyph on a quality day is the chart working**, not a bug: read
+  the bar as volume and the glyph as execution.
 - **Weekly verdicts are ratio-derived, not the per-day grades**: ≥90% of planned
   mileage is 🟩, 70–89% 🟨, below that 🟥, and a week with no planned or actual
   mileage is a 🟦 rest week.

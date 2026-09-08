@@ -11,15 +11,15 @@ process must never pay the SDK's import cost for a PDF-only feature it
 never uses — mirrors ``visuals.py``'s deferred matplotlib/weasyprint
 imports for the same reason.
 
-``briefing`` is ALSO imported lazily (inside ``generate_coaching_line``,
-not at module scope) for a second, load-bearing reason, not just import
-cost: ``briefing.py`` itself imports ``tools.py`` at module scope (as
-``agent_tools``, for the V1 monolith's MCP-tool wiring), and ``tools.py``
-imports this module — a module-scope ``from . import briefing`` here
-would close that into a real circular import (``tools -> plan_coach ->
-briefing -> tools``) that breaks at process start. Deferring to call time
-sidesteps it entirely, since by then every module involved has already
-finished initializing.
+``briefing`` must NEVER be imported at module scope here, and is no longer
+imported at all: ``briefing.py`` itself imports ``tools.py`` at module
+scope (as ``agent_tools``, for the V1 monolith's MCP-tool wiring), and
+``tools.py`` imports this module — a module-scope ``from . import
+briefing`` here would close that into a real circular import (``tools ->
+plan_coach -> briefing -> tools``) that breaks at process start. The
+call-time import that used to sidestep it existed for one purpose, reading
+``briefing.DEFAULT_MODEL``, and ``DEFAULT_MODEL`` below replaced it. The
+prohibition outlives the import it explained.
 """
 from __future__ import annotations
 
@@ -36,6 +36,44 @@ from .coach import CoachProfile
 from .grounding import GroundingFlag
 
 _LOG = logging.getLogger(__name__)
+
+#: This module's model, deliberately NOT ``briefing.DEFAULT_MODEL`` — the same
+#: split ``workout_coach`` made, arrived at one bug later.
+#:
+#: That constant drives the eval'd daily-brief generator, where a model change
+#: is a prompt change that has to clear the scorer, a cross-model A/B and the
+#: invention-rate gate. Following it meant this call could never be tuned, and
+#: it inherited the SDK defaults along with it: no ``effort``, no ``thinking``,
+#: i.e. adaptive thinking at high effort. Measured on real evening briefs
+#: (``logs/briefmail.launchd.err.log``, 2026-08-07 -> 2026-09-05): 23 of 30
+#: nights hit the old 30 s ceiling and shipped ``fallback_coaching_line``
+#: instead. Successes ran 9.3-26.6 s; failures pinned at the ceiling.
+DEFAULT_MODEL = "claude-sonnet-5"
+
+#: Low effort and thinking off — load-bearing, not polish, the same finding
+#: ``workout_coach`` measured (median 142.9 s -> 10.0 s). The control is in
+#: this app's own logs: on 2026-09-05 the brief composer wrote a whole
+#: three-card brief on ``claude-sonnet-4-6`` in 64 s with ``effort="low"``,
+#: 65 seconds before this module failed to write two sentences in 30 at
+#: default effort. There is nothing here to reason about — ``plans.py``
+#: decided every verdict in Python before the prompt was built.
+DEFAULT_EFFORT = "low"
+
+#: 45 s, matching ``reflect`` rather than ``workout_coach``'s 90 s: this is a
+#: short generation inside a scheduled job with a backstop slot, where the
+#: ceiling bounds what a bad night costs the job, not an interactive on-demand
+#: render. It is ~4.5x the ~10 s the corrected config should take and sits
+#: above the entire observed success tail under the OLD config (max 26.6 s),
+#: so it recovers most of today's distribution even if the config change
+#: under-delivers.
+#:
+#: It is not a guarantee, and no value here would be: the config bounds the
+#: failure RATE, never the wall clock. Two logged stalls (plan_coach 519.7 s
+#: against a 30 s ceiling, reflect 359 s against 45 s) blew past their
+#: ceilings entirely — ``asyncio.wait_for`` fired and cancellation did not
+#: return for minutes. The fallback stays the safety net for that residual;
+#: ``coaching_line_source`` is what makes the residual measurable.
+DEFAULT_TIMEOUT_S = 45.0
 
 # Verdict wording is date-relative: the graded day being referred to can be
 # the report's own date (an evening re-render after today's run synced and
@@ -192,7 +230,7 @@ async def generate_coaching_line(
     goal_type: str,
     *,
     model: str | None = None,
-    timeout: float = 30.0,
+    timeout: float = DEFAULT_TIMEOUT_S,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,
@@ -203,21 +241,15 @@ async def generate_coaching_line(
     Raises on any failure (missing/expired credential, network, timeout,
     empty response) — the caller (``tools.generate_brief_report``) is
     responsible for falling back to ``fallback_coaching_line``. ``model``
-    (``None`` by default) resolves to ``briefing.DEFAULT_MODEL`` — the same
-    constant the real daily brief generator always uses — read at call
-    time (not as a function-signature default) to avoid a module-scope
-    import of ``briefing`` here; see the module docstring for why. This
-    call follows ``DEFAULT_MODEL`` automatically if that constant ever
-    changes, rather than duplicating a literal that could drift out of
-    sync. ``notes_text`` is plumbed straight through to ``build_prompt`` —
-    see its docstring for the notes-parity rationale.
+    (``None`` by default) resolves to this module's own ``DEFAULT_MODEL``;
+    see that constant for why it is no longer ``briefing.DEFAULT_MODEL``.
+    ``notes_text`` is plumbed straight through to ``build_prompt`` — see
+    its docstring for the notes-parity rationale.
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 
-    from . import briefing
-
     if model is None:
-        model = briefing.DEFAULT_MODEL
+        model = DEFAULT_MODEL
 
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
@@ -229,6 +261,10 @@ async def generate_coaching_line(
         model=model,
         permission_mode="bypassPermissions",
         max_turns=1,
+        # See DEFAULT_EFFORT: without these, the model ID alone is a latency
+        # regression rather than a fix — this is what timed out 23 of 30 nights.
+        effort=DEFAULT_EFFORT,
+        thinking={"type": "disabled"},
     )
 
     async def _run() -> str:
@@ -257,8 +293,9 @@ def _cache_path() -> Path:
 
 #: Multi-entry cache cap (0.36.0). The old single-entry "latest key wins"
 #: shape thrashed the moment two different brief dates alternated — every
-#: render of A evicted B and vice versa, each miss a live SDK call on a 30 s
-#: budget. 32 entries is a month of dates with room for plan edits.
+#: render of A evicted B and vice versa, each miss a live SDK call on
+#: ``DEFAULT_TIMEOUT_S``. 32 entries is a month of dates with room for plan
+#: edits.
 CACHE_MAX_ENTRIES = 32
 
 
@@ -321,7 +358,7 @@ async def generate_coaching_line_cached(
     goal_type: str,
     *,
     model: str | None = None,
-    timeout: float = 30.0,
+    timeout: float = DEFAULT_TIMEOUT_S,
     notes_text: str | None = None,
     user_name: str = config.DEFAULT_USER_NAME,
     memory_text: str | None = None,

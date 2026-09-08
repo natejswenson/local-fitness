@@ -303,7 +303,12 @@ def patched_sdk(monkeypatch):
     return calls
 
 
-def test_generate_coaching_line_defaults_to_briefing_default_model(patched_sdk):
+def test_generate_coaching_line_does_not_follow_the_brief_generators_model(patched_sdk):
+    """Decoupled on purpose (#241). briefing.DEFAULT_MODEL also drives the
+    eval'd daily brief, where a model change has to clear the scorer, a
+    cross-model A/B and the invention-rate gate — so following it meant this
+    call could never be tuned, and it inherited the SDK's default effort along
+    with the model. 23 of 30 evening briefs timed out on that config."""
     from local_fitness.agent import briefing
 
     text = asyncio.run(
@@ -311,7 +316,41 @@ def test_generate_coaching_line_defaults_to_briefing_default_model(patched_sdk):
     )
     assert text == "Go hit your easy 4 and don't slide again."
     assert len(patched_sdk) == 1
-    assert patched_sdk[0]["options"].model == briefing.DEFAULT_MODEL
+    assert patched_sdk[0]["options"].model != briefing.DEFAULT_MODEL
+    assert patched_sdk[0]["options"].model == plan_coach.DEFAULT_MODEL
+
+
+def test_generate_coaching_line_disables_thinking_and_runs_at_low_effort(patched_sdk):
+    """The three settings whose absence caused the timeouts. Sonnet runs
+    adaptive thinking whenever `thinking` is unset, so the model ID alone would
+    have been a latency regression rather than a fix — the same finding
+    workout_coach measured (median 142.9s -> 10.0s)."""
+    asyncio.run(
+        plan_coach.generate_coaching_line(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+    )
+    options = patched_sdk[0]["options"]
+    assert options.effort == "low"
+    assert options.thinking == {"type": "disabled"}
+    assert options.max_turns == 1        # single-shot; no tool loop
+
+
+def test_generate_coaching_line_waits_the_modules_own_ceiling(patched_sdk, monkeypatch):
+    """The ceiling is a named constant above the old 30.0 literal, and it is
+    what an argument-free call actually waits. 45s matches reflect (a short
+    generation inside a scheduled job), not workout_coach's interactive 90s."""
+    seen: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(coro, timeout):
+        seen.append(timeout)
+        return await real_wait_for(coro, timeout)
+
+    monkeypatch.setattr(plan_coach.asyncio, "wait_for", recording_wait_for)
+    asyncio.run(
+        plan_coach.generate_coaching_line(_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 75, 71, "10k")
+    )
+    assert seen == [45.0]
+    assert plan_coach.DEFAULT_TIMEOUT_S == 45.0
 
 
 def test_generate_coaching_line_respects_explicit_model_override(patched_sdk):
@@ -499,7 +538,8 @@ def _fake_generator(lines):
     # double that has to be edited for every new kwarg is a double that fails
     # for reasons unrelated to what the test is checking.
     async def fake(profile, today_workout, last_7_days, adherence_pct,
-                   days_to_race, goal_type, *, model=None, timeout=30.0,
+                   days_to_race, goal_type, *, model=None,
+                   timeout=plan_coach.DEFAULT_TIMEOUT_S,
                    notes_text=None, **_kw):
         calls["n"] += 1
         result = lines[calls["n"] - 1]
@@ -522,6 +562,29 @@ def test_cached_line_reused_for_identical_inputs(monkeypatch, tmp_path):
     assert calls["n"] == 1  # second render never touched the SDK
 
 
+def test_cache_key_does_not_move_when_the_default_model_changes(monkeypatch, tmp_path):
+    """model=None hashes the literal "default", NOT DEFAULT_MODEL — the byte
+    layout generate_coaching_line_cached has always used. Guard, not a fix:
+    it is what let #241's model swap land without evicting the live cache's
+    stored lines. An explicit model is still its own key."""
+    fake, calls = _fake_generator(["Get out the door.", "Regenerated."])
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+
+    asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    # A caller naming the model "default" hits the very same entry.
+    hit = asyncio.run(plan_coach.generate_coaching_line_cached(
+        *args, model="default", cache_path=cache))
+    assert hit == "Get out the door."
+    assert calls["n"] == 1
+    # Naming the real model is a different key — it must not silently reuse it.
+    other = asyncio.run(plan_coach.generate_coaching_line_cached(
+        *args, model=plan_coach.DEFAULT_MODEL, cache_path=cache))
+    assert other == "Regenerated."
+    assert calls["n"] == 2
+
+
 def test_cache_regenerates_when_any_input_changes(monkeypatch, tmp_path):
     fake, calls = _fake_generator(["Line A.", "Line B."])
     monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
@@ -533,6 +596,38 @@ def test_cache_regenerates_when_any_input_changes(monkeypatch, tmp_path):
         _PROFILE, _TODAY_EASY, _LAST_7_DAYS, 90, 12, "10k", cache_path=cache))
     assert (a, b) == ("Line A.", "Line B.")
     assert calls["n"] == 2
+
+
+def test_cached_line_forwards_the_modules_default_timeout(monkeypatch, tmp_path):
+    """generate_coaching_line_cached -- not generate_coaching_line -- is what
+    assemble_brief_render_inputs and generate_brief_report actually call, and
+    both call it with no explicit ``timeout`` argument (tools.py:4436). So
+    ITS default is the ceiling that governed 23 of 30 timed-out evening
+    briefs, not generate_coaching_line's own default (#241, f-64d967cd). The
+    two currently share one named constant, but nothing before this test
+    asserted that on the call path a cache miss actually takes -- a caller
+    could revert this function's default to a bare 30.0 literal and the rest
+    of the suite (which either exercises generate_coaching_line directly, or
+    mocks this one's SDK call away without inspecting its timeout kwarg)
+    would stay green while the live path regressed to the exact ceiling the
+    issue reports."""
+    seen: list[float] = []
+
+    async def fake(profile, today_workout, last_7_days, adherence_pct,
+                    days_to_race, goal_type, *, model=None,
+                    timeout=plan_coach.DEFAULT_TIMEOUT_S,
+                    notes_text=None, **_kw):
+        seen.append(timeout)
+        return "Get out the door."
+
+    monkeypatch.setattr(plan_coach, "generate_coaching_line", fake)
+    cache = tmp_path / "cache.json"
+    args = (_PROFILE, _TODAY_EASY, _LAST_7_DAYS, 83, 12, "10k")
+
+    # No timeout= passed -- this is the exact call shape tools.py uses.
+    asyncio.run(plan_coach.generate_coaching_line_cached(*args, cache_path=cache))
+    assert seen == [45.0]
+    assert plan_coach.DEFAULT_TIMEOUT_S == 45.0
 
 
 def test_generation_failure_is_not_cached(monkeypatch, tmp_path):

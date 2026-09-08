@@ -15,6 +15,7 @@ from datetime import date, timedelta
 import pytest
 
 from local_fitness import db
+from local_fitness.agent import interpret
 from local_fitness.agent import report_card as rc
 
 # A reference stand-in with round numbers, so every expectation below is
@@ -2274,6 +2275,17 @@ def test_fastest_rep_split_ignores_recovery_jogs_below_the_floor():
               "avg_hr": 150, "avg_pace_sec_per_km": 300.0 - i} for i in range(4)]
     assert rc.QUALITY_MIN_SPLIT_M == 300.0
     assert rc.fastest_rep_split_pace(rc.label_splits(short)) is None
+
+
+def test_the_rep_selector_is_the_shared_one_not_a_local_copy():
+    """The card and plans.classify_workout must select the SAME rep, or the two
+    surfaces can disagree about one session — which is #242 in the other
+    direction. The selector lives in interpret.py; these names are re-exports,
+    and an identity check is what stops a future edit from re-introducing a
+    second copy here that drifts from the one plans.py grades on."""
+    assert rc.fastest_rep_split is interpret.fastest_rep_split
+    assert rc.fastest_rep_split_pace is interpret.fastest_rep_split_pace
+    assert rc.QUALITY_MIN_SPLIT_M == interpret.QUALITY_MIN_SPLIT_M
 
 
 def test_interval_pace_is_graded_on_the_fastest_split():

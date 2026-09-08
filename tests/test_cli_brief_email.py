@@ -284,3 +284,105 @@ def test_the_delivered_message_carries_the_rendered_brief(runner, wired):
     assert msg["Subject"] == f"Evening Brief · {TODAY}"
     assert "Long run 9mi today" in msg.get_body(preferencelist=("html",)).get_content()
     assert "LONG RUN 9MI TODAY" in msg.get_body(preferencelist=("plain",)).get_content()
+
+
+# --- #241: which coaching line shipped -------------------------------------
+#
+# The substitution was already logged at WARNING and ran unnoticed for 23 of 30
+# nights, because that WARNING lands in a 154 KB launchd ERROR log nobody
+# scans. So these assert the two channels a human actually meets: stdout (the
+# 4 KB one-line-a-night out log) and the nightly macOS notification. Asserting
+# on stderr or a log record would re-test exactly what already failed.
+
+PLAN_SECTION = {
+    "adherence_pct": 83,
+    "sessions_adherence_pct": 83,
+    "rest_days_counted": 1,
+    "goal_type": "10k",
+    "days_to_race": 42,
+    "week_planned_mi": 36.0,
+    "week_actual_mi": 14.2,
+    "week_walk_mi": 6.0,
+    "slips": 2,
+    "today": {
+        "type": "long",
+        "distance_mi": 9.0,
+        "pace_min_per_mi": "9:23",
+        "description": "Long run 9mi @ easy-steady.",
+        "coaching_line": "Yesterday you hit the session clean.",
+        "coaching_line_source": "generated",
+    },
+    "last_7_days": [
+        {"date": "2026-08-07", "type": "long", "planned_mi": 9.0,
+         "actual_mi": None, "verdict": "scheduled"},
+    ],
+}
+
+
+def _with_plan_section(monkeypatch, wired, source: str | None):
+    """Re-stub the assemble call with a REAL plan section whose today dict
+    carries ``source`` (or no source key at all when None), and record the
+    notification text the run produced."""
+    section = {**PLAN_SECTION, "today": dict(PLAN_SECTION["today"])}
+    if source is None:
+        section["today"].pop("coaching_line_source")
+    else:
+        section["today"]["coaching_line_source"] = source
+
+    async def _assemble(brief, target_date):
+        return {}, section
+
+    monkeypatch.setattr(agent_tools, "assemble_brief_render_inputs", _assemble)
+    notes: list[str] = []
+    monkeypatch.setattr(cli, "_notify", lambda msg: notes.append(msg))
+    return notes
+
+
+def test_a_generated_coaching_line_is_named_on_stdout(runner, wired, monkeypatch):
+    notes = _with_plan_section(monkeypatch, wired, "generated")
+    result = runner.invoke(cli.main, ["brief-email", "--no-pull", "--no-generate"])
+    assert result.exit_code == 0, result.output
+    # stdout specifically — the out log is the file that gets read.
+    assert "Coaching line: generated" in result.stdout
+    assert notes == ["Evening brief emailed"]
+
+
+def test_a_template_coaching_line_is_named_on_stdout_and_in_the_notification(
+    runner, wired, monkeypatch
+):
+    notes = _with_plan_section(monkeypatch, wired, "fallback")
+    result = runner.invoke(cli.main, ["brief-email", "--no-pull", "--no-generate"])
+    assert result.exit_code == 0, result.output
+    assert "Coaching line: fallback" in result.stdout
+    # One notification either way, and this one says the coach never spoke.
+    assert notes == ["Evening brief emailed (coaching line: TEMPLATE)"]
+    assert wired["send"] == 1  # a template line is not a failure
+
+
+def test_the_source_line_prints_on_a_dry_run_too(runner, wired, monkeypatch, tmp_path):
+    # --dry-run returns before the send, so a check that only ran after it
+    # would never fire on the path used to verify the job by hand.
+    _with_plan_section(monkeypatch, wired, "fallback")
+    result = runner.invoke(
+        cli.main, ["brief-email", "--no-pull", "--no-generate",
+                   "--dry-run", str(tmp_path / "b.eml")])
+    assert result.exit_code == 0, result.output
+    assert "Coaching line: fallback" in result.stdout
+
+
+def test_no_plan_section_prints_nothing_and_still_sends(runner, wired):
+    # The fixture's own stub returns ({}, None) — a brief with no active plan.
+    result = runner.invoke(cli.main, ["brief-email", "--no-pull", "--no-generate"])
+    assert result.exit_code == 0, result.output
+    assert "Coaching line:" not in result.stdout
+    assert wired["send"] == 1
+
+
+def test_an_older_payload_without_the_source_key_degrades_quietly(
+    runner, wired, monkeypatch
+):
+    notes = _with_plan_section(monkeypatch, wired, None)
+    result = runner.invoke(cli.main, ["brief-email", "--no-pull", "--no-generate"])
+    assert result.exit_code == 0, result.output
+    assert "Coaching line:" not in result.stdout
+    assert notes == ["Evening brief emailed"]

@@ -685,7 +685,9 @@ def _plan_today(db_path: Path | None, today: str, conn=None) -> dict:
     dates = [w["date"] for w in active["workouts"]] or [today]
     start = min(dates)
     end = max([today, *dates] + ([frontier] if frontier else []))
-    activities_by_date = plans.load_activities_by_date(start, end, db_path, conn=conn)
+    activities_by_date = plans.load_activities_by_date(
+        start, end, db_path, conn=conn,
+        quality_dates=plans.quality_pace_dates(active["workouts"]))
     cfg = plans.resolve_grading_config(db_path, conn=conn)
     return plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
 

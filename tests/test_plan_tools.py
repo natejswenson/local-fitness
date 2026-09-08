@@ -1174,3 +1174,150 @@ def test_both_write_paths_share_one_hr_bound(seeded):
     _active_plan(seeded)
     _body2, edit_err = call(tools.update_plan_workout, {"date": d, "hr_max": 14})
     assert create_err and edit_err, (create_err, edit_err)
+
+
+# --- prescribed PACE bounds are the SAME on both write paths -----------------
+# #242 r3, f-84d486cd: `target_pace_sec_per_km` went from display/coaching-only
+# to the field that CAPS every quality-day verdict (`_cap_on_rep_pace`), but
+# `validate_plan_input` still only checked finite-and-non-negative on it — the
+# exact create/edit asymmetry the HR bound above was added to close. A model
+# writing decimal minutes-per-mile into the seconds-per-km column
+# (`target_pace_sec_per_km: 7.8` for a 7:48/mi tempo) used to validate and
+# store, then cap every quality day on that plan to `missed` for its life.
+
+@pytest.mark.parametrize("bad_pace", [7.8, 50.0, 1119.0, 5000.0])
+def test_propose_rejects_an_implausible_pace(seeded, bad_pace):
+    t = date.today()
+    body, err = call(tools.propose_training_plan, _args(workouts=[
+        dict(date=(t + timedelta(days=1)).isoformat(), week_index=1, type="tempo",
+             target_distance_m=8000.0, target_pace_sec_per_km=bad_pace,
+             description="tempo")]))
+    assert err, f"target_pace_sec_per_km={bad_pace} was accepted on a proposal"
+    assert "target_pace_sec_per_km" in body["error"]
+    assert plans.get_draft_plan(db_path=seeded) is None, "a rejected plan was stored"
+
+
+@pytest.mark.parametrize("ok_pace", [
+    plans.MIN_PRESCRIBED_PACE_SEC_PER_KM, 300.0, plans.MAX_PRESCRIBED_PACE_SEC_PER_KM,
+])
+def test_propose_accepts_a_plausible_pace(seeded, ok_pace):
+    """The bound must not be so tight it rejects real prescriptions — 3:00/mi
+    is a plausible elite max-effort pace and 30:00/mi a plausible walk pace."""
+    t = date.today()
+    body, err = call(tools.propose_training_plan, _args(workouts=[
+        dict(date=(t + timedelta(days=1)).isoformat(), week_index=1, type="tempo",
+             target_distance_m=8000.0, target_pace_sec_per_km=ok_pace,
+             description="tempo")]))
+    assert not err, body
+    stored = plans.get_draft_plan(db_path=seeded)["workouts"][0]
+    assert stored["target_pace_sec_per_km"] == pytest.approx(ok_pace)
+
+
+def test_both_write_paths_reject_an_implausible_pace(seeded):
+    """The create and edit paths must agree, same discipline as the HR bound.
+    The two fields differ in unit and shape (`target_pace_sec_per_km` on
+    create vs. `pace_min_per_mi` on edit), so this drives an equivalently
+    implausible value — a 35:00/mi prescription, past `MAX_PRESCRIBED_PACE_
+    SEC_PER_MI` — through each path in its own native unit and asserts both
+    reject it."""
+    t = date.today()
+    d = (t + timedelta(days=1)).isoformat()
+    too_slow_sec_per_km = plans.units.pace_sec_per_mi_to_sec_per_km(2100.0)  # 35:00/mi
+    _body, create_err = call(tools.propose_training_plan, _args(workouts=[
+        dict(date=d, week_index=1, type="tempo", target_distance_m=8000.0,
+             target_pace_sec_per_km=too_slow_sec_per_km, description="tempo")]))
+    _active_plan(seeded)
+    _body2, edit_err = call(tools.update_plan_workout, {"date": d, "pace_min_per_mi": "35:00"})
+    assert create_err and edit_err, (create_err, edit_err)
+
+
+# --- the in-call contract for a quality day (#242 r2, f-cdcc3388) ------------
+# `validate_plan_input` refuses a target-less tempo/interval day and the pace
+# cap grades `target_pace_sec_per_km`. Both rules are invisible to the model
+# unless the tool's own schema says so — and the proposer is the surface #242
+# originated on, where an unstated rule costs a whole 60-workout call.
+
+def test_both_plan_write_schemas_state_the_quality_day_contract():
+    """A rule enforced on both write paths, stated on one, is a rule the model
+    learns by having a call rejected. `propose_training_plan` and
+    `revise_training_plan` both run `plans.validate_plan_input`, so they must
+    carry the same guidance — asserted as ONE shared constant rather than two
+    matching strings, because two copies drift."""
+    proposed = tools._PROPOSE_PLAN_SCHEMA["properties"]["workouts"]["description"]
+    revised = tools._REVISE_PLAN_SCHEMA["properties"]["workouts"]["description"]
+    assert proposed is revised is tools._PLAN_WORKOUTS_DESCRIPTION
+
+
+def test_the_quality_day_schema_states_what_the_rule_actually_is():
+    """Pinned against behaviour, not against wording: each clause below names a
+    field the grader really reads, so the description cannot go stale while the
+    rules change underneath it."""
+    text = tools._PLAN_WORKOUTS_DESCRIPTION
+
+    # The refusal, in the words validate_plan_input uses for it.
+    assert "target_duration_sec or target_distance_m" in text
+    assert "by feel" in text
+    for wtype in plans._DURATION_TYPES:
+        assert wtype in text
+    # ...and the refusal is real, so the schema is describing the code.
+    assert plans._quality_target_error("tempo", None, None)
+    assert plans._quality_target_error("tempo", None, 8000.0) is None
+
+    # The pace is graded now, and against the REP, not the run average.
+    assert "target_pace_sec_per_km" in text
+    assert "GRADED" in text
+    assert "run average" in text
+
+
+def test_a_target_less_quality_day_is_refused_by_both_write_paths(seeded):
+    """The behaviour the schema promises. Create and revise share
+    `validate_plan_input`, so a rule stated once must bite on both."""
+    t = date.today()
+    d = (t + timedelta(days=1)).isoformat()
+    bad = dict(date=d, week_index=1, type="tempo",
+               target_pace_sec_per_km=300.0, description="3x1mi")
+
+    _body, create_err = call(tools.propose_training_plan, _args(workouts=[bad]))
+    assert create_err and "target_duration_sec or target_distance_m" in _body["error"]
+
+    good = dict(bad, target_distance_m=8000.0)
+    body, err = call(tools.propose_training_plan, _args(workouts=[good]))
+    assert not err, body
+    plan_id = plans.get_draft_plan(db_path=seeded)["plan_id"]
+
+    _b2, revise_err = call(tools.revise_training_plan,
+                           {"plan_id": plan_id, "workouts": [bad]})
+    assert revise_err and "target_duration_sec or target_distance_m" in _b2["error"]
+
+
+def test_the_update_workout_schema_states_the_quality_day_contract():
+    """#242 r3, f-db0b1fbe: `_quality_target_error` was enforced on the edit
+    path (`update_active_workout`/`update_active_workouts`, #242 r2,
+    f-a9f42ce8) before the model's own in-call guidance ever said so — the
+    exact 'a rule enforced but not stated' gap #242 originated on, now on the
+    write path that rejects whole. `update_plan_workouts`'s batch schema must
+    inherit the SAME property definitions rather than a second copy that can
+    drift."""
+    props = tools._UPDATE_WORKOUT_SCHEMA["properties"]
+
+    # `type` states the rule in full, in the same terms validate_plan_input's
+    # error message and the proposer's schema use for it.
+    type_text = props["type"]["description"]
+    assert "target_duration_sec or target_distance_m" in type_text
+    assert "REQUIRED" in type_text
+    assert "rejected" in type_text
+
+    # distance_mi and duration_min each point back at it rather than staying
+    # silent about the OTHER field being able to satisfy the requirement.
+    for field in ("distance_mi", "duration_min"):
+        text = props[field]["description"]
+        assert "REQUIRED" in text or "rejected" in text, (field, text)
+
+    # ...and the refusal is real, so the schema is describing the code.
+    assert plans._quality_target_error("tempo", None, None)
+    assert plans._quality_target_error("tempo", None, 8000.0) is None
+
+    batch_props = tools._UPDATE_WORKOUTS_SCHEMA["properties"]["updates"]["items"]["properties"]
+    assert batch_props is not props   # a copy, per `dict(...)` — never the same object
+    for field in ("type", "distance_mi", "duration_min"):
+        assert batch_props[field]["description"] == props[field]["description"]

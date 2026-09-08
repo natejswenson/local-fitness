@@ -73,12 +73,13 @@ So easy/long days are penalized only for running too FAST, quality days only
 for running too SLOW, and each metric's expectation is scaled by the workout's
 intent (from the plan when present, inferred otherwise).
 
-Splits are presentation-only, with exactly THREE documented exceptions. No other
-grade reads ``activity_splits`` — only 100 of 760 activities have them (they are
-written by the daily-sync ingest path, never by backfill), so a splits-dependent
-grade would be unavailable on ~87% of the history and would silently mean
-different things on different rows. Every exception must handle absence
-explicitly, and they do it two different ways on purpose.
+Splits are presentation-only in THIS module, with exactly THREE documented
+exceptions HERE. No other grade in ``report_card.py`` reads ``activity_splits``
+— only 100 of 760 activities have them (they are written by the daily-sync
+ingest path, never by backfill), so a splits-dependent grade would be
+unavailable on ~87% of the history and would silently mean different things on
+different rows. Every exception must handle absence explicitly, and they do it
+two different ways on purpose.
 
 1. **quality-day pace against a prescribed rep target** — see
    ``fastest_rep_split``. It exists because the alternative was not a strict
@@ -91,6 +92,16 @@ explicitly, and they do it two different ways on purpose.
 3. **the prescribed-HR-cap exceedance** — see ``hr_exceedance_bpm``. This one
    *degrades* instead: with no splits the cap is still graded on the average
    alone, so it adds no new availability cliff.
+
+A FOURTH exception exists OUTSIDE this module (#242, f-c25a7c98):
+``plans.classify_workout``'s quality arm caps a `tempo`/`interval` verdict on
+the same ``fastest_rep_split`` selector — same reason as exception 1 above,
+one level up (a plan verdict and this card must not disagree about the same
+session), sharing the selector itself via ``interpret.py`` rather than
+re-deriving it. "No other grade reads ``activity_splits``" was true when
+written and is no longer true of the codebase as a whole; it was never
+rewritten to say "in this module" until this fix, so do not grep this comment
+alone and conclude a plan verdict never touches splits.
 
 The pure section below is import-light (stdlib + ``render``/``units``) and
 unit-testable with plain dicts; DB access lives under the persistence divider,
@@ -138,14 +149,13 @@ MILE_TOLERANCE = 0.03
 # Below this many comparable activities in the window, the median is noise.
 # Grading against noise is worse than not grading — return n/a and say so.
 MIN_REFERENCE_ACTIVITIES = 5
-# The smallest split a quality-day pace grade will read. Deliberately NOT the
-# `partial` flag: that is relative to the workout's OWN longest lap, so a
-# manually-lapped interval session (2-mile warmup, then 800m reps) marks every
-# rep partial and leaves the warmup as the only "full" split — which graded the
-# reps at warmup pace and guaranteed an F on exactly the workouts the splits
-# exception exists to grade fairly. 300 m sits under a standard 400 m rep and
-# well over any trailing GPS fragment.
-QUALITY_MIN_SPLIT_M = 300.0
+# The smallest split a quality-day pace grade will read. Moved to
+# ``interpret.py`` at 0.63.0, with ``fastest_rep_split`` below, so
+# ``plans.classify_workout`` can select the same rep without a
+# ``plans -> report_card -> plans`` cycle — the two surfaces disagreeing about
+# the same session is #242. Re-exported here because the name is in this
+# module's ``__all__`` and is what the card's own branches read.
+QUALITY_MIN_SPLIT_M = interpret.QUALITY_MIN_SPLIT_M
 REFERENCE_WINDOW_DAYS = 60
 # The run/walk boundary and its classifier moved to ``interpret.py`` (the pure
 # classifier module) on 2026-07-22, so ``plans.py`` can gate its mileage rollup
@@ -1318,35 +1328,12 @@ def label_splits(splits: list[dict]) -> dict:
     }
 
 
-def fastest_rep_split(labelled: dict) -> dict | None:
-    """The fastest rep-sized split, or ``None`` when there isn't one.
-
-    Rep-sized is ``distance_meters >= QUALITY_MIN_SPLIT_M`` rather than "not
-    ``partial``". The partial flag is measured against the workout's own longest
-    lap, which on a manually-lapped session is the warmup — so every rep of a
-    2-mile-warmup-then-800s workout is partial and the warmup is the only
-    candidate left, which is how a correctly-run interval session got graded at
-    warmup pace.
-
-    The distance floor still solves what the partial filter was there for: a
-    90-metre trailing fragment can post an absurdly fast pace and would win
-    every time. Anything long enough to be a rep is a fair candidate, and a
-    slower warmup simply loses ``min()``.
-
-    This is the one place a *grade* is allowed to read splits — see the quality
-    branch of ``build_card`` for why, and the module docstring for the rule it
-    is an exception to.
-    """
-    candidates = [r for r in (labelled.get("rows") or [])
-                  if (r.get("distance_meters") or 0.0) >= QUALITY_MIN_SPLIT_M
-                  and r.get("avg_pace_sec_per_km")]
-    return min(candidates, key=lambda r: r["avg_pace_sec_per_km"]) if candidates else None
-
-
-def fastest_rep_split_pace(labelled: dict) -> float | None:
-    """:func:`fastest_rep_split`'s pace in sec/km, or ``None``."""
-    best = fastest_rep_split(labelled)
-    return best["avg_pace_sec_per_km"] if best else None
+# ``fastest_rep_split``/``fastest_rep_split_pace`` live in ``interpret.py`` for
+# the reason ``QUALITY_MIN_SPLIT_M`` above does — see there for the selection
+# rule and why the ``partial`` flag is not it. Re-exported under their existing
+# names.
+fastest_rep_split = interpret.fastest_rep_split
+fastest_rep_split_pace = interpret.fastest_rep_split_pace
 
 
 def bin_hr_trace(

@@ -253,6 +253,99 @@ def test_build_plan_detail_surfaces_walk_on_long_day_still_missed():
     assert w0["actual_activity_types"] == ["walking"]
 
 
+# --- the quality-day pace cap, end to end (#242) ---------------------------
+
+def _insert_activity(conn, aid, day, atype, dist, dur, pace, splits=()):
+    conn.execute(
+        "INSERT INTO activities (activity_id, date, activity_type, "
+        "distance_meters, duration_seconds, avg_pace_sec_per_km) "
+        "VALUES (?, ?, ?, ?, ?, ?)", (aid, day, atype, dist, dur, pace))
+    for i, (sd, sp) in enumerate(splits):
+        conn.execute(
+            "INSERT INTO activity_splits (activity_id, split_index, "
+            "distance_meters, duration_seconds, avg_pace_sec_per_km) "
+            "VALUES (?, ?, ?, ?, ?)", (aid, i, sd, sd / 1000.0 * sp, sp))
+
+
+def test_load_activities_by_date_attaches_splits(dbp):
+    """The cap reads splits, and this is the ONLY place they are fetched — for
+    the reason avg_pace_sec_per_km is fetched here (see the query's comment): a
+    gate a caller can forget to wire ships as a silent no-op."""
+    with db.connect(dbp) as conn:
+        _insert_activity(conn, 1, "2026-07-01", "running", 8000.0, 2400, 300.0,
+                         splits=[(1609.344, 290.0), (1609.344, 310.0)])
+        _insert_activity(conn, 2, "2026-07-02", "running", 5000.0, 1500, 300.0)
+
+    by_date = plans.load_activities_by_date("2026-07-01", "2026-07-31", db_path=dbp)
+    with_splits = by_date["2026-07-01"][0]
+    assert [s["avg_pace_sec_per_km"] for s in with_splits["splits"]] == [290.0, 310.0]
+    assert with_splits["splits"][0]["distance_meters"] == pytest.approx(1609.344)
+    # A splitless activity carries the key with an empty list, never a missing
+    # key: the cap's `any(a.get("splits"))` short-circuit reads it on every day.
+    assert by_date["2026-07-02"][0]["splits"] == []
+
+
+def test_load_activities_by_date_keeps_each_activitys_splits_to_itself(dbp):
+    """Two runs on one day, one fast and one slow. Attaching the day's splits to
+    every row would let a walk-warmup lap fail the run beside it."""
+    with db.connect(dbp) as conn:
+        _insert_activity(conn, 1, "2026-07-01", "running", 8000.0, 2400, 300.0,
+                         splits=[(1609.344, 290.0)])
+        _insert_activity(conn, 2, "2026-07-01", "running", 3000.0, 1500, 500.0,
+                         splits=[(1609.344, 500.0)])
+
+    day = plans.load_activities_by_date("2026-07-01", "2026-07-01", db_path=dbp)["2026-07-01"]
+    by_id = {a["activity_id"]: a for a in day}
+    assert [s["avg_pace_sec_per_km"] for s in by_id[1]["splits"]] == [290.0]
+    assert [s["avg_pace_sec_per_km"] for s in by_id[2]["splits"]] == [500.0]
+
+
+def test_build_plan_detail_caps_a_quality_day_on_rep_pace(dbp):
+    """The #242 shape through the assembly path: a tempo prescribing 7:48/mi and
+    4.5 mi, run 4.01 mi at 10:07/mi. Volume alone says done (89% of target, over
+    DONE_FRACTION); the reps say it was not a tempo.
+
+    Asserted against the same plan grading an obedient run, so what moves the
+    verdict is only the pace — and adherence moves with it, which is the
+    inflation the issue reports."""
+    target_pace = 468.0 / 1.609344            # 7:48/mi
+    plan = {
+        "plan_id": 1, "goal_type": "half", "race_date": "2026-09-14",
+        "workouts": [_wk(date="2026-07-01", type="tempo",
+                         target_distance_m=4.5 * 1609.344,
+                         target_pace_sec_per_km=target_pace,
+                         description="3x1mi @ 7:48/mi")],
+    }
+    with db.connect(dbp) as conn:
+        _insert_activity(
+            conn, 1, "2026-07-01", "running", 4.01 * 1609.344, 2540,
+            633.0 / 1.609344,                 # 10:33/mi overall — still a run
+            splits=[(1609.344, p / 1.609344) for p in (625.0, 607.0, 790.0)])
+    by_date = plans.load_activities_by_date("2026-07-01", "2026-07-31", db_path=dbp)
+
+    detail = plans.build_plan_detail(plan, frontier="2026-07-08",
+                                     activities_by_date=by_date)
+    assert detail["workouts"][0]["verdict"] == "missed"
+    assert detail["adherence_pct"] == 0
+
+    # Same prescription, reps at target: done, and adherence with it.
+    # Three DISTINCT dicts, not `[{...}] * 3` — the latter aliases one dict
+    # object across all three list slots, which collapses
+    # interpret._drop_outlier_fragments's identity-based bookend detection
+    # (every slot shares one id, so "first" and "last" are the same object
+    # as every interior slot too, and the middle slot is misread as the
+    # bookend-excluded edge — #242 r4, caught by this fixture crashing).
+    obedient = {"2026-07-01": [dict(by_date["2026-07-01"][0],
+                                    distance_meters=4.5 * 1609.344,
+                                    splits=[{"distance_meters": 1609.344,
+                                             "avg_pace_sec_per_km": target_pace}
+                                            for _ in range(3)])]}
+    done = plans.build_plan_detail(plan, frontier="2026-07-08",
+                                   activities_by_date=obedient)
+    assert done["workouts"][0]["verdict"] == "done"
+    assert done["adherence_pct"] == 100
+
+
 def test_build_plan_status_inactive():
     assert plans.build_plan_status(None, frontier="2026-07-08",
                                    activities_by_date={}, today="2026-07-05") == {"active": False}
@@ -343,3 +436,87 @@ def test_update_active_workout_only_touches_active_plan(dbp):
         d = conn.execute("SELECT description FROM plan_workouts WHERE plan_id=? AND date='2026-07-01'", (pid_draft,)).fetchone()
     assert a["description"] == "active edit"
     assert d["description"] == "draft day"  # the draft's day is left alone
+
+
+# --- #242 f-a9f42ce8: the write paths get the same quality-target rule -------
+# as `validate_plan_input` (the create path). Without this, the two-call
+# "move the long run" idiom (rest the old day, prescribe the new one) can
+# reproduce the original #242 bug through an edit: a rest day's targets are
+# NULL, so flipping it to `tempo`/`interval` with no target reproduces the
+# exact by-feel shape the create-path check exists to refuse.
+
+def test_update_active_workout_rejects_a_would_be_target_less_quality_day(dbp):
+    _active(dbp)  # 2026-07-01 is `easy`, target_distance_m=6000.0
+    with pytest.raises(ValueError, match="needs target_duration_sec or target_distance_m"):
+        # Flip an easy day to tempo without setting a duration or a distance —
+        # the row's existing target_distance_m came from `easy` grading, but
+        # the write path must still refuse it once the type moves to tempo,
+        # so the merged row is what gets judged, not the field alone.
+        plans.update_active_workout(
+            "2026-07-01",
+            {"type": "tempo", "target_distance_m": None, "description": "tempo, feel it out"},
+            db_path=dbp,
+        )
+    with db.connect(dbp) as conn:  # the whole write rolled back, not just the type
+        row = conn.execute(
+            "SELECT type, target_distance_m FROM plan_workouts WHERE date='2026-07-01'"
+        ).fetchone()
+    assert row["type"] == "easy" and row["target_distance_m"] == 6000.0
+
+
+def test_update_active_workout_rejects_the_rest_to_tempo_represcription_shape(dbp):
+    """The exact f-a9f42ce8 failure scenario: a rest day (targets NULL via
+    `apply_rest_semantics`) re-prescribed straight to `tempo` with no target."""
+    _active(dbp)
+    plans.update_active_workout("2026-07-01", {"type": "rest"}, db_path=dbp)
+    with pytest.raises(ValueError, match="needs target_duration_sec or target_distance_m"):
+        plans.update_active_workout(
+            "2026-07-01", {"type": "tempo", "description": "3x1mi"}, db_path=dbp)
+
+
+def test_update_active_workout_allows_a_quality_day_with_an_existing_target(dbp):
+    """A partial edit (description only) on an existing quality day must not
+    be judged against the FIELDS passed — the row already carries a target."""
+    _active(dbp, workouts=[
+        _wk(date="2026-07-01", type="tempo", target_distance_m=None,
+            target_duration_sec=2400, description="tempo 40min"),
+        _wk(date="2026-07-02", type="long", target_distance_m=12000.0),
+    ])
+    row = plans.update_active_workout(
+        "2026-07-01", {"description": "tempo 40min, moved up"}, db_path=dbp)
+    assert row["description"] == "tempo 40min, moved up"
+    assert row["target_duration_sec"] == 2400
+
+
+def test_update_active_workouts_rejects_a_target_less_quality_day(dbp):
+    _active(dbp)
+    with pytest.raises(ValueError, match=r"update 1 \(2026-07-02\): .*needs target_duration_sec"):
+        plans.update_active_workouts(
+            [
+                ("2026-07-01", 1, {"description": "still easy"}),
+                ("2026-07-02", 1, {"type": "interval", "target_distance_m": None,
+                                    "description": "reps, no target"}),
+            ],
+            db_path=dbp,
+        )
+
+
+def test_update_active_workouts_rolls_back_the_whole_batch_on_a_target_less_day(dbp):
+    """All-or-nothing: the FIRST entry's write must not survive a LATER
+    entry's rejection — same contract the existence pre-flight already gets,
+    now proven for a check that can only run after the merge."""
+    _active(dbp)
+    with pytest.raises(ValueError, match="needs target_duration_sec or target_distance_m"):
+        plans.update_active_workouts(
+            [
+                ("2026-07-01", 1, {"description": "already-applied edit"}),
+                ("2026-07-02", 1, {"type": "tempo", "target_distance_m": None,
+                                    "description": "reps, no target"}),
+            ],
+            db_path=dbp,
+        )
+    with db.connect(dbp) as conn:
+        first = conn.execute(
+            "SELECT description FROM plan_workouts WHERE date='2026-07-01'"
+        ).fetchone()
+    assert first["description"] == "6km easy"  # unchanged — the batch rolled back

@@ -4,7 +4,576 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.63.0] - 2026-09-06
+
+### Fixed
+- **A tempo or interval day no longer grades `done` for any running at all**
+  (#242). `classify_workout` graded the quality types on duration alone, and
+  the proposer writes those days with a distance and a pace and **no**
+  duration — so the null-duration "by feel" branch, meant for a genuinely
+  target-less day, was the *only* path every proposed quality day took. Four
+  sessions on the active plan were graded `done`:
+
+  | Date | Prescribed | Fastest rep split | Was | Now |
+  |---|---|---|---|---|
+  | 2026-09-01 | tempo 3x1mi @ 7:48/mi | 10:07/mi | `done` | `missed` |
+  | 2026-08-04 | interval 5x600m @ 6:58/mi | 8:04/mi | `done` | `partial` |
+  | 2026-07-28 | tempo 20min @ 8:03/mi | 8:40/mi | `done` | `partial` |
+  | 2026-07-21 | interval 6x400m @ 6:58/mi | 9:12/mi | `done` | `missed` |
+
+  (2026-08-04's "Now" was revised from `missed` to `partial` during round-1
+  review — see the `QUALITY_PACE_PARTIAL_DEVIATION` note below;
+  `QUALITY_PACE_DONE_DEVIATION` is unchanged and every day here still ran too
+  far off pace to reach `done`.) Session adherence on that plan corrects
+  **downward from 71%** (measured through `build_plan_detail` on the live
+  plan, frontier 2026-09-07) **to 67%** — re-measured at round 2 after the
+  `QUALITY_PACE_DONE_DEVIATION` retune, superseding both the originally
+  reported 66% and the round-1 figure. This was not a bug
+  caught in review: the 2026-09-01 brief wrote "tempo hit as prescribed …
+  first clean execution after a week of easy-day overshoots", `reflect` put it
+  in `coach_journal`, and the 2026-09-05 brief cited it back as "since the
+  Sep 1 clean tempo". The report card had graded the same session 1.00 stars
+  the whole time — two surfaces describing one run in opposite terms.
+
+  The fix is in two halves and **only the second one changes those days**.
+  `_quality_volume_verdict` falls back to the run-only distance ladder when no
+  duration is prescribed, which closes a different, unreported hole (a 2 km jog
+  satisfying an 8 km interval day) but calls all four reported days `done`
+  anyway — they ran 84-119% of prescribed distance, above `DONE_FRACTION`.
+  `_cap_on_rep_pace` then lowers that verdict to what the day's fastest
+  rep-sized split earns against `target_pace_sec_per_km`: `min()` over
+  `missed < partial < done`, cap-never-promote, the report card's own F-cap
+  idiom. It abstains — returning the volume verdict untouched — when the day
+  prescribes no pace or the activity carries no rep-sized split, and returns
+  before it touches `_ran` when nothing that day carries splits at all, so the
+  backfilled tail (which has none) grades exactly as it did.
+
+  `QUALITY_PACE_DONE_DEVIATION` (0.047) is not a free number: it is the report
+  card's "slightly off target" (3.5 stars) boundary under `PLAN_TIGHTEN`, and
+  `test_the_quality_pace_cuts_still_match_the_card_star_bands` re-derives it
+  from that curve — two-sidedly, so the constant can neither drift up the
+  curve nor sit above the least-bad day #242 reported (7.7% slow).
+
+  **It was 0.0245 — the card's "on target" knot — until round-2 review
+  (f-cb50f53f), and the one knot of headroom is the dilution correction.**
+  The card's knots are calibrated for a rep graded against a rep; the plan
+  verdict grades a fixed-distance AUTO-LAP that blends reps with their jog
+  recovery against a rep target, which is the same arithmetic that had already
+  moved `QUALITY_PACE_PARTIAL_DEVIATION` off its own knot below. Holding a
+  diluted quantity to an undiluted target is the 0.40.0 load inversion in a
+  new place, and it measured as one: at 0.0245, `done` was awarded to **0 of
+  19** rated quality days across every plan in the live database. The three
+  best-executed sessions in that history sit at 3.5%, 3.6% and 6.2% slow. At
+  0.047 two of them reach `done`, all four #242 evidence days stay off it, and
+  `interval_autolapped_reps_hit` still grades `partial`.
+
+  **`QUALITY_PACE_PARTIAL_DEVIATION` was revised from 0.092 to 0.212 during
+  round-1 review** (f-cb50f53f, f-1c0a5538). It shipped as the card's "off
+  target" interior knot (2.50 stars) and, on the live plan, made `done`
+  unreachable for every quality day (6 missed / 1 partial / 0 done across 7
+  sessions) — a punitive-skew signature with no plan-side gate to catch it,
+  because nothing in the live data is manually lapped: every "rep" split is a
+  fixed-distance auto-lap blending reps with jog recovery, so even a
+  flawlessly-executed short-rep session reads 15-19% slow from that blending
+  alone. 0.212 is instead the exact deviation
+  (`widen * STAR_SCALE["pace"] + STAR_NOISE["pace"]` under `PLAN_TIGHTEN`) at
+  which the card's own curve saturates to `STAR_FLOOR` — past it the card has
+  no more resolution to give either, so a plan verdict that also stops
+  distinguishing partial from missed there cannot disagree with the card by
+  construction, even though it is no longer one of the curve's named knots.
+  `fastest_rep_split` also now drops a short, fast, one-off fragment sitting
+  beside a lap size that repeats (`interpret._drop_outlier_fragments`) — a
+  closing kick tacked onto a 3x1mi tempo whose real reps are mile-length
+  auto-laps was otherwise winning on pace alone (f-8a26a574).
+
+- **A matched warmup/cooldown pair is a repeat that is not a rep** (round-2
+  review, f-854c3442 / f-04b7680c). `_drop_outlier_fragments` treated any lap
+  size occurring twice as the session's dominant unit — and a warmup and a
+  cooldown of the same length repeat, while being the two laps on the day
+  that definitionally are *not* reps. The floor they defined then deleted the
+  real work between them, grading the session at **warmup pace**: exactly the
+  manual-lap failure `fastest_rep_split` exists to escape, reintroduced in the
+  guard added beside it. Two shapes, both verified by running the code:
+
+  | splits (m @ s/km) | selected before | should be |
+  |---|---|---|
+  | 3218 @ 410, 800 @ 260, 3218 @ 425 | 410 (warmup) | 260 |
+  | 1609 @ 390, 800 @ 260, 800 @ 262, 1609 @ 430 | 390 (warmup) | 260 |
+
+  The first had no tie at all — the bookends were the only repeated size, so
+  the single genuine rep fell under their floor. The second tied at two
+  members each and the old `max()` broke the tie toward the *larger* bucket.
+  Downstream both capped a correctly-executed session to `missed` on the plan
+  verdict and graded it 1.00 stars on the card, where the F-cap pulled the
+  overall down with it. Fixed by excluding a bucket whose only members are the
+  day's first and last candidate (bookending is what a warmup/cooldown pair
+  does and what a rep set structurally cannot, since a rep set has work on at
+  least one side), and by breaking count ties toward the **smaller** lap size.
+  The asymmetry is deliberate: keeping a fragment risks it winning `min()`,
+  which the distance floor already bounds, while dropping a rep guarantees the
+  grade is read off a warmup.
+
+  **Measured no-op on live data.** Nothing in the 90-day live corpus is
+  manually lapped with matched bookends, so all 44 cards grade identically
+  before and after (per-card diff via `calibrate_report_card --verbose`), and
+  the five graded metrics' distributions are unchanged. The fix is for the
+  session shape the fixtures prove is mis-graded, not for a regression anyone
+  has seen on this database.
+
+### Changed
+- `QUALITY_MIN_SPLIT_M`, `fastest_rep_split` and `fastest_rep_split_pace` moved
+  from `agent/report_card.py` into `agent/interpret.py` and are re-exported
+  under their existing names (#242). `report_card` imports `plans`, so the
+  selector both surfaces must share belongs in the stdlib-only pure module both
+  may import — the precedent `is_running_effort` set. The *move* is behaviour-
+  preserving; the selector itself is not unchanged in this release, and the
+  report card reads it, so the card's quality-day pace grade moves wherever
+  `_drop_outlier_fragments` (added above, corrected in round 2) changes which
+  split is selected. Measured on the live corpus that is nowhere: 44 of 44
+  cards grade identically to `dev`. Two selection rules would be exactly how
+  the plan verdict and the card come to disagree again. (`report_card.py`'s module docstring and CLAUDE.md's
+  matching bullet are now scoped to say "in this module" rather than "no other
+  grade" — f-c25a7c98.)
+- `validate_plan_input` rejects a `tempo`/`interval` workout carrying neither
+  `target_duration_sec` nor `target_distance_m`, so the by-feel branch is only
+  reachable on purpose (#242). Hardening, **not** the fix: every offending day
+  already carried a distance, so validation alone would have prevented none of
+  them. **Round-1 review (f-a9f42ce8) extended the same check to
+  `update_plan_workout` / `update_plan_workouts`**, checked on the RESOLVED
+  row after the write (a rest day's targets are NULL, so flipping one straight
+  to a quality type with no target reproduced the exact by-feel shape through
+  an edit); a violation on the batch path rolls back the whole batch.
+- `load_activities_by_date` accepts an optional `quality_dates` set narrowing
+  its `activity_splits` fetch to the dates that could actually reach the pace
+  cap, via the new `quality_pace_dates(workouts)` helper — wired into all six
+  callers (round-1 review, f-f56ee4d1). **Round-2 review found the narrowing
+  was still being certified against an empty table** and closed that three
+  ways. The shared perf fixture now writes `activity_splits` rows for its
+  trailing 120 days (`perf_fixture._SPLIT_DAYS`), so the query the gate
+  measures has data in it; `test_the_benchmarked_plan_paths_actually_fetch_
+  splits` asserts the whole chain, down to a benchmarked quality day reaching
+  the pace comparison, so it cannot silently revert to measuring nothing.
+  This is **not** the exception `perf_fixture`'s header forbids — that rule is
+  about `activities.avg_pace_sec_per_km`, which `best_recent_effort` filters
+  on; the fixture's activities stay paceless and
+  `test_the_shared_fixture_keeps_its_activities_paceless` pins the
+  distinction. And the splits fetch no longer joins back to `activities` by
+  date: it is keyed on the activity ids the function has already fetched,
+  an index seek on `activity_splits`' primary key that also returns
+  split-ordered rows for free.
+
+  Measured on the fixture (best-of-two `min`, the gated statistic, macOS
+  local):
+
+  | benchmark | no splits | with splits | delta |
+  |---|---|---|---|
+  | `_build_plan_section` | 624.6 us | 659.7 us | +5.6% |
+  | `get_training_plan_status` | 636.1 us | 662.6 us | +4.2% |
+  | `assemble_brief_context` | 949.2 us | 972.3 us | +2.4% |
+  | `get_training_plan_progress` | 960.3 us | 972.5 us | +1.3% |
+
+  Isolating `load_activities_by_date` itself: 28.3 us with the fetch skipped,
+  **43.5 us id-keyed**, 46.0 us via the old JOIN, and 111.2 us unnarrowed —
+  so the narrowing is worth 67 us and is now visible to the gate that is
+  supposed to see it. All four paths stay inside the 15%-of-min bar, but the
+  committed baseline was captured on ubuntu against a splitless fixture, so
+  this consumes roughly a third of that budget on the worst path. If
+  `validate` reads tight, recapture via the `capture-perf-baseline.yml`
+  `workflow_dispatch` job on ubuntu — never locally. `_ran`'s pinned handler
+  count in `test_get_training_plan_progress_does_not_double_classify` moves
+  87 -> 92 for the same reason: five of the fixture's quality days now reach
+  the pace cap, which the empty table had been hiding.
+
+### Added
+- `tests/evals/plan_verdicts.py` + `tests/evals/test_plan_verdicts.py` — the
+  plan-side sibling of the report-card verdict evals (#242). Fabricated
+  scenarios driven through a real SQLite database, asserting the verdict a
+  session *deserves* rather than that the grader is self-consistent.
+  `tests/test_plans.py`'s cases all passed while this shipped, because not one
+  of them could fail when the answer was wrong. A verdict change needs a
+  scenario here. **`interval_autolapped_reps_hit` was added during round-1
+  review** (f-1c0a5538): every existing manually-lapped scenario used a
+  lapping style that does not occur in the live database, so nothing covered
+  a genuinely well-run session whose only available splits are full-lap
+  blends of reps and jog recovery. **Round-2 review** made every scenario
+  grade through the `quality_dates` narrowing every production caller passes
+  (f-0c763f3a / f-cbfe0378) and pinned both loader branches against each other
+  — the evals had been taking the unnarrowed fallback, so the one branch that
+  ships was the one branch nothing exercised. Stubbing `quality_pace_dates` to
+  return an empty set (which drops every split, makes the pace cap abstain
+  everywhere, and restores #242 on every live surface) previously passed 285
+  tests; it now fails 14.
+- `scripts/calibrate_plan_verdicts.py` — the **plan-side sibling of
+  `calibrate_report_card.py`** (round-2 review, f-cb50f53f). CLAUDE.md requires
+  the card's bands to be calibrated against real data with an executable
+  check; the plan verdict had no such thing, which is how a cut that made
+  `done` unreachable shipped and survived a review round. It regrades every
+  quality day on every stored plan through the production path and fails on
+  two signatures: **punitive skew** (>60% of rated days `missed`, the card
+  gate's own bar) and an **unreachable verdict** (`done` never awarded). Only
+  days the pace cap actually had an opinion on are rated — more than half the
+  quality days in the live history have no qualifying run at all, and counting
+  absence as a verdict about the yardstick is the error the card gate avoids
+  by grading only running efforts. Manual, read-only (`mode=ro`), and
+  deliberately not in CI for the same reason as its sibling;
+  `test_the_plan_gate_is_not_wired_into_ci` fails if someone wires it up.
+  Run before touching either pace cut.
+- Two report-card verdict scenarios, `interval_two_reps_bookended` and
+  `interval_one_rep_bookended` (round-2 review, f-bdd259c2 / f-890ff6a1). This
+  release changes what the card's quality-day pace grade reads, and CLAUDE.md
+  is explicit that a grade change needs a verdict eval rather than a unit
+  test. `interval_manual_laps` could not catch either defect: its four reps
+  outnumber its two bookends, so the dominant-bucket count never ties. Both
+  new scenarios fail on the pre-fix selector (graded at warmup pace) and pass
+  after.
+
+### Release gates
+
+Per CLAUDE.md, run before shipping — output pasted rather than summarised.
+
+`uv run python scripts/calibrate_report_card.py` (exit 0):
+
+```
+Report-card calibration — 44 running efforts, trailing 90 days
+
+metric                 1.00 .. 5.00        mean    n  verdict
+-------------------------------------------------------------
+distance               ##.#.#.#......###   3.67   44  ok — 8 buckets used, top 57%, interior 25%, <=2.0* 32%
+pace                   #.#...####..#####   4.26   44  ok — 11 buckets used, top 55%, interior 41%, <=2.0* 7%
+hr (rolling band)      ....#.##...#..###   4.50   28  ok — 7 buckets used, top 68%, interior 32%, <=2.0* 7%
+hr (prescribed cap)    #.#.###.#....##.#   2.70   16  ok — 9 buckets used, top 25%, interior 56%, <=2.0* 44%
+continuity             #.#...##.#....#.#   4.45   42  ok — 7 buckets used, top 79%, interior 19%, <=2.0* 7%
+
+overall (informational, not gated)
+  mean 3.87, median 3.89 · 9/44 at 5.00 (20%) · cap fired on 16/44 (36%)
+
+OK — every rated metric still uses its scale.
+```
+
+Byte-identical to the same run with `_drop_outlier_fragments` disabled, and
+per-card identical across all 44 — this release moves no live card grade.
+
+`uv run python scripts/calibrate_plan_verdicts.py`, before and after the
+`QUALITY_PACE_DONE_DEVIATION` retune:
+
+```
+  cuts: done <= 0.0245 slow, partial <= 0.2120 slow      cuts: done <= 0.0470 slow
+  done       0  (  0%)                                   done       2  ( 11%)
+  partial   13  ( 68%)                                   partial   11  ( 58%)
+  missed     6  ( 32%)                                   missed     6  ( 32%)
+  deviation range -0.0625 .. +0.4542, median +0.1356
+  UNREACHABLE VERDICT — exit 1                           OK — exit 0
+```
+
+`uv run python scripts/warm_report_cards.py` (free survey): **21 of 21 stored
+cards stale, ~21 Claude calls / ~3.5 min.** Run `--yes` at deploy. Note the
+same survey on `dev` also reports 21 of 21 — the staleness predates this
+branch, and the per-card grade diff above confirms this release moves no read
+key. The warm is still owed as a release step; it is not this change's debt.
+
+### Fixed (docs)
+- `docs/mcp/plan_chart.md`'s overachievement gotcha said a day that runs past
+  its prescription keeps a green verdict, using the 2026-07-21 interval day as
+  its worked example — the very day this change regrades to `missed`
+  (round-2 review, f-281fe323). The page now distinguishes volume-graded days
+  (`easy`/`long`/`race`, unchanged) from quality days, and the sample chart's
+  two quality rows carry the glyphs the new grading actually produces.
+- `_PROPOSE_PLAN_SCHEMA` and `_REVISE_PLAN_SCHEMA` state the quality-day
+  contract (round-2 review, f-cdcc3388): that a `tempo`/`interval` day is
+  required to carry `target_duration_sec` or `target_distance_m`, and that
+  `target_pace_sec_per_km` on those days is now GRADED against the fastest
+  rep-sized split rather than advisory. The schema is the only guidance a
+  plan-writing model gets in-call, and #242 originated on that surface — a
+  model that has not been told has a 60-workout proposal rejected whole for a
+  rule nothing it read mentioned. Both write paths run the same
+  `validate_plan_input`, so they now share ONE description constant rather
+  than two strings that can drift.
+
+### Fixed (round-3 review)
+- **The bookend exclusion is trimmed BEFORE it looks for the day's edges, not
+  keyed on `candidates[0]`/`candidates[-1]` literally** (f-6d873a9b).
+  A trailing remainder lap (the segment Garmin logs after the last lap press
+  on every manually-lapped activity) or a leading walk-out fragment sat
+  outside the warmup/cooldown pair but became one of the two bookend ids in
+  its place, so the pair's own bucket failed the identity match, fell back
+  into the dominant-cluster pool, and its floor deleted the real rep between
+  them — the exact "graded the reps at warmup pace" failure the guard exists
+  to prevent, reintroduced by a lap it never anticipated. `interpret.
+  _trim_framing_fragments` drops any leading/trailing candidate that isn't
+  part of a repeated lap size before the bookend check runs, so it always
+  sees the true outer edge of the day's structured laps. New cases for a
+  trailing remainder lap, a leading fragment, and a remainder lap with no
+  other repeat at all.
+- **`plans._fastest_rep_pace` no longer trusts the activity_type LABEL for a
+  paceless row** (f-90178752). It used to gate its candidates on `_ran`,
+  whose label fallback is a MILEAGE decision (`_running_distance` et al.
+  charitably count a paceless on-foot row rather than drop it) — reused here
+  for a PACE decision on exactly the rows the label is known to lie about. A
+  prescribed run with no splits of its own (a manual entry / backfilled row)
+  next to a paceless walking-desk session (labelled `treadmill_running`,
+  carrying splits) let the walk's ~16:00/mi lap pace become the day's ONLY
+  pace evidence and cap a correctly-run tempo to `missed`. `_ran_by_measured_
+  pace` gates on the activity's own measured pace with NO label fallback —
+  the same exclusion `select_best_effort` already applies for the Riegel
+  basis, for the identical reason.
+- **A prescribed pace is now bounded the same way on both write paths**
+  (f-84d486cd). `target_pace_sec_per_km` went from display-only to the field
+  `_cap_on_rep_pace` grades every quality day against, but `validate_plan_
+  input` still only checked finite-and-non-negative — the exact create/edit
+  asymmetry `target_hr_max`'s bound was added to close. `MIN/MAX_PRESCRIBED_
+  PACE_SEC_PER_KM` (3:00-30:00/mi, in `plans.py`) is now shared by
+  `validate_plan_input` and `_prescription_fields` in `tools.py`.
+- **The `activity_splits` fetch backing the rep selector is explicitly
+  ordered** (f-ffcb10f2). `plans.load_activities_by_date` relied on the
+  `(activity_id, split_index)` primary key to return splits pre-ordered
+  "for free," which only holds while the query planner actually uses that
+  index — with enough ids (the `quality_dates=None` fallback over a
+  multi-year plan) it degrades to a table scan and returns rowid order
+  instead. `interpret._drop_outlier_fragments`/`fastest_rep_split` make a
+  POSITIONAL decision on each activity's own split list, so a reordering
+  changes which split a plan verdict and a report card each select — the
+  exact disagreement #242 exists to close. The query now selects
+  `split_index` and orders by `activity_id, split_index` explicitly.
+- **The edit-path schema states the quality-day contract too, not just the
+  proposer's** (f-db0b1fbe). `update_plan_workout`/`update_plan_workouts`
+  have enforced `_quality_target_error` since round-2 review (f-a9f42ce8),
+  but `_UPDATE_WORKOUT_SCHEMA` — the model's only in-call guidance for this
+  surface — never said a tempo/interval day must end up with a duration or a
+  distance target, and even told the model the opposite ("omit for rest /
+  by-feel") on `distance_mi`. `type`, `distance_mi`, and `duration_min` now
+  all state the requirement; `update_plan_workouts`'s batch schema inherits
+  the same property definitions, so a 60-entry batch edit gets the same
+  guidance the single-day edit does.
+- **The shared perf fixture's tempo-day activities now carry a measured
+  pace, and the ubuntu baseline needs a fresh capture** (f-f447488c,
+  f-a801fb5e). `_fastest_rep_pace`'s `_ran_by_measured_pace` gate (above)
+  excludes a paceless activity outright, so the fixture's activities —
+  deliberately paceless since the header comment's `best_recent_effort`
+  trade-off — could no longer reach the pace comparison at all, which would
+  have put `test_the_benchmarked_plan_paths_actually_fetch_splits` back to
+  measuring an empty gate. `perf_fixture._tempo_plan_dates` stamps a
+  measured `avg_pace_sec_per_km` on exactly the plan's 5 tempo-day
+  activities — computed from each row's own already-written distance/
+  duration ratio, not an invented number — rather than the whole
+  `_SPLIT_DAYS` window, to keep `best_recent_effort`'s pool disturbance as
+  small as the fix allows. This is on top of round-2's still-uncaptured
+  `activity_splits` addition (f-f447488c/f-a801fb5e as originally filed):
+  the committed `.benchmarks/Linux-CPython-3.12-64bit/0001_*.json` baseline
+  measurably shifts and needs recapturing — but per CLAUDE.md's perf-gate
+  rule, that recapture is only legitimate via `capture-perf-baseline.yml`'s
+  `workflow_dispatch` on `main`, after this branch merges, and only under one
+  of its two named triggers (a further perf improvement, or measured
+  runner-fleet drift). **Dispatching it against this feature branch mid-PR —
+  as an earlier draft of this note said to — is neither**: it is pre-PR/
+  post-PR cost shifting from #242's own changes, not the improvement or
+  drift the rule gates on, and it would bake this branch's own cost straight
+  into the floor it is supposed to be measured against.
+
+### Fixed (round-4 review)
+- **The perf-baseline recapture this round-3 note asked for was done anyway,
+  on the wrong branch, and reverted** (f-cdf9cf20). A round-3 follow-up
+  dispatched `capture-perf-baseline.yml` against `feature/issue-242` itself
+  (`commit_info.branch: "feature/issue-242"`, not `main`) and hand-promoted
+  the artifact to `.benchmarks/Linux-CPython-3.12-64bit/0001_*.json` —
+  exactly the "bake this branch's own cost into the floor" outcome the
+  paragraph above warns against, for neither of the rule's two legitimate
+  triggers. It also **deleted** the prior `0001_8edfb701..._20260726` (Python
+  3.12.13) artifact that CLAUDE.md's runner-fleet-drift section names as
+  still needed to settle #232 (whether 3.12.13 vs 3.12.14 alone explains a
+  measured drift) — a `capture-baseline.yml` dispatch on `8edfb70` under
+  3.12.14 can no longer be compared against it once it's gone. Reverted to
+  the original 3.12.13 baseline. The five gated benchmarks' real cost shift
+  from round 2's `activity_splits` addition and round 3's tempo-pace stamp
+  (measured in the reverted commit: `get_training_plan_progress` and
+  `get_training_plan_status` both +22-23.5%, over the 15% gate) is therefore
+  **still unrecaptured** — the CI perf-benchmark gate may fail on this PR
+  until a `main`-dispatched recapture happens post-merge, which is the
+  correct order per CLAUDE.md and not something this round can perform
+  itself.
+- **A paceless on-foot row credits a quality day's volume through `_ran`'s
+  label fallback while contributing nothing to the pace cap, and the gap
+  between the two let a full walking session grade a completed tempo**
+  (f-f0c01058). `_ran`'s label fallback is a deliberate MILEAGE-only
+  concession (a paceless row still counts toward distance because the label
+  is at least right about foot-vs-wheel), but `_cap_on_rep_pace` reused it as
+  if it also meant "confirmed running" — when `_fastest_rep_pace` found no
+  rep-sized split (the ordinary shape for a paceless row, which
+  `_ran_by_measured_pace` excludes from the pace pool entirely), the cap
+  abstained and let the volume-only verdict stand. A solitary
+  `treadmill_running` row whose distance happened to match the prescription
+  (8100 m against an 8000 m target, 8000 s duration — an implied ~26:29/mi)
+  graded `done` with zero measured running evidence anywhere in the day.
+  `_unverified_running_credit` now checks, only when the pace cap already
+  abstained, whether ANY activity crediting the day's volume can be
+  confirmed running — by measured pace, or (new) by the coarse pace implied
+  by its own `duration_seconds`/`distance_meters` when no explicit pace was
+  ever stamped. The implied-pace fallback is what keeps this from
+  over-firing on the ordinary case it must not touch: a genuinely backfilled
+  run row with no `avg_pace_sec_per_km` at all almost always implies a
+  plainly running pace from its own numbers, so it still confirms and the
+  day still abstains, unchanged. Only when nothing on the day clears either
+  bar does the day drop straight to `missed` — there is no measured pace to
+  cap it TO, and no benefit of the doubt left to extend.
+- **`interpret._drop_outlier_fragments`'s dominant-bucket selector is
+  rewritten; the previous design failed in both directions on real workout
+  shapes** (f-7fe7b9d1, f-405976cb, f-e04f6232, f-e3a8a465). Bucketing the
+  *trimmed* list by distance and asking "which bucket dominates by member
+  count" meant: (1) a lap size covering both the warmup/cooldown AND an
+  interior recovery lap (three members) escaped the old bookend check, which
+  only ever fired on a bucket of exactly two, and outnumbered the real reps
+  — a warmup/recovery/cooldown all at 1609 m deleted two genuine 800 m reps,
+  grading the session at warmup pace; (2) a single genuine standalone rep
+  positioned at the edge next to an unrelated repeated pair (a 1 km rep
+  before two easy cooldown miles) was trimmed away for being alone at the
+  edge, before its size was ever weighed against anything, losing to the
+  slower cooldown by default; (3) a symmetric pyramid's own smallest reps
+  (its literal first and last candidates) were misread as a matched
+  warmup/cooldown pair and excluded, then floored out entirely by the
+  pyramid's own middle reps; (4) a bucket the bookend pair merely SHARED a
+  size with (an interior lap of the same rounded distance) could still
+  dominate, since the exactly-two-member check never fired on a
+  three-member bucket. All four are the same category error: deciding
+  "bookend or not" at the *bucket* level rather than the *element* level.
+  The rewrite keeps everything inside the trimmed/framed range — bookends
+  included — unconditionally, since a pyramid's outer reps or a slower
+  warmup/cooldown both cost nothing sitting beside `min()`; the floor now
+  judges only what trimming discarded entirely (a closing kick, a trailing
+  remainder, a leading walk-out), against the framed core's own interior.
+  `_is_bookend_pair` is gone; the four scenarios above are pinned as new
+  regression cases in `tests/test_interpret.py`, and a test-fixture data bug
+  this exposed (`[{...}] * 3` aliasing one dict object across three list
+  slots, which collapsed the old and new identity-based bookend detection
+  alike) is fixed in `tests/test_plans_db.py`.
+
+## [0.62.0] - 2026-09-05
+
+### Fixed
+- **The evening brief email stopped shipping the deterministic template in the
+  coach's place** (#241). `plan_coach` was the last of the three single-shot
+  SDK-call siblings still following `briefing.DEFAULT_MODEL`, and it inherited
+  the SDK defaults along with the model: no `effort`, no `thinking` — adaptive
+  thinking at high effort — under the lowest ceiling of the three (30 s). It
+  timed out **23 of the 30 nights from 2026-08-07 to 09-05**, and every one of
+  those emails carried `fallback_coaching_line` instead of a coach line. It now
+  owns `DEFAULT_MODEL` (`claude-sonnet-5`), `DEFAULT_EFFORT` (`"low"`),
+  `thinking={"type": "disabled"}` and `DEFAULT_TIMEOUT_S` (45 s, matching
+  `reflect` — a short generation inside a scheduled job, not `workout_coach`'s
+  interactive 90 s), and imports `briefing` nowhere.
+
+  **Measured A/B**, 5 generations per arm against the REAL plan section and the
+  real prompt (2026-09-05, this machine; only the three knobs differ):
+
+  | Arm | Model | effort | thinking | Median | Max | Fallback rate |
+  |---|---|---|---|---|---|---|
+  | old | claude-sonnet-4-6 | (default) | (adaptive) | 35.4 s | 35.5 s | **5/5 (100%)** |
+  | new | claude-sonnet-5 | low | disabled | **6.4 s** | 8.1 s | **0/5 (0%)** |
+
+  Every old-arm run pinned at the ceiling (30 s + ~5.4 s of cancellation
+  unwinding). Output quality holds: the five new-arm lines run 59-98 words, one
+  paragraph, no markdown and no preamble — inside the 54-128 word range of the
+  eight lines the old config actually managed to cache. A live
+  `fitness brief-email --dry-run` generated in 7.6 s, printed
+  `Coaching line: generated`, and put a real coach line in the `.eml`.
+
+  The claim is a **rate**, not a guarantee: `reflect` has failed once in 31 on
+  this exact configuration, and two logged stalls (519.7 s against a 30 s
+  ceiling, 359 s against 45 s) blew past `asyncio.wait_for` entirely. No
+  ceiling value bounds that, which is why the fallback stays and why the second
+  half of this change exists.
+- **A template coaching line is no longer invisible** (#241). The substitution
+  was already logged at WARNING — into a 154 KB launchd *error* log nobody
+  scans, which is how it ran for a month unnoticed. `assemble_brief_render_inputs`
+  now sets `today["coaching_line_source"]` (`"generated"` / `"fallback"`) beside
+  the line, and three channels that are not that log report it: `brief-email`
+  echoes `Coaching line: <source>` to **stdout** (the 4 KB one-line-a-night out
+  log, and it prints on `--dry-run` too), the one existing macOS notification
+  reads `Evening brief emailed (coaching line: TEMPLATE)` on a fallback night
+  rather than firing a second notification, and `generate_brief_report`'s
+  payload carries the field so the stdio PDF path can report it as well. A cache
+  hit counts as `"generated"`: the distinction that matters is template versus
+  coach. The renderers read only `coaching_line`, so the sibling key is inert to
+  them, and it is set after the generation so no prompt or cache key moves. A
+  fallback is not a failure — the email still ships, and the exit code is
+  unchanged.
+- **An undated hand-written bullet is no longer the first thing rotation
+  evicts** (#232). `_rotate_to_fit` picked its victim with `recent_first`, the
+  ranking that deliberately sorts a bullet with no parseable timestamp *last* so
+  a hand-edited line renders at the bottom of the prompt — and then popped that
+  ranking's tail, which silently turned "shown last" into "deleted first". A
+  file holding one hand-typed bullet plus 27 stamped `2020-01-01` onwards
+  archived the hand-typed one first, ahead of a note five and a half years
+  older, and it was gone from the live file. Eviction now ranks through its own
+  `_eviction_order`, where an undated or malformed bullet is the *most*
+  protected and the tail is the oldest bullet that actually carries a timestamp.
+  It stays evictable as a last resort, so a file of nothing but hand-written
+  bullets can still come back under the 4 KB cap rather than sitting permanently
+  over budget. `recent_first` is untouched: display order in the prompt, in
+  `list_user_notes` and in `daily_snapshot` does not move. `save_user_note.md`,
+  `update_user_note.md` and `list_user_notes.md` all promised "the oldest
+  bullets by timestamp" and now state the undated case they never covered.
+- **A failing archive write can no longer destroy an evicted preference**
+  (#232). `_append_archive` logged its `OSError` and returned exactly what it
+  returns on success, so `save_user_note` and `update_user_note` truncated the
+  live file regardless: with the archive unwritable, a single capacity-tripping
+  write dropped 9 bullets on the append path and 7 on the update path, and they
+  existed nowhere afterwards — one `LOG.warning` no tool result surfaces was the
+  only trace. It now returns a success flag, and both callers keep the
+  would-be-evicted bullets live and write over the 4 KB budget when it comes
+  back `False`, taking the same way out `_rotate_to_fit` already takes for
+  unevictable prose. The cap exists to bound prompt size, not to guarantee
+  deletion, so a temporarily fat prompt beats a lost preference. Named
+  consequence: while the archive stays broken the live file grows unbounded —
+  every such write logs a `WARNING` naming the archive path and the size it went
+  over by. The update path also stops mis-reporting `position` on that skip
+  path, where nothing was popped and no line ahead of the rewritten one moved.
+- **`update_user_note` can no longer manufacture a handle collision** (#232).
+  `save_user_note` has always re-stamped a second forward rather than write a
+  `(timestamp, text)` pair a live bullet already carries; `update_user_note`
+  stamped outside the lock with no handle check at all, so two updates to the
+  same text inside one wall-clock second — or a rewrite onto text a bullet
+  stamped this second already holds — left two live bullets sharing one
+  address. A later `update_user_note` on that handle came back `duplicates: 2`,
+  and a `delete_user_note` removed one and left the twin in every future system
+  prompt. The guard is now one shared `_stamp_without_collision`, called by both
+  writers inside the held lock; `update_user_note` checks against every live
+  handle except the line it is replacing, so an update that changes nothing is
+  not forced to re-stamp itself. Rewriting two notes to the same wording stays
+  legal — they get distinct timestamps and stay independently addressable. A
+  shared handle in the file is now necessarily a hand-edit, which is what
+  `update_user_note.md`, `delete_user_note.md` and `list_user_notes.md` claimed
+  all along and now describe accurately; `save_user_note.md` documents the
+  re-stamp itself for the first time.
+- **`get_training_plan_progress` is ~6% faster, closing most of the +13.86%
+  regression PR #162 introduced** (#232). The perf gate had been reading that
+  benchmark over the threshold on slower runners since 2026-07-27 — the day
+  after the baseline was captured — and the failures were being re-run to green
+  as flakes. They were not flakes: bisected to `b28c74e`, confirmed by a local
+  A/B, and confirmed again by the shape of the CI table (on the baseline's own
+  CPU at the same clock, one sibling benchmark came in at −0.34% while this one
+  came in at +13.86%). Two behaviour-preserving fixes to code #162 added:
+  `plans._workout_actuals` folds the pace-gated run/walk classification into
+  the single pass it already runs over the day's activities, instead of walking
+  the list a second time through `_normalize_activity_types` (now deleted —
+  the fold left it with no caller); and `tools._round_floats` stops recursing
+  into leaves, rounding a container's scalar children where it finds them and
+  recursing only into a child that is itself a `dict` or a `list`. Anything
+  that is not exactly one of those types still falls through the original
+  `isinstance` ladder, so no output moves — asserted byte-for-byte against a
+  vendored copy of the old implementation over the real payload and 21
+  adversarial cases. Measured on the perf fixture: `_ran` evaluations per
+  request 123 → 87, `_round_floats` calls 470 → 83, handler latency −6.0%
+  (p05, interleaved in-process A/B). The gate, its 15% threshold and its
+  committed baseline are deliberately untouched.
+
+### Changed
+- **The perf-benchmark suite now counts work, not just connections.** New
+  deterministic assertions in `tests/test_perf_benchmarks.py` pin `_ran` and
+  `_round_floats` call counts for `get_training_plan_progress`, alongside
+  equivalence oracles proving the reductions changed no answer. Latency alone
+  cannot separate "the runner was slow" from "the code got slower" on a 2 ms
+  call — which is exactly how the regression above survived five weeks.
+  `CLAUDE.md`'s drift-vs-regression tell gains its third part: apply it per
+  benchmark, not to the run.
 
 ### Fixed
 - **An undated hand-written bullet is no longer the first thing rotation

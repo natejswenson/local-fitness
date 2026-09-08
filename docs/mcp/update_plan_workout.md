@@ -55,9 +55,9 @@ between "adjust today's run" and "silently rewrite the plan's structure".
 |---|---|---|---|---|
 | `date` | string | yes | — | ISO `YYYY-MM-DD` of a day that **already exists** in the active plan. Parsed with `date.fromisoformat`, so an impossible calendar date (`2026-02-30`, `2026-13-01`) is a hard error, not a lookup that matches nothing. |
 | `type` | string | no | unchanged | `easy` \| `long` \| `tempo` \| `interval` \| `rest` \| `race` \| `cross`. |
-| `distance_mi` | number | no | unchanged | Miles. Converted to metres (`units.from_miles`, `× 1609.344`). |
-| `pace_min_per_mi` | string \| number | no | unchanged | **`"M:SS"` preferred** — `"9:39"`. A bare number is *decimal minutes*: `9.65` is 9:39/mi. Bounded to 3:00–30:00/mi. See the trap below. |
-| `duration_min` | number | no | unchanged | Minutes. Converted to seconds and rounded. The **graded** field for `tempo`/`interval`. |
+| `distance_mi` | number | no | unchanged | Miles. Converted to metres (`units.from_miles`, `× 1609.344`). On `tempo`/`interval` this is the graded VOLUME whenever `duration_min` isn't set (see Gotchas) — it is display-only only on `easy`/`long`/`race`. |
+| `pace_min_per_mi` | string \| number | no | unchanged | **`"M:SS"` preferred** — `"9:39"`. A bare number is *decimal minutes*: `9.65` is 9:39/mi. Bounded to 3:00–30:00/mi. See the trap below. On `tempo`/`interval` this IS graded (0.63.0) — the verdict is capped by the pace of the day's fastest rep-sized split. On `easy`/`long`/`race` it stays display/coaching only. |
+| `duration_min` | number | no | unchanged | Minutes. Converted to seconds and rounded. The graded VOLUME field for `tempo`/`interval` when you set it — `distance_mi` is the fallback volume when you don't. Either way the pace cap above still applies on top. |
 | `hr_max` | number | no | unchanged | Prescribed heart-rate **ceiling** in bpm. Bounded to 90–210. Pass it whenever the day has a cap: [`workout_report_card`](workout_report_card.md) grades the run's average HR **and** how far above the ceiling it ran (in bpm, `hr_exceedance_bpm` — 0.40.2 replaced the earlier time-above-cap fraction, which was a different unit fed into bands calibrated for relative magnitudes) against this column. A cap written only into `description` is invisible to the grader (0.40.0). |
 | `description` | string | no | unchanged | Prose prescription. |
 | `seq` | integer | no | `1` | Intra-day session: 1 = first/AM, 2 = second/PM. Must be a positive int. |
@@ -216,12 +216,25 @@ Second returns the re-prescribed Sunday, as above.
   `target_duration_sec` and the payload now carries it back as `duration_seconds` plus a formatted
   `duration_formatted` (and `seq` for which session was edited), so a duration change confirms from
   the tool result — no follow-up `get_training_plan_progress` needed.
-- **Duration is what grades `tempo`/`interval`; distance is what grades `easy`/`long`/`race`.**
-  Setting `distance_mi` on a tempo day is display-only — adherence still measures running duration.
+- **A quality day grades on VOLUME, then gets CAPPED by rep pace** (0.63.0, #242). `duration_min`
+  is the graded volume on `tempo`/`interval` when you set it; `distance_mi` is the volume when you
+  don't (it is no longer display-only there — it was the shape of #242: every proposed quality day
+  had a distance and a pace and no duration, so an untouched distance field was silently what
+  volume graded on already). Either way, `pace_min_per_mi` then CAPS that verdict against the day's
+  fastest rep-sized split (≥300 m) — never raises it. On `easy`/`long`/`race`, `distance_mi` is
+  still the sole graded field and `pace_min_per_mi` is still coaching prose only.
+- **A `tempo`/`interval` day must end up with a duration OR a distance.** An edit that would leave
+  one with neither — most commonly flipping a `rest` day (targets NULL) straight to `tempo`/
+  `interval` without setting `distance_mi` or `duration_min` — is rejected with a `ValueError`
+  naming the day; the write does not land. The check runs on the RESOLVED row, so a `description`-only
+  edit to an existing, already-targeted quality day is unaffected.
 - **No dry run, no undo.** The write is immediate and the previous prescription is gone.
 - **`seq` defaults to 1.** On a double day, updating without `seq` silently edits the AM session.
 - **A stale `pace_min_per_mi` survives a `type` change** unless you also clear it — only
-  `type: "rest"` clears the numeric targets.
+  `type: "rest"` clears the numeric targets. This used to be harmless prose on every type; since
+  0.63.0 it is LOAD-BEARING the moment the type is (or becomes) `tempo`/`interval` — a pace left
+  over from a previous prescription now caps that day's verdict. Pass a fresh `pace_min_per_mi` (or
+  clear it) whenever you change a day's type onto a quality type.
 
 ## See also
 

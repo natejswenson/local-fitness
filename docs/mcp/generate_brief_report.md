@@ -34,11 +34,23 @@ a convention; a wiring fact.
 
 ## Returns
 
-A single text content block: `{"path": "<absolute path to the written PDF>"}`.
+A single text content block: the absolute path of the written PDF, plus
+`coaching_line_source` whenever the report carries a Training Plan rail.
 
 ```json
-{"path": "/var/folders/.../local-fitness-reports-48213-x9f2a1/brief-2026-07-21.pdf"}
+{"path": "/var/folders/.../local-fitness-reports-48213-x9f2a1/brief-2026-07-21.pdf",
+ "coaching_line_source": "generated"}
 ```
+
+| Field | Values | Notes |
+|---|---|---|
+| `path` | absolute path | Always present. |
+| `coaching_line_source` | `generated` \| `fallback` | Present only when the PDF has a plan rail with a today prescription. `fallback` means the Claude call failed and the line on the page is the deterministic template — the PDF is still correct, but the coach's voice is not in it. Absent when there is no plan section. |
+
+A `fallback` is not an error and never fails the call. It exists in the payload
+because the stdio path previously had no way to tell the two lines apart: the
+substitution was logged at WARNING to the server log and ran unnoticed for a
+month of evening briefs (#241).
 
 Errors (single text block, `is_error` set):
 
@@ -114,10 +126,11 @@ Mac automatically. Report the path; don't paste the JSON.
   `best_effort`, a Riegel-projection dict — not a date. That mistake has been
   made here before.)
 - **Today's coaching line is a Claude call** (`agent/plan_coach.py`: toolless,
-  single-shot, behind a single-entry disk cache keyed on the prompt hash).
-  Identical inputs reuse the cached line; any input change regenerates; failures
-  are never cached and fall back to a deterministic template. The PDF generates
-  either way.
+  single-shot, behind a disk cache keyed on the prompt hash). Identical inputs
+  reuse the cached line; any input change regenerates; failures are never cached
+  and fall back to a deterministic template. The PDF generates either way — read
+  `coaching_line_source` in the payload to know which line you got. A cache hit
+  counts as `generated`; the distinction is template versus coach.
 - **Only `data:` URIs are fetchable from the HTML.** Charts are embedded as
   data URIs and the WeasyPrint `URLFetcher` is restricted to that scheme —
   brief text can be influenced by free-text user notes, so an injected
