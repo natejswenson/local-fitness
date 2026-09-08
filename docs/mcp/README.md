@@ -20,6 +20,10 @@ worked examples, and gotchas.
 
 ```bash
 claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
+
+# Codex is already configured by ../../.codex/config.toml after project trust.
+# To configure it at user scope instead:
+codex mcp add fitness -- uv run fitness mcp-stdio
 ```
 
 **Over the running server** — 46 tools, bearer-gated:
@@ -27,7 +31,13 @@ claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
 ```bash
 claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
+
+codex mcp add fitness --url https://<your-host>/mcp/ \
+  --bearer-token-env-var LOCAL_FITNESS_API_TOKEN
 ```
+
+For Codex over HTTP, export `LOCAL_FITNESS_API_TOKEN` in the environment that
+launches Codex. The config stores the variable name, not the credential.
 
 See the [Authentication](../../README.md#authentication) section for the token,
 and [`docs/deployment.md`](../deployment.md) for the container setup.

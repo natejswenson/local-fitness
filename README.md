@@ -9,7 +9,7 @@
 A self-hosted, **agent-first** personal fitness coach. It pulls your
 [Garmin Connect](https://connect.garmin.com) data into a local SQLite database
 and computes rolling recovery and training-load baselines. You talk to your
-"coach" from an **MCP client** (Claude Desktop, Code, or Mobile) pointed at
+"coach" from an **MCP client** (Claude, Codex, or another MCP client) pointed at
 that data; a scheduled job composes a structured daily brief.
 
 The server itself runs **no Claude inference** — it hosts the deterministic
@@ -44,12 +44,12 @@ of metrics the agent reads when you ask it something or it writes a brief.
 - **Agent-first — your coach lives in an MCP client.** The fitness data and a
   set of grounded tools are exposed over the
   [Model Context Protocol](https://modelcontextprotocol.io), so you talk to your
-  training from Claude Desktop, Code, or Mobile. The agent must call a tool to
+  training from Claude Desktop, Code, Mobile, or Codex. The agent must call a tool to
   read real values before any claim — it never invents numbers. It can also
   *write*: compose a fresh daily brief, draft a training plan, log manual
   workouts and subjective notes (RPE, soreness, weight, mood…), and remember
   your preferences — all through the same tools. See
-  [MCP](#mcp--talk-to-your-data-from-claude-directly).
+  [MCP](#mcp--talk-to-your-data-from-an-agent).
 - **A scheduled daily brief.** `fitness brief` (run on a `launchd`/cron
   schedule) composes a structured morning briefing and saves it as JSON; MCP
   clients read it back via `get_brief_context`/the `fitness://brief/latest`
@@ -85,7 +85,7 @@ Garmin Connect ──pull──> SQLite (data/fitness.db) ──> baselines / CT
                                                           │
                    ┌──────────────────────────────────────┴───────────────┐
                 MCP server                                 scheduled `fitness brief`
-       (Claude Desktop/Code/Mobile, opencode:                (composes the brief →
+       (Claude, Codex, opencode:                              (composes the brief →
         coach + brief prompts, tools,                         briefings/*.json)
         resources, write surface)
 ```
@@ -112,9 +112,10 @@ signal yet.
 
 - **Python 3.12+** and [`uv`](https://docs.astral.sh/uv/)
 - A **Garmin Connect** account with some history
-- **Claude access via [Claude Code](https://claude.com/claude-code)** — the
-  `claude-agent-sdk` uses your existing Claude subscription; no separate API
-  key is required
+- **Claude access via [Claude Code](https://claude.com/claude-code)** for the
+  scheduled briefing jobs — the `claude-agent-sdk` uses your existing Claude
+  subscription; no separate API key is required. Interactive coaching can use
+  Claude, Codex, or any compatible MCP client.
 - **macOS** is the primary platform (the bundled scheduler uses `launchd`, and
   credentials default to the system Keychain). Linux/other works too — see
   [Cross-platform & Docker](#cross-platform--docker).
@@ -178,7 +179,7 @@ fitness status                # DB row counts + last ingest run info
 The brief composer defaults to a fast Sonnet model and switches to Opus on
 demand (`--opus`). One daily briefing is a rounding error against a Claude
 subscription. Conversational coaching now happens in your MCP client (see
-[MCP](#mcp--talk-to-your-data-from-claude-directly)), not a built-in REPL — the
+[MCP](#mcp--talk-to-your-data-from-an-agent)), not a built-in REPL — the
 `chat`/`ask` commands were retired in the agent-first migration.
 
 ## Server
@@ -187,7 +188,7 @@ subscription. Conversational coaching now happens in your MCP client (see
 that mounts the MCP endpoint at `/mcp/` and a `/health` liveness probe. It
 runs **no Claude inference** — it's a transport, not a conversation surface.
 There is no browsable UI; every fitness tool, prompt, and resource is reached
-through an MCP client (see [MCP](#mcp--talk-to-your-data-from-claude-directly)
+through an MCP client (see [MCP](#mcp--talk-to-your-data-from-an-agent)
 below, and the per-tool reference in [`docs/mcp/`](docs/mcp/)) —
 `fitness mcp-stdio` for a local stdio connection, or `/mcp/` for a networked
 client behind a token.
@@ -213,19 +214,27 @@ Claude inference, there are no cost-sensitive endpoints to drain a
 subscription; an in-memory per-IP rate limiter stays wired (currently a
 no-op) so any future Claude-cost path can be capped in one line.
 
-## MCP — talk to your data from Claude directly
+## MCP — talk to your data from an agent
 
 The MCP is the **only** way to interact with your coach — there is no web UI.
 The fitness tools, prompts, and resources are exposed over the [Model Context
 Protocol](https://modelcontextprotocol.io), so any MCP client (Claude Desktop,
-Code, or Mobile, opencode) can read *and* write your data. The same tool layer
+Code, or Mobile, Codex, opencode) can read *and* write your data. The same tool layer
 backs the MCP server and the scheduled brief composer, so there's one source
 of truth — no duplication.
 
-**Connect (local, no token):**
+**Connect locally from Claude (no token):**
 
 ```bash
 claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
+```
+
+**Connect locally from Codex (no token):** this repository's
+`.codex/config.toml` configures the same command automatically after you trust
+the project. To configure it in your user settings instead, run:
+
+```bash
+codex mcp add fitness -- uv run fitness mcp-stdio
 ```
 
 **Connect (over the running server, token-gated):** the server also mounts the
@@ -234,7 +243,14 @@ MCP endpoint at `/mcp/` behind the same `LOCAL_FITNESS_API_TOKEN` bearer gate.
 ```bash
 claude mcp add --transport http fitness \
   https://<your-host>/mcp/ --header "Authorization: Bearer $TOKEN"
+
+codex mcp add fitness --url https://<your-host>/mcp/ \
+  --bearer-token-env-var LOCAL_FITNESS_API_TOKEN
 ```
+
+For the Codex HTTP connection, export `LOCAL_FITNESS_API_TOKEN` in the
+environment that launches Codex. Codex reads the token at connection time, so
+the credential does not need to be written into its config file.
 
 Once connected you get **48 tools over stdio** (46 over HTTP — two are
 local-only, see below), **2 prompts**, and **2 resources**.

@@ -4,6 +4,17 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.1] - 2026-09-08
+
+### Added
+- **Claude and Codex now share the same repository contract and MCP surface.**
+  `AGENTS.md` bootstraps Codex into the complete canonical `CLAUDE.md`
+  guidance, while `.codex/config.toml` registers the existing local
+  `fitness mcp-stdio` server without embedding credentials. The README and MCP
+  reference now give working local and bearer-authenticated connection
+  commands for both clients. Claude's existing instructions, MCP setup, and
+  Claude Agent SDK scheduled-briefing backend remain supported.
+
 ## [0.63.0] - 2026-09-06
 
 ### Fixed

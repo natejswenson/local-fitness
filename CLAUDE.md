@@ -1,4 +1,4 @@
-# local-fitness — instructions for Claude
+# local-fitness — instructions for Claude and Codex
 
 > Maintainer-internal: this file is agent/ops guidance for the repo owner, not contributor onboarding — see README.md to get started.
 
@@ -15,6 +15,22 @@ Two facts shape every decision:
 
 These two pull in opposite directions — the env-driven pattern below
 is how we satisfy both.
+
+## Coding-agent compatibility
+
+- **This file is the shared source of truth.** Claude reads `CLAUDE.md`
+  directly. Codex reads the small `AGENTS.md` bootstrap, which requires it to
+  read this file completely. Put shared repository guidance here so the two
+  clients cannot drift.
+- **Codex's project MCP config is checked in.** After the repository is
+  trusted, `.codex/config.toml` registers the local `fitness` stdio server via
+  `uv run fitness mcp-stdio`. It contains no secrets and uses the same `.env`
+  loading as the CLI. Claude keeps using its existing `claude mcp add`
+  configuration; the Codex file does not affect Claude.
+- **Provider names remain meaningful.** References to Claude models, the
+  Claude Agent SDK, subscription auth, and Claude-specific runtime behavior
+  describe the scheduled briefing backend. Instructions addressed to Claude
+  as the coding agent apply to both Claude and Codex.
 
 ## The env-driven pattern (apply to every new feature)
 
@@ -260,12 +276,13 @@ After the 2026-05-04 audit, these are guardrails. Don't regress them.
   into `dev`, then a `dev → main` promotion — never a direct push to
   `main`/`dev` (admin break-glass aside). See *Branching & release
   strategy* below for the full flow.
-- **Keep CLAUDE.md current — in the same commit/PR.** Any change that
+- **Keep the shared agent guidance current — in the same commit/PR.** Any change that
   alters the workflow, architecture, deploy/branch model, security
   contract, or an env var updates the relevant CLAUDE.md section as part
-  of that same commit, not as a follow-up. CLAUDE.md is the source of
-  truth future-you reads first; a diff that changes behavior but leaves
-  CLAUDE.md stale is incomplete.
+  of that same commit, not as a follow-up. `CLAUDE.md` remains the source of
+  truth for Claude and Codex; `AGENTS.md` remains only the Codex bootstrap. A
+  diff that changes behavior but leaves the shared guidance stale is
+  incomplete.
 
 ## Branching & release strategy
 
