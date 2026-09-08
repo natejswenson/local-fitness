@@ -1,7 +1,7 @@
 [project]
 name = "local-fitness"
-version = "0.63.1"
-description = "Local Garmin-data agent: hands-off ingest + Claude-powered daily briefings"
+version = "0.64.0"
+description = "Local Garmin-data agent with Claude- or Codex-powered daily briefings"
 readme = "README.md"
 authors = [
     { name = "Nate Swenson", email = "natejswenson@gmail.com" }

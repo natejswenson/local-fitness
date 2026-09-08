@@ -9,11 +9,10 @@
   writes the result to ~/Library/LaunchAgents/. Nothing host-specific is
   committed; the placeholders keep the tracked file clone-portable.
 
-  The job runs `fitness brief`, which composes the day's brief via the
-  Claude-bound headless agent (in-process MCP through make_server()) and
-  persists it with briefs.save_brief(). It needs CLAUDE_CODE_OAUTH_TOKEN —
-  but the CLI auto-loads it from <repo>/.env via load_dotenv(), so the
-  token lives in .env (gitignored), NOT in this plist.
+  The job runs `fitness brief`, which composes and persists the day's brief.
+  LOCAL_FITNESS_BRIEF_PROVIDER in <repo>/.env selects Claude or Codex; their
+  credentials and any LOCAL_FITNESS_CODEX_BIN override stay in that gitignored
+  file, never in this plist.
 -->
 <plist version="1.0">
 <dict>

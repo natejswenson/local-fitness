@@ -27,17 +27,19 @@ This resolves your `uv` binary and this repo's path, fills them into each
 (`./ops/install-launchd.sh briefmail`) to install just one. If the Mac is
 asleep at a fire time, launchd runs the missed job once at the next wake.
 
-All three are **LaunchAgents, not LaunchDaemons**, and must stay that way: the
-bundled Claude SDK CLI reads its credential from the login keychain, which
-a user agent can reach and a system daemon cannot.
+All three are **LaunchAgents, not LaunchDaemons**, and must stay that way: model
+CLIs may read credentials from the user's credential store, which a user agent
+can reach and a system daemon cannot.
 
 ## Credentials
 
-The job needs `CLAUDE_CODE_OAUTH_TOKEN` (your Claude Max subscription — no
-per-token API billing). The CLI auto-loads `.env` from the repo root via
-`load_dotenv()`, so put the token in `<repo>/.env` (gitignored). It is
-**not** stored in the plist. The scheduled run talks to the MCP in-process,
-so it needs neither `LOCAL_FITNESS_API_TOKEN` nor an allowed-host entry.
+The composer is selected with `LOCAL_FITNESS_BRIEF_PROVIDER=claude|codex` in
+the repo-root `.env` (gitignored). Claude needs `CLAUDE_CODE_OAUTH_TOKEN`;
+Codex uses non-interactive `codex exec` and the login reported by `codex login
+status`. Neither credential is stored in the plist. Codex requires the default
+V2 toolless composer; Claude continues to support both V2 and the V1 rollback.
+Because `launchd` has a minimal `PATH`, set `LOCAL_FITNESS_CODEX_BIN` to the
+output of `command -v codex` when selecting Codex.
 
 ## The evening email job
 
@@ -145,5 +147,5 @@ names the missing variable.
 
 No launchd. Schedule `uv run fitness brief`, `uv run fitness brief-email` and
 `uv run fitness plan-calendar` with cron or systemd timers, ensuring
-`CLAUDE_CODE_OAUTH_TOKEN`, the `LOCAL_FITNESS_SMTP_*` settings and the
+the selected provider's credential, the `LOCAL_FITNESS_SMTP_*` settings and the
 `LOCAL_FITNESS_GCAL_*` values are in `<repo>/.env`.

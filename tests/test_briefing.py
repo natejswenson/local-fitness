@@ -224,6 +224,22 @@ def test_brief_effort_empty_string_falls_back_to_default(monkeypatch):
     assert briefing._brief_effort() == briefing._DEFAULT_BRIEF_EFFORT
 
 
+def test_brief_provider_defaults_to_claude(monkeypatch):
+    monkeypatch.delenv("LOCAL_FITNESS_BRIEF_PROVIDER", raising=False)
+    assert briefing._brief_provider() == "claude"
+
+
+def test_brief_provider_normalizes_codex(monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_PROVIDER", " Codex ")
+    assert briefing._brief_provider() == "codex"
+
+
+def test_brief_provider_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_PROVIDER", "other")
+    with pytest.raises(ValueError, match="expected claude or codex"):
+        briefing._brief_provider()
+
+
 # === generate_streaming: real control-flow over a fake SDK query ===========
 #
 # We drive the genuine loop by replacing ``briefing.query`` with an async
@@ -673,6 +689,37 @@ def _drain_model(model: str, save: bool = False) -> list[dict]:
         return [evt async for evt in briefing.generate_streaming(model=model, save=save)]
 
     return asyncio.run(go())
+
+
+def test_codex_provider_routes_v2_context_through_codex(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_PROVIDER", "codex")
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "1")
+    monkeypatch.setenv("LOCAL_FITNESS_CODEX_MODEL", "gpt-test")
+    calls = []
+
+    def fake_codex(system_prompt, user_prompt, *, model):
+        calls.append((system_prompt, user_prompt, model))
+        return _brief_json([
+            _takeaway(headline="Workout"),
+            _takeaway(headline="Steps"),
+            _takeaway(headline="Recovery"),
+        ])
+
+    monkeypatch.setattr(
+        briefing.codex_model, "generate_codex_completion", fake_codex)
+    events = _drain(save=True)
+
+    assert calls and calls[0][2] == "gpt-test"
+    assert "cite ONLY these numbers" in calls[0][1]
+    assert [event["type"] for event in events] == ["done"]
+    assert (stream_env / f"{date_today()}.json").exists()
+
+
+def test_codex_provider_requires_v2(stream_env, monkeypatch):
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_PROVIDER", "codex")
+    monkeypatch.setenv("LOCAL_FITNESS_BRIEF_V2", "0")
+    with pytest.raises(ValueError, match="requires the V2"):
+        _drain(save=False)
 
 
 @pytest.mark.parametrize("model,expected", [

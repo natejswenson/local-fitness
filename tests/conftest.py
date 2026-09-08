@@ -59,6 +59,26 @@ def _no_live_sdk_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_codex_calls(monkeypatch):
+    """Keep a developer's `.env` provider choice from making paid live calls.
+
+    Tests that exercise Codex set the provider and replace this transport with
+    their own fake after autouse fixtures have run.
+    """
+    from local_fitness.agent import codex_model
+
+    monkeypatch.delenv("LOCAL_FITNESS_BRIEF_PROVIDER", raising=False)
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError(
+            "Live Codex call attempted in a test. Patch "
+            "codex_model.generate_codex_completion in your test instead."
+        )
+
+    monkeypatch.setattr(codex_model, "generate_codex_completion", _blocked)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_garmin_calls(monkeypatch):
     """Hard-block live Garmin API calls for the whole suite.
 
