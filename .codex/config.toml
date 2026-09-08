@@ -1,0 +1,8 @@
+# Project-local Codex configuration. Codex loads this file after the user
+# trusts the repository. Keep secrets in .env; the stdio transport needs no
+# bearer token and inherits local-fitness's existing environment loading.
+[mcp_servers.fitness]
+command = "uv"
+args = ["run", "fitness", "mcp-stdio"]
+startup_timeout_sec = 30
+tool_timeout_sec = 120
