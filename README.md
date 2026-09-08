@@ -334,10 +334,11 @@ The DNS-rebinding guard on the HTTP transport requires the served host to be in
 your host or every request 421s).
 
 > **Scheduled brief credentials.** The scheduled `fitness brief` composer is the
-> one place the *server side* talks to Claude (a separate process from the web
-> server). It authenticates with your Claude subscription via
-> `CLAUDE_CODE_OAUTH_TOKEN` — put it in `.env` (the CLI auto-loads it, including
-> under `launchd`). The web server and the MCP endpoint don't need it. See
+> one place the server side invokes a model (a separate process from the web
+> server). Choose `LOCAL_FITNESS_BRIEF_PROVIDER=claude|codex` in `.env`. Claude
+> uses `CLAUDE_CODE_OAUTH_TOKEN`; Codex uses `codex exec` and the CLI login, plus
+> `LOCAL_FITNESS_CODEX_BIN` when the scheduler cannot find Homebrew binaries.
+> The web server and MCP endpoint need neither model credential. See
 > [`ops/`](ops/) and [`docs/deployment.md`](docs/deployment.md).
 
 ## Evening delivery — email + calendar
@@ -387,7 +388,7 @@ map.
 | `LOCAL_FITNESS_DISPLAY_UNITS` | Runner-facing display units. List payloads carry the display form for the configured units; detail views keep raw values alongside | `miles` |
 | `LOCAL_FITNESS_USER_NAME` | Fallback display name when the `user_name` setting is unset | `the user` |
 | `LOCAL_FITNESS_TZ` | Container timezone (compose interpolates it into `TZ` — a UTC container reads the wrong "today" all evening) | host zone |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude subscription token for the headless brief jobs | unset |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude subscription token when the scheduled brief provider is `claude` | unset |
 | `DYLD_LIBRARY_PATH` | macOS-only: Homebrew's lib dir so WeasyPrint finds Pango | unset |
 
 **Brief generation**
@@ -395,6 +396,9 @@ map.
 | Variable | Purpose | Default |
 |---|---|---|
 | `LOCAL_FITNESS_BRIEF_V2` | Set `0` to fall back to the V1 tool-driven composer | V2 on |
+| `LOCAL_FITNESS_BRIEF_PROVIDER` | Scheduled V2 composer backend: `claude` or `codex` | `claude` |
+| `LOCAL_FITNESS_CODEX_MODEL` | Optional model override for the Codex composer; unset uses the CLI default | unset |
+| `LOCAL_FITNESS_CODEX_BIN` | Codex executable; use an absolute path for `launchd` | `codex` from `PATH` |
 | `LOCAL_FITNESS_BRIEF_EFFORT` | Reasoning-effort override for the brief model | model default |
 | `LOCAL_FITNESS_BRIEF_IDLE_TIMEOUT_S` / `_MAX_ATTEMPTS` / `_RETRY_DELAY_S` | The SDK-stream watchdog: per-message idle kill, retry count, backoff | `120` / `3` / `20` |
 | `LOCAL_FITNESS_OPENCODE_AGENT` | Alt-model shadow-run diagnostic transport | unset |
