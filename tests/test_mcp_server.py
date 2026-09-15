@@ -573,22 +573,17 @@ def test_mcp_http_transport_excludes_local_only_tools():
         names = {t["name"] for t in payload["result"]["tools"]}
         assert names == {t.name for t in agent_tools.ALL_TOOLS}
         assert "generate_brief_report" not in names
-        assert "chart" in names
+        assert {"chart", "workout_report_card"} <= names
 
 
 def test_build_server_with_local_only_tools_serves_both():
-    # INV-T10: the exact call run_stdio() makes — build_server(extra_tools=
-    # agent_tools.LOCAL_ONLY_TOOLS) — serves ALL_TOOLS plus whatever's still
-    # local-only — the two PDF writers, generate_brief_report and
-    # workout_report_card. Both are reachable HERE (stdio) and nowhere else;
-    # build_session_manager() calls build_server() argument-free, so the
-    # networked /mcp/ transport structurally cannot serve them.
+    # run_stdio adds brief PDF export; report cards are already shared.
     server = mcp_server.build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
     handler = server.request_handlers[types.ListToolsRequest]
     res = asyncio.run(handler(types.ListToolsRequest(method="tools/list")))
     served = {t.name for t in res.root.tools}
     assert served == {t.name for t in agent_tools.ALL_TOOLS} | {
-        "generate_brief_report", "workout_report_card"}
+        "generate_brief_report"}
 
 
 def test_spa_catchall_does_not_shadow_mcp():

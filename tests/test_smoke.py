@@ -71,7 +71,8 @@ def test_tool_schemas_well_formed():
     # network-reachability reason as the SMTP password)
     # 46 at 0.57.0: -get_metric (folded into get_metric_trend's
     # include_values) and -generate_chart (folded into chart's format="png").
-    assert len(agent_tools.ALL_TOOLS) == 46
+    # 47 at 0.65.0: workout_report_card now works over HTTP.
+    assert len(agent_tools.ALL_TOOLS) == 47
     for t in agent_tools.ALL_TOOLS:
         assert t.name
         assert t.description

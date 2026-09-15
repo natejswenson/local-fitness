@@ -141,7 +141,7 @@ Mac automatically. Report the path; don't paste the JSON.
 - [`save_brief`](save_brief.md) — writes the JSON this tool renders.
 - [`get_brief_context`](get_brief_context.md) — the pre-assembled context a brief
   is composed from.
-- [`workout_report_card`](workout_report_card.md) — the other PDF tool, and the
-  other member of `LOCAL_ONLY_TOOLS`.
+- [`workout_report_card`](workout_report_card.md) — inline workout reports and explicit PDF exports
+  (available over both transports).
 - [`chart`](chart.md) — `format="png"` is the chart renderer this shares
   (`visuals.render_chart_png`).

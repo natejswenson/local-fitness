@@ -16,10 +16,8 @@ Two tools, two jobs: this one lists many cards shallowly;
 [`get_report_card`](get_report_card.md) returns one card in full with the
 coach's verbal read and preformatted markdown.
 
-**Availability note worth internalizing:** this tool and
-[`get_report_card`](get_report_card.md) are pure JSON, so they work over both
-transports — but `workout_report_card`, the thing that *creates* rows, is
-stdio-only. A remote `/mcp/` client can read the history it can't extend.
+All three report-card tools work over stdio and HTTP. A remote client can
+create a missing card with `workout_report_card`, then read it here.
 
 ## Parameters
 
@@ -128,6 +126,6 @@ pace F, not averaged into one.
 ## See also
 
 - [`get_report_card`](get_report_card.md) — one card in full, with the coach's read
-- [`workout_report_card`](workout_report_card.md) — render (and thereby store) a card; stdio-only
+- [`workout_report_card`](workout_report_card.md) — render (and thereby store) a card; both transports
 - [`get_training_plan_progress`](get_training_plan_progress.md) — plan adherence, the *other* "how am I doing" axis
 - [`query_workouts`](query_workouts.md) — the raw sessions behind the cards
