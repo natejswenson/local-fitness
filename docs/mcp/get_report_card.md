@@ -15,16 +15,22 @@ deterministic Python and the read is the coach's phrasing of them, so a
 paraphrase can only drift out of agreement with the ratings in the table.
 
 Use [`list_report_cards`](list_report_cards.md) to find `activity_id`s. Use
-[`workout_report_card`](workout_report_card.md) (stdio-only) when you want a
+[`workout_report_card`](workout_report_card.md) when you want a
 *fresh* grading of a session, or a PDF.
 
 ## Parameters
 
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
+| `format` | string | no | `inline` | `inline`: text + HR image; `table`: JSON/Markdown. |
 | `activity_id` | integer | yes | — | From [`list_report_cards`](list_report_cards.md) or [`query_workouts`](query_workouts.md). Must be an `int` — a numeric string is rejected. |
 
 ## Returns
+
+Default inline returns report text and an HR image where available, with a
+stored-snapshot timestamp. It reuses cached HR samples without fetching Garmin
+or changing the saved ratings. Machine fields live in `structuredContent`.
+The JSON below describes `format="table"`:
 
 ```json
 {
@@ -69,7 +75,7 @@ Use [`list_report_cards`](list_report_cards.md) to find `activity_id`s. Use
 Failure returns `is_error: true`, with the id echoed so the caller can recover:
 
 ```json
-{"error": "no stored report card for activity 23685126977 yet — a card is stored whenever it is rendered from a local session (workout_report_card is stdio-only and cannot be called over the network)",
+{"error": "no stored report card for activity 23685126977 yet — create it with workout_report_card(activity_id=…) from a local or remote session",
  "activity_id": 23685126977}
 ```
 
@@ -111,9 +117,8 @@ top of it rather than instead of it.
   so they are absent from a stored card by design — an empty `hr_trace` here
   does not mean the run had no HR data.
 - **A missing card means never rendered, not badly run.** There is no backfill;
-  history starts when cards start rendering. And `workout_report_card` is
-  stdio-only, so a phone connected over `/mcp/` can read cards but cannot create
-  the one it's asking for.
+  history starts when cards start rendering. Call `workout_report_card` to
+  create the missing card over either transport.
 - **The stored read doubles as the render cache.** A re-render whose prompt key
   matches this row reuses the read with no SDK call — which is why the read here
   is usually identical to what a fresh local render would print.
@@ -126,6 +131,6 @@ top of it rather than instead of it.
 ## See also
 
 - [`list_report_cards`](list_report_cards.md) — find `activity_id`s and trend the ratings
-- [`workout_report_card`](workout_report_card.md) — render fresh (and store); stdio-only, returns a PDF path
+- [`workout_report_card`](workout_report_card.md) — render fresh (and store); inline report or explicit PDF export
 - [`get_workout_detail`](get_workout_detail.md) — the raw session; use the card when a graded one exists
 - [`list_coach_memories`](list_coach_memories.md) — the *other* durable record: the coach's journal

@@ -410,13 +410,9 @@ today", "how's my training load", "what did I run last week"):
   (a plan, a week schedule) → one compact `label: value · label: value` line per
   item, not a wide grid.
 - **Always render charts fully *in the reply*, never in a collapsed tool call.**
-  When you produce a chart/graph (the `chart` styles, or an ad-hoc render),
-  paste the full output into the message in a fenced code block so it shows
-  expanded by default — then add the coach read. It's fine to compute the chart
-  by running the renderer via Bash, but a chart left only in the Bash/tool-call
-  output is collapsed in the UI and forces the user to hit Ctrl-O to see it,
-  which Nate flagged as "very unfriendly." Reproduce the exact output in the
-  reply. Applies to every chart, every time.
+  Inline PNGs from `chart`, `plan_chart`, or a workout report should be shown
+  with their captions. For ASCII output, paste the full chart in a fenced code
+  block. A chart left only in the tool call forces the user to expand it.
 - This is advice, not an enforced gate — but with a tool that exists for the
   job, there's no reason to query the DB by hand.
 
@@ -1173,27 +1169,30 @@ These are settled — don't redesign without a reason.
   with `is_error` unset). PDF-render failures now name the exception class +
   message plus a recovery (`format='table'` / read the brief via resource) —
   "see the server log" is a dead end for an agent that can't read the log.
-- **The two PDF-writing tools are stdio-only — `generate_brief_report` and
-  `workout_report_card` (0.25.0); the PNG chart renderer lives in `ALL_TOOLS`
-  as `chart`'s `format="png"` (0.57.0 — the former `generate_chart` tool,
-  which had moved into `ALL_TOOLS` 2026-07-13, folded into `chart` because
-  the two shared fetch/whitelist/styles: two names for one job, the
-  get_today_status ambiguity again; `get_metric` folded into
-  `get_metric_trend`'s `include_values=true` the same release, raw series
-  capped at 120 rows).** The rule that decides
-  membership: a tool that hands back a *filesystem path* is local-only,
-  because a remote `/mcp/` caller gets a container-internal path it cannot
-  retrieve. The png chart renders a standalone matplotlib PNG on
-  demand and returns it as an inline MCP image content block (alongside
-  the saved file path as text) — reachable over both `fitness mcp-stdio` and
-  the networked `/mcp/` transport, since a client never needs the local
-  file path to see the chart. `generate_brief_report` (`agent/tools.py`'s
-  `LOCAL_ONLY_TOOLS`) renders a saved daily brief
-  into a polished PDF (`agent/visuals.py`'s WeasyPrint pipeline, reusing the
-  `budget` project's validated color theme) and stays stdio-only for the
-  same reason as before: a PDF isn't representable as an MCP content block,
-  so a phone-triggered call over `/mcp/` would get back a container-internal
-  path with no way to retrieve the file. Since the 2026-07-09 UX pass, it
+- **Reports are inline by default on both MCP transports (0.65.0).**
+  `workout_report_card` lives in `ALL_TOOLS` (47 HTTP / 48 stdio tools).
+  Default `format="inline"` returns Markdown + an MCP HR image from local
+  samples/laps, with computed ratings in `structuredContent`. It uses a matching
+  cached coach read or a labeled deterministic summary; it NEVER calls Garmin,
+  a model, or reflection. Explicit local table/PDF exports preserve generation
+  on cache miss; `coaching="cached"` suppresses it. HTTP rejects `generate`.
+  `get_report_card` repeats the saved snapshot with inline presentation.
+  `chart` and `plan_chart` default to PNG; ASCII stays available explicitly
+  (calendar/spark imply ASCII). No PNG writes a file or opens Preview.
+  `web/mcp_server.py` keeps SDK tool schemas but overrides its lossy external
+  result adapter to preserve image/structured content and set a ContextVar
+  transport capability. User arguments cannot turn on local export behavior.
+  **Remote workout PDFs require `LOCAL_FITNESS_PUBLIC_URL`**, a trusted HTTP(S)
+  origin configured by the operator, never inferred from Host headers.
+  `web/artifacts.py` holds up to 32 PDFs / 32 MiB for 600 seconds in memory.
+  A random capability authorizes ONLY GET of that exact PDF; it is not an API
+  token. Expiry/restart/eviction invalidates it. `/health` remains the sole public
+  path; downloads require their capability (scope path, never Host-derived).
+  Do not expose directories or put the API token in URLs. Downloads are no-store.
+  Coverage notices distinguish recorded sync dates from data completeness:
+  ingest success cannot guarantee every Garmin endpoint succeeded.
+  **`generate_brief_report` alone remains stdio-only.** It and explicit local
+  workout PDF exports retain the existing file lifecycle. The brief tool
   writes to and auto-opens from an **ephemeral per-process tmp directory by
   default** (`tempfile.mkdtemp`, PID-embedded naming, cleaned up via `atexit`
   when the `fitness mcp-stdio` process exits — a fresh subprocess per
@@ -1213,8 +1212,7 @@ These are settled — don't redesign without a reason.
   diverged on ~50% of paired Linux renders, measured 2026-07-23; macOS's
   allocator usually masks it), so the "identical content reuses one filename"
   half of the contract failed at random and its CI test was a coin flip.
-  The png chart still uses `_content_tag()` (bytes) — matplotlib's
-  PNG writer IS reproducible. This is not cosmetic — macOS `open`
+  Local PDF filenames matter: macOS `open`
   RE-FOCUSES an already-open Preview window for a path it has seen rather than
   reloading the bytes, so the old deterministic `brief-<date>.pdf` showed a
   STALE render on every re-generate. A user read yesterday's-looking page and

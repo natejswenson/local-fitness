@@ -1,14 +1,14 @@
 # `chart`
 
-> Chart one daily metric over the last N days — terminal ASCII/emoji (default) or a rendered PNG returned inline (`format="png"`). **Availability:** stdio + HTTP
+> Chart one daily metric over the last N days — a rendered PNG returned inline (default) or terminal ASCII/emoji (`format="ascii"`). **Availability:** stdio + HTTP
 
 ## What it does
 
 Answers "show me my resting HR for the last month". It plots ONE metric from
 `daily_metrics`, one of the three training-load series from `baselines`
 (`ctl`/`atl`/`tsb`), or the derived `intensity_minutes_weighted` — as terminal
-text you paste straight into a reply (the default), or as a polished matplotlib
-PNG returned inline (`format="png"`; the former `generate_chart` tool, folded
+text (`format="ascii"`), or as a matplotlib
+PNG returned inline (the default; the former `generate_chart` tool, folded
 in at 0.57.0 — same whitelist, same window semantics). For "scheduled vs
 actual" / "am I hitting my plan", neither format is right — that is
 [`plan_chart`](plan_chart.md), which is a two-series view these single-series
@@ -21,19 +21,25 @@ renderers cannot express.
 | `metric` | string | yes | — | Whitelisted against `_CHART_METRICS`: every column in `DAILY_NUMERIC_METRICS`, plus `ctl` / `atl` / `tsb` (read from `baselines`, not `daily_metrics`), plus `intensity_minutes_weighted` (derived: `moderate + 2 × vigorous`). An unknown name errors and echoes the allowed list. |
 | `days` | integer | yes | — | Trailing window ending today. The cutoff is `today - days` **inclusive**, so a full-data 28-day ask reports `n=29`. Bounds-checked to `1..3650`; a non-int (including `bool`) or an out-of-range value errors rather than being clamped. |
 | `style` | string | no | `calendar` (ascii) / `line` (png) | ascii: `calendar` / `line` / `bar` / `combo` / `spark`. png: `line` / `bar` / `combo` only — an ascii-only style with `format="png"` errors with the allowed list. |
-| `format` | string | no | `ascii` | `ascii` = terminal chart in a text block. `png` = matplotlib image returned as an inline image content block, plus the saved file path as text (content-addressed filename `chart-{metric}-{style}-{N}d-<sha8>.png`, auto-opened locally). |
+| `format` | string | no | `png` | Inline PNG + caption, with no local file path. Explicit `calendar`/`spark` styles select ASCII if format is omitted. |
 
 ### Which style
 
 | Style | Shape | Color | Good for |
 |---|---|---|---|
-| `calendar` | Week-stacked heat grid, Mon→Sun, one cell per day, weekly aggregate in the right column | emoji heat ramp | The default. Stays compact at any window — 90 days is ~13 rows. |
+| `calendar` | Week-stacked heat grid, Mon→Sun, one cell per day, weekly aggregate in the right column | emoji heat ramp | The ASCII default. Stays compact at any window — 90 days is ~13 rows. |
 | `line` | Smoothed, down-sampled curve in box-drawing glyphs (`─ ╭ ╮ ╰ ╯ │`) with a y-axis | mono | Trend shape over a long window. |
 | `bar` | One horizontal bar per point | emoji heat ramp | Windows of ~2 weeks or less. |
 | `combo` | 2D vertical bars plus a least-squares trend line (`•`) on a labelled y-axis | mono | Series that go negative — TSB / freshness — and any "is this rising or falling" ask. |
 | `spark` | One-line block sparkline plus min..max | mono | A dense series inline in a sentence. |
 
 ## Returns
+
+The default response has a PNG image and readable caption in `content`, with
+metric/date/reading-count fields in `structuredContent`. Show both image and
+caption. Data ending early and today's provisional values are labeled.
+
+### ASCII (`format="ascii"`)
 
 A single text content block holding the rendered chart **verbatim** — plain
 text, not JSON. (Errors are the exception: those come back as
@@ -81,7 +87,7 @@ TSB.)
 **Ask:** "how's my resting heart rate looked this month?"
 
 ```
-chart(metric="rhr", days=28)
+chart(metric="rhr", days=28, format="ascii")
 ```
 
 Then paste the full block into the reply (see the first gotcha) and add the
@@ -93,11 +99,8 @@ the last four days at 47–48. That's the taper showing up."*
 `format="png"` renders the same series with matplotlib: `line` (axis chart with
 gridlines, default), `bar` (vertical bars), or `combo` (bars + a least-squares
 trend line of the same metric — one metric, one axis, never a dual-axis chart).
-The response carries TWO content blocks — the saved file path as text, then the
-PNG as an inline image — so a networked `/mcp/` client sees the chart without
-needing the path. Filenames are content-addressed (changed data lands on a new
-file so macOS `open` shows fresh bytes instead of refocusing a stale window;
-identical data reuses one file).
+The response carries a date-labeled caption and a PNG image, with machine fields
+in `structuredContent`. Neither a local file nor Preview is needed to view it.
 
 ## Gotchas
 

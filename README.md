@@ -252,7 +252,7 @@ For the Codex HTTP connection, export `LOCAL_FITNESS_API_TOKEN` in the
 environment that launches Codex. Codex reads the token at connection time, so
 the credential does not need to be written into its config file.
 
-Once connected you get **48 tools over stdio** (46 over HTTP — two are
+Once connected you get **48 tools over stdio** (47 over HTTP — one is
 local-only, see below), **2 prompts**, and **2 resources**.
 
 📖 **[Full per-tool reference → `docs/mcp/`](docs/mcp/)** — one page per tool
@@ -280,10 +280,10 @@ is a map; that directory is the documentation.
   `workout_report_card`, which *rates* one session — distance, pace, HR and
   continuity each get a 1-5 star score from one shared curve, plus an
   intent-weighted overall. Every render is stored, so `list_report_cards` /
-  `get_report_card` read the rated history back (JSON, so both transports)
+  `get_report_card` read the rated history back (both transports)
   without re-rating anything.
-- **Charts** — `chart` (inline ASCII/emoji by default; `format="png"` renders
-  a matplotlib image returned as an inline image block) and `plan_chart`
+- **Charts** — `chart` (inline PNG by default; `format="ascii"` returns
+  terminal text) and `plan_chart`
   (**the** scheduled-vs-actual view — don't hand-roll it).
 - **Training plans** — the agent owns the whole lifecycle, because there is no
   UI: `propose_training_plan` / `revise_training_plan` (draft),
@@ -323,11 +323,12 @@ is a map; that directory is the documentation.
   and `fitness://brief/latest` (your most recent brief as Markdown, with a
   STALE banner when it predates today).
 
-**Two tools are stdio-only:** `generate_brief_report` and
-`workout_report_card`. The rule is that a tool handing back a *filesystem path*
-can't work over the network — a remote caller gets a container-internal path it
-cannot retrieve. `chart`'s png format is networked precisely because it
-returns the image inline instead.
+**Workout reports work over both transports.** Ask for a report to receive
+formatted ratings and an HR chart immediately, using stored data and cached or
+computed coaching text. `workout_report_card(format="pdf")` returns a local file
+over stdio or a ten-minute download link over HTTP. Configure
+`LOCAL_FITNESS_PUBLIC_URL` to the server origin your browser can reach for remote
+PDF downloads. `generate_brief_report` alone remains stdio-only.
 
 The DNS-rebinding guard on the HTTP transport requires the served host to be in
 `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` (defaults to common local hosts; set it to
@@ -381,8 +382,9 @@ map.
 | `LOCAL_FITNESS_DATA_DIR` | Where the SQLite DB + notes live | `./data` |
 | `LOCAL_FITNESS_BRIEFINGS_DIR` | Where daily briefings are written | `./briefings` |
 | `LOCAL_FITNESS_NOTES_PATH` | The agent's durable user-notes file | `./data/user_notes.md` |
-| `LOCAL_FITNESS_REPORTS_DIR` | Persistent PDF/PNG output dir for the file-writing tools | ephemeral per-process tmp dir |
+| `LOCAL_FITNESS_REPORTS_DIR` | Persistent local PDF export directory | ephemeral per-process tmp dir |
 | `LOCAL_FITNESS_HOST` | Bind host for `fitness serve` | `127.0.0.1` |
+| `LOCAL_FITNESS_PUBLIC_URL` | Trusted HTTP(S) server origin for expiring PDF links; no path, query, or credentials | unset (inline reports work) |
 | `LOCAL_FITNESS_API_TOKEN` | Bearer token gating `/mcp/` (required for non-loopback binds) | unset |
 | `LOCAL_FITNESS_MCP_ALLOWED_HOSTS` | Host allowlist for the MCP transport's DNS-rebinding guard | `127.0.0.1,localhost` |
 | `LOCAL_FITNESS_DISPLAY_UNITS` | Runner-facing display units. List payloads carry the display form for the configured units; detail views keep raw values alongside | `miles` |

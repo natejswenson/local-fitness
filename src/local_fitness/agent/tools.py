@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import replace as replace_dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,7 @@ from uuid import uuid4
 
 from claude_agent_sdk import create_sdk_mcp_server
 from claude_agent_sdk import tool as _sdk_tool
+from mcp.types import ToolAnnotations
 from pydantic import ValidationError
 
 from .. import config, db, notes, plans
@@ -55,6 +57,10 @@ LOG = logging.getLogger(__name__)
 
 
 SERVER_NAME = "fitness"
+
+# Direct host/CLI calls may export local files. The HTTP adapter disables
+# this per call; arguments can never enable host-side effects remotely.
+LOCAL_REPORT_EXPORTS: ContextVar[bool] = ContextVar("local_report_exports", default=True)
 
 # Strong references to in-flight auto-reflect tasks (workout_report_card's
 # fire-and-forget hook). asyncio holds tasks weakly; without this set a
@@ -250,7 +256,7 @@ _DB_ERROR_REMEDIATION = (
 )
 
 
-def tool(name: str, description: str, input_schema: Any):
+def tool(name: str, description: str, input_schema: Any, *, annotations=None):
     """The SDK ``tool`` decorator plus a last-resort error envelope.
 
     Every handler is wrapped in one try/except so an unhandled
@@ -262,7 +268,7 @@ def tool(name: str, description: str, input_schema: Any):
     inherits the guard by using this decorator, which it must, since this
     module shadows the SDK import.
     """
-    sdk_decorator = _sdk_tool(name, description, input_schema)
+    sdk_decorator = _sdk_tool(name, description, input_schema, annotations=annotations)
 
     def decorate(fn):
         async def guarded(args: dict) -> dict:
@@ -277,6 +283,18 @@ def tool(name: str, description: str, input_schema: Any):
         return sdk_decorator(guarded)
 
     return decorate
+
+
+def _inline_result(payload: dict, png: bytes | None = None) -> dict:
+    """Portable human text + image, with machine fields kept structured."""
+    import base64
+
+    content = [{"type": "text", "text": payload["markdown"]}]
+    if png:
+        content.append({"type": "image", "data": base64.b64encode(png).decode("ascii"),
+                        "mimeType": "image/png"})
+    return {"content": content,
+            "structuredContent": _round_floats({k: v for k, v in payload.items() if k != "markdown"})}
 
 
 def _validate_days(value: Any, name: str = "days", *, lo: int = 1, hi: int = 3650) -> str | None:
@@ -688,8 +706,9 @@ _CHART_SCHEMA = {
             "type": "string",
             "enum": ["ascii", "png"],
             "description": (
-                "ascii (default) = terminal chart to reproduce in the reply; "
-                "png = rendered matplotlib image returned inline."
+                "png (default) = image displayed inline in chat; "
+                "ascii = terminal chart to reproduce in the reply. "
+                "An explicit calendar/spark style selects ascii when format is omitted."
             ),
         },
     },
@@ -788,14 +807,17 @@ def _bucket_weekly(
     # format="png". They shared _fetch_metric_series, _CHART_METRICS and
     # overlapping style enums: two names for one job, the exact ambiguity
     # the get_today_status removal (0.48.0) documented.
-    "Chart a metric over the last N days. format 'ascii' (default): "
+    "Chart a metric over the last N days. Defaults to an inline PNG image "
+    "(styles: line, bar, combo). Display the returned image in your reply. "
+    "format 'ascii': "
     "terminal chart (styles: calendar heat-grid [default], line, bar, "
     "combo, spark) — reproduce the full output in a fenced code block in "
     "your reply, never leave it only in the collapsed tool call. format "
-    "'png': polished matplotlib image returned inline as an image content "
-    "block plus its saved file path (styles: line [default], bar, combo). "
+    "'png': image content with no local-file lookup or auto-open needed. "
     "For scheduled-vs-actual plan views use plan_chart instead.",
     _CHART_SCHEMA,
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                openWorldHint=False),
 )
 async def chart(args: dict) -> dict:
     metric = args["metric"]
@@ -804,7 +826,8 @@ async def chart(args: dict) -> dict:
     err = _validate_days(args["days"])
     if err:
         return _err(err)
-    fmt_arg = args.get("format") or "ascii"
+    fmt_arg = args.get("format") or (
+        "ascii" if args.get("style") in {"calendar", "spark"} else "png")
     if fmt_arg not in ("ascii", "png"):
         return _err(f"unknown format '{fmt_arg}'", allowed=["ascii", "png"])
     if fmt_arg == "png":
@@ -857,6 +880,8 @@ _PLAN_CHART_SCHEMA = {
             "type": "boolean",
             "description": "Force weekly buckets; default auto (daily rows ≤21 days, weekly above)",
         },
+        "format": {"type": "string", "enum": ["png", "ascii"],
+                   "description": "Inline image (png, default) or terminal chart (ascii)."},
     },
     "required": [],
 }
@@ -923,17 +948,22 @@ def _plan_chart_weekly_rows(graded: list[dict]) -> list[dict]:
 
 @tool(
     "plan_chart",
-    "Render a scheduled-vs-actual training-plan chart (ASCII/emoji): one bar "
+    "Render a scheduled-vs-actual training-plan chart. Defaults to an inline "
+    "PNG image; display it in your reply. format='ascii' returns text. One bar "
     "per day (or per week for long windows) — █ = on-foot miles (run + walk, "
     "since easy days count prescribed walking), ░ = shortfall vs plan, verdict "
     "glyph per row (🟩done 🟨partial 🟥missed 🟦rest ⬜pending). "
     "THE tool for 'planned vs actual' / 'am I hitting my plan' asks — don't "
-    "hand-roll a chart. Reproduce the full output in a fenced code block in "
-    "your reply, then add the coach read — never leave it only in the "
-    "collapsed tool call.",
+    "hand-roll a chart. For ascii, reproduce the output in a fenced code "
+    "block. For png, show the image and its caption.",
     _PLAN_CHART_SCHEMA,
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                openWorldHint=False),
 )
 async def plan_chart(args: dict) -> dict:
+    output_format = args.get("format") or "png"
+    if output_format not in {"png", "ascii"}:
+        return _err("format must be 'png' or 'ascii'")
     days = args.get("days") or 14
     err = _validate_days(days)
     if err:
@@ -980,7 +1010,25 @@ async def plan_chart(args: dict) -> dict:
         # run/walk convention (0.27.0 label-vs-measurement class).
         legend = "█ on-foot mi vs ░ short of plan · 🟩done 🟨partial 🟥missed 🟦rest ⬜pending"
 
-    return _text(charts.render_plan_vs_actual(rows, title=title, legend=legend))
+    if output_format == "ascii":
+        return _text(charts.render_plan_vs_actual(rows, title=title, legend=legend))
+    from . import visuals
+
+    caption = f"Planned vs actual · through {anchor}{adh}. Actual is on-foot miles (run + walk)."
+    if anchor < date.today().isoformat():
+        caption += " Data ends before today; call sync_garmin_data(force=true) to check for updates."
+    if weekly:
+        caption += " Weekly labels describe mileage completion, not workout execution."
+    payload = {"markdown": caption, "through": anchor, "weekly": weekly,
+               "adherence_pct": adherence, "rows": rows}
+    try:
+        async with visuals.RENDER_LOCK:
+            png = await asyncio.to_thread(visuals.render_plan_chart_png, rows, weekly=weekly)
+    except Exception as e:
+        payload["markdown"] += f"\n\nChart unavailable ({type(e).__name__}); text follows.\n\n"
+        payload["markdown"] += charts.render_plan_vs_actual(rows, title=title, legend=legend)
+        return _inline_result(payload)
+    return _inline_result(payload, png)
 
 
 _QUERY_WORKOUTS_SCHEMA = {
@@ -4725,43 +4773,66 @@ async def _chart_png(args: dict) -> dict:
     except Exception as e:
         return _err(f"chart render failed: {e}")
 
-    try:
-        reports_dir = await asyncio.to_thread(_default_reports_dir)
-    except OSError as e:
-        return _err(f"could not prepare reports directory: {e}")
-    # Content-address the filename with the same tag the two PDF tools use
-    # (0.28.2): macOS `open` REFOCUSES an already-open Preview window for a path
-    # it has seen rather than reloading the bytes, so a day-deterministic
-    # `chart-...-<date>.png` name showed a STALE chart when the same
-    # metric/chart_type/days re-rendered after an intra-day sync. The content
-    # tag makes changed bytes land on a NEW filename (a genuinely fresh window)
-    # while identical bytes reuse one file (idempotent — refocusing is correct
-    # when the bytes match). See _content_tag and the PDF paths above.
-    try:
-        final_path = _write_atomic(
-            reports_dir,
-            f"chart-{metric}-{chart_type}-{days}d-{_content_tag(png_bytes)}.png",
-            png_bytes,
-        )
-    except ValueError:
-        return _err("resolved path escaped reports directory")
-    await _auto_open(final_path)
-    # Fix A (2026-07-10 doc): add an inline image content block alongside the
-    # existing text (file path) block, so a networked /mcp/ client — which
-    # has no way to retrieve a local file path — still gets the chart.
-    # Reuses visuals._data_uri's base64 step, stripping the "data:...," prefix
-    # ImageContent.data doesn't want (the encoding math must not be re-derived
-    # at a second call site).
-    image_b64 = visuals._data_uri(png_bytes).split(",", 1)[1]
-    return {
-        "content": [
-            {"type": "text", "text": json.dumps({"path": str(final_path)})},
-            {"type": "image", "data": image_b64, "mimeType": "image/png"},
-        ]
-    }
+    caption = f"{metric} · {dates[0]} to {dates[-1]} · {len(values)} readings."
+    if dates[-1] < _partial_day_anchor(metric, date.today()).isoformat():
+        caption += " Data ends early; call sync_garmin_data(force=true) to check for updates."
+    if dates[-1] == date.today().isoformat():
+        caption += " Today's reading may still change."
+    return _inline_result({"markdown": caption, "metric": metric,
+                           "start_date": dates[0], "end_date": dates[-1],
+                           "readings": len(values)}, png_bytes)
 
 
-_REPORT_CARD_FORMATS = frozenset({"both", "table", "pdf"})
+_REPORT_CARD_FORMATS = frozenset({"inline", "both", "table", "pdf"})
+
+def _report_data_quality(conn, card: dict) -> dict:
+    """Coverage dates are evidence, not a guarantee of endpoint completeness.
+
+    Reuses the caller's connection and never fetches anything from Garmin.
+    """
+    today = date.today().isoformat()
+    through = db.last_known_daily_date(conn=conn)
+    as_of = data_as_of_today(conn, today)
+    messages = []
+    if not as_of:
+        messages.append(
+            "No recorded Garmin sync covering today. The latest workout may be out of date; "
+            "use sync_garmin_data(force=true) to check for updates.")
+    if not card.get("splits", {}).get("available"):
+        messages.append(
+            "Lap splits are missing. Split-level detail is unavailable; "
+            "sync_garmin_data(force=true) can refresh recent activities, "
+            "but older activities may need a targeted backfill.")
+    return {"daily_metrics_through": through, "last_ingest_covering_today": as_of,
+            "refresh_recommended": not bool(as_of), "messages": messages}
+
+
+def _report_caption(payload: dict) -> str:
+    text = payload["markdown"] or "Stored report text is unavailable; the snapshot is included."
+    if payload.get("coaching_source") in {"deterministic", "fallback"}:
+        text += "\n\n*Coaching text: computed summary.*"
+    text += "".join(f"\n\n{msg}" for msg in payload.get("data_quality", {}).get("messages", []))
+    return text
+
+
+async def _inline_report(payload: dict, card: dict) -> dict:
+    """One presentation path for freshly computed and stored report cards."""
+    from . import visuals
+
+    text = _report_caption(payload)
+    png = None
+    try:
+        series = visuals.hr_chart_series(card)
+        if series and any(series["values"]):
+            async with visuals.RENDER_LOCK:
+                png = await asyncio.to_thread(visuals.render_split_hr_png, card)
+        else:
+            text += "\n\nNo stored HR trace or lap heart rates are available to chart."
+    except Exception:
+        LOG.warning("inline HR chart unavailable", exc_info=True)
+        text += "\n\nHR chart could not be rendered; the report above is still available."
+    return _inline_result({**payload, "markdown": text}, png)
+
 
 _REPORT_CARD_SCHEMA = {
     "type": "object",
@@ -4776,9 +4847,11 @@ _REPORT_CARD_SCHEMA = {
         },
         "format": {
             "type": "string",
-            "enum": ["both", "table", "pdf"],
-            "description": "Output format, default 'both'.",
+            "enum": ["inline", "both", "table", "pdf"],
+            "description": "inline (default): report + HR image in chat; table: JSON/Markdown; pdf/both: explicit PDF export.",
         },
+        "coaching": {"type": "string", "enum": ["cached", "generate"],
+                     "description": "Inline/HTTP use cached or deterministic text. Local table/PDF exports generate on a cache miss; cached skips generation. generate is local-only."},
     },
     "required": [],
 }
@@ -4797,20 +4870,38 @@ _REPORT_CARD_SCHEMA = {
     "pass activity_id or date to grade a specific one. Grades against the active training plan's "
     "prescribed workout when one exists for that date, otherwise against a "
     "60-day rolling median of comparable activities — the card always says "
-    "which. Returns a `markdown` field (render it to the user VERBATIM, it is "
-    "already formatted) and, unless format='table', a `path` to a PDF. "
-    "Local-only: reachable via stdio MCP clients on this machine, never over "
-    "the network.",
+    "which. Default format='inline' returns preformatted report text and an "
+    "HR image: display BOTH in the reply, preserving the computed ratings. "
+    "No model generation or Garmin fetch on the default path: coaching uses "
+    "matching cached text or a labeled deterministic read. format='table' "
+    "returns a markdown field; pdf/both explicitly export a PDF (local path "
+    "on stdio, expiring download link on HTTP when configured). "
+    "Missing data is labeled with refresh guidance.",
     _REPORT_CARD_SCHEMA,
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                openWorldHint=False),
 )
 async def workout_report_card(args: dict) -> dict:
     target_date = args.get("date")
     if target_date is not None and (msg := _validate_date(target_date)):
         return _err(msg)
-    fmt = args.get("format") or "both"
+    fmt = args.get("format") or "inline"
     if fmt not in _REPORT_CARD_FORMATS:
         return _err(f"unknown format '{fmt}'", allowed=sorted(_REPORT_CARD_FORMATS))
     activity_id = args.get("activity_id")
+    local_exports = LOCAL_REPORT_EXPORTS.get()
+    coaching_mode = args.get("coaching") or (
+        "cached" if fmt == "inline" or not local_exports else "generate")
+    if coaching_mode not in {"cached", "generate"}:
+        return _err("coaching must be 'cached' or 'generate'")
+    if coaching_mode == "generate" and not local_exports:
+        return _err("Generated coaching is local-only; use coaching='cached' for an immediate report.")
+    if fmt in {"pdf", "both"} and not local_exports:
+        from ..web import artifacts
+        try:
+            artifacts.public_url()
+        except ValueError as e:
+            return _err(str(e))
 
     # ONE connection for every read this tool makes (was ~8: the inputs load,
     # then resolve_coach_profile ×2, user_name, the memory/ledger resolve ×2,
@@ -4826,12 +4917,17 @@ async def workout_report_card(args: dict) -> dict:
     with db.connect() as conn:
         inputs = report_card.load_report_card_inputs(
             conn, activity_id=activity_id, target_date=target_date,
-            hr_trace=fmt != "table",
+            hr_trace=fmt in {"pdf", "both"} and local_exports,
         )
         if inputs is None:
             return _err(
                 "no matching activity found", activity_id=activity_id,
                 date=target_date)
+
+        if fmt == "inline" or (not local_exports and fmt in {"pdf", "both"}):
+            from ..ingest.details import load_cached_hr_samples
+
+            inputs["hr_samples"] = load_cached_hr_samples(conn, inputs["activity"]["activity_id"])
 
         card = report_card.build_card(
             inputs["activity"], inputs["splits"], inputs["plan_workout"],
@@ -4894,16 +4990,24 @@ async def workout_report_card(args: dict) -> dict:
         # journal is never touched.
         _should_reflect = memory.memory_enabled() and not journal.has_event(
             "report_card", _activity_key, conn=conn)
+        _should_reflect = _should_reflect and coaching_mode == "generate"
+        quality = _report_data_quality(conn, card)
 
     if (_stored and _stored[0] == read_key
             and card_store.read_is_complete(_stored[1])):
         card["coach_read"] = _stored[1]
+        read_source = "cached"
         LOG.info("workout read reused from the stored card (key match)")
+    elif coaching_mode == "cached":
+        card["coach_read"] = workout_coach.fallback_read(card)
+        read_key = None
+        read_source = "deterministic"
     else:
         try:
             card["coach_read"] = await workout_coach.generate_read_cached(
                 profile, card, notes_text=_notes_text, user_name=_user_name,
                 memory_text=_memory_text)
+            read_source = "generated"
         except Exception:
             LOG.warning(
                 "workout read generation failed for activity %s, using fallback",
@@ -4914,6 +5018,7 @@ async def workout_report_card(args: dict) -> dict:
             # NULL key means "not the coach's voice": never reused by the
             # fast path, never allowed to overwrite a real-read row.
             read_key = None
+            read_source = "fallback"
 
     # Auto-reflect (fire-and-forget): the coach may write this session into
     # its journal. has_event makes the common case — re-rendering a card —
@@ -4949,12 +5054,16 @@ async def workout_report_card(args: dict) -> dict:
         "intent": card["intent"],
         "intent_source": card["intent_source"],
         "splits_available": card["splits"]["available"],
+        "coaching_source": read_source,
+        "data_quality": quality,
     }
     if inputs["other_activities_on_date"]:
         # A double-day shouldn't silently hide its second session.
         payload["other_activities_on_date"] = inputs["other_activities_on_date"]
     if fmt == "table":
         return _text(payload)
+    if fmt == "inline":
+        return await _inline_report(payload, card)
 
     from . import visuals  # lazy: defers matplotlib/weasyprint import cost
 
@@ -5008,6 +5117,17 @@ async def workout_report_card(args: dict) -> dict:
             inputs["activity"]["activity_id"], pages,
         )
         payload["pages"] = pages
+
+    if not local_exports:
+        from ..web import artifacts
+        try:
+            filename = f"report-card-{inputs['activity']['activity_id']}-{_render_tag(card, split_chart or b'')}.pdf"
+            payload.update(artifacts.publish(pdf_bytes, filename))
+        except ValueError as e:
+            return _err(str(e))
+        payload["markdown"] = _report_caption(payload)
+        payload["markdown"] += f"\n\n[Download PDF]({payload['download_url']}) (expires in 10 minutes)."
+        return _inline_result(payload, split_chart)
 
     try:
         reports_dir = await asyncio.to_thread(_default_reports_dir)
@@ -5131,20 +5251,28 @@ async def list_report_cards(args: dict) -> dict:
     "One stored workout report card by activity_id: the full graded snapshot, "
     "the coach's verbal read from that render, and a preformatted `markdown` "
     "card (render it to the user VERBATIM — it is already formatted). "
-    + _CARD_SNAPSHOT_NOTE + " Use list_report_cards to find activity_ids.",
-    {"activity_id": int},
+    + _CARD_SNAPSHOT_NOTE + " Default inline returns text and an HR image; "
+    "display both. format='table' returns JSON/Markdown. "
+    "Use list_report_cards to find activity_ids, or workout_report_card to create a missing card.",
+    {"type": "object", "properties": {
+        "activity_id": {"type": "integer"},
+        "format": {"type": "string", "enum": ["inline", "table"]},
+    }, "required": ["activity_id"]},
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
 )
 async def get_report_card(args: dict) -> dict:
     activity_id = args.get("activity_id")
     if activity_id is None or not isinstance(activity_id, int):
         return _err("activity_id is required")
+    fmt = args.get("format") or "inline"
+    if fmt not in {"inline", "table"}:
+        return _err("format must be 'inline' or 'table'")
     loaded = card_store.load_card(activity_id)
     if loaded is None:
         return _err(
             f"no stored report card for activity {activity_id} yet — a card "
-            "is stored whenever it is rendered from a local session "
-            "(workout_report_card is stdio-only and cannot be called over "
-            "the network)",
+            "can be created now with workout_report_card(activity_id=…) "
+            "from either a local or remote session",
             activity_id=activity_id)
     try:
         markdown = report_card.render_markdown(loaded["card"])
@@ -5155,14 +5283,28 @@ async def get_report_card(args: dict) -> dict:
             "stored card for activity %s failed to render markdown",
             activity_id, exc_info=True)
         markdown = None
-    return _text({
+    payload = {
         "activity_id": loaded["activity_id"],
         "date": loaded["activity_date"],
         "graded_at": loaded["graded_at"],
         "card": loaded["card"],
         "markdown": markdown,
         "coach_read": loaded["card"].get("coach_read"),
-    })
+    }
+    if fmt == "table":
+        return _text(payload)
+    payload["markdown"] = (markdown or "Stored report text is unavailable.") + (
+        f"\n\n*Stored snapshot · rated {loaded['graded_at']}.*")
+    with db.connect() as conn:
+        payload["data_quality"] = _report_data_quality(conn, loaded["card"])
+        from ..ingest.details import load_cached_hr_samples
+
+        # Snapshots deliberately omit the bulky trace. Restore it for display
+        # from the local sample cache only; never regrade or mutate the snapshot.
+        display_card = {**loaded["card"], "hr_trace": report_card.bin_hr_trace(
+            load_cached_hr_samples(conn, activity_id))}
+    payload["coaching_source"] = "cached" if loaded.get("read_cache_key") else "deterministic"
+    return await _inline_report(payload, display_card)
 
 
 ALL_TOOLS = [
@@ -5217,27 +5359,14 @@ ALL_TOOLS = [
     save_brief,
     list_report_cards,
     get_report_card,
+    workout_report_card,
 ]
 
-# Registered ONLY here, never merged into ALL_TOOLS — wired into run_stdio()
-# alone (see web/mcp_server.py's build_server(extra_tools=...)), never into
-# build_session_manager()'s HTTP /mcp/ transport. A phone-triggered call over
-# that transport would get back a container-internal path with no way to
-# retrieve the file — a real constraint for a PDF, which isn't representable
-# as MCP ImageContent. chart's png format (the former
-# generate_chart, folded in 0.57.0) is deliberately NOT here: it returns an
-# inline image content block, so the "no way to retrieve the file remotely"
-# problem does not apply and it stays reachable over both transports via
-# ALL_TOOLS above. Only the heavy `import matplotlib`/`import weasyprint`
-# statements (inside generate_brief_report's body and visuals.py's own module
-# body) are deferred, not this list.
-# workout_report_card joins it for the same reason: it writes a PDF, and its
-# markdown table rides along in the same payload so the table and the PDF can
-# never report different grades. That does put a transport-safe table behind
-# the stdio boundary; splitting it into an ALL_TOOLS table-only sibling is a
-# ~15-line addition calling the same report_card.build_card() if that's ever
-# wanted — not shipped speculatively.
-LOCAL_ONLY_TOOLS = [generate_brief_report, workout_report_card]
+# Brief PDF export remains local-only because it returns a filesystem path.
+# Workout reports are shared: inline by default, local files on explicit stdio
+# export, and bounded capability downloads on HTTP. The adapter sets the
+# transport capability per call; user arguments cannot enable local behavior.
+LOCAL_ONLY_TOOLS = [generate_brief_report]
 
 
 def server_version() -> str:

@@ -201,10 +201,11 @@ chat pane, so keep it clean:
   `Wk 5 · Jul 13 · Build · long 8mi · threshold 4×6min`.
 - Prefer `label: value · label: value` lines and short bullets over wide grids.
 - Assume ~70-character width. Bold at most the single most important thing.
-- **Charts:** when you call `chart`, reproduce its full output in a fenced code block
-  in your reply, then add the coach read — never leave the chart sitting
-  only in the collapsed tool call, which forces {user_name} to expand it
-  manually.
+- **Charts:** show `chart`/`plan_chart` PNGs and captions in the reply.
+  For ASCII, reproduce the full output in a fenced code block.
+- **Workout reports:** `workout_report_card` grades the latest run directly.
+  Show its text, HR image and data notices; preserve ratings. Export PDF only
+  when asked.
 This governs your conversational prose only — the structured JSON brief is
 separate and its schema is unchanged.
 {notes_section}

@@ -1232,3 +1232,44 @@ def test_negative_start_index_is_treated_as_zero():
         build, visuals.DENSITY_PRESETS, start_index=-3)
     assert index == 0
     assert calls == [visuals.DENSITY_PRESETS[0]["name"]]
+
+
+@pytest.mark.parametrize("rows", [[], [{"label": "day"}] * 61])
+def test_plan_png_rejects_unreadable_row_counts(rows):
+    with pytest.raises(ValueError, match="1–60 rows"):
+        visuals.render_plan_chart_png(rows)
+
+
+def test_plan_png_renders_rest_and_missing_distance():
+    import io
+
+    from PIL import Image
+
+    rows = [{"label": "09-14 rest", "verdict": "rest", "rest": True,
+             "planned": None, "actual": None},
+            {"label": "09-15 easy", "verdict": "pending", "rest": False,
+             "planned": 0, "actual": None}]
+    data = visuals.render_plan_chart_png(rows)
+    with Image.open(io.BytesIO(data)) as im:
+        assert im.size == (1350, 480)
+        assert im.convert("L").getextrema()[0] < 100
+
+
+@pytest.mark.parametrize("avg_hr", [90, 142])
+def test_hr_chart_keeps_whole_run_reference_visible_with_partial_laps(monkeypatch, avg_hr):
+    from matplotlib.figure import Figure
+
+    card = _report_card_with_splits(6, long_read=False)  # lap averages 130–135
+    card["activity"]["avg_hr"] = avg_hr
+    limits = []
+    savefig = Figure.savefig
+
+    def capture(fig, *args, **kwargs):
+        limits.append(fig.axes[0].get_ylim())
+        return savefig(fig, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", capture)
+    png = visuals.render_split_hr_png(card)
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    low, high = limits[0]
+    assert low < min(130, avg_hr) and high > max(135, avg_hr)

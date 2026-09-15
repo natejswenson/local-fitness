@@ -53,6 +53,8 @@ services:
       # Bearer token gating /mcp/ (and every other non-public path) —
       # REQUIRED when binding 0.0.0.0
       - LOCAL_FITNESS_API_TOKEN=${LOCAL_FITNESS_API_TOKEN}
+      # Optional: browser-reachable origin for ten-minute workout PDF links.
+      - LOCAL_FITNESS_PUBLIC_URL=${LOCAL_FITNESS_PUBLIC_URL:-}
       # MCP server host allowlist — MUST include the served host or every
       # /mcp/ request 421s (DNS-rebinding guard). The code default is
       # loopback only ("127.0.0.1,localhost"), so a deployment serving at a

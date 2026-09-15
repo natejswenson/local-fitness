@@ -591,12 +591,29 @@ def build_server(extra_tools: list | None = None) -> Server:
     ``agent_tools.LOCAL_ONLY_TOOLS`` (see its definition for the current
     membership and the rule that decides it: a tool handing back a filesystem
     path a remote caller can't retrieve is local-only) off the streamable-HTTP
-    /mcp/ transport. Today that set is generate_brief_report + workout_report_card
-    (both write PDFs); chart's png format (the former generate_chart) is NOT
-    in it — an inline image block needs no file retrieval. If a future edit ever passes
-    ``LOCAL_ONLY_TOOLS`` there too "for consistency", the HTTP transport
-    silently regains tools this whole boundary exists to keep off it."""
+    /mcp/ transport. Today only generate_brief_report is local-only. Workout
+    reports use inline images or expiring PDF download URLs over HTTP.
+    """
     instance = agent_tools.make_server(extra_tools=extra_tools)["instance"]
+    registry = {t.name: t for t in agent_tools.ALL_TOOLS + (extra_tools or [])}
+
+    # The SDK's in-process adapter flattens resource links and drops
+    # structuredContent. External clients need the native MCP envelope.
+    # Keep the same handlers/schemas; only the transport conversion differs.
+    @instance.call_tool()
+    async def _call_external_tool(name: str, arguments: dict) -> types.CallToolResult:
+        if name not in registry:
+            raise ValueError(f"unknown tool: {name}")
+        token = agent_tools.LOCAL_REPORT_EXPORTS.set(bool(extra_tools))
+        try:
+            result = await registry[name].handler(arguments)
+            return types.CallToolResult.model_validate({
+                **{k: v for k, v in result.items() if k != "is_error"},
+                "isError": result.get("is_error", False),
+            })
+        finally:
+            agent_tools.LOCAL_REPORT_EXPORTS.reset(token)
+
     _register_prompts_and_resources(instance)
     _install_coach_persona(instance)
     return instance
