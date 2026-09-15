@@ -51,3 +51,11 @@ PDF is a separate output choice; remote downloads never expose filesystem paths.
 - Run the full Python suite, Ruff, prompt scorer and applicable performance
   checks. Visually inspect generated synthetic charts and a PDF. Land through
   a feature PR into `dev`, rebuild the container from `dev`, and smoke-test it.
+
+## Deployment follow-up
+
+The live check found missing WeasyPrint native libraries in the image and a
+compose host allowlist that did not include the served hostname. Add the PDF
+libraries/fonts to `Dockerfile`, make an actual PDF render a build-time check,
+wire the explicit MCP hostname into the local deployment, then repeat CI and
+the live report/download journey.

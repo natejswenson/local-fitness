@@ -74,6 +74,11 @@ services:
       - fitness-claude-config:/home/app/.claude
 ```
 
+The runtime image includes the native PDF libraries and fonts. Its build renders
+a one-page PDF as the app user; a missing renderer dependency fails the build.
+For remote exports, set `LOCAL_FITNESS_PUBLIC_URL` to a browser-reachable origin
+and include that hostname in `LOCAL_FITNESS_MCP_ALLOWED_HOSTS`.
+
 The compose-side `.env` file (sibling of `docker-compose.yml`, same
 shape as this repo's `.env.example`) supplies the interpolated
 variables above (`LOCAL_FITNESS_TZ`, the two Garmin credentials,
