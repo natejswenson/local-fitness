@@ -1191,6 +1191,9 @@ These are settled — don't redesign without a reason.
   Do not expose directories or put the API token in URLs. Downloads are no-store.
   Coverage notices distinguish recorded sync dates from data completeness:
   ingest success cannot guarantee every Garmin endpoint succeeded.
+  The runtime image installs Pango/FreeType and fonts and renders a real PDF
+  during its build (0.65.1). Python tests install these separately in CI, so a
+  green Python suite alone cannot prove the deployed PDF runtime works.
   **`generate_brief_report` alone remains stdio-only.** It and explicit local
   workout PDF exports retain the existing file lifecycle. The brief tool
   writes to and auto-opens from an **ephemeral per-process tmp directory by

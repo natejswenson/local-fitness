@@ -4,6 +4,13 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.65.1] - 2026-09-14
+
+### Fixed
+- Install Pango/FreeType and fonts in the runtime image so remote workout PDF
+  exports work in the deployed container. The Docker build now renders a real
+  one-page PDF as the app user, catching missing native libraries before deploy.
+
 ## [0.65.0] - 2026-09-14
 
 ### Added
