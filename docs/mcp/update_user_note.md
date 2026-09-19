@@ -133,3 +133,7 @@ Read first, then target the handle exactly as shown:
 - [`save_user_note`](save_user_note.md) — add a genuinely new preference instead
 - [`delete_user_note`](delete_user_note.md) — drop it entirely
 - [`log_observation`](log_observation.md) — the *other* family: subjective data, not instructions
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).

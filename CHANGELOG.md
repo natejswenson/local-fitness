@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add an optional source-owned Obsidian memory transport for preferences and coach
+  journal, with no fallback writes, stable retry IDs, vault-aware persona cache
+  invalidation, and a memory-only stdio MCP mode for shared clients. Legacy remains
+  the default; operational fitness data and inference settings are unchanged.
+
 All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

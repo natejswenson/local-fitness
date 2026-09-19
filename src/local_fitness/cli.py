@@ -54,7 +54,8 @@ def main(verbose: bool):
 
 
 @main.command("mcp-stdio")
-def mcp_stdio():
+@click.option("--memory-only", is_flag=True, help="Expose only preference/journal tools; no coach persona.")
+def mcp_stdio(memory_only: bool = False):
     """Serve the fitness tools as an MCP server over stdio (local, auth-free).
 
     Claude: `claude mcp add --transport stdio fitness -- uv run fitness
@@ -70,8 +71,9 @@ def mcp_stdio():
     # schema exists so the live coach-persona resolution finds the settings table
     # on a fresh clone. (The persona wrap is fail-open regardless, but without
     # this stdio would degrade to no-persona until the DB is initialized.)
-    db.init_schema()
-    asyncio.run(mcp_server.run_stdio())
+    if not memory_only:
+        db.init_schema()
+    asyncio.run(mcp_server.run_stdio(memory_only=True) if memory_only else mcp_server.run_stdio())
 
 
 @main.command()

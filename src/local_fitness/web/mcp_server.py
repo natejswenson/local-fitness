@@ -492,6 +492,9 @@ def _data_version() -> int | None:
 
 
 def _notes_stat() -> tuple:
+    from .. import memory_client
+    if memory_client.enabled('preferences') or memory_client.enabled('journal'):
+        return ('vault', memory_client.call('revision'))
     try:
         st = notes._default_notes_path().stat()
         return (st.st_mtime_ns, st.st_size)
@@ -577,7 +580,7 @@ def _install_coach_persona(instance: Server) -> None:
     instance.create_initialization_options = _with_coach_persona
 
 
-def build_server(extra_tools: list | None = None) -> Server:
+def build_server(extra_tools: list | None = None, *, memory_only: bool = False) -> Server:
     """The reused, fully-wired low-level MCP Server (one source of truth).
 
     The SDK's ``create_sdk_mcp_server`` only wires the TOOL handlers; we register
@@ -594,8 +597,14 @@ def build_server(extra_tools: list | None = None) -> Server:
     /mcp/ transport. Today only generate_brief_report is local-only. Workout
     reports use inline images or expiring PDF download URLs over HTTP.
     """
-    instance = agent_tools.make_server(extra_tools=extra_tools)["instance"]
-    registry = {t.name: t for t in agent_tools.ALL_TOOLS + (extra_tools or [])}
+    selected = agent_tools.ALL_TOOLS + (extra_tools or [])
+    if memory_only:
+        selected = [t for t in selected if t.name in MEMORY_TOOL_NAMES]
+        instance = agent_tools.create_sdk_mcp_server(
+            name=agent_tools.SERVER_NAME, version=agent_tools.server_version(), tools=selected)["instance"]
+    else:
+        instance = agent_tools.make_server(extra_tools=extra_tools)["instance"]
+    registry = {t.name: t for t in selected}
 
     # The SDK's in-process adapter flattens resource links and drops
     # structuredContent. External clients need the native MCP envelope.
@@ -614,8 +623,9 @@ def build_server(extra_tools: list | None = None) -> Server:
         finally:
             agent_tools.LOCAL_REPORT_EXPORTS.reset(token)
 
-    _register_prompts_and_resources(instance)
-    _install_coach_persona(instance)
+    if not memory_only:
+        _register_prompts_and_resources(instance)
+        _install_coach_persona(instance)
     return instance
 
 
@@ -669,7 +679,13 @@ def _prewarm_matplotlib() -> None:
         )
 
 
-async def run_stdio() -> None:
+MEMORY_TOOL_NAMES = frozenset({
+    'save_user_note', 'list_user_notes', 'update_user_note', 'delete_user_note',
+    'save_coach_memory', 'list_coach_memories', 'recall_coach_memories', 'delete_coach_memory',
+})
+
+
+async def run_stdio(*, memory_only: bool = False) -> None:
     """Serve the same tools over stdio (local, auth-free), PLUS
     ``agent_tools.LOCAL_ONLY_TOOLS`` — the PDF-writing tools
     (generate_brief_report + workout_report_card) — reachable here and ONLY
@@ -678,8 +694,9 @@ async def run_stdio() -> None:
     trailing-slash gotchas of the HTTP path do not apply."""
     from mcp.server.stdio import stdio_server
 
-    threading.Thread(target=_prewarm_matplotlib, daemon=True).start()
+    if not memory_only:
+        threading.Thread(target=_prewarm_matplotlib, daemon=True).start()
 
-    server = build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS)
+    server = build_server(extra_tools=agent_tools.LOCAL_ONLY_TOOLS, memory_only=memory_only)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())

@@ -48,6 +48,10 @@ def save_entry(
     ``sqlite3.IntegrityError`` on a duplicate ``(source, source_key, seq)`` —
     callers decide whether that's a race to swallow (reflect) or a bug.
     """
+    if db_path is None:
+        from .. import memory_client
+        if memory_client.enabled('journal'):
+            return memory_client.call('journal.save_entry', {'text': text, 'source': source, 'source_key': source_key, 'seq': seq, 'entry_date': entry_date})
     text = (text or "").strip()
     if not text:
         raise ValueError("journal entry text is required")
@@ -88,6 +92,10 @@ def has_event(
 ) -> bool:
     """Whether the event was already reflected on — the idempotency pre-check
     that keeps a re-render from paying an SDK call (or writing a duplicate)."""
+    if db_path is None:
+        from .. import memory_client
+        if memory_client.enabled('journal'):
+            return memory_client.call('journal.has_event', {'source': source, 'source_key': source_key})
     sql = ("SELECT 1 FROM coach_journal WHERE source = ? AND source_key = ? "
            "LIMIT 1")
     if conn is not None:
@@ -118,6 +126,10 @@ def list_entries(
     its read cache key) stop moving every time an unrelated entry is written:
     an entry dated after the card can no longer enter that card's memory.
     """
+    if db_path is None:
+        from .. import memory_client
+        if memory_client.enabled('journal'):
+            return memory_client.call('journal.list_entries', {'days': days, 'limit': limit, 'include_archived': include_archived, 'on_or_before': on_or_before})
     sql = ("SELECT entry_id, created_at, entry_date, source, source_key, seq, "
            "text, archived FROM coach_journal")
     conditions: list[str] = []
@@ -154,6 +166,10 @@ def list_entries(
 
 
 def delete_entry(entry_id: int, db_path: Path | None = None) -> bool:
+    if db_path is None:
+        from .. import memory_client
+        if memory_client.enabled('journal'):
+            return memory_client.call('journal.delete_entry', {'entry_id': entry_id})
     with db.connect(db_path) as conn:
         cur = conn.execute(
             "DELETE FROM coach_journal WHERE entry_id = ?", (int(entry_id),))
@@ -236,6 +252,10 @@ def search_entries(
     FTS5, or as a belt-and-suspenders catch if MATCH still errors).
     Raises ``ValueError`` only on an unsearchable (empty/punctuation) query.
     """
+    if db_path is None:
+        from .. import memory_client
+        if memory_client.enabled('journal'):
+            return memory_client.call('journal.search_entries', {'query': query, 'limit': limit})
     match = _fts_query(query)  # validates even when we fall back to LIKE
     with db.connect(db_path) as conn:
         if _fts_available(conn):

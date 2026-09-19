@@ -1965,3 +1965,22 @@ These are settled — don't redesign without a reason.
 - `src/local_fitness/db.py` — SQLite schema + connection helpers.
 - `tests/` — pytest. `test_security.py` is the audit-regression file.
 - `docs/deployment.md` — what the deploying side wires into compose.
+
+## Optional Obsidian memory backend
+
+`memory_client.py` routes default-path preference and journal calls to one local
+writer when the corresponding `LOCAL_FITNESS_PREFERENCES_BACKEND` or
+`LOCAL_FITNESS_JOURNAL_BACKEND` is `vault`; both default to `legacy`. Explicit
+`path`/`db_path` calls remain legacy, for isolated tools and tests. Journal `conn=`
+callers in vault mode read the writer's committed snapshot independently of the
+operational SQLite connection; never imply one transaction spans both stores.
+The writer URL and token-file path are deployment settings. Never introduce a
+fallback write on transport failure. Retries reuse the same request UUID/payload.
+The operational database, settings/personality, grading, and model choices stay
+unchanged. The MCP persona cache incorporates the vault content revision.
+
+`mcp-stdio --memory-only` advertises and dispatches only the existing eight memory
+tools and installs no coach persona/resources. No aliases or new tool names.
+Local storage integration uses no OpenAI API key. Sequential Obsidian body edits
+are supported; simultaneous manual editing and application writes are not promised
+conflict-free. Invalid records must be repaired rather than silently overwritten.

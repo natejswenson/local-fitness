@@ -568,3 +568,6 @@ opening a PR.
 ## License
 
 [MIT](LICENSE) © 2026 Nate Swenson
+
+Optional shared Obsidian memory and the memory-only MCP connection are documented
+in [deployment](docs/deployment.md#optional-shared-obsidian-memory).
