@@ -115,3 +115,7 @@ guarantee you have the complete set for those filters.
 - [`delete_coach_memory`](delete_coach_memory.md) — remove one by `entry_id`
 - [`get_coach_personality`](get_coach_personality.md) — hot and archived counts in one call
 - [`list_user_notes`](list_user_notes.md) — the *other* family: durable instructions, not observations
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).

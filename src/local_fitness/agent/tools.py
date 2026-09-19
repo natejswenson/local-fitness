@@ -33,7 +33,7 @@ from claude_agent_sdk import tool as _sdk_tool
 from mcp.types import ToolAnnotations
 from pydantic import ValidationError
 
-from .. import config, db, notes, plans
+from .. import config, db, memory_client, notes, plans
 from ..ingest import baselines as baselines_mod
 from . import (
     briefs,
@@ -274,6 +274,9 @@ def tool(name: str, description: str, input_schema: Any, *, annotations=None):
         async def guarded(args: dict) -> dict:
             try:
                 return await fn(args)
+            except memory_client.MemoryUnavailable:
+                return _err('Shared fitness memory is unavailable; no save was confirmed',
+                            remediation='Restore the local memory writer connection and retry; do not create a legacy copy.')
             except sqlite3.DatabaseError as e:
                 LOG.warning("tool %s: database error", name, exc_info=True)
                 return _err(f"database error: {e}", remediation=_DB_ERROR_REMEDIATION)

@@ -84,3 +84,7 @@ Failure returns `is_error: true` with `{"error": ...}`:
 - [`recall_coach_memories`](recall_coach_memories.md) — find the entry by keyword, archive included
 - [`save_coach_memory`](save_coach_memory.md) — often the better answer: write the correction, don't erase the history
 - [`delete_user_note`](delete_user_note.md) — the *other* family: drop a coaching preference
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).

@@ -443,7 +443,12 @@ def assemble_status(
     # Newest-first, same ranking as render_for_prompt/list_user_notes — a
     # plain read_notes() would be oldest-first and disagree with the other
     # two model-facing surfaces the moment any note is refined in place.
-    user_notes = [n.text for n in notes.recent_first(notes.read_notes()) if n.text]
+    memory_degraded = False
+    try:
+        user_notes = [n.text for n in notes.recent_first(notes.read_notes()) if n.text]
+    except (OSError, ValueError):
+        user_notes = []
+        memory_degraded = True
     latest_brief_date, brief_stale_days = _latest_brief_freshness(today)
 
     payload = {
@@ -455,6 +460,8 @@ def assemble_status(
         "latest_brief_date": latest_brief_date,
         "brief_stale_days": brief_stale_days,
     }
+    if memory_degraded:
+        payload['memory_status'] = 'unavailable; preferences omitted'
     if staleness is not None and staleness.get("data_as_of"):
         payload["data_as_of"] = staleness["data_as_of"]
     return payload

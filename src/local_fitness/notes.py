@@ -352,6 +352,10 @@ def read_notes(path: Path | None = None) -> list[Note]:
     ``daily_snapshot``'s ``user_notes`` all do, so the three model-facing
     surfaces cannot disagree about which note is newest.
     """
+    if path is None:
+        from . import memory_client
+        if memory_client.enabled('preferences'):
+            return [Note(**n) for n in memory_client.call('notes.read_notes')]
     p = path or _default_notes_path()
     if not p.exists():
         return []
@@ -471,6 +475,14 @@ def render_for_prompt(path: Path | None = None) -> str:
     the "prefer the newer note" rule from evidence it can see, rather than
     trusting an ordering it has no way to verify.
     """
+    if path is None:
+        from . import memory_client
+        if memory_client.enabled('preferences'):
+            try:
+                return memory_client.call('notes.render_for_prompt')
+            except (OSError, ValueError):
+                LOG.warning('Vault preferences unavailable; prompt memory degraded', exc_info=True)
+                return ''
     notes = recent_first(read_notes(path))
     if not notes:
         return ""
@@ -540,6 +552,10 @@ def append_note(text: str, path: Path | None = None) -> Note:
     cap bounds prompt size; it is not a licence to destroy a preference
     that has nowhere else to go.
     """
+    if path is None:
+        from . import memory_client
+        if memory_client.enabled('preferences'):
+            return Note(**memory_client.call('notes.append_note', {'text': text}))
     text = " ".join(text.split())  # collapse all whitespace to single spaces
     if not text:
         raise ValueError("note text is empty after whitespace normalization")
@@ -773,6 +789,11 @@ def update_note(handle: str, new_text: str, path: Path | None = None) -> tuple[N
     text costs. The returned ``position`` then still points at the
     rewritten line, because no line ahead of it moved.
     """
+    if path is None:
+        from . import memory_client
+        if memory_client.enabled('preferences'):
+            result = memory_client.call('notes.update_note', {'handle': handle, 'new_text': new_text})
+            return (Note(**result[0]), result[1]) if result is not None else None
     new_text = " ".join(new_text.split())
     if not new_text:
         raise ValueError("new note text is empty after whitespace normalization")
@@ -844,6 +865,10 @@ def delete_note(handle: str, path: Path | None = None) -> int | None:
     was already deleted, was rewritten by an update, or was rotated to
     the archive. ``handle`` is normalised the same way as ``update_note``.
     """
+    if path is None:
+        from . import memory_client
+        if memory_client.enabled('preferences'):
+            return memory_client.call('notes.delete_note', {'handle': handle})
     p = path or _default_notes_path()
     if not p.exists():
         return None

@@ -111,3 +111,7 @@ Failure returns `is_error: true` with `{"error": ...}`:
 - [`delete_coach_memory`](delete_coach_memory.md) — the only real deletion path
 - [`save_user_note`](save_user_note.md) — the *other* family: a durable instruction, not an observation
 - [`get_coach_personality`](get_coach_personality.md) — journal size and whether memory injection is enabled
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).

@@ -138,3 +138,7 @@ On failure (empty note text): `{"error": "..."}` with `is_error: true`.
 - [`delete_user_note`](delete_user_note.md) — drop a preference
 - [`log_observation`](log_observation.md) — the *other* family: timestamped subjective data, not preferences
 - [`daily_snapshot`](daily_snapshot.md) — returns `user_notes` alongside today's metrics
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).
