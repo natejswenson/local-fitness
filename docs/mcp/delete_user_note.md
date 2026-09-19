@@ -80,3 +80,7 @@ Failure returns `is_error: true` with `{"error": "no note with handle '7c2f9a10'
 - [`update_user_note`](update_user_note.md) — usually what "change that note" actually means
 - [`save_user_note`](save_user_note.md) — add a preference
 - [`delete_observation`](delete_observation.md) — the *other* family: drop a logged data point
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).

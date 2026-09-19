@@ -26,7 +26,7 @@ claude mcp add --transport stdio fitness -- uv run fitness mcp-stdio
 codex mcp add fitness -- uv run fitness mcp-stdio
 ```
 
-**Over the running server** — 46 tools, bearer-gated:
+**Over the running server** — 47 tools, bearer-gated:
 
 ```bash
 claude mcp add --transport http fitness \
@@ -44,21 +44,22 @@ and [`docs/deployment.md`](../deployment.md) for the container setup.
 
 ## Availability: stdio vs HTTP
 
-Two tools are **local-only** — registered by `run_stdio()` and structurally
+One tool is **local-only** — registered by `run_stdio()` and structurally
 unreachable over the networked `/mcp/` transport:
 
 | | stdio (`fitness mcp-stdio`) | HTTP (`/mcp/`) |
 |---|---|---|
-| Tool count | **48** | **46** |
+| Tool count | **48** | **47** |
 | [`generate_brief_report`](generate_brief_report.md) | ✅ | ❌ |
-| [`workout_report_card`](workout_report_card.md) | ✅ | ❌ |
+| [`workout_report_card`](workout_report_card.md) | ✅ | ✅ (inline or PDF link) |
 
 **The rule that decides membership:** a tool that hands back a *filesystem path*
 is local-only, because a remote caller receives a container-internal path it
 cannot retrieve. [`chart`](chart.md)'s png format (the former
 `generate_chart`, folded in at 0.57.0) is networked precisely because it
 returns the PNG as an inline MCP image content block — the client never needs
-the path.
+the path. Workout reports follow the same inline contract, with explicit remote PDF
+exports available when `LOCAL_FITNESS_PUBLIC_URL` is configured.
 
 ## Tools by area
 
@@ -85,7 +86,7 @@ Three tools overlap here; the distinction is on each page.
 |---|---|
 | [`query_workouts`](query_workouts.md) | List/filter sessions — returns `{workouts, count, truncated}` |
 | [`get_workout_detail`](get_workout_detail.md) | One session in full, including splits where they exist |
-| [`workout_report_card`](workout_report_card.md) | 📄 **Rated** report card for one session — 1-5 stars, not adjectives |
+| [`workout_report_card`](workout_report_card.md) | **Rated** report card for one session — 1-5 stars, not adjectives |
 | [`log_manual_workout`](log_manual_workout.md) | ✍️ Record a non-Garmin session (feeds CTL/ATL/TSB) |
 | [`delete_manual_workout`](delete_manual_workout.md) | ✍️ Remove one |
 | [`list_report_cards`](list_report_cards.md) | Graded history — every card ever rendered, newest run first |
@@ -93,9 +94,8 @@ Three tools overlap here; the distinction is on each page.
 
 Stored cards are **dated snapshots**, rated against the plan active at that
 render, and there is no backfill — history starts when cards start rendering.
-The two query tools are pure JSON so they work over both transports, but
-`workout_report_card`, which creates the rows, is stdio-only: a remote client
-can read the rated history it cannot extend.
+All three report-card tools work over both transports: remote clients can
+create reports and retrieve their history.
 
 ### Analysis
 
@@ -143,7 +143,7 @@ propose_training_plan ──> DRAFT ──> commit_training_plan ──> ACTIVE
 | [`chart`](chart.md) | ASCII/emoji chart inline in the reply, or `format="png"` for a matplotlib image |
 | [`plan_chart`](plan_chart.md) | **The** tool for scheduled-vs-actual — never hand-roll this |
 | [`generate_brief_report`](generate_brief_report.md) | 📄 Render a saved brief to a PRESS-themed PDF |
-| [`workout_report_card`](workout_report_card.md) | 📄 Graded single-workout card, markdown + PDF |
+| [`workout_report_card`](workout_report_card.md) | Graded single-workout card, inline or PDF export |
 
 ### Preferences and subjective data
 

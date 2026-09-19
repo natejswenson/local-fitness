@@ -779,7 +779,7 @@ def _active_plan_today(seeded):
 
 def test_plan_chart_daily_renders_plan_rows(seeded):
     _active_plan_today(seeded)
-    text, err = call(tools.plan_chart, {"days": 14})
+    text, err = call(tools.plan_chart, {"format": "ascii", "days": 14})
     assert not err
     assert "plan vs actual · last 14d" in text
     assert f"{date.today().isoformat()[5:]} easy" in text
@@ -794,7 +794,7 @@ def test_plan_chart_daily_renders_plan_rows(seeded):
 
 def test_plan_chart_weekly_mode(seeded):
     _active_plan_today(seeded)
-    text, err = call(tools.plan_chart, {"days": 14, "weekly": True})
+    text, err = call(tools.plan_chart, {"format": "ascii", "days": 14, "weekly": True})
     assert not err
     assert "weekly" in text
     assert "wk " in text
@@ -802,7 +802,7 @@ def test_plan_chart_weekly_mode(seeded):
 
 def test_plan_chart_auto_weekly_past_threshold(seeded):
     _active_plan_today(seeded)
-    text, err = call(tools.plan_chart, {"days": 30})
+    text, err = call(tools.plan_chart, {"format": "ascii", "days": 30})
     assert not err
     assert "weekly" in text
 

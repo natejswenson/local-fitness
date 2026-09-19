@@ -543,3 +543,34 @@ def test_recall_hostile_queries_are_inert(tmp_path, monkeypatch):
     payload = json.loads(result["content"][0]["text"])
     assert payload["count"] == 1
     assert payload["matches"][0]["text"] == stored
+
+
+@pytest.mark.anyio
+async def test_pdf_capability_grants_only_exact_get(app_with_token, monkeypatch):
+    from urllib.parse import urlsplit
+
+    from local_fitness.web import artifacts
+
+    monkeypatch.setenv("LOCAL_FITNESS_PUBLIC_URL", "https://fitness.example.test")
+    monkeypatch.setattr(artifacts, "_ARTIFACTS", {})
+    path = urlsplit(artifacts.publish(b"%PDF-private", "report-1.pdf")["download_url"]).path
+    transport = httpx.ASGITransport(app=app_with_token.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        good = await client.get(path)
+        assert good.status_code == 200 and good.content == b"%PDF-private"
+        assert good.headers["referrer-policy"] == "no-referrer"
+        assert good.headers["x-content-type-options"] == "nosniff"
+        assert good.headers["content-disposition"] == 'attachment; filename="report-1.pdf"'
+        # The capability cannot be repurposed as an API token or a Host-path auth bypass.
+        for headers in ({"Authorization": f"Bearer {path.split('/')[2]}"},
+                        {"Host": "example.test" + path + "#"}):
+            response = await client.post("/mcp/", headers=headers)
+            assert response.status_code == 401
+        for method in ("POST", "HEAD", "DELETE"):
+            assert (await client.request(method, path)).status_code == 401
+        assert (await client.get(path + "/other")).status_code == 401
+        monkeypatch.setattr(artifacts.time, "monotonic", lambda: float("inf"))
+        assert (await client.get(path)).status_code == 401
+        expired = await client.get(path, headers={"Authorization": "Bearer test-token-fixed"})
+        assert expired.status_code == 404
+        assert "request the PDF again" in expired.json()["error"]

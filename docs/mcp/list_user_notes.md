@@ -117,3 +117,7 @@ is handled). A missing or unreadable notes file returns
 - [`delete_user_note`](delete_user_note.md) — remove one by handle (write)
 - [`list_observations`](list_observations.md) — the *other* family: subjective data points, not preferences
 - [`daily_snapshot`](daily_snapshot.md) — bundles `user_notes` into the daily payload
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).

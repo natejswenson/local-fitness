@@ -1,11 +1,8 @@
 """Rendering internals shared by the `generate_brief_report` and
 `workout_report_card` MCP tools plus `chart`'s png format (agent/tools.py).
 
-Only the first two are `LOCAL_ONLY_TOOLS` — they hand back a filesystem path, which
-is useless to a caller on the far side of the networked `/mcp/` transport.
-`chart format="png"` (the former `generate_chart` tool, folded in 0.57.0) is in
-`ALL_TOOLS`: it returns the PNG as an inline MCP image content block, so a
-client never needs the path.
+Only the brief PDF tool is local-only. Workout reports and charts return
+inline MCP images; remote workout PDF exports use capability download URLs.
 
 Heavy native imports (matplotlib, weasyprint) are deferred into the two
 render functions' bodies rather than this module's top level — this module
@@ -412,6 +409,58 @@ def render_chart_png(
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
+    return buf.getvalue()
+
+
+def render_plan_chart_png(rows: list[dict], *, weekly: bool = False) -> bytes:
+    """Draw the SAME planned/actual rows as the terminal chart, without regrading.
+
+    Paired bars keep the plan visible when actual mileage exceeds it. Text
+    labels carry verdicts so neither color nor a bar length implies execution.
+    """
+    if not rows or len(rows) > 60:
+        raise ValueError("PNG plan charts need 1–60 rows; use weekly=true or a shorter window")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    theme = branding.load_theme()
+    paper, ink, dim = (theme["colors"][k] for k in ("paper", "ink", "dim"))
+    fig = Figure(figsize=(9, max(3.2, 1.7 + len(rows) * 0.46)), dpi=150, facecolor=paper)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(paper)
+    for i, row in enumerate(rows):
+        for field, offset, color, label in (
+            ("planned", -0.17, dim, "Planned"), ("actual", 0.17, ink, "Actual"),
+        ):
+            value = row[field]
+            ax.barh(i + offset, value or 0, height=0.25, color=color,
+                    label=label if i == 0 else None)
+            if value is not None:
+                ax.annotate(f"{value:.1f}", (value, i + offset), xytext=(4, 0),
+                            textcoords="offset points", va="center", fontsize=8, color=ink)
+    maximum = max((r[k] or 0 for r in rows for k in ("planned", "actual")), default=0)
+    ax.set_xlim(0, max(1, maximum * 1.16))
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([f"{r['label']}  ·  {r['verdict'] or 'unknown'}" for r in rows],
+                       fontsize=9, color=ink)
+    ax.invert_yaxis()
+    ax.set_xlabel("Miles · actual includes running + walking", color=dim, fontsize=9)
+    ax.set_title("Planned vs actual" + (" · weekly mileage" if weekly else ""),
+                 loc="left", color=ink, fontsize=14, pad=34)
+    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.01), ncol=2,
+              frameon=False, fontsize=9, labelcolor=ink, borderaxespad=0)
+    ax.tick_params(axis="both", length=0, colors=dim)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.grid(axis="x", color=dim, alpha=0.15)
+    ax.set_axisbelow(True)
+    fig.tight_layout(pad=1.5)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=paper)
     return buf.getvalue()
 
 
@@ -1371,7 +1420,14 @@ def render_split_hr_png(card: dict) -> bytes:
     ax.set_facecolor(paper)
     ax.bar(series["positions"], values, color=colors,
            width=series["width"], align="edge")
-    ylo, yhi = value_axis_bounds([v for v in values if v] or [0, 1])
+    # A partial set of laps can put the whole-run average outside their range.
+    # Keep its reference line/label inside the axes; otherwise bbox_inches=tight
+    # expands the PNG around an off-chart label and shrinks the useful plot.
+    avg_hr = card.get("activity", {}).get("avg_hr")
+    hr_values = [v for v in values if v]
+    if avg_hr:
+        hr_values.append(avg_hr)
+    ylo, yhi = value_axis_bounds(hr_values or [0, 1])
     ax.set_ylim(max(0, ylo), yhi)
     ax.set_xlim(0, series["xmax"])
 
@@ -1387,7 +1443,6 @@ def render_split_hr_png(card: dict) -> bytes:
     # effort instead of against a bare axis. Dim dashed rather than accent: it
     # is a reference, and the accent now belongs to the pace line, which is the
     # series the reader is meant to trace.
-    avg_hr = card.get("activity", {}).get("avg_hr")
     if avg_hr:
         # A paper-colored backing box, because the label sits over the bars and
         # the reference line runs near the middle of the data by construction —

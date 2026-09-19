@@ -7,6 +7,7 @@ exfiltrate data through the MCP transport if left unauthenticated.
 
 Endpoints:
   GET  /health   — liveness probe (public)
+  GET  /reports/{capability}/download.pdf — one short-lived PDF capability
   ANY  /mcp/*    — the authenticated MCP streamable-HTTP transport (the
                    API surface — see agent/tools.py's mcp__fitness__* tools)
 
@@ -55,7 +56,7 @@ _rate_lock = asyncio.Lock()
 # Claude sessions (Claude Code/Desktop) and other MCP clients (opencode,
 # etc.) over streamable-HTTP at /mcp/. Built once at import; mounted below
 # and run in the lifespan. See docs/plans/2026-06-16-fitness-mcp-server-design.md.
-from . import mcp_server  # noqa: E402
+from . import artifacts, mcp_server  # noqa: E402
 
 _MCP_SERVER, _MCP_MANAGER = mcp_server.build_session_manager()
 
@@ -122,12 +123,19 @@ async def require_api_token(request: Request, call_next):
 
     Off when ``LOCAL_FITNESS_API_TOKEN`` is unset (dev convenience on
     loopback). On when set: every non-public request must carry
-    ``Authorization: Bearer <token>``. Constant-time comparison prevents
+    ``Authorization: Bearer <token>`` or an exact PDF download capability.
+    Constant-time comparison prevents
     timing-side-channel guessing.
 
     Reads ``scope["path"]``, NEVER ``request.url.path`` — see ``_request_path``.
     """
     path = _request_path(request)
+    # A download capability authenticates precisely one GET. Resolve the
+    # router's path (never Host-derived URL), and pass the bytes to the route
+    # so eviction/expiry between middleware and route cannot change the result.
+    if request.method == "GET" and (artifact := artifacts.resolve(path)):
+        request.state.report_artifact = artifact
+        return await call_next(request)
     if API_TOKEN is None or _is_public_path(path):
         return await call_next(request)
     auth_header = request.headers.get("authorization", "")
@@ -135,6 +143,23 @@ async def require_api_token(request: Request, call_next):
     if not secrets.compare_digest(auth_header, expected):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return await call_next(request)
+
+
+@app.get("/reports/{token}/download.pdf")
+async def download_report(request: Request, token: str):
+    artifact = getattr(request.state, "report_artifact", None)
+    if artifact is None:
+        return JSONResponse({"error": "download expired or unavailable; request the PDF again"},
+                            status_code=404)
+    return Response(
+        artifact.data, media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+            "Cache-Control": "private, no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.middleware("http")

@@ -311,11 +311,11 @@ def test_trend_values_exclude_todays_partial_reading_for_steps(tmp_path, monkeyp
     assert payload["values"][-1]["value"] == 11000
 
 
-def test_chart_default_is_compact_calendar(seeded):
+def test_chart_ascii_default_is_compact_calendar(seeded):
     # No style -> calendar (the default). It must be the week-stacked grid (its
     # "Mon→Sun" legend is the signature) and COMPACT: a 30-day window is a handful
     # of week-rows, never one row per day (the truncation bug fix).
-    text, err = call(tools.chart, {"metric": "rhr", "days": 30})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 30})
     assert not err
     assert "rhr · last 30d" in text
     assert "Mon→Sun" in text          # calendar legend signature
@@ -326,7 +326,7 @@ def test_chart_default_is_compact_calendar(seeded):
 def test_chart_bar_style_is_one_row_per_day(seeded):
     # Explicit bar style is still available and is one row per day (best for
     # short windows) — distinctly taller than the calendar for the same window.
-    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "bar"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 14, "style": "bar"})
     assert not err
     assert any(sq in text for sq in tools.charts._HEAT)
     assert "Mon→Sun" not in text                  # NOT the calendar
@@ -338,7 +338,7 @@ def test_chart_calendar_cumulative_steps_weekly_sum(seeded):
     # mean. The fixture seeds 9000 steps/day and any 14-day window contains a full
     # Mon-Sun week, so a 7*9000 = 63000 weekly total must appear (proves the tool
     # routes steps with cumulative=True).
-    text, err = call(tools.chart, {"metric": "steps", "days": 14})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "steps", "days": 14})
     assert not err
     assert "Mon→Sun" in text
     assert "63000" in text
@@ -346,7 +346,7 @@ def test_chart_calendar_cumulative_steps_weekly_sum(seeded):
 
 def test_chart_line_style(seeded):
     # A clean box-drawing line (mono) — not braille, not the calendar grid, not emoji.
-    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "line"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 14, "style": "line"})
     assert not err
     assert "rhr · last 14d" in text
     assert any(g in text for g in "─╭╮╰╯│")       # box-drawing line
@@ -358,14 +358,14 @@ def test_chart_line_style(seeded):
 def test_chart_combo_has_trendline(seeded):
     # sleep_seconds varies across the window (steps is flat in the fixture), so
     # bars and the overlaid trend line are both visible.
-    text, err = call(tools.chart, {"metric": "sleep_seconds", "days": 14, "style": "combo"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "sleep_seconds", "days": 14, "style": "combo"})
     assert not err
     assert "█" in text and "•" in text and "┤" in text
     assert "h" in text  # seconds formatted as hours on the axis
 
 
 def test_chart_spark(seeded):
-    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "spark"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 14, "style": "spark"})
     assert not err
     assert any(b in text for b in tools.charts._BLOCKS)
 
@@ -373,13 +373,13 @@ def test_chart_spark(seeded):
 def test_chart_derived_weighted_intensity(seeded):
     # mod(20) + 2×vig(5) = 30 for every seeded day; the tool must accept the
     # derived metric name and not 500 on the computed column.
-    text, err = call(tools.chart, {"metric": "intensity_minutes_weighted", "days": 7})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "intensity_minutes_weighted", "days": 7})
     assert not err
     assert "intensity_minutes_weighted" in text
 
 
 def test_chart_baseline_metric_tsb(seeded):
-    text, err = call(tools.chart, {"metric": "tsb", "days": 14, "style": "combo"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "tsb", "days": 14, "style": "combo"})
     assert not err
     assert "tsb" in text  # pulled from baselines, not daily_metrics
     # The fixture's tsb is a flat -5.0 window: bars must still render, and the
@@ -393,7 +393,7 @@ def test_chart_baseline_metric_tsb(seeded):
 def test_chart_baseline_metrics_ctl_atl(seeded, metric):
     # ctl/atl ride the same whitelisted f-string path against the baselines
     # table as tsb; exercise both so the branch isn't covered by tsb alone.
-    text, err = call(tools.chart, {"metric": metric, "days": 14, "style": "spark"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": metric, "days": 14, "style": "spark"})
     assert not err
     assert metric in text
 
@@ -402,14 +402,14 @@ def test_chart_combo_trend_footer_is_unit_consistent(seeded):
     # Significant 1: the combo trend footer reports formatted endpoints (same
     # value_fmt as the axis), never a raw-unit "/step" slope. sleep_seconds shows
     # an "h" axis, so the footer endpoints must read in hours too — not raw seconds.
-    text, err = call(tools.chart, {"metric": "sleep_seconds", "days": 14, "style": "combo"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "sleep_seconds", "days": 14, "style": "combo"})
     assert not err
     footer = [ln for ln in text.split("\n") if "trend" in ln][0]
     assert "→" in footer            # endpoint form, not a per-step number
     assert "/step" not in footer    # no raw-unit slope
     assert "h" in footer            # formatted in hours, matching the axis
     # A unitless integer metric still gets clean integer endpoints (no "/step").
-    text2, err2 = call(tools.chart, {"metric": "rhr", "days": 14, "style": "combo"})
+    text2, err2 = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 14, "style": "combo"})
     assert not err2
     footer2 = [ln for ln in text2.split("\n") if "trend" in ln][0]
     assert "→" in footer2
@@ -418,19 +418,19 @@ def test_chart_combo_trend_footer_is_unit_consistent(seeded):
 
 
 def test_chart_unknown_metric(seeded):
-    payload, err = call(tools.chart, {"metric": "bogus", "days": 14})
+    payload, err = call(tools.chart, {"format": "ascii", "metric": "bogus", "days": 14})
     assert err
     assert "unknown metric" in payload["error"]
 
 
 def test_chart_unknown_style(seeded):
-    payload, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "pie"})
+    payload, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 14, "style": "pie"})
     assert err
     assert "unknown style" in payload["error"]
 
 
 def test_chart_no_data(seeded):
-    payload, err = call(tools.chart, {"metric": "vo2_max", "days": 14})
+    payload, err = call(tools.chart, {"format": "ascii", "metric": "vo2_max", "days": 14})
     assert err
     assert payload["error"] == "no data in window"   # not "unknown metric"
 
@@ -2242,7 +2242,7 @@ def test_sync_garmin_data_is_in_full_tool_set():
 
 
 # --- PDF/chart tools: generate_brief_report / chart's png format -----------
-# NB: LOCAL_ONLY_TOOLS is generate_brief_report + workout_report_card; since
+# NB: LOCAL_ONLY_TOOLS is generate_brief_report; since
 # Fix A (2026-07-13; folded into chart as format="png" at 0.57.0) — the png
 # render lives in ALL_TOOLS (it returns an inline
 # image block, so a remote caller no longer needs the local file path).
@@ -2256,7 +2256,7 @@ def test_fetch_metric_series_matches_chart_tool_output(seeded):
     assert len(dates) == len(values) > 0
     assert dates == sorted(dates)  # ascending, matching the ORDER BY date SQL
 
-    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "spark"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 14, "style": "spark"})
     assert not err
     fmt = tools._chart_value_fmt("rhr")
     assert fmt(min(values)) in text
@@ -2677,12 +2677,6 @@ def test_chart_png_rejects_ascii_only_styles(seeded):
     assert not tools.subprocess.run.called
 
 
-def test_chart_png_defaults_to_line_style(seeded, reports_tmp):
-    payload, err = call(tools.chart, {"metric": "rhr", "days": 14, "format": "png"})
-    assert not err
-    assert Path(payload["path"]).name.startswith("chart-rhr-line-14d-")
-
-
 def test_chart_unknown_format_is_an_error(seeded):
     payload, err = call(tools.chart, {"metric": "rhr", "days": 14, "format": "svg"})
     assert err
@@ -2745,19 +2739,6 @@ def test_generate_brief_report_path_escape_is_error(seeded, reports_tmp, monkeyp
     assert not tools.subprocess.run.called
 
 
-def test_chart_png_path_escape_is_error(seeded, reports_tmp, monkeypatch):
-    def boom(*_a, **_k):
-        raise ValueError("escaped")
-
-    monkeypatch.setattr(tools, "_write_atomic", boom)
-    payload, err = call(
-        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
-    )
-    assert err
-    assert "escaped reports directory" in payload["error"]
-    assert not tools.subprocess.run.called
-
-
 def test_chart_png_render_failure_is_error(seeded, monkeypatch):
     # Unlike generate_brief_report, a png chart has no takeaway to fall
     # back to -- a render failure is a hard error, not a graceful skip.
@@ -2773,44 +2754,6 @@ def test_chart_png_render_failure_is_error(seeded, monkeypatch):
     assert err
     assert "chart render failed" in payload["error"]
     assert not tools.subprocess.run.called
-
-
-def test_chart_png_happy_path_writes_expected_png(seeded, reports_tmp):
-    # INV-T8 + INV-9: valid PNG at the content-addressed filename format
-    # chart-metric-chart_type-Nd-<sha8>.png.
-    reports_dir, _briefs_dir = reports_tmp
-    payload, err = call(
-        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
-    )
-    assert not err
-    path = Path(payload["path"])
-    assert re.fullmatch(r"chart-rhr-line-14d-[0-9a-f]{8}\.png", path.name)
-    assert path.parent == reports_dir
-    assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-
-
-def test_chart_png_filename_is_content_addressed(seeded, reports_tmp):
-    # Same stale-Preview-refocus fix the PDFs got in 0.28.2: identical chart
-    # bytes reuse ONE filename (idempotent — refocus is correct), but changed
-    # bytes must land on a NEW filename so macOS `open` shows the fresh render
-    # instead of refocusing a stale window. A day-stamped name could not do
-    # this (it was constant across an intra-day re-render).
-    args = {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
-    p1, err1 = call(tools.chart, args)
-    p2, err2 = call(tools.chart, args)
-    assert not err1 and not err2
-    # Identical data twice -> identical content-addressed filename.
-    assert p1["path"] == p2["path"]
-
-    # Change the underlying series, re-render the SAME request: because the
-    # rendered bytes differ, the filename must change.
-    with db.connect() as conn:
-        conn.execute("UPDATE daily_metrics SET rhr = rhr + 7")
-        conn.commit()
-    p3, err3 = call(tools.chart, args)
-    assert not err3
-    assert p3["path"] != p1["path"]
-    assert Path(p3["path"]).name.startswith("chart-rhr-line-14d-")
 
 
 def test_chart_png_response_carries_inline_image_block(seeded, reports_tmp):
@@ -2830,8 +2773,9 @@ def test_chart_png_response_carries_inline_image_block(seeded, reports_tmp):
     assert image["mimeType"] == "image/png"
     decoded = base64.b64decode(image["data"])
     assert decoded[:8] == b"\x89PNG\r\n\x1a\n"
-    path = Path(json.loads(content[0]["text"])["path"])
-    assert decoded == path.read_bytes()
+    assert "path" not in result["structuredContent"]
+    assert "rhr" in content[0]["text"]
+    assert list(reports_tmp[0].glob("*.png")) == []
 
 
 def test_generate_chart_is_gone_and_chart_owns_both_formats(seeded):
@@ -2882,27 +2826,6 @@ def test_generate_brief_report_auto_opens_and_dispatches_via_to_thread(
     assert tools._default_reports_dir in recorded
 
 
-def test_chart_png_auto_opens_and_dispatches_via_to_thread(
-    seeded, reports_tmp, monkeypatch
-):
-    recorded = []
-    _spy_to_thread(monkeypatch, recorded)
-
-    payload, err = call(
-        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
-    )
-    assert not err
-    final_path = Path(payload["path"])
-    tools.subprocess.run.assert_called_once_with(
-        ["open", str(final_path)],
-        check=False,
-        timeout=10,
-        stdout=tools.subprocess.DEVNULL,
-        stderr=tools.subprocess.DEVNULL,
-    )
-    assert tools._default_reports_dir in recorded
-
-
 def test_generate_brief_report_auto_open_failure_does_not_fail_tool(
     seeded, reports_tmp, monkeypatch
 ):
@@ -2913,15 +2836,6 @@ def test_generate_brief_report_auto_open_failure_does_not_fail_tool(
     ])
     monkeypatch.setattr(tools.subprocess, "run", Mock(side_effect=OSError("no open binary")))
     payload, err = call(tools.generate_brief_report, {"date": d})
-    assert not err
-    assert Path(payload["path"]).exists()
-
-
-def test_chart_png_auto_open_failure_does_not_fail_tool(seeded, reports_tmp, monkeypatch):
-    monkeypatch.setattr(tools.subprocess, "run", Mock(side_effect=OSError("no open binary")))
-    payload, err = call(
-        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
-    )
     assert not err
     assert Path(payload["path"]).exists()
 
@@ -2943,29 +2857,11 @@ def test_generate_brief_report_reports_dir_error_is_clean(seeded, reports_tmp, m
     assert not tools.subprocess.run.called
 
 
-def test_chart_png_reports_dir_error_is_clean(seeded, monkeypatch):
-    def boom():
-        raise OSError("disk full")
-
-    monkeypatch.setattr(tools, "_default_reports_dir", boom)
-    payload, err = call(
-        tools.chart, {"metric": "rhr", "days": 14, "format": "png", "style": "line"}
-    )
-    assert err
-    assert "could not prepare reports directory" in payload["error"]
-    assert not tools.subprocess.run.called
-
-
-def test_pdf_writing_tools_are_local_only_chart_is_not():
-    # INV-4 (rewritten per Fix A, 2026-07-10 doc; extended for
-    # workout_report_card): a tool that hands back a *filesystem path* is
-    # local-only, because a remote /mcp/ caller gets a container-internal path
-    # with no way to retrieve the file. Both PDF writers qualify. chart —
-    # including its png format, the former generate_chart — does NOT: the
-    # inline ImageContent block sidesteps the retrieval problem.
+def test_only_brief_pdf_export_is_local_only():
+    # Workout PDF exports have a remote download path; brief PDFs remain local.
     all_names = {t.name for t in tools.ALL_TOOLS}
     local_only_names = {t.name for t in tools.LOCAL_ONLY_TOOLS}
-    assert local_only_names == {"generate_brief_report", "workout_report_card"}
+    assert local_only_names == {"generate_brief_report"}
     assert all_names.isdisjoint(local_only_names)
     assert "chart" in all_names
 
@@ -3813,7 +3709,7 @@ def test_bucket_weekly_anchors_to_monday():
 
 
 def test_chart_bar_long_window_buckets_weekly(seeded):
-    text, err = call(tools.chart, {"metric": "rhr", "days": 35, "style": "bar"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 35, "style": "bar"})
     assert not err
     assert "weekly avg" in text
     # ~6 ISO weeks cover a 35-day window with 40 seeded days — never 35 rows.
@@ -3822,19 +3718,19 @@ def test_chart_bar_long_window_buckets_weekly(seeded):
 
 
 def test_chart_bar_long_window_cumulative_metric_sums(seeded):
-    text, err = call(tools.chart, {"metric": "steps", "days": 35, "style": "bar"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "steps", "days": 35, "style": "bar"})
     assert not err
     assert "weekly sum" in text
 
 
 def test_chart_combo_long_window_buckets_weekly(seeded):
-    text, err = call(tools.chart, {"metric": "rhr", "days": 35, "style": "combo"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 35, "style": "combo"})
     assert not err
     assert "weekly avg" in text
 
 
 def test_chart_bar_short_window_stays_daily(seeded):
-    text, err = call(tools.chart, {"metric": "rhr", "days": 14, "style": "bar"})
+    text, err = call(tools.chart, {"format": "ascii", "metric": "rhr", "days": 14, "style": "bar"})
     assert not err
     assert "weekly" not in text
 
@@ -4056,7 +3952,7 @@ def test_report_card_bad_format_is_an_error(rc_seeded, monkeypatch):
     monkeypatch.setattr(tools.db, "connect", boom)
     payload, err = call(tools.workout_report_card, {"format": "csv"})
     assert err
-    assert payload["allowed"] == ["both", "pdf", "table"]
+    assert payload["allowed"] == ["both", "inline", "pdf", "table"]
 
 
 def test_report_card_table_format_writes_no_file(rc_seeded, reports_tmp):
@@ -4069,7 +3965,7 @@ def test_report_card_table_format_writes_no_file(rc_seeded, reports_tmp):
 
 def test_report_card_writes_a_pdf(rc_seeded, reports_tmp):
     reports_dir, _ = reports_tmp
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     path = Path(payload["path"])
     assert re.fullmatch(r"report-card-1-[0-9a-f]{8}\.pdf", path.name)
@@ -4089,7 +3985,7 @@ def test_report_card_surfaces_page_overflow_instead_of_spilling_silently(
     monkeypatch.setattr(
         visuals, "render_report_card_pdf", lambda *_a, **_k: (b"%PDF-two-pages", 2))
     with caplog.at_level(logging.WARNING):
-        payload, err = call(tools.workout_report_card, {})
+        payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     assert payload["pages"] == 2
     assert any("still 2 pages" in r.message for r in caplog.records)
@@ -4098,7 +3994,7 @@ def test_report_card_surfaces_page_overflow_instead_of_spilling_silently(
 def test_report_card_single_page_leaves_no_pages_field(rc_seeded, reports_tmp):
     """The overflow signal is present ONLY on overflow — a normal one-page card
     carries no `pages` key."""
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     assert "pages" not in payload
 
@@ -4106,7 +4002,7 @@ def test_report_card_single_page_leaves_no_pages_field(rc_seeded, reports_tmp):
 def test_report_card_pdf_states_the_rolling_reference(rc_seeded, reports_tmp):
     """The 'which yardstick' requirement is asserted in the rendered page, not
     merely in the payload."""
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "".join(page.extract_text() or "" for page in doc.pages)
@@ -4131,7 +4027,7 @@ def test_report_card_pdf_states_the_plan_reference(rc_seeded, reports_tmp):
             "VALUES (7, ?, 1, 1, 'easy', 10000, 330, 'Easy 10k')",
             (today,),
         )
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     assert payload["reference"] == "rolling_60d"     # the HR/load pool
     assert payload["intent_source"] == "plan"
@@ -4147,7 +4043,7 @@ def test_report_card_without_splits_still_grades_and_still_renders(rc_seeded, re
     case, not an edge case."""
     with db.connect(rc_seeded) as conn:
         conn.execute("DELETE FROM activity_splits WHERE activity_id = 1")
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     assert payload["splits_available"] is False
     assert payload["overall"]["stars"] is not None   # ratings are unaffected
@@ -4192,7 +4088,7 @@ def test_report_card_pdf_render_failure_is_an_error(rc_seeded, reports_tmp, monk
         raise RuntimeError("weasyprint exploded")
 
     monkeypatch.setattr(visuals, "render_report_card_pdf", boom)
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert err
     assert "PDF render failed" in payload["error"]
 
@@ -4207,7 +4103,7 @@ def test_report_card_split_chart_failure_never_sinks_the_card(
         raise RuntimeError("matplotlib exploded")
 
     monkeypatch.setattr(visuals, "render_split_hr_png", boom)
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     assert Path(payload["path"]).read_bytes()[:5] == b"%PDF-"
 
@@ -4217,7 +4113,7 @@ def test_report_card_path_escape_is_error(rc_seeded, reports_tmp, monkeypatch):
         raise ValueError("escaped")
 
     monkeypatch.setattr(tools, "_write_atomic", boom)
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert err
     assert "escaped reports directory" in payload["error"]
 
@@ -4251,10 +4147,10 @@ def test_report_card_pdf_resolves_the_hr_trace(rc_seeded, reports_tmp, monkeypat
                 for i in range(13)]
 
     monkeypatch.setattr(details, "fetch_hr_samples", _fetch)
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     assert calls == [1]
-    _, err2 = call(tools.workout_report_card, {})
+    _, err2 = call(tools.workout_report_card, {"format": "both"})
     assert not err2
     assert calls == [1]  # served from the SQLite cache the first render wrote
 
@@ -4269,7 +4165,7 @@ def test_report_card_coach_read_failure_falls_back_and_still_renders(
 
     monkeypatch.setattr(tools.workout_coach, "generate_read_cached", _boom)
     with caplog.at_level(logging.WARNING):
-        payload, err = call(tools.workout_report_card, {})
+        payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     assert Path(payload["path"]).read_bytes()[:5] == b"%PDF-"
     assert any("workout read generation failed" in r.message for r in caplog.records)
@@ -4281,7 +4177,7 @@ def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monke
                 "hr": "Stayed low.", "stimulus": "Banked what it should."}
 
     monkeypatch.setattr(tools.workout_coach, "generate_read_cached", _read)
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     with pdfplumber.open(io.BytesIO(Path(payload["path"]).read_bytes())) as doc:
         text = "\n".join(p.extract_text() or "" for p in doc.pages)
@@ -4305,7 +4201,7 @@ def test_report_card_pdf_leads_with_the_coach_read(rc_seeded, reports_tmp, monke
 def test_report_card_pdf_splits_table_has_no_distance_column(rc_seeded, reports_tmp):
     """Dropped as duplicative: the row label already IS the distance, so a
     Distance column printed '1.00 mi' beside a column headed 'Mile'."""
-    payload, err = call(tools.workout_report_card, {})
+    payload, err = call(tools.workout_report_card, {"format": "both"})
     assert not err
     html_out = visuals._render_splits_html(
         report_card.build_card(
@@ -4333,13 +4229,11 @@ def test_report_card_grade_column_is_left_aligned_like_the_others():
     assert grade_rule and "text-align: left" in grade_rule[0]
 
 
-def test_report_card_is_local_only():
-    """Regression guard for web/mcp_server.py's transport contract: a
-    PDF-writing tool must never reach the networked /mcp/ surface, which has
-    no way to retrieve a local path."""
-    assert "workout_report_card" in [t.name for t in tools.LOCAL_ONLY_TOOLS]
-    assert "workout_report_card" not in [t.name for t in tools.ALL_TOOLS]
-    assert "mcp__fitness__workout_report_card" not in tools.allowed_tool_names()
+def test_report_card_is_shared():
+    """Remote users can create a report directly, with no local-file dependency."""
+    assert "workout_report_card" not in [t.name for t in tools.LOCAL_ONLY_TOOLS]
+    assert "workout_report_card" in [t.name for t in tools.ALL_TOOLS]
+    assert "mcp__fitness__workout_report_card" in tools.allowed_tool_names()
 
 
 # --- the one-page guarantee (end-to-end) ------------------------------------
@@ -4857,10 +4751,10 @@ def test_list_report_cards_payload_filters_and_order(rc_cards, reports_tmp, monk
     assert [c["activity_id"] for c in payload["cards"]] == [103]
 
 
-def test_get_report_card_missing_row_points_at_a_local_session(seeded):
+def test_get_report_card_missing_row_points_at_creation_tool(seeded):
     payload, err = call(tools.get_report_card, {"activity_id": 42})
     assert err
-    assert "local session" in payload["error"]
+    assert "workout_report_card" in payload["error"]
     payload, err = call(tools.get_report_card, {})
     assert err and "activity_id is required" in payload["error"]
 
@@ -4870,7 +4764,7 @@ def test_get_report_card_returns_the_stored_snapshot_verbatim(
     _patch_generate(monkeypatch)
     rendered, err = call(tools.workout_report_card, {"format": "table"})
     assert not err
-    payload, err = call(tools.get_report_card, {"activity_id": 1})
+    payload, err = call(tools.get_report_card, {"activity_id": 1, "format": "table"})
     assert not err
     assert payload["activity_id"] == 1
     assert payload["date"] == date.today().isoformat()
@@ -5256,7 +5150,7 @@ def test_report_card_pdf_failure_returns_stable_reason_and_logs(rc_seeded, repor
 
     monkeypatch.setattr(visuals, "render_report_card_pdf", boom)
     with caplog.at_level(logging.WARNING, logger="local_fitness.agent.tools"):
-        payload, err = call(tools.workout_report_card, {})
+        payload, err = call(tools.workout_report_card, {"format": "both"})
     assert err
     assert payload["error"] == (
         "PDF render failed: RuntimeError: cairo exploded with a 40-line traceback"

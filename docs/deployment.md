@@ -53,6 +53,8 @@ services:
       # Bearer token gating /mcp/ (and every other non-public path) —
       # REQUIRED when binding 0.0.0.0
       - LOCAL_FITNESS_API_TOKEN=${LOCAL_FITNESS_API_TOKEN}
+      # Optional: browser-reachable origin for ten-minute workout PDF links.
+      - LOCAL_FITNESS_PUBLIC_URL=${LOCAL_FITNESS_PUBLIC_URL:-}
       # MCP server host allowlist — MUST include the served host or every
       # /mcp/ request 421s (DNS-rebinding guard). The code default is
       # loopback only ("127.0.0.1,localhost"), so a deployment serving at a
@@ -71,6 +73,11 @@ services:
       # once for the OAuth flow, persists to a named volume)
       - fitness-claude-config:/home/app/.claude
 ```
+
+The runtime image includes the native PDF libraries and fonts. Its build renders
+a one-page PDF as the app user; a missing renderer dependency fails the build.
+For remote exports, set `LOCAL_FITNESS_PUBLIC_URL` to a browser-reachable origin
+and include that hostname in `LOCAL_FITNESS_MCP_ALLOWED_HOSTS`.
 
 The compose-side `.env` file (sibling of `docker-compose.yml`, same
 shape as this repo's `.env.example`) supplies the interpolated
@@ -167,3 +174,38 @@ Set `TZ` to your own zone (the compose snippet above defaults to
 ```bash
 docker exec <container> date        # must match `date` on the host
 ```
+
+## Optional shared Obsidian memory
+
+Preferences and journal can independently use `LOCAL_FITNESS_PREFERENCES_BACKEND=vault`
+and `LOCAL_FITNESS_JOURNAL_BACKEND=vault` (both default to `legacy`). Vault mode
+requires `LOCAL_FITNESS_MEMORY_URL` and `LOCAL_FITNESS_MEMORY_TOKEN_FILE`.
+All writes go through one authenticated writer; do not run independent writers
+against a host/container bind mount. The writer owns Markdown and recovery state;
+fitness keeps operational measurements, plans, personality, and the derived ledger.
+Storage requests never invoke a model. A failed requested save raises an explicit
+error and never falls back to the legacy store. Prompt reads degrade with a warning.
+
+For a host writer, add these settings to the fitness service in compose:
+
+```yaml
+environment:
+  LOCAL_FITNESS_PREFERENCES_BACKEND: vault
+  LOCAL_FITNESS_JOURNAL_BACKEND: vault
+  LOCAL_FITNESS_MEMORY_URL: http://host.docker.internal:8766/memory
+  LOCAL_FITNESS_MEMORY_TOKEN_FILE: /run/secrets/fitness-memory-token
+volumes:
+  - ${FITNESS_MEMORY_TOKEN_FILE}:/run/secrets/fitness-memory-token:ro
+```
+
+The container needs only the token mount, not the vault or control-state directories.
+On Linux, configure `host.docker.internal` to the host gateway where supported.
+Use HTTPS for any nonlocal deployment; plain HTTP is limited to localhost and the
+Docker host alias. Redirects are refused to avoid forwarding the bearer token.
+
+`fitness mcp-stdio --memory-only` exposes the eight existing preference/journal
+tools without the coach persona, report resources, or unrelated fitness mutations.
+It is suitable for a global ChatGPT desktop/Codex registration. Keep the ordinary
+project-local fitness MCP server for full fitness work. Restart clients after
+changing backend configuration. A memory-only connection does not initialize the
+operational database.

@@ -132,3 +132,7 @@ Answer from that line and nothing else. One match means one fact.
 - [`save_coach_memory`](save_coach_memory.md) — write one line
 - [`delete_coach_memory`](delete_coach_memory.md) — the only path that really removes an entry
 - [`get_report_card`](get_report_card.md) — the *other* durable record: graded workout snapshots
+
+The optional vault backend uses the same tool contract through a single local
+writer. It is also available through `fitness mcp-stdio --memory-only`. See
+[deployment](../deployment.md#optional-shared-obsidian-memory).

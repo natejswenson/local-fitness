@@ -1,12 +1,13 @@
 # `plan_chart`
 
-> Scheduled-vs-actual training-plan chart (ASCII/emoji): one bar per day or per week, with a verdict glyph per row. **Availability:** stdio + HTTP
+> Scheduled-vs-actual training-plan chart (inline PNG by default; ASCII/emoji optional): one bar per day or per week, with a verdict glyph per row. **Availability:** stdio + HTTP
 
 ## What it does
 
 THE tool for "planned vs actual", "am I hitting my plan", "how's the week
 going". It reads the ACTIVE plan, grades every prescribed day against real
-activities, and draws two series in one bar — `█` for **on-foot** miles (run +
+activities. The default PNG draws paired planned/actual bars with numeric
+labels and verdict text. `format="ascii"` draws two series in one bar — `█` for **on-foot** miles (run +
 walk, since easy days count prescribed walking by design), `░` padding out to
 the prescribed distance, so the `░` tail *is* the shortfall.
 Never hand-roll matplotlib or an ASCII grid for this view. Use
@@ -19,10 +20,19 @@ day-by-day numbers rather than a picture.
 
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
+| `format` | string | no | `png` | Inline PNG and caption, or `ascii` for terminal text. |
 | `days` | integer | no | `14` | Trailing window ending at the **data frontier** (`db.last_known_daily_date()`), falling back to today when the DB is empty — not at the wall clock. Bounds-checked to `1..3650`. |
 | `weekly` | boolean | no | auto | Auto means daily rows for `days ≤ 21` and weekly buckets above. Pass `true`/`false` to force it either way. |
 
 ## Returns
+
+PNG is returned as an MCP image alongside a caption with the data frontier and
+refresh guidance when stale. Machine fields (`rows`, `through`, `weekly`,
+`adherence_pct`) live in `structuredContent`. Weekly verdicts describe mileage
+completion, not workout execution. If rendering fails or a window exceeds 60
+rows, the same data is returned as text; use a shorter window for a PNG.
+
+The examples below show `format="ascii"`:
 
 A single text content block holding the rendered chart **verbatim** — plain
 text, not JSON. Errors are the exception: `{"error": "no active training

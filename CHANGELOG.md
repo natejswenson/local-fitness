@@ -1,8 +1,47 @@
 # Changelog
 
+## Unreleased
+
+- Add an optional source-owned Obsidian memory transport for preferences and coach
+  journal, with no fallback writes, stable retry IDs, vault-aware persona cache
+  invalidation, and a memory-only stdio MCP mode for shared clients. Legacy remains
+  the default; operational fitness data and inference settings are unchanged.
+
 All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.65.1] - 2026-09-14
+
+### Fixed
+- Install Pango/FreeType and fonts in the runtime image so remote workout PDF
+  exports work in the deployed container. The Docker build now renders a real
+  one-page PDF as the app user, catching missing native libraries before deploy.
+
+## [0.65.0] - 2026-09-14
+
+### Added
+- Workout reports are available over HTTP for ChatGPT and other remote MCP
+  clients. Default reports return formatted ratings and an HR image immediately,
+  using cached or computed coaching text without model generation or Garmin calls.
+- Explicit remote PDF exports return a ten-minute download link when
+  `LOCAL_FITNESS_PUBLIC_URL` is configured. Downloads use a bounded in-memory
+  store and capabilities scoped to one PDF; no API token or local path is exposed.
+- Report coverage notices identify missing splits and absent sync coverage.
+  Stored reports can be replayed inline with their original ratings.
+- Synthetic end-to-end MCP journeys cover reports, chart images, cached reads,
+  PDF downloads, degraded data, and capability authorization.
+
+### Fixed
+- HR charts keep the whole-run average inside the plotting area when only a
+  subset of laps is available, avoiding a stretched image and tiny plot.
+
+### Changed
+- Metric and planned-vs-actual charts default to inline PNGs. ASCII remains
+  available explicitly; calendar/spark styles still imply ASCII. PNGs no longer
+  write files or open Preview. Local explicit PDF exports retain that behavior.
+- The external MCP adapter preserves structured fields and images. Only the
+  daily-brief PDF tool remains local-only (47 HTTP tools / 48 stdio tools).
 
 ## [0.64.0] - 2026-09-08
 

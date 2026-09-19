@@ -11,9 +11,11 @@ FROM python:3.12-slim AS runtime
 #  - ca-certificates / gnupg: nodesource repo signing.
 #  - nodejs: required because the Claude Agent SDK shells out to the
 #    `claude` CLI, which is published via npm.
+#  - Pango/FreeType + fonts: WeasyPrint renders remote workout PDF exports.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg \
+        libpango-1.0-0 libpangoft2-1.0-0 fonts-dejavu-core \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -58,6 +60,11 @@ RUN mkdir -p /data /briefings /home/app/.garminconnect /home/app/.claude \
     && chown -R app:app /data /briefings /home/app/.garminconnect /home/app/.claude
 
 USER app
+
+# Import-only/build-success checks miss native PDF dependencies. Exercise a
+# real one-page render as the runtime user; no network or private data involved.
+RUN .venv/bin/python -c \
+    "from weasyprint import HTML; report = HTML(string='<p>PDF runtime check</p>').render(); assert len(report.pages) == 1; assert report.write_pdf().startswith(b'%PDF-')"
 
 EXPOSE 8765
 

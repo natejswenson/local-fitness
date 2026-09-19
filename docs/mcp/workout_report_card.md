@@ -1,6 +1,6 @@
 # `workout_report_card`
 
-> Rated report card for ONE workout — four compliance star ratings plus an overall, an unrated training-stimulus report, a coach's read, and a PRESS-themed PDF. **Availability:** stdio only — local
+> Rated report card for ONE workout — four compliance star ratings plus an overall, an unrated training-stimulus report, a coach's read, an inline HR image, and an optional PRESS-themed PDF. **Availability:** stdio + HTTP
 
 ## What it does
 
@@ -18,16 +18,21 @@ verbatim.** Do not re-summarize it, do not rebuild your own verdict from the
 structured fields, and do not assemble a card by hand out of
 `get_workout_detail` when a graded one exists.
 
-### Why this one is local-only
+### In ChatGPT and other remote clients
 
-The rule: **a tool that hands back a filesystem path is local-only**, because a
-remote `/mcp/` caller receives a container-internal path it cannot retrieve. A
-PDF cannot ride back as an MCP content block the way `generate_chart`'s PNG
-does, so there is no networked escape hatch. This tool sits in
-`LOCAL_ONLY_TOOLS` and is registered **only** by `run_stdio()`'s
-`build_server(extra_tools=LOCAL_ONLY_TOOLS)`; `build_session_manager()` calls
-`build_server()` argument-free, so the authenticated `/mcp/` transport
-structurally cannot see it.
+The default `format="inline"` returns formatted report text plus a PNG image
+when stored HR data is available. Display both. Grades are deterministic; the
+coaching text reuses a matching cached read or uses a labeled computed summary.
+The immediate path never calls a model, reflects into the journal, or fetches
+Garmin data. Missing splits and absent sync coverage are surfaced with guidance.
+These coverage dates do not certify that every Garmin endpoint succeeded.
+
+Request `format="pdf"` to export. Over HTTP, set `LOCAL_FITNESS_PUBLIC_URL` to a
+trusted, browser-reachable HTTP(S) origin: the response contains a download link
+valid for up to ten minutes. Links authorize only one PDF, contain no API token,
+and can expire early on restart or storage eviction (32 files / 32 MiB total).
+Without this setting, PDF export returns guidance to use inline instead.
+Over stdio, explicit PDF exports retain local save-and-open behavior.
 
 ## Parameters
 
@@ -35,7 +40,8 @@ structurally cannot see it.
 |---|---|---|---|---|
 | `activity_id` | integer | no | — | Grade this exact activity. **Overrides `date`.** Bypasses the `distance_meters > 0` filter, so a strength session can be requested explicitly and comes back with `n/a` where metrics are missing. |
 | `date` | string | no | — | `YYYY-MM-DD`; grades that day's primary session — the **first** `start_time` with distance and duration > 0. First, not last, because the prescription it gets graded against is the day's lowest `seq`, i.e. the morning session; taking the last one paired an evening shakeout with the morning's long-run target. Malformed dates error before any DB access. |
-| `format` | string | no | `both` | `both` \| `table` \| `pdf`. `table` skips the PDF **and** skips the on-demand HR-trace fetch, keeping the call purely local and fast. |
+| `format` | string | no | `inline` | `inline`: text + HR image; `table`: JSON/Markdown; `pdf` or `both`: explicit PDF export. |
+| `coaching` | string | no | `cached` for inline/HTTP | `cached`: matching stored read or computed summary. `generate`: local-only model generation on a cache miss; default for local table/PDF exports. |
 
 With neither `activity_id` nor `date`, it grades the most recent logged activity
 with distance and duration.
@@ -204,6 +210,14 @@ rather than floored — cases the letter cap ignored entirely.
 
 ## Returns
 
+Inline/remote PDF responses carry readable Markdown in `content`, an optional
+MCP image block, and machine fields in `structuredContent`. Display the content
+in the reply; do not reconstruct grades from those fields. `coaching_source`
+labels cached/generated/deterministic/fallback prose; `data_quality` carries
+coverage dates, refresh guidance, and missing-split notices.
+
+The following JSON shape applies to local table/PDF responses:
+
 A single text content block holding this object. `markdown` is the payload;
 everything else is metadata for the caller's own logic.
 
@@ -239,7 +253,8 @@ everything else is metadata for the caller's own logic.
 | `intent` / `intent_source` | e.g. `"interval"` / `"plan"`, or `"easy"` / `"inferred"`. |
 | `splits_available` | False for the ~88% of history that was backfilled. |
 | `other_activities_on_date` | Present only on a double day, so the other session isn't silently hidden. Each entry is `{activity_id, activity_type, distance_mi, start_time}` — enough to say *which* session went ungraded, which a bare id could not. |
-| `path` | Present unless `format="table"`. |
+| `path` | Local PDF exports only. |
+| `download_url` / `download_expires_in_seconds` | Remote PDF exports only; up to 600 seconds. |
 
 Errors: `no matching activity found` (with the `activity_id` / `date` echoed),
 `malformed date '...'`, `unknown format '...'`, `PDF render failed: ...`.
@@ -341,35 +356,20 @@ table only and not the PDF, `workout_report_card(format="table")`.
   did — so a splits-dependent grade would be unavailable on ~88% of history and
   would quietly mean different things on different rows. The per-sample HR trace
   and the HR-drift line are the same: printed, never graded.
-- **A split-heavy card (6+ splits) renders as 2 PDF pages.** Known layout
-  limitation, not a bug, and it predates the coach read. The card sits right on
-  the page boundary and the read's word count is the swing factor — which is why
-  the 45-words-per-paragraph budget is real rather than cosmetic. Measure any
-  added content with `len(HTML(...).render().pages)` against a 6-split activity
-  before shipping it.
-- **`format="both"` and `format="pdf"` return the same payload** — `markdown` is
-  always included. `format="table"` is the meaningful switch: it drops `path`
-  *and* skips the on-demand HR-trace fetch, which is the only branch of this tool
-  that can touch the network.
-- **The PDF path may call Garmin.** `load_report_card_inputs(hr_trace=True)`
-  resolves ~1700 per-sample HR readings for the one activity being graded and
-  caches them forever in `activity_hr_samples`. Never backfilled — 747
-  activities of detail calls is exactly the shape that trips Garmin's 429. Every
-  failure mode (missing credential, expired token, no HR channel, pre-0.25.0 DB)
-  returns "no samples" and the chart falls back to per-lap; a failed fetch caches
-  nothing.
-- **The coach read is a Claude call and can degrade.** `claude-sonnet-5`,
-  `effort=low`, thinking disabled, 90s timeout, behind a single-entry disk cache
-  keyed on the pure prompt hash **plus `activity_id`** (without the id, a double
-  day with identical names and grades served the first card's read for the
-  second). A generation missing any of the four labelled sections raises, is
-  never cached, and drops to the deterministic `fallback_read` template — the
-  card's grades are unaffected either way, since every letter was computed in
-  Python first.
+- **PDFs use the existing one-page density ladder.** If even the densest
+  layout overflows, the response reports `pages`; it never silently hides it.
+- **`format="both"` and `format="pdf"` return the same payload**, including
+  report text. Default inline returns text plus an HR image without PDF cost.
+- **Only explicit local PDF exports may fetch Garmin's detailed HR trace.**
+  Inline reports and HTTP exports read the local sample cache, then fall back
+  to lap averages. Missing HR yields a report with a clear chart notice.
+- **Generated coaching is opt-in for inline, and local-only.** Local table/PDF
+  exports preserve generation-on-miss for existing warming scripts. A failed
+  generation falls back to computed text and cannot overwrite a stored real read.
 - **WeasyPrint needs native Pango/HarfBuzz.** On macOS: `brew install pango`
   then `export DYLD_LIBRARY_PATH="$(brew --prefix)/lib"` (or put it in `.env`).
   `format="table"` needs none of this.
-- **Output location and theming.** Default is a per-process ephemeral
+- **Local PDF output location and theming.** Default is a per-process ephemeral
   `tempfile.mkdtemp()` directory, auto-opened on macOS and cleaned up at exit;
   `LOCAL_FITNESS_REPORTS_DIR` opts into a persistent one. Styling is the PRESS
   brand theme, deep-merge-overridable via `LOCAL_FITNESS_BRAND_FILE` — only D and
