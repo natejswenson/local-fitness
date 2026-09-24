@@ -66,3 +66,24 @@ The real tool outputs exposed issues absent from the short synthetic fixtures:
   readings under dated headings to remove the repeated date column and separate
   settled comparisons from provisional readings.
 These are presentation corrections, not changes to the grading or plan semantics.
+
+## Follow-up evaluation at `5b6357d`
+The repeated user request resumes this plan. Fresh read-only MCP requests confirm
+the five fixes above, but inspection of the production freshness transition found
+another presentation defect: the footer says all provisional readings are excluded
+from comparisons even when a fresh sync includes today's value and its delta.
+Raw provisional sleep stages also have no comparison to exclude.
+
+Correction: label only the withheld reading as excluded in its table row; keep a
+general may-change note for all provisional readings; show the sync remedy only
+when comparisons actually exclude today's readings. Preserve payloads and the
+existing freshness computation. Cover fresh, stale, raw-only and mixed cases,
+including a real MCP request against fabricated fresh/stale ingest records.
+Inspect fresh/stale previews at 360px and 760px and rerun affected tests, the full
+suite, lint, prompt scorer and an isolated container build/smoke test.
+This follow-up stays local; no remote reads, publication or deployment.
+
+Focused independent review: `/root/freshness_plan_review`. Accepted correction:
+the production builder can set exclusion flags when no reading exists. Show an
+exclusion label/remedy only for a non-null withheld `provisional_today_value`,
+not a flag alone. Include a raw-only case carrying empty excluded metrics.
