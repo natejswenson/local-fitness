@@ -260,8 +260,7 @@ def test_missing_database_and_missing_tables_fail_soft_without_creating_files(tm
 
 
 def test_real_cli_dry_run_reads_digest_facts_and_writes_only_mime(email_db, tmp_path, monkeypatch):
-    import email
-    from email import policy
+    from email import message_from_bytes, policy
 
     from click.testing import CliRunner
 
@@ -274,7 +273,7 @@ def test_real_cli_dry_run_reads_digest_facts_and_writes_only_mime(email_db, tmp_
     out = tmp_path / "digest.eml"
     result = CliRunner().invoke(cli.main, ["brief-email", "--date", "2025-12-31", "--no-pull", "--no-generate", "--dry-run", str(out)])
     assert result.exit_code == 0, result.output
-    parsed = email.message_from_bytes(out.read_bytes(), policy=policy.default)
+    parsed = message_from_bytes(out.read_bytes(), policy=policy.default)
     text = parsed.get_body(preferencelist=("plain",)).get_content()
     assert "2.0 mi walked." in text and "12,345" in text
     assert "Tomorrow · Jan 01" in text
@@ -294,3 +293,19 @@ def test_critical_context_survives_the_total_budget_on_a_dense_double_day():
     assert digest.insight == email_digest.BRIEF_CUE
     assert digest.tomorrow == ("2 sessions planned.",)
     assert len(email_render.build_text(digest).split()) <= 80
+
+
+def test_email_input_loading_does_not_import_the_agent_tool_runtime(tmp_path):
+    import subprocess
+    import sys
+
+    result = subprocess.run([
+        sys.executable, "-c",
+        "import sys; from pathlib import Path; "
+        "from local_fitness.agent.email_digest import load_inputs; "
+        "load_inputs('2026-09-24', Path(sys.argv[1])); "
+        "assert 'local_fitness.agent.tools' not in sys.modules; "
+        "assert 'claude_agent_sdk' not in sys.modules",
+        str(tmp_path / "missing.db"),
+    ], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

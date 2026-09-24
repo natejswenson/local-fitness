@@ -927,6 +927,8 @@ These are settled — don't redesign without a reason.
   send, and do the bytes have to pass through a model turn?
   **The evening email has an 80-word budget** (0.67.0). `email_digest.load_inputs`
   reads the brief's date and target+1's plan through a read-only connection;
+  shared sync provenance lives in `db.data_as_of_today`, so email input
+  loading never imports the agent tool runtime (PR #269 CodeQL follow-up).
   `compose` builds one bounded digest for both `email_render.build_html` and
   `build_text`. Actual activity leads, with steps so far, logged workout time,
   last night's sleep, at most one complete takeaway and tomorrow's outline.

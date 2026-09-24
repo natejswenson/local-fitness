@@ -6,9 +6,12 @@ web fonts, markdown, scripts or remote assets are needed to read the message.
 from __future__ import annotations
 
 import html
+from typing import TYPE_CHECKING
 
-from .email_digest import Digest
 from .schemas import Brief
+
+if TYPE_CHECKING:
+    from .email_digest import Digest
 
 EMAIL_MAX_WIDTH_PX = 560
 

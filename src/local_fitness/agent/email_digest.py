@@ -39,8 +39,6 @@ def load_inputs(target: str, db_path: Path | None = None) -> EmailInputs:
     Passing the path explicitly avoids get_db_path's mkdir on fresh clones.
     Archived dates do not reuse a present-day sync as historical provenance.
     """
-    from .tools import data_as_of_today
-
     next_day = (date.fromisoformat(target) + timedelta(days=1)).isoformat()
     result = EmailInputs(historical=target < date.today().isoformat(),
                          distance_unit="mi" if units.display_units() == "miles" else "km")
@@ -66,7 +64,7 @@ def load_inputs(target: str, db_path: Path | None = None) -> EmailInputs:
             except sqlite3.Error:
                 LOG.warning("Evening email plan unavailable", exc_info=True)
             if not result.historical:
-                result.synced_at = data_as_of_today(conn, target)
+                result.synced_at = db.data_as_of_today(conn, target)
     except sqlite3.Error:
         LOG.warning("Evening email database unavailable", exc_info=True)
     return result

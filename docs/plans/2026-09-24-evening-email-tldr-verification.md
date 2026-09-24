@@ -14,7 +14,8 @@ from email assembly. The PDF path remains intact. Version: 0.67.0.
 The parent reviewed the final diff against the plan, with particular attention
 to missing totals, sport/effort classification, all date+seq prescriptions,
 source timestamps, escaping, send markers and private data. All tracked fixtures
-are fabricated. No SMTP send, live Garmin pull, merge or deployment was performed.
+are fabricated. At initial draft delivery, no SMTP send, live Garmin pull, merge
+or deployment was performed; see the later preview-send follow-up below.
 
 ## Observed layout
 
@@ -69,3 +70,30 @@ assembly, successful-send/backstop guards, zero versus unavailable metrics,
 incomplete duration/distance totals, cycling/mixed/unknown effort, km units,
 prescribed walks, year rollover, double/many sessions, complete source selection,
 overlong critical prose, hostile markup, missing DB/tables and date mismatch.
+
+
+## PR bot follow-up (2026-09-24)
+
+Reviewed all three inline GitHub Advanced Security comments on PR #269:
+
+- CodeQL alerts 109 and 110: accepted. Moved the shared sync timestamp query
+  and failure-status vocabulary to `db.py`; callers use that one implementation.
+  Email loading no longer imports `agent.tools`, and `email_render` imports its
+  digest type only under `TYPE_CHECKING`. The query and connection reuse are
+  unchanged. A fresh-process regression test proves loading email inputs imports
+  neither the agent tool module nor the Claude SDK.
+- CodeQL alert 108: accepted. The MIME test now consistently uses `from email
+  import ...`, rather than mixing both import styles for the same module.
+
+Validation: 447 focused tests passed; full suite **2,919 passed, 6 skipped**,
+**95.34% coverage**. Ruff, prompt scorer (11/11), diff check, isolated Docker
+build, and a network-disabled container import/render smoke passed. The smoke
+intentionally exercises a missing database and verifies its unavailable-data
+fallback. No presentation or prompt changes were made in this follow-up.
+
+The user explicitly requested one email to inspect in their inbox. Prepared a
+62-word preview from saved local data using the normal renderer and mailer,
+then sent it to the configured recipient. SMTP accepted the message. Its
+subject is prefixed `Preview:`; this direct preview send does not write the
+nightly `.emailed-*` marker. No Garmin pull, regeneration, merge or deployment
+was performed. The private EML and send receipt remain outside Git.

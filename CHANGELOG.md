@@ -21,6 +21,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the extra plan-coach call. The full PDF briefing remains available.
 
 ### Fixed
+- Remove circular email/tool imports by sharing sync provenance in the database
+  layer and keeping the renderer's digest import for type checking only.
 - Email activity summaries distinguish measured walking, running and unknown
   effort, exclude bikes from foot distance, and preserve missing values.
   Tomorrow includes every session or an explicit session count, with a cue to

@@ -639,30 +639,6 @@ SETTLING_METRICS = frozenset({
 })
 
 
-def data_as_of_today(conn, today_iso: str) -> str | None:
-    """``completed_at`` of the newest successful ingest run whose pull REACHED
-    ``today`` — the honest freshness stamp for today's daily_metrics row.
-
-    Coverage-filtered on ``last_date_fetched``: a ZIP backfill or historical
-    pull that completed seconds ago never touched today's row, and counting it
-    would stamp a stale snapshot "fresh" — the exact direction of lie this
-    field exists to prevent. Fail-open ``None`` on any DB problem (fresh
-    clone, no runs yet). Takes the caller's connection — daily_snapshot is on
-    the perf gate's ``db.connect()`` open-count, so this must never open one.
-    """
-    placeholders = ",".join("?" * len(_SYNC_FAILURE_STATUSES))
-    try:
-        row = conn.execute(
-            "SELECT completed_at FROM ingest_runs "
-            f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
-            "AND status != 'in_progress' AND last_date_fetched >= ? "
-            "ORDER BY completed_at DESC LIMIT 1",
-            (*tuple(_SYNC_FAILURE_STATUSES), today_iso),
-        ).fetchone()
-    except sqlite3.Error:
-        return None
-    return row["completed_at"] if row and row["completed_at"] else None
-
 
 def settling_staleness(conn, today_iso: str, now: datetime) -> dict:
     """``{"data_as_of": iso|None, "stale": bool}`` for today's settling rows.
@@ -675,7 +651,7 @@ def settling_staleness(conn, today_iso: str, now: datetime) -> dict:
     A future-dated ``completed_at`` (clock skew) reads as stale, mirroring
     ``_recent_successful_sync``.
     """
-    as_of = data_as_of_today(conn, today_iso)
+    as_of = db.data_as_of_today(conn, today_iso)
     if as_of is None:
         return {"data_as_of": None, "stale": True}
     try:
@@ -1455,15 +1431,6 @@ async def find_anomalies(args: dict) -> dict:
     })
 
 
-# The pull statuses that mean nothing landed and the caller has to act.
-# `partial` is deliberately NOT here: daily.pull reports it whenever any gap
-# remains anywhere back to EARLIEST_BACKFILL_DATE, so a DB with one missing
-# historical day is partial on every sync forever — flagging that as an error
-# told the user their fresh sync had failed.
-_SYNC_FAILURE_STATUSES = frozenset({
-    "auth_failure", "not_configured", "failure", "interrupted",
-})
-
 
 def _sync_state(result: dict, *, recomputed: bool) -> str:
     """One-line plain-English read of a pull that isn't an outright failure.
@@ -1520,7 +1487,7 @@ def _recent_successful_sync(now: datetime) -> datetime | None:
     ten seconds ago is a reason to retry, not to skip. Fail-open on any DB
     problem: a fresh clone with no schema yet must fall through to the real
     pull (which is what creates the data), never error on its guard."""
-    placeholders = ",".join("?" * len(_SYNC_FAILURE_STATUSES))
+    placeholders = ",".join("?" * len(db.SYNC_FAILURE_STATUSES))
     try:
         with db.connect() as conn:
             row = conn.execute(
@@ -1528,7 +1495,7 @@ def _recent_successful_sync(now: datetime) -> datetime | None:
                 f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
                 "AND status != 'in_progress' "
                 "ORDER BY completed_at DESC LIMIT 1",
-                tuple(_SYNC_FAILURE_STATUSES),
+                tuple(db.SYNC_FAILURE_STATUSES),
             ).fetchone()
     except sqlite3.Error:
         return None
@@ -1649,7 +1616,7 @@ async def sync_garmin_data(args: dict) -> dict:
     recomputed = bool(result.get("days_pulled") or result.get("activities_loaded"))
     if recomputed:
         await asyncio.to_thread(baselines_mod.recompute, lookback_days=90)
-    if status in _SYNC_FAILURE_STATUSES:
+    if status in db.SYNC_FAILURE_STATUSES:
         return _err(
             result.get("error") or f"Garmin sync failed ({status})",
             status=status,
@@ -4812,7 +4779,7 @@ def _report_data_quality(conn, card: dict) -> dict:
     """
     today = date.today().isoformat()
     through = db.last_known_daily_date(conn=conn)
-    as_of = data_as_of_today(conn, today)
+    as_of = db.data_as_of_today(conn, today)
     messages = []
     if not as_of:
         messages.append(
