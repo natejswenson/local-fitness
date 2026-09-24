@@ -259,6 +259,23 @@ local-only, see below), **2 prompts**, and **2 resources**.
 with parameters, return shapes, worked examples, and gotchas. The summary below
 is a map; that directory is the documentation.
 
+**Everyday use in Codex:** ask naturally. Daily check-ins and plan views return
+readable Markdown with dates and units; charts and workout reports appear in the
+conversation. PDFs are available when you ask to export one.
+
+| Ask | Result |
+|---|---|
+| “How am I doing today?” | Daily readings with provisional values and data dates labeled |
+| “What's my workout today?” | A compact prescription with pace and HR cap |
+| “Show every session this week” | Plan progress with each session's verdict and shared daily totals |
+| “Sync and grade my latest run” | One sync, then the report and HR chart using the returned activity |
+| “Chart my resting heart rate” | A labeled inline chart that preserves gaps in recorded days |
+
+For integrations: `daily_snapshot`, `get_training_plan_status`, and
+`get_training_plan_progress` now default to Markdown `content` plus the complete
+payload in `structuredContent` on external MCP. Pass `format="json"` to retain
+the previous JSON text response. Internal SDK calls still return JSON text.
+
 - **Prompts**
   - **`coach`** — assembles your full daily snapshot (metrics vs. baseline,
     training load, recent workouts in miles) *and* the coach persona + your
@@ -349,7 +366,10 @@ Two optional scheduled jobs carry the plan to where you already look:
 - **Brief email** (`fitness brief-email`, launchd 19:00 with a 20:00
   backstop) — pulls fresh Garmin data, **regenerates** the brief against the
   full day (by evening the morning brief describes a day that hadn't happened
-  yet), and sends it as a styled HTML email with the chart PNGs inline. Pure
+  yet), and sends a compact PRESS email: actual activity, steps, workout time,
+  main workout score (out of 5), sleep score (out of 100), resting HR,
+  one bounded takeaway and tomorrow's workout outline. HTML and plain text share
+  an 80-word budget; charts and long analysis stay in the full briefing. Pure
   `smtplib` — no model, no connector — with TLS certificate verification
   enforced on both the implicit-TLS (465) and STARTTLS paths. Configure the
   SMTP credentials in `.env`; the enabled state and recipients are managed

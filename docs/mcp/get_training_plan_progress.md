@@ -51,8 +51,22 @@ window ending today, unrelated to the 14/7 one.
 | Name | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `full` | boolean | no | `false` | `true` ⇒ return every workout in the plan instead of the rolling window. Only affects `workouts`. |
+| `format` | string | no | `inline` | External MCP: Markdown plus structured data; `json` retains legacy JSON text. |
 
 ## Returns
+
+External MCP returns readable Markdown in `content` and the complete payload
+below in `structuredContent`. Internal SDK calls and `format="json"` retain
+JSON text. Active responses add `as_of`, `data_through`, and
+`workout_window: {full, start, end}` so the displayed range is explicit.
+The saved `title` identifies the plan; custom plans use an end-date label.
+
+The readable view labels `this_week` as **Trailing 7 days**. Actual distance and
+pace belong to the whole date and repeat in each structured workout on a double
+day; the Markdown shows distance **once per date as a shared day total**. Today's
+total is labeled **So far today**; future dates do not display actual totals. These
+are not allocations to individual sessions. Prescriptions retain their `seq`,
+HR caps, descriptions and computed verdicts.
 
 `{"active": false}` when nothing is active. Otherwise:
 

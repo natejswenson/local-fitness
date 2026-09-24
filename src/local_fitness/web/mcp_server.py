@@ -14,6 +14,7 @@ Design: ``docs/plans/2026-06-16-fitness-mcp-server-design.md``.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -28,10 +29,9 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .. import config, db, notes
-from ..agent import brief_planner, briefs, coach, memory, prompts
+from ..agent import brief_planner, briefs, chat_views, coach, memory, prompts
 from ..agent import tools as agent_tools
 from ..agent.briefs import DEFAULT_BRIEFINGS_DIR
-from ..agent.render import render_table
 from ..agent.schemas import Brief
 from ..agent.status import assemble_status
 
@@ -61,122 +61,8 @@ def _user_name() -> str:
 
 
 def _render_status(status: dict[str, Any]) -> str:
-    """Readable markdown rendering of ``assemble_status()`` for the coach
-    prompt. Snapshot table, training-load read, and recent workouts in miles.
-    The active user notes are NOT rendered here — they're already in the
-    persona (``system_prompt`` injects them via ``render_for_prompt``).
-
-    Rounded through ``agent_tools._round_floats`` first. That helper's own
-    docstring calls it "the ONE choke point every tool payload flows through",
-    but it only ran inside ``_text``/``_err`` — so this renderer, which formats
-    ``assemble_status()`` straight to markdown, bypassed it. The same data
-    therefore reached the model two ways: ``daily_snapshot`` returned
-    ``tsb: -0.08`` while the ``/coach`` prompt printed
-    ``TSB -0.077230305434135``. Raw float64 in a prompt is noise the model has
-    to re-round before it can speak, and it invites a spurious-precision
-    read-back."""
-    status = agent_tools._round_floats(status)
-    lines: list[str] = []
-    lines.append(f"## Daily snapshot — {status.get('date', '')}")
-    lines.append("")
-
-    # Snapshot table of today's metrics — built via the shared render_table so
-    # the brief and the coach snapshot use one table renderer (one look).
-    metrics = status.get("metrics") or []
-    rows: list[list[str]] = []
-    for m in metrics:
-        name = m.get("metric", "")
-        value = m.get("value")
-        # sleep_seconds carries a pre-formatted "7h 33m" shape (units.format_hm,
-        # via status._metric_rows) — use it over the raw seconds int when present.
-        value_str = "—" if value is None else str(m.get("value_formatted") or value)
-        treatment = m.get("treatment")
-        if treatment == "baseline_delta":
-            baseline = m.get("baseline_formatted") or m.get("baseline")
-            delta_pct = m.get("delta_pct")
-            arrow = m.get("arrow") or ""
-            if baseline is not None and delta_pct is not None:
-                read = f"{arrow} {delta_pct:+}% vs baseline {baseline}"
-            elif baseline is not None:
-                read = f"baseline {baseline}"
-            else:
-                read = "no baseline yet"
-        elif treatment == "trend_arrow":
-            arrow = m.get("arrow")
-            read = f"7-day trend {arrow}" if arrow else "trend: too few points"
-        else:
-            read = ""
-        rows.append([name, value_str, read])
-    lines.append(render_table(["Metric", "Value", "Read"], rows))
-    # A table of nothing but dashes is what "no daily_metrics row for today
-    # yet" looks like from here — indistinguishable, without a line saying so,
-    # from a genuinely flat day. assemble_status always emits one row per
-    # DAILY_NUMERIC_METRICS, so all-None values IS the missing-row case.
-    if metrics and all(m.get("value") is None for m in metrics):
-        lines.append("")
-        lines.append(
-            f"No Garmin data for {status.get('date', '')} yet — run "
-            "sync_garmin_data to refresh."
-        )
-    lines.append("")
-
-    # Training-load read. The as_of date rides along because CTL/ATL/TSB come
-    # from the latest baselines row on/before today, which may be days old —
-    # and TSB decays daily even with zero workouts, so an undated read of a
-    # stale row states the wrong freshness with full confidence.
-    tl = status.get("training_load") or {}
-    lines.append("## Training load")
-    as_of = tl.get("as_of")
-    as_of_str = f" (as of {as_of})" if as_of else ""
-    lines.append(
-        f"CTL (fitness): {tl.get('ctl')} · ATL (fatigue): {tl.get('atl')} · "
-        f"TSB (freshness): {tl.get('tsb')}{as_of_str} — "
-        f"{tl.get('interpretation', '')}"
-    )
-    baseline_stale = tl.get("baseline_stale_days")
-    if isinstance(baseline_stale, int) and baseline_stale > 0:
-        lines.append(
-            f"⚠ Training load is {baseline_stale} day(s) stale (newest "
-            f"baselines: {as_of}) — TSB decays daily, so the freshness read "
-            "above is out of date. Run sync_garmin_data to refresh."
-        )
-    lines.append("")
-
-    # Recent workouts (miles / formatted convenience fields from status.py).
-    workouts = status.get("recent_workouts") or []
-    lines.append("## Recent workouts")
-    if not workouts:
-        lines.append("No workouts logged yet.")
-    else:
-        for w in workouts:
-            parts: list[str] = [str(w.get("date", ""))]
-            atype = w.get("activity_name") or w.get("activity_type")
-            if atype:
-                parts.append(str(atype))
-            if w.get("distance_mi") is not None:
-                parts.append(f"{w['distance_mi']} mi")
-            if w.get("duration_formatted"):
-                parts.append(str(w["duration_formatted"]))
-            if w.get("pace_min_per_mi"):
-                parts.append(f"{w['pace_min_per_mi']} /mi")
-            if w.get("avg_hr") is not None:
-                parts.append(f"{w['avg_hr']} bpm avg")
-            lines.append(f"- {' · '.join(parts)}")
-    lines.append("")
-
-    # Brief freshness — surface a failing nightly generation in the coach's
-    # own snapshot (the brief resource already banners it; this covers the
-    # /coach prompt path). Only rendered when there's something to flag.
-    stale_days = status.get("brief_stale_days")
-    if stale_days is not None and stale_days > 0:
-        lines.append(
-            f"⚠ Morning brief is {stale_days} day(s) stale (newest: "
-            f"{status.get('latest_brief_date')}) — the nightly generation has "
-            "likely been failing. Worth mentioning to the runner."
-        )
-        lines.append("")
-
-    return "\n".join(lines)
+    """Share the external snapshot view and its rounding with the coach prompt."""
+    return chat_views.render_snapshot(agent_tools._round_floats(status))
 
 
 def _render_schema_resource() -> str:
@@ -260,7 +146,7 @@ def _coach_prompt(arguments: dict[str, str] | None) -> types.GetPromptResult:
     persona = prompts.system_prompt(
         _user_name(), coach.resolve_coach_profile(),
         memory.render_memory_for_prompt(user_name=_user_name()))
-    snapshot = _render_status(assemble_status())
+    snapshot = _render_status(assemble_status(settling_guard=True))
     text = (
         f"{persona}\n\n"
         f"# Today's data (already retrieved — no tool call needed for this)\n"
@@ -616,6 +502,16 @@ def build_server(extra_tools: list | None = None, *, memory_only: bool = False) 
         token = agent_tools.LOCAL_REPORT_EXPORTS.set(bool(extra_tools))
         try:
             result = await registry[name].handler(arguments)
+            renderer = chat_views.RENDERERS.get(name)
+            if renderer and arguments.get("format") != "json" and not result.get("is_error"):
+                # Only these read tools opt in. Keep the SDK's JSON contract and
+                # all original machine fields; presentation performs no I/O.
+                try:
+                    payload = json.loads(result["content"][0]["text"])
+                    result = {**result, "content": [{"type": "text", "text": renderer(payload)}],
+                              "structuredContent": payload}
+                except (KeyError, ValueError, TypeError):
+                    _LOG.warning("chat view unavailable for %s; preserving JSON", name, exc_info=True)
             return types.CallToolResult.model_validate({
                 **{k: v for k, v in result.items() if k != "is_error"},
                 "isError": result.get("is_error", False),

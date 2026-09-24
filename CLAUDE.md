@@ -413,6 +413,23 @@ today", "how's my training load", "what did I run last week"):
   Inline PNGs from `chart`, `plan_chart`, or a workout report should be shown
   with their captions. For ASCII output, paste the full chart in a fenced code
   block. A chart left only in the tool call forces the user to expand it.
+- **Chat views preserve the facts and their dates (0.66.0).** External MCP
+  `daily_snapshot`, `get_training_plan_status`, and `get_training_plan_progress`
+  return Markdown plus the complete original payload in `structuredContent`.
+  `format="json"` preserves JSON text; internal SDK handlers keep that contract.
+  `agent/chat_views.py` is pure presentation with no DB/model/network work.
+  Snapshot comparisons excluded from today are dated yesterday; current form
+  uses `current_form_date`, never the pipeline's `as_of`.
+  Fresh provisional values can carry comparisons: only a non-null withheld
+  `provisional_today_value` gets an exclusion label and sync remedy. Raw-only
+  provisional readings carry the may-change note, never a blanket exclusion claim.
+  Plan views state the data frontier and effective window. Progress's actuals are
+  shared DAY totals,
+  repeated per prescription in the payload: display them once per date, never
+  label them per-session actuals. `this_week` means trailing seven days. Status
+  contains one session; use progress for every session on a double day.
+  Reuse returned data within the turn, sync once when freshness matters, and
+  route a saved-brief request to `fitness://brief/latest` without regenerating it.
 - This is advice, not an enforced gate — but with a tool that exists for the
   job, there's no reason to query the DB by hand.
 
@@ -893,8 +910,8 @@ These are settled — don't redesign without a reason.
   model in it** (0.51.0). `fitness brief-email` (launchd
   `com.localfitness.briefmail`, 19:00 + 20:00 backstop) pulls Garmin,
   recomputes baselines, **regenerates the brief — overwriting
-  `briefings/<today>.json`** — and sends it as a PRESS-styled HTML email with
-  the chart PNGs attached inline. The overwrite is deliberate: by 19:00 the
+  `briefings/<today>.json`** — and sends a compact PRESS fitness TL;DR.
+  The overwrite is deliberate: by 19:00 the
   day's training is in the data and the morning brief describes a day that hadn't
   happened. It does **not** double-journal — `reflect` keys on
   `("brief", <date>)` behind a `journal.has_event` pre-check.
@@ -908,20 +925,39 @@ These are settled — don't redesign without a reason.
   PNGs into the MIME tree as CID parts at full fidelity. Before proposing an
   MCP connector for any *scheduled* delivery, check both: does it actually
   send, and do the bytes have to pass through a model turn?
-  `agent/email_render.py` (pure) + `agent/mailer.py` (I/O) is the usual
-  divider. **`email_render` is a SIBLING of `visuals._build_html`, never a
-  reuse**: Gmail strips `<style>` and `@font-face` and refuses `data:` URIs, so
-  every rule rides an inline `style=` attribute — including on the markdown
-  library's output, which arrives unstyled and is rewritten by
-  `_style_fragment`. Each of those three failures is *silent* (correct in a
-  browser preview, broken in the inbox), which is why they are the hardest-
-  guarded cases in `tests/test_email_render.py`. There is **no density ladder**:
-  a page is a fixed budget, an email scrolls, so nothing is ever truncated —
-  the one place the email is deliberately more complete than the PDF. Chart
-  naming has ONE definition (`email_render.chart_cid`) used by both the
-  `src="cid:…"` and the `Content-ID` header;
-  `test_every_cid_reference_resolves_to_an_attached_image` is what keeps a
-  reference from pointing at nothing. Config is provider-agnostic with Gmail
+  **The evening email has an 80-word budget** (0.67.0). `email_digest.load_inputs`
+  reads the brief's date and target+1's plan through a read-only connection;
+  shared sync provenance lives in `db.data_as_of_today`, so email input
+  loading never imports the agent tool runtime (PR #269 CodeQL follow-up).
+  `compose` builds one bounded digest for both `email_render.build_html` and
+  `build_text`. Actual activity leads, with steps so far, logged workout time,
+  main workout score (/5), sleep score (/100), resting HR (bpm), at most one
+  complete takeaway and tomorrow's outline. Two large activity totals sit above
+  three compact score/recovery metrics. Known-empty workouts show 0m; incomplete
+  durations remain unavailable. The main session is the longest measured run,
+  otherwise the earliest positive-distance/duration on-foot activity. Filter
+  on-foot types BEFORE pace selection. Read saved capped `overall_stars` by
+  activity ID AND date on the existing read-only connection, labelled saved;
+  only today's missing card can use `load_report_card_inputs(hr_trace=False)`
+  and `build_card` for its capped `overall.stars`. No card writes, HR fetch,
+  model call or historical/future regrading; a score failure preserves the
+  other metrics. Saved snapshots are not a claim of grading at the sync time.
+  Missing data is not zero, walking uses measured effort after an on-foot type
+  guard, and no prescription is distinct from prescribed rest. Every tomorrow
+  date+seq is accounted for: up to two complete structured outlines, otherwise
+  an explicit session count. The full-instructions cue is mandatory because rep
+  and recovery details can exist only in the plan description. Critical prose
+  that cannot fit becomes a review cue, never a positive replacement or a
+  mid-sentence fragment. Sync and brief timestamps remain distinct; archived
+  dates do not borrow today's sync. Tests bound all visible copy, not just prose.
+  **Email assembly no longer calls `assemble_brief_render_inputs`**: no charts,
+  chart attachments, extra plan-coach call, markdown details or weekly table.
+  The PDF retains that helper and its full plan/coaching behavior. No prompts
+  changed. `email_render` remains a pure sibling of the PDF renderer, using
+  inline CSS, system fonts and presentation tables with no remote assets.
+  `mailer` retains generic CID support via `email_render.chart_cid`, tested
+  independently, but the nightly digest passes an empty image mapping.
+  Config is provider-agnostic with Gmail
   defaults (`LOCAL_FITNESS_SMTP_*`, `LOCAL_FITNESS_BRIEF_EMAIL_TO/FROM`); only
   the password has no default, and port 465 is implicit TLS while anything else
   upgrades via STARTTLS. **The backstop dedupe is NOT `--if-missing`'s**: a
@@ -1911,10 +1947,11 @@ These are settled — don't redesign without a reason.
   ceiling value bounds the wall clock. That is why the fix has a second half:
   the fallback is fail-soft by design and was therefore **invisible for a
   month**. `assemble_brief_render_inputs` now sets
-  `today["coaching_line_source"]` (`"generated"`/`"fallback"`), `brief-email`
-  echoes it to **stdout** and names a template line in the one existing macOS
-  notification, and `generate_brief_report`'s payload carries it for the stdio
-  path. Stdout deliberately, not stderr: the WARNING behind every one of those
+  `today["coaching_line_source"]` (`"generated"`/`"fallback"`), and
+  `generate_brief_report`'s payload carries it for the stdio path. The email
+  reported it on stdout and in its macOS notification until 0.67.0 removed
+  the plan-coach line from the compact digest altogether. Stdout deliberately,
+  not stderr: the WARNING behind every one of those
   23 nights already went to stderr, into a 154 KB launchd error log nobody
   scans. A signal in the channel that failed is not a signal. A cache hit
   counts as `"generated"` — the distinction that matters is template versus

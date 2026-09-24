@@ -120,9 +120,7 @@ def test_render_status_falls_back_to_raw_value_when_unformatted():
 # --- U6: the snapshot must date its training load and flag a frozen frontier
 
 _STALE_WARNING = (
-    "⚠ Training load is 5 day(s) stale (newest baselines: 2026-07-21) — "
-    "TSB decays daily, so the freshness read above is out of date. "
-    "Run sync_garmin_data to refresh."
+    "Training-load sync is 5 days stale (last updated 2026-07-21). Ask to sync Garmin."
 )
 
 
@@ -141,24 +139,22 @@ def test_render_status_dates_training_load_and_warns_when_baselines_are_stale():
     # A 5-day-old baselines row served undated reads as today's freshness.
     text = mcp_server._render_status(_status_with_load({
         "ctl": 40.0, "atl": 45.0, "tsb": -5.0,
-        "as_of": "2026-07-21", "baseline_stale_days": 5,
+        "as_of": "2026-07-21", "current_form_date": "2026-07-20", "baseline_stale_days": 5,
         "interpretation": "slightly fatigued",
     }))
-    assert (
-        "CTL (fitness): 40.0 · ATL (fatigue): 45.0 · TSB (freshness): -5.0 "
-        "(as of 2026-07-21) — slightly fatigued"
-    ) in text
+    assert "Current form · 2026-07-20 · slightly fatigued" in text
+    assert "| 40 | 45 | -5 |" in text
     assert _STALE_WARNING in text
 
 
 def test_render_status_dates_training_load_without_warning_when_current():
     text = mcp_server._render_status(_status_with_load({
         "ctl": 40.0, "atl": 45.0, "tsb": -5.0,
-        "as_of": "2026-07-26", "baseline_stale_days": 0,
+        "as_of": "2026-07-26", "current_form_date": "2026-07-25", "baseline_stale_days": 0,
         "interpretation": "slightly fatigued",
     }))
-    assert "(as of 2026-07-26)" in text
-    assert "⚠ Training load is" not in text
+    assert "Current form · 2026-07-25" in text
+    assert "Training-load sync is" not in text
     assert "sync_garmin_data" not in text
 
 
@@ -170,12 +166,10 @@ def test_render_status_omits_as_of_and_warning_when_no_baselines_row():
         "as_of": None, "baseline_stale_days": None,
         "interpretation": "no training-load data yet",
     }))
-    assert (
-        "CTL (fitness): None · ATL (fatigue): None · TSB (freshness): None "
-        "— no training-load data yet"
-    ) in text
+    assert "No training-load data yet." in text
+    assert "None" not in text
     assert "as of" not in text
-    assert "⚠ Training load is" not in text
+    assert "Training-load sync is" not in text
 
 
 def test_render_status_explains_an_all_dashes_metrics_table():
@@ -192,7 +186,7 @@ def test_render_status_explains_an_all_dashes_metrics_table():
         ],
     ))
     assert (
-        "No Garmin data for 2026-07-26 yet — run sync_garmin_data to refresh."
+        "No daily readings available. Ask to sync Garmin to get started."
     ) in text
 
 
@@ -445,7 +439,8 @@ def test_tool_call_returns_unwrapped_content():
     result = res.root  # CallToolResult
     assert result.isError is not True
     assert result.content and result.content[0].type == "text"
-    payload = json.loads(result.content[0].text)
+    payload = result.structuredContent
+    assert result.content[0].text.startswith("## Daily snapshot")
     # daily_snapshot delegates to
     # status.assemble_status(); "recent_days" doesn't exist on that shape
     # anymore. "training_load" is a key assemble_status() always guarantees

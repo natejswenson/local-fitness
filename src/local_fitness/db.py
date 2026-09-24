@@ -453,6 +453,41 @@ def init_schema(db_path: Path | None = None) -> None:
                 "degrades to substring search")
 
 
+# The pull statuses that mean nothing landed and the caller has to act.
+# `partial` is deliberately NOT here: daily.pull reports it whenever any gap
+# remains anywhere back to EARLIEST_BACKFILL_DATE, so a DB with one missing
+# historical day is partial on every sync forever — flagging that as an error
+# told the user their fresh sync had failed.
+SYNC_FAILURE_STATUSES = frozenset({
+    "auth_failure", "not_configured", "failure", "interrupted",
+})
+
+
+def data_as_of_today(conn, today_iso: str) -> str | None:
+    """``completed_at`` of the newest successful ingest run whose pull REACHED
+    ``today`` — the honest freshness stamp for today's daily_metrics row.
+
+    Coverage-filtered on ``last_date_fetched``: a ZIP backfill or historical
+    pull that completed seconds ago never touched today's row, and counting it
+    would stamp a stale snapshot "fresh" — the exact direction of lie this
+    field exists to prevent. Fail-open ``None`` on any DB problem (fresh
+    clone, no runs yet). Takes the caller's connection — daily_snapshot is on
+    the perf gate's ``db.connect()`` open-count, so this must never open one.
+    """
+    placeholders = ",".join("?" * len(SYNC_FAILURE_STATUSES))
+    try:
+        row = conn.execute(
+            "SELECT completed_at FROM ingest_runs "
+            f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
+            "AND status != 'in_progress' AND last_date_fetched >= ? "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (*tuple(SYNC_FAILURE_STATUSES), today_iso),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row["completed_at"] if row and row["completed_at"] else None
+
+
 def last_known_daily_date(
     db_path: Path | None = None, conn: sqlite3.Connection | None = None
 ) -> str | None:

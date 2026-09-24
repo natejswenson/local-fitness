@@ -11,6 +11,59 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.67.0] - 2026-09-24
+
+### Changed
+- Evening email becomes a compact PRESS fitness TL;DR with an 80-word budget:
+  actual activity, steps, workout time, main workout score, sleep score,
+  resting HR, one takeaway and tomorrow's workout
+  outline. HTML and plain text carry identical facts and qualifications.
+- Emphasize activity totals above a compact score/recovery row. Reuse saved
+  workout ratings with a saved label, or calculate today's missing rating with
+  the existing local grader; historical missing scores stay unavailable.
+- Remove email charts, markdown deep dives, weekly tables, social byline and
+  the extra plan-coach call. The full PDF briefing remains available.
+
+### Fixed
+- Remove circular email/tool imports by sharing sync provenance in the database
+  layer and keeping the renderer's digest import for type checking only.
+- Email activity summaries distinguish measured walking, running and unknown
+  effort, exclude bikes from foot distance, and preserve missing values.
+  Tomorrow includes every session or an explicit session count, with a cue to
+  full instructions. Old-day previews identify archived data and the current
+  saved plan; sync and briefing generation times stay distinct.
+- Inline styles, fixed-layout presentation tables and safe escaped text keep
+  the compact email readable on narrow screens without external images/fonts.
+
+## [0.66.0] - 2026-09-24
+
+### Added
+- Daily check-ins and active-plan views return readable Markdown plus complete
+  structured data in Codex and other MCP clients. `format="json"` retains the
+  previous text envelope; internal SDK calls remain JSON. Plan responses carry
+  the data frontier and displayed window, and label shared daily actuals once
+  per date on double days.
+
+### Fixed
+- Live usage follow-up: custom plans use an end-date label and their saved title;
+  today's full instructions survive the status summary; walking classifications
+  stay visible beside activity names; future sessions no longer show zero actuals.
+  Snapshot tables group readings by date for easier reading in narrow chat columns.
+- Snapshot exclusion labels apply only to withheld readings. Freshly synced values
+  keep their comparisons without contradictory exclusion text or a redundant sync
+  suggestion; provisional readings without comparisons retain the may-change note.
+- Snapshot presentation dates yesterday's comparisons separately from today's
+  provisional readings, and dates training load by its last complete day rather
+  than the pipeline timestamp. Empty views give a next step instead of null tables.
+- Metric charts include readable titles and date ranges, preserve gaps and real
+  calendar spacing, display isolated readings, and label both ends of the window.
+
+### Changed
+- Conversation guidance favors the smallest useful lookup, reuses returned data,
+  and forwards images into the reply. Saved briefs use the existing resource;
+  workout PDFs remain explicit exports. No added model, Garmin or database reads
+  are required to produce the new chat views.
+
 ## [0.65.1] - 2026-09-14
 
 ### Fixed

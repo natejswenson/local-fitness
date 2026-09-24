@@ -2758,7 +2758,7 @@ def test_chart_png_render_failure_is_error(seeded, monkeypatch):
 
 def test_chart_png_response_carries_inline_image_block(seeded, reports_tmp):
     # Fix A (2026-07-10 doc): the response gains a SECOND content block —
-    # an image, base64-decodable, matching the same PNG bytes written to disk.
+    # an image, base64-decodable, without a local file requirement.
     import base64
 
     result = asyncio.run(
@@ -2774,7 +2774,8 @@ def test_chart_png_response_carries_inline_image_block(seeded, reports_tmp):
     decoded = base64.b64decode(image["data"])
     assert decoded[:8] == b"\x89PNG\r\n\x1a\n"
     assert "path" not in result["structuredContent"]
-    assert "rhr" in content[0]["text"]
+    assert "Resting heart rate" in content[0]["text"]
+    assert result["structuredContent"]["metric"] == "rhr"
     assert list(reports_tmp[0].glob("*.png")) == []
 
 

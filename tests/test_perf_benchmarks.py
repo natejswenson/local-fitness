@@ -337,7 +337,7 @@ def test_get_training_plan_progress_does_not_double_classify(default_db, monkeyp
 def test_get_training_plan_progress_rounds_without_a_call_per_node(default_db, monkeypatch):
     """`_round_floats` recursed into every leaf, so serializing this payload
     cost one Python call per node: 470 for 10 KB. The container branches now
-    handle their own scalar children, leaving one call per dict/list (85
+    handle their own scalar children, leaving one call per dict/list (86
     here, with the clock pinned to `_TODAY` + 58d — see `_freeze_progress_clock`
     for why an unpinned clock makes this count grow with wall-clock date).
 
@@ -350,11 +350,13 @@ def test_get_training_plan_progress_rounds_without_a_call_per_node(default_db, m
     83 before #242 r3; the +2 is the fixture change that fix required
     (`perf_fixture._tempo_plan_dates` stamping a measured pace on 5 tempo-day
     activities), not drift — see
-    ``test_get_training_plan_progress_does_not_double_classify``."""
+    ``test_get_training_plan_progress_does_not_double_classify``.
+    0.66.0 adds one container for explicit workout_window metadata (85 → 86);
+    its date strings and boolean add no leaf calls or database work."""
     _freeze_progress_clock(monkeypatch, _TODAY + timedelta(days=58))
     counts = _count_calls(monkeypatch, tools, "_round_floats")
     _run(tools.get_training_plan_progress.handler({}))
-    assert counts["n"] == 85
+    assert counts["n"] == 86
 
 
 # --- equivalence oracles: the work went away, the answers did not -----------
