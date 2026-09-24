@@ -241,7 +241,7 @@ def _emailed_marker(target: Date) -> Path:
 def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
                 if_unsent: bool, dry_run: Path | None, to: str | None,
                 no_notify: bool):
-    """Pull, regenerate today's brief, and email it as a PRESS-styled report.
+    """Pull, regenerate today's brief, and email a compact fitness TL;DR.
 
     The evening counterpart to `brief`. Regenerating is the default and it
     deliberately OVERWRITES `briefings/<today>.json`: the 19:00 brief sees a
@@ -251,13 +251,10 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
     not journal the day twice — `reflect` keys on `("brief", <date>)` and
     pre-checks `journal.has_event`.
     """
-    import asyncio
-
     # Imported as app_config: this module defines a click GROUP named `config`
     # at module scope, which shadows the package's config module.
     from . import config as app_config
-    from .agent import branding, briefs, email_render, mailer
-    from .agent import tools as agent_tools
+    from .agent import branding, briefs, email_digest, email_render, mailer
     from .agent.schemas import Brief
 
     target = Date.fromisoformat(target_date) if target_date else Date.today()
@@ -299,25 +296,13 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
         sys.exit(1)
     brief = Brief.model_validate_json(brief_path.read_text(encoding="utf-8"))
 
-    charts, plan_section = asyncio.run(
-        agent_tools.assemble_brief_render_inputs(brief, target.isoformat()))
+    if brief.date != target.isoformat():
+        raise click.ClickException("Saved brief date does not match the requested date.")
 
-    # STDOUT, deliberately — not err=True. The WARNING behind a fallback
-    # already goes to stderr, and it fired 23 nights running into a 154 KB
-    # launchd error log nobody scans (#241). This lands in the 4 KB
-    # one-line-a-night out log instead, and prints on --dry-run too. Nothing
-    # at all when there is no plan section, or when an older payload carries
-    # no source key. ``coaching_line_source()`` is the one accessor for this
-    # field — shared with generate_brief_report so the same optional-field
-    # guard isn't written twice (#241, f-1f6a8ae5).
-    line_source = agent_tools.coaching_line_source(plan_section)
-    if line_source is not None:
-        click.echo(f"Coaching line: {line_source}")
-
+    digest = email_digest.compose(brief, email_digest.load_inputs(target.isoformat()))
     theme = branding.load_theme()
-    html_body = email_render.build_html(
-        brief, {int(k) for k in charts}, plan_section, theme)
-    text_body = email_render.build_text(brief, plan_section)
+    html_body = email_render.build_html(digest, theme)
+    text_body = email_render.build_text(digest)
     subject = email_render.subject_for(brief)
 
     if dry_run is not None:
@@ -329,14 +314,14 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
             click.echo(f"  ⚠ {e}", err=True)
             sys.exit(2)
 
-    msg = mailer.build_message(subject, html_body, text_body, charts, cfg)
+    msg = mailer.build_message(subject, html_body, text_body, {}, cfg)
 
     if dry_run is not None:
         dry_run.parent.mkdir(parents=True, exist_ok=True)
         dry_run.write_bytes(msg.as_bytes())
         click.echo(
             f"Dry run — wrote {dry_run} "
-            f"({len(charts)} chart(s), {len(html_body)} chars of HTML). "
+            f"({len(text_body.split())} words, {len(html_body)} chars of HTML). "
             "Nothing was sent."
         )
         return
@@ -352,13 +337,7 @@ def brief_email(target_date: str | None, no_pull: bool, no_generate: bool,
     _emailed_marker(target).write_text(msg["Message-ID"] or "", encoding="utf-8")
     click.echo(f"Emailed {subject} to {', '.join(cfg.to)}")
     if not no_notify:
-        # Folded into the ONE existing notification rather than firing a
-        # second: a template line is not a failure, it is a fact about the
-        # email that just shipped, and this is the channel that reaches a human
-        # the same evening.
-        suffix = (" (coaching line: TEMPLATE)"
-                  if line_source == "fallback" else "")
-        _notify(f"Evening brief emailed{suffix}")
+        _notify("Evening brief emailed")
 
 
 @main.command(name="plan-calendar")

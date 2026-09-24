@@ -11,6 +11,30 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.67.0] - 2026-09-24
+
+### Changed
+- Evening email becomes a compact PRESS fitness TL;DR with an 80-word budget:
+  actual activity, steps, workout time, main workout score, sleep score,
+  resting HR, one takeaway and tomorrow's workout
+  outline. HTML and plain text carry identical facts and qualifications.
+- Emphasize activity totals above a compact score/recovery row. Reuse saved
+  workout ratings with a saved label, or calculate today's missing rating with
+  the existing local grader; historical missing scores stay unavailable.
+- Remove email charts, markdown deep dives, weekly tables, social byline and
+  the extra plan-coach call. The full PDF briefing remains available.
+
+### Fixed
+- Remove circular email/tool imports by sharing sync provenance in the database
+  layer and keeping the renderer's digest import for type checking only.
+- Email activity summaries distinguish measured walking, running and unknown
+  effort, exclude bikes from foot distance, and preserve missing values.
+  Tomorrow includes every session or an explicit session count, with a cue to
+  full instructions. Old-day previews identify archived data and the current
+  saved plan; sync and briefing generation times stay distinct.
+- Inline styles, fixed-layout presentation tables and safe escaped text keep
+  the compact email readable on narrow screens without external images/fonts.
+
 ## [0.66.0] - 2026-09-24
 
 ### Added

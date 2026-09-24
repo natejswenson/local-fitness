@@ -639,30 +639,6 @@ SETTLING_METRICS = frozenset({
 })
 
 
-def data_as_of_today(conn, today_iso: str) -> str | None:
-    """``completed_at`` of the newest successful ingest run whose pull REACHED
-    ``today`` — the honest freshness stamp for today's daily_metrics row.
-
-    Coverage-filtered on ``last_date_fetched``: a ZIP backfill or historical
-    pull that completed seconds ago never touched today's row, and counting it
-    would stamp a stale snapshot "fresh" — the exact direction of lie this
-    field exists to prevent. Fail-open ``None`` on any DB problem (fresh
-    clone, no runs yet). Takes the caller's connection — daily_snapshot is on
-    the perf gate's ``db.connect()`` open-count, so this must never open one.
-    """
-    placeholders = ",".join("?" * len(_SYNC_FAILURE_STATUSES))
-    try:
-        row = conn.execute(
-            "SELECT completed_at FROM ingest_runs "
-            f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
-            "AND status != 'in_progress' AND last_date_fetched >= ? "
-            "ORDER BY completed_at DESC LIMIT 1",
-            (*tuple(_SYNC_FAILURE_STATUSES), today_iso),
-        ).fetchone()
-    except sqlite3.Error:
-        return None
-    return row["completed_at"] if row and row["completed_at"] else None
-
 
 def settling_staleness(conn, today_iso: str, now: datetime) -> dict:
     """``{"data_as_of": iso|None, "stale": bool}`` for today's settling rows.
@@ -675,7 +651,7 @@ def settling_staleness(conn, today_iso: str, now: datetime) -> dict:
     A future-dated ``completed_at`` (clock skew) reads as stale, mirroring
     ``_recent_successful_sync``.
     """
-    as_of = data_as_of_today(conn, today_iso)
+    as_of = db.data_as_of_today(conn, today_iso)
     if as_of is None:
         return {"data_as_of": None, "stale": True}
     try:
@@ -1455,15 +1431,6 @@ async def find_anomalies(args: dict) -> dict:
     })
 
 
-# The pull statuses that mean nothing landed and the caller has to act.
-# `partial` is deliberately NOT here: daily.pull reports it whenever any gap
-# remains anywhere back to EARLIEST_BACKFILL_DATE, so a DB with one missing
-# historical day is partial on every sync forever — flagging that as an error
-# told the user their fresh sync had failed.
-_SYNC_FAILURE_STATUSES = frozenset({
-    "auth_failure", "not_configured", "failure", "interrupted",
-})
-
 
 def _sync_state(result: dict, *, recomputed: bool) -> str:
     """One-line plain-English read of a pull that isn't an outright failure.
@@ -1520,7 +1487,7 @@ def _recent_successful_sync(now: datetime) -> datetime | None:
     ten seconds ago is a reason to retry, not to skip. Fail-open on any DB
     problem: a fresh clone with no schema yet must fall through to the real
     pull (which is what creates the data), never error on its guard."""
-    placeholders = ",".join("?" * len(_SYNC_FAILURE_STATUSES))
+    placeholders = ",".join("?" * len(db.SYNC_FAILURE_STATUSES))
     try:
         with db.connect() as conn:
             row = conn.execute(
@@ -1528,7 +1495,7 @@ def _recent_successful_sync(now: datetime) -> datetime | None:
                 f"WHERE completed_at IS NOT NULL AND status NOT IN ({placeholders}) "
                 "AND status != 'in_progress' "
                 "ORDER BY completed_at DESC LIMIT 1",
-                tuple(_SYNC_FAILURE_STATUSES),
+                tuple(db.SYNC_FAILURE_STATUSES),
             ).fetchone()
     except sqlite3.Error:
         return None
@@ -1649,7 +1616,7 @@ async def sync_garmin_data(args: dict) -> dict:
     recomputed = bool(result.get("days_pulled") or result.get("activities_loaded"))
     if recomputed:
         await asyncio.to_thread(baselines_mod.recompute, lookback_days=90)
-    if status in _SYNC_FAILURE_STATUSES:
+    if status in db.SYNC_FAILURE_STATUSES:
         return _err(
             result.get("error") or f"Garmin sync failed ({status})",
             status=status,
@@ -4475,15 +4442,11 @@ def _build_plan_section(target_date: str) -> dict | None:
 
 
 def coaching_line_source(plan_section: dict | None) -> str | None:
-    """The single accessor for ``plan_section["today"]["coaching_line_source"]``
-    (#241, f-1f6a8ae5) — tolerates a missing section and a missing ``"today"``,
-    so both ``generate_brief_report`` and ``cli.brief_email`` read the field
-    through one guard instead of two independent copies of the same
-    truthiness check. ``assemble_brief_render_inputs``'s own docstring is what
-    this rule generalizes: "Two copies would drift silently, and the
-    divergence would only be visible to someone holding both artifacts side
-    by side" — that was true of the section-building logic, and it is
-    equally true of reading one optional field back out of it."""
+    """Read PDF coaching provenance, tolerating absent/older plan payloads.
+
+    Originally shared with the evening email (#241); the compact email has
+    no generated plan-coach line as of 0.67.0.
+    """
     if not plan_section:
         return None
     today = plan_section.get("today")
@@ -4497,14 +4460,9 @@ async def assemble_brief_render_inputs(
 ) -> tuple[dict[str, bytes], dict | None]:
     """Chart PNGs + the resolved Training Plan section for one saved brief.
 
-    Extracted from ``generate_brief_report`` so the PDF and the evening email
-    (``cli.brief_email``) build their render inputs from ONE implementation.
-    They target different renderers, but "which takeaways get a chart", "what
-    window does that chart cover" and "what does the plan section say" are
-    properties of the brief, not of the output format. Two copies would drift
-    silently, and the divergence would only be visible to someone holding both
-    artifacts side by side.
-
+    Originally shared by the PDF and evening email. Since 0.67.0 the email
+    uses ``email_digest`` and does not render charts or generate a coaching
+    line; this remains the PDF's full render-input path.
     Returns ``(charts_by_index, plan_section)``. ``charts_by_index`` is keyed by
     ``str(index)`` over ``enumerate(brief.takeaways)`` — NOT by metric name (two
     takeaways can cite the same metric). ``plan_section`` is None when there is
@@ -4515,18 +4473,17 @@ async def assemble_brief_render_inputs(
     ``coaching_line_source()`` above, not by indexing ``plan_section`` directly.
 
     ``coaching_line_source`` is diagnostic metadata about HOW the line was
-    produced, not part of what either renderer draws (#241, f-32b8f4da) — a
+    produced, not part of what the PDF renderer draws (#241, f-32b8f4da) — a
     caller that hashes ``plan_section`` wholesale to name an output file (see
     ``generate_brief_report``'s ``_render_tag`` call) MUST strip this key
     first, or a field the page never shows would silently move a
     content-addressed filename. It is left on the returned dict rather than
-    returned as a third tuple element only because the email path
-    (``cli.brief_email``) wants it alongside the rest of the section, not as
-    a fourth thing to thread through.
+    returned as a third tuple element for compatibility with existing PDF
+    callers; the compact evening email does not consume this payload.
 
     Best-effort throughout, and deliberately so: a chart that will not render is
     skipped, a malformed plan section becomes None, and a failed coaching-line
-    generation falls back to the deterministic template. Both callers are
+    generation falls back to the deterministic template. The caller is
     enriching a brief that is already saved and already correct, so nothing here
     may take that brief down with it.
     """
@@ -4822,7 +4779,7 @@ def _report_data_quality(conn, card: dict) -> dict:
     """
     today = date.today().isoformat()
     through = db.last_known_daily_date(conn=conn)
-    as_of = data_as_of_today(conn, today)
+    as_of = db.data_as_of_today(conn, today)
     messages = []
     if not as_of:
         messages.append(
