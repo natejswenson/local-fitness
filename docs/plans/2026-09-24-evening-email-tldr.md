@@ -90,3 +90,35 @@ Independent reviewer: `/root/email_plan_review`, read-only local review.
   The earlier 433 px width was browser zoom, not a layout overflow.
 
 No unresolved blockers. These corrections are part of the committed scope.
+
+## Five-metric refinement (user request, September 24)
+The user now requires steps, workout time, workout score, sleep score and
+resting HR, and explicitly requests another real preview email. Replace sleep
+duration with the Garmin sleep score, retain daily sync provenance, and use
+two large activity metrics above three smaller score/recovery metrics. Keep
+the existing 80-word budget and tomorrow's workout.
+
+Workout score means the main on-foot session's existing continuous 1–5 report
+card score, labelled "Main workout score"; it is not a new daily aggregate.
+Select the longest measured running effort, otherwise the earliest on-foot
+session with positive distance and duration, matching the report-card date
+selection convention while excluding bikes/strength. Prefer the stored score
+for that activity/date. When a current-day card does not exist, use the existing
+deterministic card builder with local inputs and hr_trace=False. Do not generate
+coaching, fetch Garmin, save cards, or recompute unrecorded historical scores.
+Absent/ungradeable metrics remain unavailable, never a zero rating.
+
+Verify five-metric HTML/plain-text parity, source/date selection, saved-score
+precedence, missing values and scoring failure isolation; inspect all-populated
+and missing-data previews at 320/390 px and desktop. Send one new preview to
+the existing configured recipient through the SMTP transport after inspection,
+without changing the nightly sent marker. Run required checks and update PR #269.
+
+Focused independent review: `/root/email_plan_review`. Accepted: label cached
+ratings as saved snapshots, read capped overall_stars by activity ID AND date
+on the existing read-only connection, and guard on-foot types before pace
+selection. Derive scores only when target == today, never future or historical
+dates. Pass the builder's explicit supported inputs (not the loader's auxiliary
+keys). Verify the real SQLite→loader→builder path leaves the database unchanged,
+and failures in scoring preserve the other metrics. Known-empty workouts show
+0m, while unknown/incomplete durations stay unavailable. No unresolved blockers.
