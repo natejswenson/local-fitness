@@ -23,18 +23,23 @@ Which one do I call?
 
 ## Parameters
 
-Takes no parameters.
+Optional `format`: `"inline"` (default) or `"json"` for legacy JSON text.
 
 ## Returns
 
-`assemble_status()` (`src/local_fitness/agent/status.py`) builds the payload.
-Seven top-level keys:
+External MCP returns a readable Markdown snapshot in `content` and the complete
+payload below in `structuredContent`. `format="json"` and internal SDK calls
+retain the original JSON text envelope. The readable view labels partial and
+provisional readings, dates yesterday's comparisons, and omits saved preferences
+from the visible text (they remain in the structured payload).
+
+`assemble_status()` (`src/local_fitness/agent/status.py`) builds the payload:
 
 | Key | Meaning |
 |---|---|
 | `date` | ISO date the snapshot is anchored to (wall-clock today for the tool). |
 | `metrics` | One row per metric in `DAILY_NUMERIC_METRICS` (18 rows), sorted alphabetically. Always all 18 — `value` is `null` when the day has no reading. |
-| `training_load` | `ctl` / `atl` / `tsb` from the latest `baselines` row on or before `date`, plus a plain-English `interpretation`. |
+| `training_load` | `ctl` / `atl` / `tsb` from the last complete day, dated by `current_form_date`, plus a plain-English `interpretation`. `as_of` dates the pipeline; today's projection is separate. |
 | `recent_workouts` | The last 5 activities (`date DESC, start_time DESC`), raw columns plus mile/formatted convenience fields. |
 | `user_notes` | The saved coaching notes as a list of strings (`data/user_notes.md`), newest-first — same ranking as [`list_user_notes`](list_user_notes.md) and the system prompt's notes section, so no two of the three model-facing surfaces disagree about which note is newest. |
 | `latest_brief_date` | ISO date of the newest file in the briefings dir, or `null` when none exist. |

@@ -26,9 +26,17 @@ still means "no active plan", not "no plan exists".
 
 ## Parameters
 
-Takes no parameters.
+Optional `format`: `"inline"` (default) or `"json"` for legacy JSON text.
 
 ## Returns
+
+External MCP returns readable Markdown in `content` and the complete payload
+below in `structuredContent`. `format="json"` and internal SDK calls retain
+JSON text. Active responses also carry `as_of` (today) and `data_through` (latest
+daily-data date). A stale frontier is labeled, never treated as missed training.
+
+`today` and `last_graded` each contain **one session**, with its `date` and `seq`.
+For every session on a double day, use `get_training_plan_progress`.
 
 When no plan is active — the whole payload:
 

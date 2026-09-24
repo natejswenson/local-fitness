@@ -24,6 +24,7 @@ import io
 import json
 import logging
 from collections.abc import Callable, Sequence
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -350,17 +351,26 @@ def render_chart_png(
     FigureCanvasAgg(fig)  # explicit non-global canvas attach, never via pyplot
     ax = fig.add_subplot(111)
     ax.set_facecolor(paper)
-    x = np.arange(len(labels))
+    # Calendar spacing is meaningful: two readings ten days apart must not
+    # look adjacent. Keep absent days as gaps rather than interpolating them.
+    ordinals = [date.fromisoformat(d).toordinal() for d in dates]
+    x = np.array([d - ordinals[0] for d in ordinals])
 
     ylo, yhi = value_axis_bounds(values)
 
     if chart_type == "line":
-        ax.plot(x, values, color=ink, linewidth=2)
+        plot_x = np.arange(x[0], x[-1] + 1)
+        readings = dict(zip(x, values, strict=True))
+        plot_y = [readings.get(d, np.nan) for d in plot_x]
+        ax.plot(plot_x, plot_y, color=ink, linewidth=2)
+        # A single reading or an isolated point next to a gap has no segment.
+        # Explicit markers keep it visible at every window length.
+        ax.scatter(x, values, color=ink, s=12, zorder=3)
         # Fill down to the padded axis floor, NOT to y=0 — a single-argument
         # fill_between fills to zero and drags autoscale down with it, which
         # rendered a 48–57bpm resting-HR band as a sliver atop a 0–57 axis
         # (Nate, 2026-07-19: autoscale everything; zero-basing is pointless).
-        ax.fill_between(x, values, ylo, color=ink, alpha=0.06)
+        ax.fill_between(plot_x, plot_y, ylo, color=ink, alpha=0.06)
     elif chart_type == "bar":
         ax.bar(x, values, color=ink)
     elif chart_type == "combo":
@@ -397,8 +407,7 @@ def render_chart_png(
     # rotation was unreadable once the figure became a band — rotated labels
     # eat the height the band exists to save, and there is no room to spend.
     if len(labels) > CHART_X_TICKS:
-        step = max(1, (len(labels) - 1) // (CHART_X_TICKS - 1))
-        idx = list(range(0, len(labels), step))[:CHART_X_TICKS]
+        idx = np.linspace(0, len(labels) - 1, CHART_X_TICKS, dtype=int).tolist()
     else:
         idx = list(range(len(labels)))
     ax.set_xticks(x[idx])

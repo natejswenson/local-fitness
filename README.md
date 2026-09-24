@@ -259,6 +259,23 @@ local-only, see below), **2 prompts**, and **2 resources**.
 with parameters, return shapes, worked examples, and gotchas. The summary below
 is a map; that directory is the documentation.
 
+**Everyday use in Codex:** ask naturally. Daily check-ins and plan views return
+readable Markdown with dates and units; charts and workout reports appear in the
+conversation. PDFs are available when you ask to export one.
+
+| Ask | Result |
+|---|---|
+| “How am I doing today?” | Daily readings with provisional values and data dates labeled |
+| “What's my workout today?” | A compact prescription with pace and HR cap |
+| “Show every session this week” | Plan progress with each session's verdict and shared daily totals |
+| “Sync and grade my latest run” | One sync, then the report and HR chart using the returned activity |
+| “Chart my resting heart rate” | A labeled inline chart that preserves gaps in recorded days |
+
+For integrations: `daily_snapshot`, `get_training_plan_status`, and
+`get_training_plan_progress` now default to Markdown `content` plus the complete
+payload in `structuredContent` on external MCP. Pass `format="json"` to retain
+the previous JSON text response. Internal SDK calls still return JSON text.
+
 - **Prompts**
   - **`coach`** — assembles your full daily snapshot (metrics vs. baseline,
     training load, recent workouts in miles) *and* the coach persona + your

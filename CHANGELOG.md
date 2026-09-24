@@ -11,6 +11,28 @@ All notable changes to local-fitness are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.66.0] - 2026-09-24
+
+### Added
+- Daily check-ins and active-plan views return readable Markdown plus complete
+  structured data in Codex and other MCP clients. `format="json"` retains the
+  previous text envelope; internal SDK calls remain JSON. Plan responses carry
+  the data frontier and displayed window, and label shared daily actuals once
+  per date on double days.
+
+### Fixed
+- Snapshot presentation dates yesterday's comparisons separately from today's
+  provisional readings, and dates training load by its last complete day rather
+  than the pipeline timestamp. Empty views give a next step instead of null tables.
+- Metric charts include readable titles and date ranges, preserve gaps and real
+  calendar spacing, display isolated readings, and label both ends of the window.
+
+### Changed
+- Conversation guidance favors the smallest useful lookup, reuses returned data,
+  and forwards images into the reply. Saved briefs use the existing resource;
+  workout PDFs remain explicit exports. No added model, Garmin or database reads
+  are required to produce the new chat views.
+
 ## [0.65.1] - 2026-09-14
 
 ### Fixed
