@@ -80,7 +80,7 @@ def render_snapshot(payload: dict) -> str:
     yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
     lines = [f"## Daily snapshot · {today}", ""]
     metrics = payload.get("metrics") or []
-    rows = []
+    rows_by_date = defaultdict(list)
     missing = []
     provisional = False
     ordered = sorted(metrics, key=lambda m: (
@@ -96,7 +96,7 @@ def render_snapshot(payload: dict) -> str:
         if baseline is not None:
             context.append(f"usual {metric_value(key, baseline)}")
         if metric.get("delta_pct") is not None:
-            context.append(f"{metric['delta_pct']:+g}%")
+            context.append(f"{metric.get('arrow') or ''} {metric['delta_pct']:+g}%".strip())
         elif metric.get("treatment") == "trend_arrow" and metric.get("arrow"):
             context.append(f"7-day trend {metric['arrow']}")
         if metric.get("partial_today"):
@@ -105,21 +105,25 @@ def render_snapshot(payload: dict) -> str:
             context.append("provisional")
             provisional = True
         if value is not None:
-            rows.append([label, metric_value(key, value), value_date, " · ".join(context) or "—"])
+            rows_by_date[value_date].append([label, metric_value(key, value), " · ".join(context) or "—"])
         else:
             missing.append(f"{label} ({value_date})")
         if metric.get("provisional_today_value") is not None:
-            rows.append([label, metric_value(key, metric["provisional_today_value"]), today,
-                         "provisional · excluded from comparison"])
+            rows_by_date[today].append([label, metric_value(key, metric["provisional_today_value"]),
+                                       "provisional"])
             provisional = True
-    if rows:
-        lines.extend([render_table(["Metric", "Value", "Date", "Context"], rows), ""])
+    if rows_by_date:
+        for day, label in ((yesterday, "Yesterday"), (today, "Today")):
+            if rows_by_date.get(day):
+                lines.extend([f"### {label} · {day}", "",
+                              render_table(["Metric", "Value", "Context"], rows_by_date[day]), ""])
         if missing:
             lines.extend(["Unavailable: " + "; ".join(missing) + ".", ""])
     else:
         lines.extend(["No daily readings available. Ask to sync Garmin to get started.", ""])
     if provisional:
-        lines.extend(["Today's provisional readings may change. Ask to sync Garmin for an updated reading.", ""])
+        lines.extend(["Today's provisional readings may change and are excluded from comparisons. "
+                      "Ask to sync Garmin for an updated reading.", ""])
     if payload.get("data_as_of"):
         lines.extend([f"Last sync covering today: {_plain(payload['data_as_of'])}.", ""])
 
@@ -138,6 +142,8 @@ def render_snapshot(payload: dict) -> str:
     lines.extend(["### Recent workouts", ""])
     for workout in payload.get("recent_workouts") or []:
         parts = [_plain(workout.get("date", "")), _plain(workout.get("activity_name") or workout.get("activity_type") or "Workout")]
+        if workout.get("effort"):
+            parts.append(f"classified as {_plain(workout['effort'])}")
         if workout.get("distance_mi") is not None:
             parts.append(f"{workout['distance_mi']:g} mi")
         elif workout.get("distance_meters") is not None:
@@ -163,9 +169,12 @@ def _plan_intro(payload: dict) -> list[str]:
     if not payload.get("active"):
         lines.extend(["No active training plan.", ""])
     else:
+        if payload.get("title"):
+            lines.extend([f"**{_plain(payload['title'])}**", ""])
         parts = [_plain(payload.get("goal_type") or "Active plan")]
         if payload.get("race_date"):
-            parts.append(f"race {payload['race_date']}")
+            date_label = "ends" if payload.get("goal_type") == "custom" else "race"
+            parts.append(f"{date_label} {payload['race_date']}")
         if payload.get("target_time_formatted"):
             parts.append(f"target {payload['target_time_formatted']}")
         lines.extend([" · ".join(parts), ""])
@@ -202,8 +211,9 @@ def render_plan_status(payload: dict) -> str:
             continue
         lines.extend([f"### {title} · {workout['date']} · session {workout.get('seq') or 1}", "",
                       _prescription(workout) + f" · {_plain(workout.get('verdict') or 'pending')}", ""])
-        if workout.get("description"):
-            lines.extend([_plain(workout['description']), ""])
+        description = workout.get("description_full") or workout.get("description")
+        if description:
+            lines.extend([_plain(description), ""])
     lines.append("This is a single-session summary. Ask for plan progress to see every session, including double days.")
     return "\n".join(lines)
 
@@ -223,7 +233,7 @@ def render_plan_progress(payload: dict) -> str:
         gap = payload.get("goal_gap")
         if gap and gap.get("gap_formatted"):
             lines.extend([f"Projected gap: {gap['gap_formatted']} (positive = slower than goal).", ""])
-    else:
+    elif payload.get("goal_type") != "custom" or payload.get("target_time_formatted"):
         lines.extend(["Projected finish unavailable: no qualifying effort or goal distance.", ""])
     week = payload.get("this_week") or {}
     if week:
@@ -247,8 +257,11 @@ def render_plan_progress(payload: dict) -> str:
             if workout.get("description"):
                 lines.append(f"  {_plain(workout['description'])}")
         actual = _distance(workouts[0], "actual")
-        if actual is not None:
-            lines.extend(["", f"Day total: {actual} on foot (running + walking; shared across sessions)."])
+        today = payload.get("as_of")
+        if actual is not None and (not today or day <= today):
+            label = "So far today" if day == today else "Day total"
+            scope = "running + walking" + ("; shared across sessions" if len(workouts) > 1 else "")
+            lines.extend(["", f"{label}: {actual} on foot ({scope})."])
         lines.append("")
     return "\n".join(lines).rstrip()
 

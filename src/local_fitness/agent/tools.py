@@ -3843,6 +3843,7 @@ async def get_training_plan_status(_args: dict) -> dict:
     status["pending_draft"] = pending_draft
     status["as_of"] = today
     status["data_through"] = frontier
+    status["title"] = active.get("title")
 
     # 2d: pure formatting of data already in hand. (plans.py does import
     # agent.units since 0.35.0 — a pure stdlib leaf, no cycle — so display
@@ -3853,6 +3854,13 @@ async def get_training_plan_status(_args: dict) -> dict:
     for key in ("today", "last_graded"):
         w = status.get(key)
         if w is not None:
+            # Keep the legacy capped description; chat needs the complete
+            # prescription, including any constraints after character 120.
+            # Reuse loaded rows and match both date and session on double days.
+            source = next((row for row in active["workouts"]
+                           if row["date"] == w["date"] and row.get("seq", 1) == w.get("seq", 1)), None)
+            if source and source.get("description"):
+                w["description_full"] = source["description"]
             _augment_plan_workout(w)
             duration_formatted = units.format_duration(w.get("target_duration_sec"))
             if duration_formatted is not None:
@@ -4016,6 +4024,7 @@ async def get_training_plan_progress(args: dict) -> dict:
 
     return _text({
         "active": True,
+        "title": active.get("title"),
         "goal_type": detail.get("goal_type"),
         "as_of": today,
         "data_through": frontier,

@@ -20,11 +20,15 @@ def test_snapshot_dates_each_value_and_never_compares_provisional_today():
                       "as_of": "2026-09-24", "current_form_date": "2026-09-23"})
     before = deepcopy(payload)
     text = chat_views.render_snapshot(payload)
-    assert "| Resting heart rate | 50 bpm | 2026-09-23 | usual 50 bpm · +0% |" in text
-    assert "| Resting heart rate | 54 bpm | 2026-09-24 | provisional · excluded from comparison |" in text
-    assert "| Steps | 0 | 2026-09-23 |" in text
-    assert "| Sleep | 7h 30m | 2026-09-24 | provisional |" in text
-    assert "| Active calories | 0 kcal | 2026-09-24 | partial total |" in text
+    yesterday, today = text.split("### Today · 2026-09-24")
+    assert "### Yesterday · 2026-09-23" in yesterday
+    assert "| Resting heart rate | 50 bpm | usual 50 bpm · +0% |" in yesterday
+    assert "| Resting heart rate | 54 bpm | provisional |" in today
+    assert "| Steps | 0 |" in yesterday
+    assert "| Sleep | 7h 30m | provisional |" in today
+    assert "| Active calories | 0 kcal | partial total |" in today
+    assert "excluded from comparisons" in today
+    assert "| Date |" not in text
     assert "Current form · 2026-09-23" in text
     assert "Current form · 2026-09-24" not in text
     assert payload == before
@@ -109,7 +113,7 @@ def test_progress_displays_daily_actuals_once_on_double_day():
     text = chat_views.render_plan_progress(payload)
     assert "Session 1 · easy · 3 mi · done" in text
     assert "Session 2 · easy · 4 mi · partial" in text
-    assert text.count("Day total: 7 mi") == 1
+    assert text.count("So far today: 7 mi") == 1
     assert "shared across sessions" in text
     assert "Trailing 7 days" in text
     assert "Displayed window: 2026-09-10 to 2026-10-01" in text
@@ -139,3 +143,46 @@ def test_projection_keeps_basis_and_uncertainty_beside_estimate():
     assert "Projected finish: 52:00 · confidence low (estimate)" in text
     assert "Based on 2026-09-01 · 2 mi · 8:00/mi · extrapolation 3.1×" in text
     assert "Projected gap: +2:00 (positive = slower than goal)" in text
+
+
+def test_custom_plan_has_title_and_neutral_end_date_without_inventing_a_race():
+    payload = {"active": True, "goal_type": "custom", "title": "Base building",
+               "race_date": "2026-11-30", "workouts": []}
+    for render in (chat_views.render_plan_status, chat_views.render_plan_progress):
+        text = render(payload)
+        assert "**Base building**" in text
+        assert "custom · ends 2026-11-30" in text
+        assert "race" not in text and "Projected finish unavailable" not in text
+    # Custom-distance races still retain a supplied projection.
+    payload["predicted_finish_formatted"] = "42:00"
+    assert "Projected finish: 42:00" in chat_views.render_plan_progress(payload)
+
+
+def test_status_preserves_full_instructions_as_literal_text():
+    description = "Keep the effort easy. " * 8 + "[Finish](https://invalid) with a cooldown."
+    text = chat_views.render_plan_status({"active": True, "today": {
+        "date": "2026-09-24", "description": description[:120], "description_full": description}})
+    assert "with a cooldown." in text
+    assert "\\[Finish\\]" in text
+    assert text.count("Keep the effort easy.") == 8
+
+
+def test_snapshot_shows_computed_effort_even_when_activity_name_disagrees():
+    text = chat_views.render_snapshot(snapshot(recent_workouts=[{
+        "date": "2026-09-23", "activity_name": "Treadmill Running", "effort": "walk"}],
+        metrics=[{"metric": "rhr", "value": 50, "baseline": 52, "arrow": "↓", "delta_pct": -3.8}]))
+    assert "Treadmill Running · classified as walk" in text
+    assert "↓ -3.8%" in text
+
+
+def test_progress_never_presents_future_zero_as_completed_actuals():
+    payload = {"active": True, "as_of": "2026-09-24", "data_through": "2026-09-24",
+               "workouts": [{"date": day, "type": "easy", "actual_distance_mi": 0,
+                             "verdict": "pending"}
+                            for day in ("2026-09-23", "2026-09-24", "2026-09-25")]}
+    text = chat_views.render_plan_progress(payload)
+    assert "Day total: 0 mi" in text.split("### 2026-09-24")[0]
+    assert "So far today: 0 mi" in text
+    future = text.split("### 2026-09-25")[1]
+    assert "pending" in future and "0 mi" not in future
+    assert "shared across sessions" not in text

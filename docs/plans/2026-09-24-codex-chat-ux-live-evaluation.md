@@ -61,6 +61,8 @@ The real tool outputs exposed issues absent from the short synthetic fixtures:
   Show the existing effort classification beside the original activity name.
 - Progress displays future zero totals as actual activity. Suppress future actuals
   and label today's totals as unfinished; retain all original structured fields.
-- Inspect the crowded date/context snapshot table at narrow width and reduce
-  repeated dates by grouping readings under dated headings if overflow is confirmed.
+- At 360px the snapshot did not overflow, but values/units and dates wrapped across
+  multiple lines and only four distinct metrics fit in the first screen. Group
+  readings under dated headings to remove the repeated date column and separate
+  settled comparisons from provisional readings.
 These are presentation corrections, not changes to the grading or plan semantics.

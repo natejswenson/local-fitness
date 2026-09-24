@@ -21,6 +21,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per date on double days.
 
 ### Fixed
+- Live usage follow-up: custom plans use an end-date label and their saved title;
+  today's full instructions survive the status summary; walking classifications
+  stay visible beside activity names; future sessions no longer show zero actuals.
+  Snapshot tables group readings by date for easier reading in narrow chat columns.
 - Snapshot presentation dates yesterday's comparisons separately from today's
   provisional readings, and dates training load by its last complete day rather
   than the pipeline timestamp. Empty views give a next step instead of null tables.

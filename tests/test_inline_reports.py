@@ -282,9 +282,11 @@ def seed_chat_plan():
     today = date.today()
     workouts = [{"date": (today + timedelta(days=offset)).isoformat(), "week_index": 1,
                  "seq": seq, "type": "easy", "target_distance_m": 5000,
-                 "target_hr_max": 145, "description": "Easy effort"}
+                 "target_hr_max": 145,
+                 "description": f"Session {seq}: " + "Easy effort. " * 12 + "Finish with a cooldown."}
                 for offset, seq in [(-30, 1), (-1, 1), (0, 1), (0, 2), (20, 1)]]
-    plan = plans.insert_draft({"goal_type": "10k", "race_date": (today + timedelta(days=30)).isoformat(),
+    plan = plans.insert_draft({"goal_type": "10k", "title": "Autumn training",
+                              "race_date": (today + timedelta(days=30)).isoformat(),
                               "target_time_seconds": 3000, "created_at": today.isoformat()}, workouts)
     plans.commit_plan(plan, now=today.isoformat())
 
@@ -316,8 +318,24 @@ def test_progress_window_and_full_plan_are_honest_on_wire(remote):
     assert short_data["adherence_pct"] == full_data["adherence_pct"]
     assert "Displayed window:" in default["content"][0]["text"]
     assert "Full plan:" in full["content"][0]["text"]
-    assert default["content"][0]["text"].count("Day total: 6.21 mi") == 2  # yesterday + today, not per session
+    text = default["content"][0]["text"]
+    assert text.count("Day total: 6.21 mi") == 1  # yesterday, not per session
+    assert text.count("So far today: 6.21 mi") == 1
     assert "Session 2" in default["content"][0]["text"]
+
+
+def test_status_retains_full_prescription_without_changing_legacy_description(remote):
+    seed_chat_plan()
+    status = call_remote(remote, "get_training_plan_status")
+    payload = status["structuredContent"]
+    assert payload["title"] == "Autumn training"
+    assert "**Autumn training**" in status["content"][0]["text"]
+    for key in ("today", "last_graded"):
+        workout = payload[key]
+        assert workout["description"] == workout["description_full"][:120]
+        assert workout["description_full"].endswith("Finish with a cooldown.")
+        assert workout["description_full"].startswith(f"Session {workout['seq']}:")
+    assert status["content"][0]["text"].count("Finish with a cooldown.") == 2
 
 
 def test_chat_view_failure_preserves_original_data(remote, monkeypatch):

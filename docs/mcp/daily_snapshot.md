@@ -30,8 +30,10 @@ Optional `format`: `"inline"` (default) or `"json"` for legacy JSON text.
 External MCP returns a readable Markdown snapshot in `content` and the complete
 payload below in `structuredContent`. `format="json"` and internal SDK calls
 retain the original JSON text envelope. The readable view labels partial and
-provisional readings, dates yesterday's comparisons, and omits saved preferences
+provisional readings, groups readings under dated Yesterday/Today headings, and omits saved preferences
 from the visible text (they remain in the structured payload).
+Recent workouts include the computed effort classification beside the original
+activity name, so a treadmill label cannot silently turn a walk into a run.
 
 `assemble_status()` (`src/local_fitness/agent/status.py`) builds the payload:
 
@@ -141,10 +143,9 @@ follow-ups needed.
 - **`metrics` rows always exist even when the value is `null`.** All 18 metrics
   are emitted every time. A missing reading is `"value": null`, not an absent
   row — don't read row count as data coverage.
-- **`value` is today's reading only.** Garmin's sync lags: if the pull hasn't
-  run yet, today's row may be absent and every `value` reads `null` while the
-  `baseline`s still populate. `brief_stale_days` and the trend arrows are your
-  clue that the data frontier is behind.
+- **Read the date flags with `value`.** `partial_today_excluded` and
+  `provisional_today_excluded` anchor the comparison to yesterday; a separate
+  `provisional_today_value` belongs to today. Missing values are not zeros.
 - **`brief_stale_days > 0` means orphaned sync**: the pull advanced but the
   nightly brief generation failed. Read `logs/brief.launchd.err.log` before
   touching the Claude credential — see CLAUDE.md's failure-signature table.
