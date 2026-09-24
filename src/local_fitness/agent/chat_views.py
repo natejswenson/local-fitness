@@ -83,6 +83,7 @@ def render_snapshot(payload: dict) -> str:
     rows_by_date = defaultdict(list)
     missing = []
     provisional = False
+    withheld = False
     ordered = sorted(metrics, key=lambda m: (
         _PRIORITY.index(m["metric"]) if m["metric"] in _PRIORITY else len(_PRIORITY), m["metric"]))
     for metric in ordered:
@@ -110,8 +111,9 @@ def render_snapshot(payload: dict) -> str:
             missing.append(f"{label} ({value_date})")
         if metric.get("provisional_today_value") is not None:
             rows_by_date[today].append([label, metric_value(key, metric["provisional_today_value"]),
-                                       "provisional"])
+                                       "provisional; excluded from comparisons"])
             provisional = True
+            withheld = True
     if rows_by_date:
         for day, label in ((yesterday, "Yesterday"), (today, "Today")):
             if rows_by_date.get(day):
@@ -122,8 +124,10 @@ def render_snapshot(payload: dict) -> str:
     else:
         lines.extend(["No daily readings available. Ask to sync Garmin to get started.", ""])
     if provisional:
-        lines.extend(["Today's provisional readings may change and are excluded from comparisons. "
-                      "Ask to sync Garmin for an updated reading.", ""])
+        notice = "Today's provisional readings may change."
+        if withheld:
+            notice += " Ask to sync Garmin for updated readings."
+        lines.extend([notice, ""])
     if payload.get("data_as_of"):
         lines.extend([f"Last sync covering today: {_plain(payload['data_as_of'])}.", ""])
 

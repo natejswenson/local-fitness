@@ -25,6 +25,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   today's full instructions survive the status summary; walking classifications
   stay visible beside activity names; future sessions no longer show zero actuals.
   Snapshot tables group readings by date for easier reading in narrow chat columns.
+- Snapshot exclusion labels apply only to withheld readings. Freshly synced values
+  keep their comparisons without contradictory exclusion text or a redundant sync
+  suggestion; provisional readings without comparisons retain the may-change note.
 - Snapshot presentation dates yesterday's comparisons separately from today's
   provisional readings, and dates training load by its last complete day rather
   than the pipeline timestamp. Empty views give a next step instead of null tables.

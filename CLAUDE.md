@@ -419,8 +419,12 @@ today", "how's my training load", "what did I run last week"):
   `format="json"` preserves JSON text; internal SDK handlers keep that contract.
   `agent/chat_views.py` is pure presentation with no DB/model/network work.
   Snapshot comparisons excluded from today are dated yesterday; current form
-  uses `current_form_date`, never the pipeline's `as_of`. Plan views state the
-  data frontier and effective window. Progress's actuals are shared DAY totals,
+  uses `current_form_date`, never the pipeline's `as_of`.
+  Fresh provisional values can carry comparisons: only a non-null withheld
+  `provisional_today_value` gets an exclusion label and sync remedy. Raw-only
+  provisional readings carry the may-change note, never a blanket exclusion claim.
+  Plan views state the data frontier and effective window. Progress's actuals are
+  shared DAY totals,
   repeated per prescription in the payload: display them once per date, never
   label them per-session actuals. `this_week` means trailing seven days. Status
   contains one session; use progress for every session on a double day.

@@ -324,6 +324,38 @@ def test_progress_window_and_full_plan_are_honest_on_wire(remote):
     assert "Session 2" in default["content"][0]["text"]
 
 
+def test_snapshot_freshness_transition_keeps_explanation_consistent_with_comparison(remote):
+    today = date.today().isoformat()
+    now = datetime.now().isoformat()
+    with db.connect() as conn:
+        conn.execute("UPDATE daily_metrics SET rhr = 55 WHERE date = ?", (today,))
+        conn.execute("INSERT INTO baselines (date, rhr_60day_mean) VALUES (?, 50)", (today,))
+    stale = call_remote(remote, "daily_snapshot")
+    stale_rhr = next(m for m in stale["structuredContent"]["metrics"] if m["metric"] == "rhr")
+    assert stale_rhr["value"] == 50 and stale_rhr["delta_pct"] == 0
+    assert stale_rhr["provisional_today_value"] == 55
+    stale_text = stale["content"][0]["text"]
+    assert "| Resting heart rate | 50 bpm | usual 50 bpm · → +0% |" in stale_text
+    assert "| Resting heart rate | 55 bpm | provisional; excluded from comparisons |" in stale_text
+    assert "Ask to sync Garmin for updated readings." in stale_text
+    with db.connect() as conn:
+        conn.execute("INSERT INTO ingest_runs (source, started_at, completed_at, status, "
+                     "last_date_fetched) VALUES ('daily', ?, ?, 'success', ?)",
+                     (now, now, today))
+    fresh = call_remote(remote, "daily_snapshot")
+    fresh_rhr = next(m for m in fresh["structuredContent"]["metrics"] if m["metric"] == "rhr")
+    assert fresh_rhr["value"] == 55 and fresh_rhr["delta_pct"] == 10
+    assert fresh_rhr["provisional_today"] is True
+    assert "provisional_today_excluded" not in fresh_rhr
+    fresh_today = fresh["content"][0]["text"].split(f"### Today · {today}")[1]
+    assert "| Resting heart rate | 55 bpm | usual 50 bpm · ↑ +10% · provisional |" in fresh_today
+    assert "Today's provisional readings may change." in fresh_today
+    assert "excluded from comparisons" not in fresh_today
+    assert "sync Garmin" not in fresh_today
+    assert fresh["structuredContent"] == json.loads(
+        call_remote(remote, "daily_snapshot", {"format": "json"})["content"][0]["text"])
+
+
 def test_status_retains_full_prescription_without_changing_legacy_description(remote):
     seed_chat_plan()
     status = call_remote(remote, "get_training_plan_status")

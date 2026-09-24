@@ -1,6 +1,8 @@
 """Readable projections preserve computed meaning, dates and session identity."""
 from copy import deepcopy
 
+import pytest
+
 from local_fitness.agent import chat_views
 
 
@@ -9,7 +11,7 @@ def snapshot(**updates):
             "recent_workouts": [], **updates}
 
 
-def test_snapshot_dates_each_value_and_never_compares_provisional_today():
+def test_snapshot_dates_each_value_and_labels_only_withheld_readings_excluded():
     payload = snapshot(metrics=[
         {"metric": "rhr", "value": 50, "baseline": 50, "delta_pct": 0,
          "provisional_today_excluded": True, "provisional_today_value": 54},
@@ -23,7 +25,7 @@ def test_snapshot_dates_each_value_and_never_compares_provisional_today():
     yesterday, today = text.split("### Today · 2026-09-24")
     assert "### Yesterday · 2026-09-23" in yesterday
     assert "| Resting heart rate | 50 bpm | usual 50 bpm · +0% |" in yesterday
-    assert "| Resting heart rate | 54 bpm | provisional |" in today
+    assert "| Resting heart rate | 54 bpm | provisional; excluded from comparisons |" in today
     assert "| Steps | 0 |" in yesterday
     assert "| Sleep | 7h 30m | provisional |" in today
     assert "| Active calories | 0 kcal | partial total |" in today
@@ -32,6 +34,33 @@ def test_snapshot_dates_each_value_and_never_compares_provisional_today():
     assert "Current form · 2026-09-23" in text
     assert "Current form · 2026-09-24" not in text
     assert payload == before
+
+
+@pytest.mark.parametrize("metrics, expected_row", [
+    ([{"metric": "rhr", "value": 55, "baseline": 50, "delta_pct": 10,
+       "arrow": "↑", "provisional_today": True}],
+     "| Resting heart rate | 55 bpm | usual 50 bpm · ↑ +10% · provisional |"),
+    ([{"metric": "sleep_deep_seconds", "value": 3600, "provisional_today": True},
+      {"metric": "rhr", "value": None, "provisional_today_excluded": True},
+      {"metric": "steps", "value": 0, "partial_today_excluded": True}],
+     "| Sleep deep | 1h 00m | provisional |"),
+])
+def test_provisional_readings_without_withheld_values_do_not_request_resync(metrics, expected_row):
+    text = chat_views.render_snapshot(snapshot(metrics=metrics))
+    assert expected_row in text.split("### Today · 2026-09-24")[1]
+    assert "Today's provisional readings may change." in text
+    assert "excluded from comparisons" not in text
+    assert "sync Garmin" not in text
+
+
+def test_zero_withheld_reading_is_labeled_even_without_yesterdays_value():
+    text = chat_views.render_snapshot(snapshot(metrics=[{
+        "metric": "sleep_seconds", "value": None, "provisional_today_value": 0,
+        "provisional_today_excluded": True}]))
+    assert "| Sleep | 0m | provisional; excluded from comparisons |" in text
+    assert "Sleep (2026-09-23)" in text
+    assert "Ask to sync Garmin for updated readings." in text
+    assert text.count("Today's provisional readings may change.") == 1
 
 
 def test_only_provisional_data_is_not_an_empty_database():

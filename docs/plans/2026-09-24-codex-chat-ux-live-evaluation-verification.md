@@ -113,3 +113,61 @@ test process's connection factory with existing `db.connect_readonly`. They used
 only read tools. No Garmin, plan, journal, calendar/email, model, or report-cache
 writes were requested. Raw responses, persona data, preview pages and images
 remain private temporary artifacts outside Git; committed regressions are fabricated.
+
+## Follow-up live evaluation at `5b6357d`
+
+Reviewed amendment commit: `06e9361`. The repeated request resumed the existing
+local evaluation. No remote reads, push, PR update or deployment were performed.
+
+Fresh processes repeated the same 29-request matrix using actual local data and
+the configured memory backend: **27 successful responses, 2 expected errors**.
+The first sandboxed attempt could not reach the loopback memory service; it was
+discarded and rerun with local access. All four readable/JSON pairs matched, all
+four before/after structured payloads matched, and all 12 repeated responses were
+identical. The five previously corrected usability defects remained fixed.
+
+The follow-up found a remaining contradiction at the freshness transition:
+fresh provisional readings carried today's valid delta while the footer claimed
+they were excluded. Raw-only provisional values also triggered that claim and an
+unnecessary sync suggestion. Exclusion now appears only on the withheld row;
+the generic footer says readings may change, and only a displayed withheld value
+adds the sync remedy. Missing exclusion-flagged values and partial tallies do not
+trigger it; zero withheld values do. No calculation or structured fact changed.
+
+Five selected regression cases failed before the correction and passed afterward.
+An additional private **real stdio journey made six successful requests** using a
+fabricated database, changing only its ingest timestamp and readings to exercise
+fresh, stale and raw-only states. Every inline/JSON pair matched. The permanent
+HTTP regression exercises the same production transition with distinct current
+and previous values and a baseline.
+
+Browser inspection used the same local Markdown proxy at 360px/760px. Six live
+snapshot/status/progress layouts and four synthetic fresh/stale layouts had zero
+horizontal overflow. Inspected the complete plan instructions, fresh/stale labels,
+and actual HR and plan chart images. The final live snapshot measured:
+
+| Proxy measurement | Original before live fixes | Final follow-up |
+| --- | ---: | ---: |
+| 360px combined table height | 1733px | 1510px (-13%) |
+| 360px response height | 2353px | 2283px (-3%) |
+| 760px response height | 1465px | 1612px (+10%) |
+
+These supersede the earlier dimensions for the final snapshot. Explicit exclusion
+labels cost 144px at narrow width compared with the first corrected version;
+the tradeoff keeps the comparison meaning beside each value. Native Codex rendering,
+automatic model routing and conversational latency remain unverified. No claim of
+end-to-end speed improvement is made.
+
+Validation after the correction:
+- Focused chat/MCP/status suite: **120 passed**.
+- `uv run --offline pytest -x`: **2926 passed, 6 skipped, 1 existing warning**;
+  **95.32% coverage**, 51.34 seconds. Same isolated legacy-backend and macOS native
+  library/cache settings as above. Timed benchmarks remain skipped by default.
+- Ruff passed; prompt scorer **11/11**; `git diff --check` passed.
+- Isolated Docker build passed, including the actual PDF runtime render. MCP
+  empty-snapshot smoke passed with `--network none` and no host mounts. An initial
+  smoke used the image's system Python instead of its application virtualenv and
+  could not import the package; the corrected application interpreter passed.
+
+Reviewed the final diff: pure presentation, fabricated regressions, shared guidance
+and result notes only. All personal captures/previews stay outside Git.
