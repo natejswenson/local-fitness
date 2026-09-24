@@ -7,7 +7,7 @@ reader should understand the day and next step in under twenty seconds.
 ## Acceptance criteria
 - Lead with actual activity for the brief's date, followed by three useful
   numbers, at most one brief takeaway, and the next day's prescribed workout.
-- Typical visible copy is at most 80 words; stressful inputs never grow into a
+- All visible copy is at most 80 words; stressful inputs never grow into a
   deep dive. Long generated prose is omitted with an honest full-brief cue,
   never cut mid-sentence or rewritten into unsupported coaching.
 - PRESS typography, warm paper, whitespace and rules; readable at 320/390 px
@@ -85,6 +85,8 @@ Independent reviewer: `/root/email_plan_review`, read-only local review.
 - Accepted: use sync provenance only for contemporaneous data; an older date is
   an archived snapshot, not a claim that today's ingest refreshed that date.
 - Baseline reproduction: fabricated old email has 319 visible words, 1,405 px
-  document height and 433 px document width in a 390 px viewport (no charts).
+  document height at the initial browser zoom. Corrected, zoom-adjusted
+  measurement at 320 CSS px: 1,781 px content height and no horizontal overflow.
+  The earlier 433 px width was browser zoom, not a layout overflow.
 
 No unresolved blockers. These corrections are part of the committed scope.

@@ -4475,15 +4475,11 @@ def _build_plan_section(target_date: str) -> dict | None:
 
 
 def coaching_line_source(plan_section: dict | None) -> str | None:
-    """The single accessor for ``plan_section["today"]["coaching_line_source"]``
-    (#241, f-1f6a8ae5) — tolerates a missing section and a missing ``"today"``,
-    so both ``generate_brief_report`` and ``cli.brief_email`` read the field
-    through one guard instead of two independent copies of the same
-    truthiness check. ``assemble_brief_render_inputs``'s own docstring is what
-    this rule generalizes: "Two copies would drift silently, and the
-    divergence would only be visible to someone holding both artifacts side
-    by side" — that was true of the section-building logic, and it is
-    equally true of reading one optional field back out of it."""
+    """Read PDF coaching provenance, tolerating absent/older plan payloads.
+
+    Originally shared with the evening email (#241); the compact email has
+    no generated plan-coach line as of 0.67.0.
+    """
     if not plan_section:
         return None
     today = plan_section.get("today")
@@ -4497,14 +4493,9 @@ async def assemble_brief_render_inputs(
 ) -> tuple[dict[str, bytes], dict | None]:
     """Chart PNGs + the resolved Training Plan section for one saved brief.
 
-    Extracted from ``generate_brief_report`` so the PDF and the evening email
-    (``cli.brief_email``) build their render inputs from ONE implementation.
-    They target different renderers, but "which takeaways get a chart", "what
-    window does that chart cover" and "what does the plan section say" are
-    properties of the brief, not of the output format. Two copies would drift
-    silently, and the divergence would only be visible to someone holding both
-    artifacts side by side.
-
+    Originally shared by the PDF and evening email. Since 0.67.0 the email
+    uses ``email_digest`` and does not render charts or generate a coaching
+    line; this remains the PDF's full render-input path.
     Returns ``(charts_by_index, plan_section)``. ``charts_by_index`` is keyed by
     ``str(index)`` over ``enumerate(brief.takeaways)`` — NOT by metric name (two
     takeaways can cite the same metric). ``plan_section`` is None when there is
@@ -4515,18 +4506,17 @@ async def assemble_brief_render_inputs(
     ``coaching_line_source()`` above, not by indexing ``plan_section`` directly.
 
     ``coaching_line_source`` is diagnostic metadata about HOW the line was
-    produced, not part of what either renderer draws (#241, f-32b8f4da) — a
+    produced, not part of what the PDF renderer draws (#241, f-32b8f4da) — a
     caller that hashes ``plan_section`` wholesale to name an output file (see
     ``generate_brief_report``'s ``_render_tag`` call) MUST strip this key
     first, or a field the page never shows would silently move a
     content-addressed filename. It is left on the returned dict rather than
-    returned as a third tuple element only because the email path
-    (``cli.brief_email``) wants it alongside the rest of the section, not as
-    a fourth thing to thread through.
+    returned as a third tuple element for compatibility with existing PDF
+    callers; the compact evening email does not consume this payload.
 
     Best-effort throughout, and deliberately so: a chart that will not render is
     skipped, a malformed plan section becomes None, and a failed coaching-line
-    generation falls back to the deterministic template. Both callers are
+    generation falls back to the deterministic template. The caller is
     enriching a brief that is already saved and already correct, so nothing here
     may take that brief down with it.
     """

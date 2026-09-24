@@ -366,7 +366,9 @@ Two optional scheduled jobs carry the plan to where you already look:
 - **Brief email** (`fitness brief-email`, launchd 19:00 with a 20:00
   backstop) — pulls fresh Garmin data, **regenerates** the brief against the
   full day (by evening the morning brief describes a day that hadn't happened
-  yet), and sends it as a styled HTML email with the chart PNGs inline. Pure
+  yet), and sends a compact PRESS email: actual activity, three useful numbers,
+  one bounded takeaway and tomorrow's workout outline. HTML and plain text share
+  an 80-word budget; charts and long analysis stay in the full briefing. Pure
   `smtplib` — no model, no connector — with TLS certificate verification
   enforced on both the implicit-TLS (465) and STARTTLS paths. Configure the
   SMTP credentials in `.env`; the enabled state and recipients are managed
