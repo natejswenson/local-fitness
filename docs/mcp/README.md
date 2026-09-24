@@ -6,6 +6,11 @@ web UI. This directory documents every tool, one page each.
 Start here to find the right tool; follow the link for parameters, return shape,
 worked examples, and gotchas.
 
+Daily snapshot and plan status/progress default to readable Markdown plus
+`structuredContent` in Codex and other external MCP clients. Use `format="json"`
+for integrations expecting the previous JSON text envelope. Images belong in
+the assistant's reply with their captions, not only inside collapsed tool output.
+
 - **[Connecting](#connecting)**
 - **[Availability: stdio vs HTTP](#availability-stdio-vs-http)**
 - **[Tools by area](#tools-by-area)**

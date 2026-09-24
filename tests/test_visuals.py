@@ -39,6 +39,54 @@ def test_render_chart_png_unsupported_chart_type_raises():
         visuals.render_chart_png(_SERIES, "calendar", _fmt)
 
 
+@pytest.mark.parametrize("style", ["line", "bar", "combo"])
+def test_chart_uses_calendar_spacing_and_labels_both_ends(monkeypatch, style):
+    from matplotlib.figure import Figure
+
+    saved = Figure.savefig
+    axes = []
+
+    def inspect(fig, *args, **kwargs):
+        axes.append(fig.axes[0])
+        return saved(fig, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", inspect)
+    series = [("2026-09-01", 50), ("2026-09-02", 51), ("2026-09-12", 49)]
+    visuals.render_chart_png(series, style, _fmt, window_label="Resting heart rate · September")
+    ax = axes[0]
+    assert list(ax.get_xticks()) == [0, 1, 11]
+    assert [tick.get_text() for tick in ax.get_xticklabels()] == ["09-01", "09-02", "09-12"]
+    assert ax.get_title(loc="left") == "Resting heart rate · September"
+    if style == "line":
+        import math
+
+        assert all(math.isnan(v) for v in ax.lines[0].get_ydata()[2:11])
+        assert list(ax.collections[0].get_offsets()[:, 0]) == [0, 1, 11]
+    else:
+        assert [round(p.get_x() + p.get_width() / 2) for p in ax.patches] == [0, 1, 11]
+
+
+def test_single_reading_has_a_visible_mark_and_long_window_keeps_last_date(monkeypatch):
+    from datetime import date, timedelta
+
+    from matplotlib.figure import Figure
+
+    saved = Figure.savefig
+    axes = []
+
+    def inspect(fig, *args, **kwargs):
+        axes.append(fig.axes[0])
+        return saved(fig, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", inspect)
+    visuals.render_chart_png([("2026-09-01", 50)], "line", _fmt)
+    assert axes[-1].collections[0].get_offsets().tolist() == [[0, 50]]
+    assert axes[-1].collections[0].get_sizes()[0] > 0
+    series = [((date(2026, 9, 1) + timedelta(days=d)).isoformat(), 50 + d) for d in range(90)]
+    visuals.render_chart_png(series, "line", _fmt)
+    assert axes[-1].get_xticks()[0] == 0 and axes[-1].get_xticks()[-1] == 89
+
+
 def _pdf_text(pdf_bytes: bytes) -> str:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
         return "\n".join(p.extract_text() or "" for p in doc.pages)

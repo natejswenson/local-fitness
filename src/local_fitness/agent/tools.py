@@ -39,6 +39,7 @@ from . import (
     briefs,
     card_store,
     charts,
+    chat_views,
     coach,
     interpret,
     journal,
@@ -388,6 +389,12 @@ _DAILY_SNAPSHOT_DESCRIPTION = (
     "No plan/anomalies/candidates in this payload — "
     "use get_brief_context for the full read or anything plan-/trend-related."
 )
+
+_CHAT_FORMAT_PROPERTY = {
+    "type": "string", "enum": ["inline", "json"], "default": "inline",
+    "description": "External MCP: readable Markdown plus complete structured data (default), or legacy JSON text. Internal SDK output stays JSON.",
+}
+_CHAT_VIEW_SCHEMA = {"type": "object", "properties": {"format": _CHAT_FORMAT_PROPERTY}}
 
 
 #: Cap on the raw series get_metric_trend attaches with include_values=true
@@ -2781,7 +2788,7 @@ async def update_plan_calendar_settings(args: dict) -> dict:
 @tool(
     "daily_snapshot",
     _DAILY_SNAPSHOT_DESCRIPTION,
-    {},
+    _CHAT_VIEW_SCHEMA,
 )
 async def daily_snapshot(_args: dict) -> dict:
     # Lazy import: status.py imports DAILY_NUMERIC_METRICS from this module, so
@@ -3811,7 +3818,7 @@ _PLAN_RAW_DISPLAY_PAIRS = (
     "— surface it, then either commit_training_plan or "
     "discard_training_plan_draft. Proposing another plan silently archives "
     "it. Use get_training_plan_draft to read the whole thing.",
-    {},
+    _CHAT_VIEW_SCHEMA,
 )
 async def get_training_plan_status(_args: dict) -> dict:
     with db.connect() as conn:
@@ -3834,6 +3841,9 @@ async def get_training_plan_status(_args: dict) -> dict:
         cfg = plans.resolve_grading_config(conn=conn)
     status = plans.build_plan_status(active, frontier, activities_by_date, today, cfg)
     status["pending_draft"] = pending_draft
+    status["as_of"] = today
+    status["data_through"] = frontier
+    status["title"] = active.get("title")
 
     # 2d: pure formatting of data already in hand. (plans.py does import
     # agent.units since 0.35.0 — a pure stdlib leaf, no cycle — so display
@@ -3844,6 +3854,13 @@ async def get_training_plan_status(_args: dict) -> dict:
     for key in ("today", "last_graded"):
         w = status.get(key)
         if w is not None:
+            # Keep the legacy capped description; chat needs the complete
+            # prescription, including any constraints after character 120.
+            # Reuse loaded rows and match both date and session on double days.
+            source = next((row for row in active["workouts"]
+                           if row["date"] == w["date"] and row.get("seq", 1) == w.get("seq", 1)), None)
+            if source and source.get("description"):
+                w["description_full"] = source["description"]
             _augment_plan_workout(w)
             duration_formatted = units.format_duration(w.get("target_duration_sec"))
             if duration_formatted is not None:
@@ -3854,6 +3871,7 @@ async def get_training_plan_status(_args: dict) -> dict:
 _PROGRESS_SCHEMA = {
     "type": "object",
     "properties": {
+        "format": _CHAT_FORMAT_PROPERTY,
         "full": {
             "type": "boolean",
             "description": (
@@ -4006,7 +4024,15 @@ async def get_training_plan_progress(args: dict) -> dict:
 
     return _text({
         "active": True,
+        "title": active.get("title"),
         "goal_type": detail.get("goal_type"),
+        "as_of": today,
+        "data_through": frontier,
+        "workout_window": {
+            "full": full,
+            "start": min(dates) if full else window_start,
+            "end": max(dates) if full else window_end,
+        },
         "race_date": detail.get("race_date"),
         "target_time_seconds": target_time_seconds,
         "target_time_formatted": units.format_duration(target_time_seconds),
@@ -4771,12 +4797,13 @@ async def _chart_png(args: dict) -> dict:
     try:
         async with visuals.RENDER_LOCK:
             png_bytes = await asyncio.to_thread(
-                visuals.render_chart_png, list(zip(dates, values, strict=True)), chart_type, fmt
+                visuals.render_chart_png, list(zip(dates, values, strict=True)), chart_type, fmt,
+                window_label=f"{chat_views.metric_label(metric)} · {dates[0]} to {dates[-1]}",
             )
     except Exception as e:
         return _err(f"chart render failed: {e}")
 
-    caption = f"{metric} · {dates[0]} to {dates[-1]} · {len(values)} readings."
+    caption = f"{chat_views.metric_label(metric)} · {dates[0]} to {dates[-1]} · {len(values)} readings."
     if dates[-1] < _partial_day_anchor(metric, date.today()).isoformat():
         caption += " Data ends early; call sync_garmin_data(force=true) to check for updates."
     if dates[-1] == date.today().isoformat():

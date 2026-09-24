@@ -413,6 +413,23 @@ today", "how's my training load", "what did I run last week"):
   Inline PNGs from `chart`, `plan_chart`, or a workout report should be shown
   with their captions. For ASCII output, paste the full chart in a fenced code
   block. A chart left only in the tool call forces the user to expand it.
+- **Chat views preserve the facts and their dates (0.66.0).** External MCP
+  `daily_snapshot`, `get_training_plan_status`, and `get_training_plan_progress`
+  return Markdown plus the complete original payload in `structuredContent`.
+  `format="json"` preserves JSON text; internal SDK handlers keep that contract.
+  `agent/chat_views.py` is pure presentation with no DB/model/network work.
+  Snapshot comparisons excluded from today are dated yesterday; current form
+  uses `current_form_date`, never the pipeline's `as_of`.
+  Fresh provisional values can carry comparisons: only a non-null withheld
+  `provisional_today_value` gets an exclusion label and sync remedy. Raw-only
+  provisional readings carry the may-change note, never a blanket exclusion claim.
+  Plan views state the data frontier and effective window. Progress's actuals are
+  shared DAY totals,
+  repeated per prescription in the payload: display them once per date, never
+  label them per-session actuals. `this_week` means trailing seven days. Status
+  contains one session; use progress for every session on a double day.
+  Reuse returned data within the turn, sync once when freshness matters, and
+  route a saved-brief request to `fitness://brief/latest` without regenerating it.
 - This is advice, not an enforced gate — but with a tool that exists for the
   job, there's no reason to query the DB by hand.
 

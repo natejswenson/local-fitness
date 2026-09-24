@@ -101,6 +101,9 @@ gridlines, default), `bar` (vertical bars), or `combo` (bars + a least-squares
 trend line of the same metric — one metric, one axis, never a dual-axis chart).
 The response carries a date-labeled caption and a PNG image, with machine fields
 in `structuredContent`. Neither a local file nor Preview is needed to view it.
+The image itself names the metric and date range. Samples are spaced by calendar
+date; missing days break a line rather than implying observations. Isolated
+readings are marked, and both ends of a long window remain labeled.
 
 ## Gotchas
 

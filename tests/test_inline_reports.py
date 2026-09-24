@@ -9,11 +9,15 @@ import asyncio
 import base64
 import importlib
 import io
+import json
+import sys
 from datetime import date, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pdfplumber
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from PIL import Image
 from starlette.testclient import TestClient
 
@@ -270,3 +274,155 @@ def test_remote_plan_chart_uses_the_shared_plan_rows(remote, monkeypatch):
     assert "text follows" in fallback["content"][0]["text"]
     assert "easy" in fallback["content"][0]["text"]
     assert [c["type"] for c in fallback["content"]] == ["text"]
+
+
+def seed_chat_plan():
+    from local_fitness import plans
+
+    today = date.today()
+    workouts = [{"date": (today + timedelta(days=offset)).isoformat(), "week_index": 1,
+                 "seq": seq, "type": "easy", "target_distance_m": 5000,
+                 "target_hr_max": 145,
+                 "description": f"Session {seq}: " + "Easy effort. " * 12 + "Finish with a cooldown."}
+                for offset, seq in [(-30, 1), (-1, 1), (0, 1), (0, 2), (20, 1)]]
+    plan = plans.insert_draft({"goal_type": "10k", "title": "Autumn training",
+                              "race_date": (today + timedelta(days=30)).isoformat(),
+                              "target_time_seconds": 3000, "created_at": today.isoformat()}, workouts)
+    plans.commit_plan(plan, now=today.isoformat())
+
+
+@pytest.mark.parametrize("name", list(tools.chat_views.RENDERERS))
+def test_external_chat_views_preserve_json_and_structured_payload(remote, name):
+    seed_chat_plan()
+    original = asyncio.run(getattr(tools, name).handler({}))
+    payload = json.loads(original["content"][0]["text"])
+    assert "structuredContent" not in original  # internal SDK contract stays JSON
+    legacy = call_remote(remote, name, {"format": "json"})
+    assert legacy["content"] == original["content"]
+    inline = call_remote(remote, name)
+    assert not inline["isError"]
+    assert inline["structuredContent"] == payload
+    assert inline["content"][0]["text"].startswith("## ")
+    assert "path" not in inline["structuredContent"]
+    invalid = call_remote(remote, name, {"format": "html"})
+    assert invalid["isError"]
+
+
+def test_progress_window_and_full_plan_are_honest_on_wire(remote):
+    seed_chat_plan()
+    default = call_remote(remote, "get_training_plan_progress")
+    full = call_remote(remote, "get_training_plan_progress", {"full": True})
+    short_data, full_data = default["structuredContent"], full["structuredContent"]
+    assert len(short_data["workouts"]) == 3
+    assert len(full_data["workouts"]) == 5
+    assert short_data["adherence_pct"] == full_data["adherence_pct"]
+    assert "Displayed window:" in default["content"][0]["text"]
+    assert "Full plan:" in full["content"][0]["text"]
+    text = default["content"][0]["text"]
+    assert text.count("Day total: 6.21 mi") == 1  # yesterday, not per session
+    assert text.count("So far today: 6.21 mi") == 1
+    assert "Session 2" in default["content"][0]["text"]
+
+
+def test_snapshot_freshness_transition_keeps_explanation_consistent_with_comparison(remote):
+    today = date.today().isoformat()
+    now = datetime.now().isoformat()
+    with db.connect() as conn:
+        conn.execute("UPDATE daily_metrics SET rhr = 55 WHERE date = ?", (today,))
+        conn.execute("INSERT INTO baselines (date, rhr_60day_mean) VALUES (?, 50)", (today,))
+    stale = call_remote(remote, "daily_snapshot")
+    stale_rhr = next(m for m in stale["structuredContent"]["metrics"] if m["metric"] == "rhr")
+    assert stale_rhr["value"] == 50 and stale_rhr["delta_pct"] == 0
+    assert stale_rhr["provisional_today_value"] == 55
+    stale_text = stale["content"][0]["text"]
+    assert "| Resting heart rate | 50 bpm | usual 50 bpm · → +0% |" in stale_text
+    assert "| Resting heart rate | 55 bpm | provisional; excluded from comparisons |" in stale_text
+    assert "Ask to sync Garmin for updated readings." in stale_text
+    with db.connect() as conn:
+        conn.execute("INSERT INTO ingest_runs (source, started_at, completed_at, status, "
+                     "last_date_fetched) VALUES ('daily', ?, ?, 'success', ?)",
+                     (now, now, today))
+    fresh = call_remote(remote, "daily_snapshot")
+    fresh_rhr = next(m for m in fresh["structuredContent"]["metrics"] if m["metric"] == "rhr")
+    assert fresh_rhr["value"] == 55 and fresh_rhr["delta_pct"] == 10
+    assert fresh_rhr["provisional_today"] is True
+    assert "provisional_today_excluded" not in fresh_rhr
+    fresh_today = fresh["content"][0]["text"].split(f"### Today · {today}")[1]
+    assert "| Resting heart rate | 55 bpm | usual 50 bpm · ↑ +10% · provisional |" in fresh_today
+    assert "Today's provisional readings may change." in fresh_today
+    assert "excluded from comparisons" not in fresh_today
+    assert "sync Garmin" not in fresh_today
+    assert fresh["structuredContent"] == json.loads(
+        call_remote(remote, "daily_snapshot", {"format": "json"})["content"][0]["text"])
+
+
+def test_status_retains_full_prescription_without_changing_legacy_description(remote):
+    seed_chat_plan()
+    status = call_remote(remote, "get_training_plan_status")
+    payload = status["structuredContent"]
+    assert payload["title"] == "Autumn training"
+    assert "**Autumn training**" in status["content"][0]["text"]
+    for key in ("today", "last_graded"):
+        workout = payload[key]
+        assert workout["description"] == workout["description_full"][:120]
+        assert workout["description_full"].endswith("Finish with a cooldown.")
+        assert workout["description_full"].startswith(f"Session {workout['seq']}:")
+    assert status["content"][0]["text"].count("Finish with a cooldown.") == 2
+
+
+def test_chat_view_failure_preserves_original_data(remote, monkeypatch):
+    original = call_remote(remote, "daily_snapshot", {"format": "json"})
+    monkeypatch.setitem(tools.chat_views.RENDERERS, "daily_snapshot", Mock(side_effect=ValueError("bad view")))
+    result = call_remote(remote, "daily_snapshot")
+    assert not result["isError"]
+    assert result["content"] == original["content"]
+
+
+@pytest.mark.parametrize("name", list(tools.chat_views.RENDERERS))
+def test_chat_presentation_adds_no_database_opens(remote, monkeypatch, name):
+    seed_chat_plan()
+    call_remote(remote, name, {"format": "json"})  # warm the independent persona cache
+    original = db.connect
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "connect", counted)
+    plain = call_remote(remote, name, {"format": "json"})
+    json_count = len(calls)
+    calls.clear()
+    shown = call_remote(remote, name)
+    assert not plain["isError"] and not shown["isError"]
+    assert len(calls) == json_count == 1
+
+
+def test_real_stdio_chat_views_and_images(report_db, monkeypatch):
+    # Exercise the actual stdio protocol used by Codex, with an isolated DB.
+    # This starts our own Python server, never a model CLI or a signed-in client.
+    seed_chat_plan()
+    params = StdioServerParameters(command=sys.executable, args=["-c",
+        "import asyncio; from local_fitness.web.mcp_server import run_stdio; asyncio.run(run_stdio())"],
+        env={"LOCAL_FITNESS_DATA_DIR": str(report_db.parent),
+             "LOCAL_FITNESS_NOTES_PATH": str(report_db.parent / "notes.md"),
+             "LOCAL_FITNESS_BRIEFINGS_DIR": str(report_db.parent / "briefings"),
+             "LOCAL_FITNESS_PREFERENCES_BACKEND": "legacy",
+             "LOCAL_FITNESS_JOURNAL_BACKEND": "legacy", "LOCAL_FITNESS_COACH_MEMORY": "0",
+             "MPLCONFIGDIR": str(report_db.parent / "mpl"),
+             "XDG_CACHE_HOME": str(report_db.parent / "cache")})
+
+    async def journey():
+        async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+            await session.initialize()
+            for name in tools.chat_views.RENDERERS:
+                original = await session.call_tool(name, {"format": "json"})
+                shown = await session.call_tool(name, {})
+                assert not shown.isError
+                assert shown.structuredContent == json.loads(original.content[0].text)
+                assert shown.content[0].text.startswith("## ")
+            chart = await session.call_tool("chart", {"metric": "rhr", "days": 7})
+            assert not chart.isError
+            assert "Resting heart rate" in chart.content[0].text
+            png_from(chart.model_dump())
+    asyncio.run(journey())

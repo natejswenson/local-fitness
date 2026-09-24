@@ -13,12 +13,12 @@ one renders a verdict with a named yardstick. Use
 [`plan_chart`](plan_chart.md) instead when the question is about the plan as a
 whole rather than one session.
 
-The returned `markdown` field is already formatted. **Render it to the user
-verbatim.** Do not re-summarize it, do not rebuild your own verdict from the
+The returned report text (`content` by default; `markdown` in JSON exports) is
+already formatted. **Render it to the user verbatim.** Do not re-summarize it, do not rebuild your own verdict from the
 structured fields, and do not assemble a card by hand out of
 `get_workout_detail` when a graded one exists.
 
-### In ChatGPT and other remote clients
+### In Codex, ChatGPT and other MCP clients
 
 The default `format="inline"` returns formatted report text plus a PNG image
 when stored HR data is available. Display both. Grades are deterministic; the
@@ -311,10 +311,10 @@ invented scale is banned just as squarely).
 workout_report_card()
 ```
 
-→ grades the most recent activity, writes
-`report-card-<activity_id>.pdf`, opens it on the Mac, and returns the payload.
-Paste `markdown` into the reply as-is and stop there. If the user wants the
-table only and not the PDF, `workout_report_card(format="table")`.
+→ grades the most recent activity and returns report text plus the available
+HR image directly in chat. Display both, including data notices. No PDF is
+written or opened by default. Use `workout_report_card(format="pdf")` only for
+an explicit export request; `format="table"` retains the JSON/Markdown response.
 
 ## Gotchas
 
@@ -392,5 +392,5 @@ table only and not the PDF, `workout_report_card(format="table")`.
 - [`query_workouts`](query_workouts.md) — find the `activity_id`.
 - [`plan_chart`](plan_chart.md) — adherence across the plan instead of one
   session.
-- [`generate_brief_report`](generate_brief_report.md) — the other PDF tool, and
-  the other member of `LOCAL_ONLY_TOOLS`.
+- [`generate_brief_report`](generate_brief_report.md) — the daily-brief PDF
+  exporter, the only member of `LOCAL_ONLY_TOOLS`.
