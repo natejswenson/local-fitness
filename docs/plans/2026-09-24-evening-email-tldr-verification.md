@@ -4,7 +4,7 @@ Reviewed plan commit: `a5de5fd`.
 
 ## Result
 
-The evening email now leads with measured activity, three daily numbers, one
+The evening email now leads with measured activity, five daily numbers, one
 bounded takeaway and tomorrow's prescribed workout outline. HTML and plain text
 share an 80-word ceiling. Dense days prioritize workout outlines over optional
 commentary; critical context retains an explicit review cue. Charts, markdown
@@ -97,3 +97,52 @@ then sent it to the configured recipient. SMTP accepted the message. Its
 subject is prefixed `Preview:`; this direct preview send does not write the
 nightly `.emailed-*` marker. No Garmin pull, regeneration, merge or deployment
 was performed. The private EML and send receipt remain outside Git.
+
+## Five requested metrics and second preview (2026-09-24)
+
+Reviewed amendment commit: `ca63497`, with focused independent review from
+`/root/email_plan_review`. The user requested steps, workout time, workout
+score, sleep score and resting HR, and explicitly authorized another email.
+
+The two activity totals now lead a 2+3 metric layout. The three smaller values
+show the main on-foot workout's existing capped score out of 5, Garmin sleep
+score out of 100 and resting HR in bpm. Saved workout scores are labelled
+saved; only today's missing card is calculated with the existing local grader.
+No rubric changes, model calls, card writes or Garmin fetches were introduced.
+Known-empty workouts show 0m; incomplete totals and ungradeable scores show —.
+
+Final browser checks, all visually inspected with no horizontal overflow:
+
+| Preview | Words | Height at 320 CSS px |
+| --- | ---: | ---: |
+| Five populated metrics | 75 | 702 px |
+| Missing data | 54 | 656 px |
+| Dense double day | 77 | 682 px |
+| Actual saved-data preview | 68 | 696 px |
+
+The populated sample is 669 px tall at 390 px and 646 px on desktop. The
+temporary viewport override was reset. PRESS lint found zero issues in all
+four artifacts. MIME/plain-text parity and the complete 80-word budget remain
+covered by tests; inbox-client appearance is left for the requested user review.
+
+Validation: full suite **2,929 passed, 6 skipped**, **95.35% coverage**; Ruff,
+prompt scorer **11/11** and diff check passed. The expanded tests exercise
+real database selection and local capped grading, saved-score precedence,
+bike/walk exclusion from main-run selection, date isolation, historical/future
+non-regrading, missing/invalid scores and failure isolation. A fresh process
+exercises today's uncached scoring path without importing the agent tools or
+Claude SDK. Database snapshots confirm no score writes. Initial new fixtures
+needed a required description and a running prescription before they exercised
+the intended cap; the final real-grading case passes.
+
+The isolated Docker build passed, including native PDF rendering. A separate
+network-disabled container used synthetic SQLite data to calculate a workout
+score, render all five metrics and verify that no report card was saved and
+no agent runtime imported.
+
+SMTP accepted one new message to the configured recipient, subject
+`Updated preview: Your fitness TL;DR · 2026-09-24`. It uses the reviewed
+saved-data HTML/plain MIME. The preview's direct mailer path does not set the
+nightly sent marker. Private artifacts/receipt remain in the temporary preview
+directory; no personal health data was committed. The running deployment was
+not replaced as part of this draft-PR refinement.

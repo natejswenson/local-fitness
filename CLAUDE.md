@@ -931,7 +931,17 @@ These are settled — don't redesign without a reason.
   loading never imports the agent tool runtime (PR #269 CodeQL follow-up).
   `compose` builds one bounded digest for both `email_render.build_html` and
   `build_text`. Actual activity leads, with steps so far, logged workout time,
-  last night's sleep, at most one complete takeaway and tomorrow's outline.
+  main workout score (/5), sleep score (/100), resting HR (bpm), at most one
+  complete takeaway and tomorrow's outline. Two large activity totals sit above
+  three compact score/recovery metrics. Known-empty workouts show 0m; incomplete
+  durations remain unavailable. The main session is the longest measured run,
+  otherwise the earliest positive-distance/duration on-foot activity. Filter
+  on-foot types BEFORE pace selection. Read saved capped `overall_stars` by
+  activity ID AND date on the existing read-only connection, labelled saved;
+  only today's missing card can use `load_report_card_inputs(hr_trace=False)`
+  and `build_card` for its capped `overall.stars`. No card writes, HR fetch,
+  model call or historical/future regrading; a score failure preserves the
+  other metrics. Saved snapshots are not a claim of grading at the sync time.
   Missing data is not zero, walking uses measured effort after an on-foot type
   guard, and no prescription is distinct from prescribed rest. Every tomorrow
   date+seq is accounted for: up to two complete structured outlines, otherwise

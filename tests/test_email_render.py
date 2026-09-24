@@ -22,7 +22,8 @@ def make_brief(**over):
 
 
 def make_inputs(**over):
-    payload = dict(daily={"steps": 10240, "sleep_seconds": 25500}, activities=[{
+    payload = dict(daily={"steps": 10240, "sleep_score": 86, "rhr": 52},
+        workout_score=4.25, score_saved=True, activities=[{
         "activity_type": "treadmill_running", "distance_meters": 6759.2448,
         "duration_seconds": 4200, "avg_pace_sec_per_km": 650}], has_plan=True,
         tomorrow=[dict(type="easy", target_distance_m=4828.032,
@@ -64,7 +65,9 @@ def test_email_is_a_digest_with_matching_text_and_no_details_or_assets():
     assert visible.words == text.split()
     assert len(visible.words) <= 80
     assert "4.2 mi walked." in text
-    assert "10,240" in text and "7h 05m" in text
+    for metric in ("10,240 Steps so far", "1h 10m Workout time",
+                   "4.25/5 Main workout score (saved)", "86/100 Sleep score", "52 bpm Resting HR"):
+        assert metric in text
     assert "Tomorrow · Aug 08" in text and "Easy run" in text
     assert "Full instructions in your fitness chat." in text
     for omitted in ("PRIVATE LONG DETAILS", "<img", "<style", "@font-face", "data:",
@@ -159,7 +162,9 @@ def test_brief_time_is_separate_from_sync_time():
 def test_activity_is_measured_and_missing_totals_never_look_complete(rows, expected):
     digest = email_digest.compose(make_brief(), make_inputs(activities=rows))
     assert digest.headline == expected
-    expected_duration = "30m" if rows == [dict(activity_type="strength_training", duration_seconds=1800)] else "—"
+    expected_duration = ("0m" if rows == [] else "30m"
+                         if rows == [dict(activity_type="strength_training", duration_seconds=1800)]
+                         else "—")
     assert digest.stats[1][0] == expected_duration
 
 
@@ -173,8 +178,10 @@ def test_mixed_running_walking_is_named_and_cycling_never_added_to_foot_miles():
 
 def test_missing_duration_is_not_summed_as_zero_and_zero_steps_are_real():
     rows = [dict(activity_type="cycling", duration_seconds=1800), dict(activity_type="strength")]
-    digest = email_digest.compose(make_brief(), make_inputs(activities=rows, daily={"steps": 0}))
-    assert digest.stats == (("0", "Steps so far"), ("—", "Workout time"), ("—", "Last night's sleep"))
+    digest = email_digest.compose(make_brief(), make_inputs(
+        activities=rows, daily={"steps": 0, "sleep_score": 0}, workout_score=None, score_saved=False))
+    assert digest.stats == (("0", "Steps so far"), ("—", "Workout time"),
+                            ("—", "Main workout score"), ("0/100", "Sleep score"), ("—", "Resting HR"))
 
 
 @pytest.mark.parametrize("inputs,expected", [
@@ -209,7 +216,7 @@ def email_db(tmp_path):
     path = tmp_path / "fitness.db"
     db.init_schema(path)
     with db.connect(path) as conn:
-        conn.execute("INSERT INTO daily_metrics(date,steps,sleep_seconds) VALUES ('2025-12-31',12345,25200)")
+        conn.execute("INSERT INTO daily_metrics(date,steps,sleep_score,rhr) VALUES ('2025-12-31',12345,88,54)")
         conn.execute("INSERT INTO activities(activity_id,date,activity_type,distance_meters,duration_seconds,avg_pace_sec_per_km) VALUES (1,'2025-12-31','treadmill_running',3218.688,2100,650)")
         conn.execute("INSERT INTO activities(activity_id,date,activity_type,distance_meters) VALUES (2,'2026-01-01','running',99999)")
         conn.execute("INSERT INTO training_plans(plan_id,status,goal_type,race_date,created_at) VALUES (1,'active','5k','2027-02-01','2026-12-01')")
@@ -223,7 +230,7 @@ def test_readonly_loader_selects_target_day_and_all_ordered_tomorrow_sessions(em
     with db.connect_readonly(email_db) as conn:
         before = conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
     inputs = email_digest.load_inputs("2025-12-31", email_db)
-    assert inputs.daily == {"steps": 12345, "sleep_seconds": 25200}
+    assert inputs.daily == {"steps": 12345, "sleep_score": 88, "rhr": 54}
     assert len(inputs.activities) == 1 and inputs.activities[0]["distance_meters"] == 3218.688
     assert [w["type"] for w in inputs.tomorrow] == ["easy", "cross"]
     assert inputs.historical is True and inputs.synced_at is None
@@ -295,17 +302,114 @@ def test_critical_context_survives_the_total_budget_on_a_dense_double_day():
     assert len(email_render.build_text(digest).split()) <= 80
 
 
-def test_email_input_loading_does_not_import_the_agent_tool_runtime(tmp_path):
+def test_email_input_loading_does_not_import_the_agent_tool_runtime(email_db):
     import subprocess
     import sys
+    from datetime import date
+
+    from local_fitness import db
+
+    today = date.today().isoformat()
+    with db.connect(email_db) as conn:
+        conn.execute("UPDATE activities SET date=? WHERE activity_id=1", (today,))
 
     result = subprocess.run([
         sys.executable, "-c",
         "import sys; from pathlib import Path; "
         "from local_fitness.agent.email_digest import load_inputs; "
-        "load_inputs('2026-09-24', Path(sys.argv[1])); "
+        "load_inputs(sys.argv[2], Path(sys.argv[1])); "
         "assert 'local_fitness.agent.tools' not in sys.modules; "
         "assert 'claude_agent_sdk' not in sys.modules",
-        str(tmp_path / "missing.db"),
+        str(email_db), today,
     ], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_main_score_prefers_saved_capped_rating_for_longest_run_not_bike_or_walk(email_db, monkeypatch):
+    from local_fitness import db
+    from local_fitness.agent import report_card
+
+    with db.connect(email_db) as conn:
+        for aid, kind, distance, pace in [(3, "cycling", 40000, 100),
+                                          (4, "running", 5000, 330), (5, "running", 1000, 280)]:
+            conn.execute("INSERT INTO activities(activity_id,date,activity_type,distance_meters,duration_seconds,avg_pace_sec_per_km) VALUES (?,'2025-12-31',?,?,1800,?)",
+                         (aid, kind, distance, pace))
+        conn.execute("INSERT INTO report_cards(activity_id,activity_date,graded_at,overall_stars,mean_stars,card_json) VALUES (4,'2025-12-31','2025-12-31T19:00:00',2.75,4.5,'{}')")
+        before = list(conn.iterdump())
+    monkeypatch.setattr(report_card, "build_card", lambda *a, **kw: pytest.fail("saved score must not be recomputed"))
+    inputs = email_digest.load_inputs("2025-12-31", email_db)
+    assert inputs.workout_score == 2.75 and inputs.score_saved is True
+    with db.connect_readonly(email_db) as conn:
+        assert list(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("target", ["2025-12-31", "2099-01-01"])
+def test_missing_historical_or_future_score_is_never_recomputed(email_db, monkeypatch, target):
+    from local_fitness import db
+    from local_fitness.agent import report_card
+
+    with db.connect(email_db) as conn:
+        conn.execute("UPDATE activities SET date=? WHERE activity_id=1", (target,))
+        # A saved rating for another date is not evidence for the target date.
+        conn.execute("INSERT INTO report_cards(activity_id,activity_date,graded_at,overall_stars,card_json) VALUES (1,'2025-01-01','2025-01-01',4.5,'{}')")
+    monkeypatch.setattr(report_card, "load_report_card_inputs", lambda *a, **kw: pytest.fail("must not regrade"))
+    assert email_digest.load_inputs(target, email_db).workout_score is None
+
+
+def test_current_day_score_uses_real_local_grader_without_writes(email_db, monkeypatch):
+    from datetime import date
+
+    from local_fitness import db
+    from local_fitness.agent import report_card
+    from local_fitness.ingest import details
+
+    today = date.today().isoformat()
+    with db.connect(email_db) as conn:
+        conn.execute("UPDATE activities SET date=?,avg_hr=180,avg_pace_sec_per_km=330,duration_seconds=1062 WHERE activity_id=1", (today,))
+        conn.execute("INSERT INTO plan_workouts(plan_id,date,seq,week_index,type,target_distance_m,target_pace_sec_per_km,target_hr_max,description) VALUES (1,?,1,1,'easy',3218.688,330,130,'Easy session.')", (today,))
+        before = list(conn.iterdump())
+    monkeypatch.setattr(details, "get_hr_samples", lambda *a, **kw: pytest.fail("no HR trace/network access"))
+    with db.connect_readonly(email_db) as conn:
+        data = report_card.load_report_card_inputs(conn, activity_id=1, hr_trace=False)
+        data.pop("other_activities_on_date")
+        expected = report_card.build_card(**data)["overall"]
+    inputs = email_digest.load_inputs(today, email_db)
+    assert inputs.workout_score == expected["stars"]
+    assert inputs.workout_score < expected["mean_stars"]
+    assert inputs.score_saved is False
+    with db.connect_readonly(email_db) as conn:
+        assert list(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("score", [None, 0, 6, float("inf")])
+def test_unavailable_or_invalid_saved_scores_never_become_a_rating(email_db, score):
+    from local_fitness import db
+
+    with db.connect(email_db) as conn:
+        conn.execute("INSERT INTO report_cards(activity_id,activity_date,graded_at,overall_stars,card_json) VALUES (1,'2025-12-31','2025-12-31',?,'{}')", (score,))
+    inputs = email_digest.load_inputs("2025-12-31", email_db)
+    assert inputs.workout_score is None and inputs.score_saved is False
+
+
+def test_score_storage_failure_preserves_other_four_metrics_and_plan(email_db):
+    from local_fitness import db
+
+    with db.connect(email_db) as conn:
+        conn.execute("DROP TABLE report_cards")
+    digest = email_digest.compose(make_brief(date="2025-12-31"),
+                                 email_digest.load_inputs("2025-12-31", email_db))
+    assert [value for value, _ in digest.stats] == ["12,345", "35m", "—", "88/100", "54 bpm"]
+    assert len(digest.tomorrow) == 2
+
+
+def test_current_workout_with_no_gradeable_reference_has_no_score(email_db):
+    from datetime import date
+
+    from local_fitness import db
+
+    today = date.today().isoformat()
+    with db.connect(email_db) as conn:
+        conn.execute("UPDATE activities SET date=? WHERE activity_id=1", (today,))
+    inputs = email_digest.load_inputs(today, email_db)
+    assert inputs.workout_score is None and inputs.score_saved is False
+    assert len(inputs.activities) == 1

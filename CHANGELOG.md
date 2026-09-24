@@ -15,8 +15,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - Evening email becomes a compact PRESS fitness TL;DR with an 80-word budget:
-  actual activity, three daily numbers, one takeaway and tomorrow's workout
+  actual activity, steps, workout time, main workout score, sleep score,
+  resting HR, one takeaway and tomorrow's workout
   outline. HTML and plain text carry identical facts and qualifications.
+- Emphasize activity totals above a compact score/recovery row. Reuse saved
+  workout ratings with a saved label, or calculate today's missing rating with
+  the existing local grader; historical missing scores stay unavailable.
 - Remove email charts, markdown deep dives, weekly tables, social byline and
   the extra plan-coach call. The full PDF briefing remains available.
 

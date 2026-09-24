@@ -42,12 +42,18 @@ def build_html(digest: Digest, theme: dict) -> str:
                     margin="8px 0 0", overflow_wrap="anywhere", word_wrap="break-word")
     section = _css(font_family=f["display_stack"], font_size="14px", font_weight="800",
                    line_height="1.35", color=c["ink"], margin="0 0 8px")
-    stat_cells = "".join(
-        f'<td width="33.33%" valign="top" style="padding:0 4px 0 0">'
-        f'<p style="{_css(font_family=f["mono_stack"], font_size="19px", line_height="1.3", color=c["ink"], margin="0", overflow_wrap="anywhere", word_wrap="break-word")}">{escape(value)}</p>'
-        f'<p style="{label};margin:5px 0 0">{escape(name)}</p></td>'
-        for value, name in digest.stats
-    )
+    def stat_row(stats: tuple[tuple[str, str], ...], size: str) -> str:
+        cells = "".join(
+            f'<td width="{100 / len(stats):.2f}%" valign="top" style="padding:0 8px 0 0">'
+            f'<p style="{_css(font_family=f["mono_stack"], font_size=size, line_height="1.3", color=c["ink"], margin="0", overflow_wrap="anywhere", word_wrap="break-word")}">{escape(value)}</p>'
+            f'<p style="{label};margin:5px 0 0">{escape(name)}</p></td>'
+            for value, name in stats
+        )
+        return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                f'border="0" style="table-layout:fixed"><tr>{cells}</tr></table>')
+
+    activity_stats = stat_row(digest.stats[:2], "30px")
+    recovery_stats = stat_row(digest.stats[2:], "19px")
     tomorrow = "".join(
         f'<p style="{body};margin:0 0 4px">{escape(line)}</p>'
         for line in digest.tomorrow
@@ -81,7 +87,8 @@ def build_html(digest: Digest, theme: dict) -> str:
   <h1 style="{headline}">{escape(digest.headline)}</h1>
   {activity_note}
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed;margin:24px 0;border-top:1px solid {c['rule']};border-bottom:1px solid {c['rule']}">
-    <tr><td style="padding:16px 0"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed"><tr>{stat_cells}</tr></table></td></tr>
+    <tr><td style="padding:16px 0">{activity_stats}</td></tr>
+    <tr><td style="padding:16px 0;border-top:1px solid {c['paper_elevated']}">{recovery_stats}</td></tr>
   </table>
   {insight}
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed;margin:20px 0 0;border-top:1px solid {c['paper_elevated']}"><tr><td style="padding:18px 0 0">

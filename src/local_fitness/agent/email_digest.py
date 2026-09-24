@@ -6,6 +6,7 @@ Missing input stays missing; no model, chart, Garmin call or write happens here.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import sqlite3
 from dataclasses import dataclass, field, replace
@@ -31,6 +32,49 @@ class EmailInputs:
     synced_at: str | None = None
     historical: bool = False
     distance_unit: str = "mi"
+    workout_score: float | None = None
+    score_saved: bool = False
+
+
+def _workout_score(conn: sqlite3.Connection, target: str,
+                   activities: list[dict]) -> tuple[float | None, bool]:
+    """Main on-foot session, using the existing capped 1–5 report-card score.
+
+    Stored cards are snapshots, not recomputable history. An uncached score
+    can be derived for today only; this path never saves or generates a read.
+    """
+    eligible = [r for r in activities if plans._is_on_foot(r.get("activity_type"))
+                and (r.get("distance_meters") or 0) > 0
+                and (r.get("duration_seconds") or 0) > 0]
+    if not eligible:
+        return None, False
+    running = [r for r in eligible
+               if interpret.is_running_effort(r.get("avg_pace_sec_per_km")) is True]
+    main = max(running, key=lambda r: r["distance_meters"]) if running else eligible[0]
+    saved = conn.execute(
+        "SELECT overall_stars FROM report_cards WHERE activity_id=? AND activity_date=?",
+        (main["activity_id"], target),
+    ).fetchone()
+    if saved is not None:
+        score = saved["overall_stars"]
+    elif target == date.today().isoformat():
+        from . import report_card
+
+        inputs = report_card.load_report_card_inputs(
+            conn, activity_id=main["activity_id"], hr_trace=False)
+        if inputs is None:
+            return None, False
+        card = report_card.build_card(
+            inputs["activity"], inputs["splits"], inputs["plan_workout"],
+            inputs["reference"], inputs["context"], inputs["hr_samples"],
+            inputs["recent_activities"], inputs["upcoming_workouts"], inputs["hr_zones"],
+        )
+        score = card["overall"]["stars"]
+    else:
+        return None, False
+    if score is None or not math.isfinite(score) or not 1 <= score <= 5:
+        return None, False
+    return score, saved is not None
 
 
 def load_inputs(target: str, db_path: Path | None = None) -> EmailInputs:
@@ -46,14 +90,20 @@ def load_inputs(target: str, db_path: Path | None = None) -> EmailInputs:
         with db.connect_readonly(db_path or db.DEFAULT_DB_PATH) as conn:
             try:
                 row = conn.execute(
-                    "SELECT steps, sleep_seconds FROM daily_metrics WHERE date=?", (target,)
+                    "SELECT steps, sleep_score, rhr FROM daily_metrics WHERE date=?", (target,)
                 ).fetchone()
                 result.daily = dict(row) if row else {}
                 result.activities = [dict(r) for r in conn.execute(
-                    "SELECT activity_type, distance_meters, duration_seconds, "
-                    "avg_pace_sec_per_km FROM activities WHERE date=?", (target,))]
+                    "SELECT activity_id, activity_type, distance_meters, duration_seconds, "
+                    "avg_pace_sec_per_km FROM activities WHERE date=? "
+                    "ORDER BY start_time, activity_id", (target,))]
             except sqlite3.Error:
                 LOG.warning("Evening email activity data unavailable", exc_info=True)
+            try:
+                result.workout_score, result.score_saved = _workout_score(
+                    conn, target, result.activities or [])
+            except (sqlite3.Error, ValueError, TypeError, KeyError):
+                LOG.warning("Evening email workout score unavailable", exc_info=True)
             try:
                 active = plans.get_active_plan(conn=conn)
                 result.has_plan = active is not None
@@ -159,11 +209,17 @@ def compose(brief: Brief, inputs: EmailInputs) -> Digest:
     headline, activity_note = _activity(inputs)
     rows = inputs.activities
     duration = (sum(r["duration_seconds"] for r in rows)
-                if rows and all(r.get("duration_seconds") is not None for r in rows) else None)
+                if rows is not None and all(r.get("duration_seconds") is not None for r in rows)
+                else None)
     steps = inputs.daily.get("steps")
+    sleep = inputs.daily.get("sleep_score")
+    rhr = inputs.daily.get("rhr")
+    score_label = "Main workout score" + (" (saved)" if inputs.score_saved else "")
     stats = ((f"{steps:,}" if steps is not None else "—", "Steps so far"),
              (units.format_hm(duration) or "—", "Workout time"),
-             (units.format_hm(inputs.daily.get("sleep_seconds")) or "—", "Last night's sleep"))
+             (f"{inputs.workout_score:.2f}/5" if inputs.workout_score is not None else "—", score_label),
+             (f"{sleep:g}/100" if sleep is not None else "—", "Sleep score"),
+             (f"{rhr:g} bpm" if rhr is not None else "—", "Resting HR"))
     selected = min(brief.takeaways, key=lambda t: {
         "critical": 0, "caution": 1, "positive": 2, "neutral": 3}[t.tone])
     # Render source prose only when it fits WHOLE and is plain, not markdown.
