@@ -31,7 +31,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .. import config
-from . import grounding, prompts
+from . import codex_model, grounding, prompts
 from .coach import CoachProfile
 from .grounding import GroundingFlag
 
@@ -248,14 +248,18 @@ async def generate_coaching_line(
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 
-    if model is None:
-        model = DEFAULT_MODEL
-
     system_prompt, user_prompt = build_prompt(
         profile, today_workout, last_7_days, adherence_pct, days_to_race, goal_type,
         notes_text=notes_text, user_name=user_name, memory_text=memory_text,
         sessions_adherence_pct=sessions_adherence_pct,
     )
+    if codex_model.coaching_provider() == "codex":
+        return await asyncio.to_thread(
+            codex_model.generate_codex_text, system_prompt, user_prompt,
+            model=model, timeout=timeout,
+        )
+    if model is None:
+        model = DEFAULT_MODEL
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
@@ -382,7 +386,8 @@ async def generate_coaching_line_cached(
         memory_text=memory_text, sessions_adherence_pct=sessions_adherence_pct,
     )
     key = hashlib.sha256(
-        "\x00".join([system_prompt, user_prompt, model or "default"]).encode("utf-8")
+        "\x00".join([system_prompt, user_prompt,
+                     codex_model.coaching_cache_model(model)]).encode("utf-8")
     ).hexdigest()
     path = cache_path or _cache_path()
     cached = _read_cached_line(path, key)

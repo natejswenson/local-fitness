@@ -68,6 +68,9 @@ def _no_live_codex_calls(monkeypatch):
     from local_fitness.agent import codex_model
 
     monkeypatch.delenv("LOCAL_FITNESS_BRIEF_PROVIDER", raising=False)
+    monkeypatch.delenv("LOCAL_FITNESS_COACH_PROVIDER", raising=False)
+    monkeypatch.delenv("LOCAL_FITNESS_CODEX_COACH_MODEL", raising=False)
+    monkeypatch.delenv("LOCAL_FITNESS_CODEX_MODEL", raising=False)
 
     def _blocked(*args, **kwargs):
         raise RuntimeError(
@@ -76,6 +79,18 @@ def _no_live_codex_calls(monkeypatch):
         )
 
     monkeypatch.setattr(codex_model, "generate_codex_completion", _blocked)
+    monkeypatch.setattr(codex_model, "generate_codex_text", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_memory_backends(monkeypatch):
+    """A configured developer's vault must not be contacted by default tests.
+
+    Dedicated transport tests explicitly opt in after this fixture runs.
+    CLI imports load .env during collection, just like the calendar settings.
+    """
+    monkeypatch.setenv("LOCAL_FITNESS_PREFERENCES_BACKEND", "legacy")
+    monkeypatch.setenv("LOCAL_FITNESS_JOURNAL_BACKEND", "legacy")
 
 
 @pytest.fixture(autouse=True)

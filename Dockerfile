@@ -9,8 +9,7 @@ FROM python:3.12-slim AS runtime
 # System deps:
 #  - curl: needed for the healthcheck and the uv installer.
 #  - ca-certificates / gnupg: nodesource repo signing.
-#  - nodejs: required because the Claude Agent SDK shells out to the
-#    `claude` CLI, which is published via npm.
+#  - nodejs: the Claude and Codex subscription transports use npm CLIs.
 #  - Pango/FreeType + fonts: WeasyPrint renders remote workout PDF exports.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -23,6 +22,9 @@ RUN apt-get update \
 # Pin the Claude Code CLI to the version the SDK expects (see
 # claude_agent_sdk/_cli_version.py). Bump in lockstep with the SDK.
 RUN npm install -g @anthropic-ai/claude-code@2.1.119
+
+# Pin the Codex transport too; both scheduled and MCP coaching need the CLI.
+RUN npm install -g @openai/codex@0.157.1 && codex --version
 
 # Install uv into a system path so the non-root user picks it up too.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
@@ -56,8 +58,8 @@ ENV LOCAL_FITNESS_HOST=0.0.0.0 \
 
 # Pre-create the volume mount points so the bind-mounts can attach
 # cleanly on first run, and own them as `app` so writes succeed.
-RUN mkdir -p /data /briefings /home/app/.garminconnect /home/app/.claude \
-    && chown -R app:app /data /briefings /home/app/.garminconnect /home/app/.claude
+RUN mkdir -p /data /briefings /home/app/.garminconnect /home/app/.claude /home/app/.codex \
+    && chown -R app:app /data /briefings /home/app/.garminconnect /home/app/.claude /home/app/.codex
 
 USER app
 

@@ -28,7 +28,7 @@ import re
 from datetime import date
 
 from .. import config
-from . import journal, ledger, memory, prompts, workout_coach
+from . import codex_model, journal, ledger, memory, prompts, workout_coach
 from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
@@ -220,6 +220,11 @@ async def generate_reflection(
 
     system_prompt, user_prompt = build_prompt(
         profile, event, ledger_text, recent_entries, user_name=user_name)
+    if codex_model.coaching_provider() == "codex":
+        return await asyncio.to_thread(
+            codex_model.generate_codex_text, system_prompt, user_prompt,
+            model=model, timeout=timeout,
+        )
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model or DEFAULT_MODEL,
