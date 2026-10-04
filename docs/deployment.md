@@ -8,6 +8,14 @@ end-to-end.
 
 ## Container deployment (Traefik or any reverse proxy)
 
+Scheduled coaching and journal generation follow `LOCAL_FITNESS_BRIEF_PROVIDER`
+by default. Optionally inject `LOCAL_FITNESS_COACH_PROVIDER=claude|codex` and
+`LOCAL_FITNESS_CODEX_COACH_MODEL` to select them independently. For Codex, install
+its CLI and persist a writable, owner-only `CODEX_HOME`. Complete
+`codex login --device-auth` inside that runner so it owns a refreshable login;
+an old copy of a desktop auth cache is not a maintained session. Both models
+use the existing subscription credentials, with no API key required.
+
 The `Dockerfile` produces an image that:
 
 - Binds `0.0.0.0:8765` (so Docker port-forwarding can reach it).
@@ -50,6 +58,12 @@ services:
       # Long-lived Claude Code subscription token (so the Agent SDK
       # subprocess can authenticate without per-request API billing)
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      # The same provider selection applies to scheduled and MCP coaching.
+      - LOCAL_FITNESS_BRIEF_PROVIDER=${LOCAL_FITNESS_BRIEF_PROVIDER:-claude}
+      - LOCAL_FITNESS_COACH_PROVIDER=${LOCAL_FITNESS_COACH_PROVIDER:-${LOCAL_FITNESS_BRIEF_PROVIDER:-claude}}
+      - LOCAL_FITNESS_CODEX_MODEL=${LOCAL_FITNESS_CODEX_MODEL:-}
+      - LOCAL_FITNESS_CODEX_COACH_MODEL=${LOCAL_FITNESS_CODEX_COACH_MODEL:-}
+      - CODEX_HOME=/home/app/.codex
       # Bearer token gating /mcp/ (and every other non-public path) —
       # REQUIRED when binding 0.0.0.0
       - LOCAL_FITNESS_API_TOKEN=${LOCAL_FITNESS_API_TOKEN}
@@ -72,6 +86,8 @@ services:
       # auth isn't bind-mountable — run `docker exec -it fitness claude`
       # once for the OAuth flow, persists to a named volume)
       - fitness-claude-config:/home/app/.claude
+      # Persist Codex login/refresh; authenticate as the app user with device auth.
+      - fitness-codex-config:/home/app/.codex
 ```
 
 The runtime image includes the native PDF libraries and fonts. Its build renders
@@ -83,7 +99,9 @@ The compose-side `.env` file (sibling of `docker-compose.yml`, same
 shape as this repo's `.env.example`) supplies the interpolated
 variables above (`LOCAL_FITNESS_TZ`, the two Garmin credentials,
 `CLAUDE_CODE_OAUTH_TOKEN`, `LOCAL_FITNESS_API_TOKEN`,
-`LOCAL_FITNESS_MCP_ALLOWED_HOSTS`, `LOCAL_FITNESS_DISPLAY_UNITS`). Generate the API token once with:
+`LOCAL_FITNESS_MCP_ALLOWED_HOSTS`, `LOCAL_FITNESS_DISPLAY_UNITS`,
+`LOCAL_FITNESS_BRIEF_PROVIDER` and optional Codex model settings). Declare the
+named credential volumes in your Compose file. Generate the API token once with:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"

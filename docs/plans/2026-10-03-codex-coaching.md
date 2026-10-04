@@ -41,3 +41,14 @@ Operational audit: Garmin sync, database integrity, memory reads, SMTP TLS/login
 email dry-run, Calendar OAuth/read and HTTPS/MCP authentication passed. After
 delivery, verify real Codex coaching/reflection and canonical runner health,
 without manually sending email or changing calendar prescriptions.
+
+Live synthetic verification found a Codex subprocess crash during simultaneous
+calls; a separate workout call passed in 13.7s. Keep ephemeral SQLite state in
+the transport's private temporary directory via supported `CODEX_SQLITE_HOME`,
+while leaving credentials persistent. Recheck simultaneous generators afterward.
+
+The corrected concurrent probe passed all three actual Codex generators. The
+Compose server also needs the pinned Codex CLI and persistent credentials:
+include the CLI in the runtime image and wire only the fitness service to the
+existing refreshed credential home, preserving unrelated stack edits. Verify
+the authenticated HTTPS coaching path after deploying merged dev.
