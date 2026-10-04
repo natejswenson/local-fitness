@@ -356,7 +356,15 @@ your host or every request 421s).
 > server). Choose `LOCAL_FITNESS_BRIEF_PROVIDER=claude|codex` in `.env`. Claude
 > uses `CLAUDE_CODE_OAUTH_TOKEN`; Codex uses `codex exec` and the CLI login, plus
 > `LOCAL_FITNESS_CODEX_BIN` when the scheduler cannot find Homebrew binaries.
-> The web server and MCP endpoint need neither model credential. See
+> Plan coaching, workout commentary and automatic journal reflection follow that
+> provider too. `LOCAL_FITNESS_COACH_PROVIDER=claude|codex` overrides them together;
+> `LOCAL_FITNESS_CODEX_COACH_MODEL` optionally selects their Codex model (otherwise
+> `LOCAL_FITNESS_CODEX_MODEL`, then the CLI default). Keep a persistent writable
+> Codex credential directory for unattended token refresh. Sign a container in
+> independently with `codex login --device-auth` rather than maintaining a stale
+> snapshot of a desktop login.
+> MCP coaching uses the selected provider's credentials in the server too;
+> health checks and deterministic data tools do not need model credentials. See
 > [`ops/`](ops/) and [`docs/deployment.md`](docs/deployment.md).
 
 ## Evening delivery — email + calendar

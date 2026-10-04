@@ -33,7 +33,7 @@ import re
 from pathlib import Path
 
 from .. import config
-from . import prompts, report_card, units
+from . import codex_model, prompts, report_card, units
 from .coach import CoachProfile
 
 _LOG = logging.getLogger(__name__)
@@ -531,12 +531,16 @@ async def generate_read(
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 
-    if model is None:
-        model = DEFAULT_MODEL
-
     system_prompt, user_prompt = build_prompt(
         profile, card, notes_text=notes_text, user_name=user_name,
         memory_text=memory_text)
+    if codex_model.coaching_provider() == "codex":
+        return await asyncio.to_thread(
+            codex_model.generate_codex_text, system_prompt, user_prompt,
+            model=model, timeout=timeout,
+        )
+    if model is None:
+        model = DEFAULT_MODEL
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
@@ -609,8 +613,8 @@ def read_cache_key(
     """The read's cache key — the ONE key definition, shared by
     ``generate_read_cached``'s file cache and ``card_store``'s persisted rows.
 
-    Pure: ``build_prompt`` is pure, so the key is a function of the card,
-    voice, notes and memory alone. The byte layout is load-bearing —
+    No DB/network work: the key includes the card, voice, notes, memory and
+    selected deployment provider/model. The Claude byte layout is retained —
     ``sha256("\\x00".join([system_prompt, user_prompt, model or "default",
     str(activity_id)]))``, with the literal ``"default"`` (NOT
     ``DEFAULT_MODEL``) when ``model`` is None — because a stored row's key
@@ -628,7 +632,7 @@ def read_cache_key(
         memory_text=memory_text)
     return hashlib.sha256(
         "\x00".join([
-            system_prompt, user_prompt, model or "default",
+            system_prompt, user_prompt, codex_model.coaching_cache_model(model),
             str((card.get("activity") or {}).get("activity_id", "")),
         ]).encode("utf-8")
     ).hexdigest()

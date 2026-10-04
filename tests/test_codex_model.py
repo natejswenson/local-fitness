@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ _REAL_GENERATE = codex_model.generate_codex_completion
 
 def test_codex_completion_uses_isolated_noninteractive_exec(monkeypatch):
     monkeypatch.delenv("LOCAL_FITNESS_CODEX_BIN", raising=False)
+    monkeypatch.setenv("CODEX_HOME", "/persistent/credentials")
     captured = {}
 
     def fake_run(argv, **kwargs):
@@ -32,6 +34,9 @@ def test_codex_completion_uses_isolated_noninteractive_exec(monkeypatch):
     assert captured["argv"][-3:] == ["--model", "gpt-test", "-"]
     assert captured["kwargs"]["input"].startswith("system\n\nuser")
     assert captured["kwargs"]["cwd"] is not None
+    assert captured["kwargs"]["env"]["CODEX_HOME"] == "/persistent/credentials"
+    assert captured["kwargs"]["env"]["CODEX_SQLITE_HOME"] == str(
+        Path(captured["kwargs"]["cwd"]) / "state")
 
 
 def test_codex_completion_honors_explicit_binary(monkeypatch):

@@ -437,6 +437,27 @@ today", "how's my training load", "what did I run last week"):
 
 These are settled — don't redesign without a reason.
 
+- **Coaching uses the configured subscription provider** (0.68.0).
+  `LOCAL_FITNESS_COACH_PROVIDER=claude|codex` overrides plan coaching, workout
+  commentary and automatic journal reflection together; absent it, they follow
+  `LOCAL_FITNESS_BRIEF_PROVIDER`, then Claude for unconfigured clones. Existing
+  Claude model/effort/thinking defaults remain unchanged. Codex uses a strict
+  JSON text envelope through `codex_model`, with the same prompts, caller
+  deadlines and downstream parsers/fallbacks. It resolves the explicit model,
+  `LOCAL_FITNESS_CODEX_COACH_MODEL`, `LOCAL_FITNESS_CODEX_MODEL`, then its CLI
+  default; it never inherits a caller's Claude default model. Plan/workout cache
+  identity resolves provider/model settings without DB or network work and
+  separates Codex models while retaining the old Claude key layout. Cache keys
+  therefore include deployment routing settings as well as prompt inputs.
+  Tests strip ambient provider settings and default preference/journal backends
+  to legacy; dedicated vault tests opt in explicitly. Otherwise CLI `.env`
+  loading makes unrelated tests contact a developer's real memory writer.
+  For unattended Codex, sign the runner in independently with device auth and
+  keep its owner-only credential directory persistent and writable for refresh.
+  Each ephemeral composition sets `CODEX_SQLITE_HOME` to its private temporary
+  directory, so concurrent runs do not put SQLite/WAL state in the credential
+  bind mount. Never isolate `CODEX_HOME` itself: login refresh must persist.
+
 - **The web UI is retired (2026-07-09) — MCP is the only client surface.**
   The entire `web/` directory (React/Vite SPA), every UI-only REST route
   (`/api/*`), the background-sync-orchestration subsystem, and the SPA
